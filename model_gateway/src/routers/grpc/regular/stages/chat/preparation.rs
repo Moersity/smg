@@ -162,24 +162,26 @@ pub(crate) async fn prepare_chat_like(
         };
 
         // Step 2: Process messages and apply chat template
-        let processed_messages = match utils::process_chat_messages_with_placeholders(
-            &body_ref,
-            &*tokenizer,
-            placeholder_tokens.as_ref(),
-            media_order,
-        ) {
-            Ok(msgs) => msgs,
-            Err(e) => {
-                error!(function = "ChatPreparationStage::execute", error = %e, "Failed to process chat messages");
-                return Err(error::bad_request("process_messages_failed", e));
-            }
-        };
+        let (processed_messages, prompt_encoding) =
+            match utils::process_chat_messages_with_placeholders(
+                &body_ref,
+                &*tokenizer,
+                placeholder_tokens.as_ref(),
+                media_order,
+            ) {
+                Ok(msgs) => msgs,
+                Err(e) => {
+                    error!(function = "ChatPreparationStage::execute", error = %e, "Failed to process chat messages");
+                    return Err(error::bad_request("process_messages_failed", e));
+                }
+            };
 
-        // Step 3: Tokenize the processed text (no special tokens - chat template already handles them)
-        let encoding = match utils::encode_blocking(
+        // Step 3: Tokenize the prompt the way its renderer said to (a flat
+        // encode of the text, or the encode the renderer prepared)
+        let encoding = match utils::encode_prompt_blocking(
             tokenizer.clone(),
-            processed_messages.text.clone(),
-            false,
+            &processed_messages.text,
+            prompt_encoding,
         )
         .await
         {
