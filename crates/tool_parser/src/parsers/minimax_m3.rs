@@ -286,13 +286,6 @@ impl MinimaxM3Parser {
             .map(|tool| &tool.function.parameters)
     }
 
-    fn property_schema<'a>(schema: Option<&'a Value>, name: &str) -> Option<&'a Value> {
-        schema?
-            .get("properties")
-            .and_then(Value::as_object)?
-            .get(name)
-    }
-
     /// Serialize one complete top-level parameter. Repeated names emit a later
     /// duplicate member with the same aggregate value as the complete parser;
     /// JSON consumers use that last member.
@@ -348,6 +341,30 @@ impl MinimaxM3Parser {
         self.active_element = None;
         self.discard_invoke_body = false;
         self.invoke_aborted = false;
+    }
+
+    /// Whether a buffered tool-call wrapper can still become a valid invoke.
+    ///
+    /// Whitespace is allowed between the wrapper and the invoke marker. Once
+    /// the first non-whitespace bytes diverge from that marker, later input
+    /// cannot turn the candidate into a tool call.
+    fn could_start_invoke(buffer: &str) -> bool {
+        let Some(after_wrapper) = buffer.strip_prefix(TOOL_CALL_START) else {
+            return false;
+        };
+        let candidate = after_wrapper.trim_start();
+        if candidate.is_empty() || INVOKE_START.starts_with(candidate) {
+            return true;
+        }
+
+        let Some(after_invoke) = candidate.strip_prefix(INVOKE_START) else {
+            return false;
+        };
+        after_invoke.is_empty()
+            || after_invoke
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_whitespace() || c == '>')
     }
 
     /// Decode common XML entities.
@@ -732,7 +749,6 @@ impl ToolParser for MinimaxM3Parser {
                         }
                     }
                 }
-
                 if self.discard_invoke_body {
                     let invoke_end = self.buffer.find(INVOKE_END);
                     let wrapper_end = self.buffer.find(TOOL_CALL_END);
@@ -822,6 +838,18 @@ impl ToolParser for MinimaxM3Parser {
             // This preserves the existing all-text fallback for a malformed
             // complete wrapper while still avoiding repeated scans.
             if self.wrapper_prefix_held {
+                if !Self::could_start_invoke(&self.buffer) {
+                    // Release the false wrapper, then resume the normal-text
+                    // scan so a later marker (including a partial one) is still
+                    // recognized rather than flushed as ordinary content.
+                    normal_text.push_str(TOOL_CALL_START);
+                    self.buffer.drain(..TOOL_CALL_START.len());
+                    self.in_tool_call = false;
+                    self.wrapper_prefix_held = false;
+                    self.wrapper_scan_pos = 0;
+                    continue;
+                }
+
                 let search = &self.buffer[self.wrapper_scan_pos..];
                 let invoke = search
                     .find(INVOKE_START)
@@ -1020,6 +1048,25 @@ impl ToolParser for MinimaxM3Parser {
 
     fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {
         helpers::get_unstreamed_args(&self.prev_tool_call_arr, &self.streamed_args_for_tool)
+    }
+
+    fn take_unstreamed_normal_text(&mut self) -> String {
+        // Before a valid invoke header is announced, the buffered wrapper is
+        // still only a prospective tool call and must fall back to text at EOF.
+        // Once an invoke has been announced, its remaining buffer is tool-call
+        // syntax and cannot be re-emitted as normal content.
+        let prospective_tool_call = !self.in_tool_call || self.wrapper_prefix_held;
+        let buffered = std::mem::take(&mut self.buffer);
+        self.in_tool_call = false;
+        self.wrapper_prefix_held = false;
+        self.wrapper_scan_pos = 0;
+        self.abandon_streaming_invoke();
+
+        if prospective_tool_call {
+            buffered
+        } else {
+            String::new()
+        }
     }
 
     fn reset(&mut self) {
