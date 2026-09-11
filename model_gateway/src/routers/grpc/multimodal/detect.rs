@@ -226,6 +226,7 @@ mod tests {
     fn extracts_image_media_part() {
         let messages = vec![
             ChatMessage::System {
+                ext: Default::default(),
                 content: MessageContent::Text("You are helpful".to_string()),
                 name: None,
             },
