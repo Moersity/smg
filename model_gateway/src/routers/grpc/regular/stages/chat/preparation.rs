@@ -65,6 +65,8 @@ pub(crate) async fn prepare_chat_like(
     ctx: &mut RequestContext,
     request: &ChatCompletionRequest,
 ) -> Result<(Vec<u32>, ProcessedMessages, Option<(String, String)>), Response> {
+    utils::validate_chat_content_parts(&request.messages)
+        .map_err(|e| error::bad_request("unsupported_content_part", e))?;
     {
         // Step 0: Resolve tokenizer from registry (cached for reuse in response processing)
         let tokenizer =
@@ -162,24 +164,26 @@ pub(crate) async fn prepare_chat_like(
         };
 
         // Step 2: Process messages and apply chat template
-        let processed_messages = match utils::process_chat_messages_with_placeholders(
-            &body_ref,
-            &*tokenizer,
-            placeholder_tokens.as_ref(),
-            media_order,
-        ) {
-            Ok(msgs) => msgs,
-            Err(e) => {
-                error!(function = "ChatPreparationStage::execute", error = %e, "Failed to process chat messages");
-                return Err(error::bad_request("process_messages_failed", e));
-            }
-        };
+        let (processed_messages, prompt_encoding) =
+            match utils::process_chat_messages_with_placeholders(
+                &body_ref,
+                &*tokenizer,
+                placeholder_tokens.as_ref(),
+                media_order,
+            ) {
+                Ok(msgs) => msgs,
+                Err(e) => {
+                    error!(function = "ChatPreparationStage::execute", error = %e, "Failed to process chat messages");
+                    return Err(error::bad_request("process_messages_failed", e));
+                }
+            };
 
-        // Step 3: Tokenize the processed text (no special tokens - chat template already handles them)
-        let encoding = match utils::encode_blocking(
+        // Step 3: Tokenize the prompt the way its renderer said to (a flat
+        // encode of the text, or the encode the renderer prepared)
+        let encoding = match utils::encode_prompt_blocking(
             tokenizer.clone(),
-            processed_messages.text.clone(),
-            false,
+            &processed_messages.text,
+            prompt_encoding,
         )
         .await
         {
@@ -254,32 +258,35 @@ pub(crate) async fn prepare_chat_like(
         }
 
         // Step 4: Build tool constraints if needed
-        // The tool parser registry handles both structural tag (for native format
-        // parsers like Mistral, KimiK2) and generic JSON schema fallback.
-        let tool_call_constraint = if let (Some(tools), Some(tool_choice)) =
-            (body_ref.tools.as_ref(), request.tool_choice.as_ref())
-        {
-            ctx.components
-                .tool_parser_factory
-                .registry()
-                .generate_tool_constraint(
-                    ctx.components
-                        .parser_resolver
-                        .tool_parser(&request.model)
-                        .as_deref(),
-                    tools,
-                    tool_choice,
+        let enable_thinking = utils::resolve_user_thinking(
+            request.chat_template_kwargs.as_ref(),
+            request.reasoning_effort.as_deref(),
+            tokenizer.as_ref(),
+        )
+        .unwrap_or(true);
+        let tool_call_constraint = ctx
+            .components
+            .tool_parser_factory
+            .registry()
+            .generate_chat_constraint(
+                ctx.components
+                    .parser_resolver
+                    .tool_parser(&request.model)
+                    .as_deref(),
+                body_ref.tools.as_deref().unwrap_or_default(),
+                request
+                    .tool_choice
+                    .as_ref()
+                    .unwrap_or(&ToolChoice::Value(ToolChoiceValue::Auto)),
+                enable_thinking,
+            )
+            .map_err(|e| {
+                error!(function = "ChatPreparationStage::execute", error = %e, "Invalid tool configuration");
+                error::bad_request(
+                    "invalid_tool_configuration",
+                    format!("Invalid tool configuration: {e}"),
                 )
-                .map_err(|e| {
-                    error!(function = "ChatPreparationStage::execute", error = %e, "Invalid tool configuration");
-                    error::bad_request(
-                        "invalid_tool_configuration",
-                        format!("Invalid tool configuration: {e}"),
-                    )
-                })?
-        } else {
-            None
-        };
+            })?;
 
         let preserve_reasoning_special_tokens = request.separate_reasoning
             && utils::reasoning_parser_requires_special_tokens(
