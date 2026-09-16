@@ -45,11 +45,15 @@ from smg_grpc_servicer.vllm.kv_events import (
     stream_kv_events,
 )
 from smg_grpc_servicer.vllm.kv_transfer import (
+    pairing_fields,
     params_from_request,
     params_to_response_fields,
     resolve_pd_connector,
 )
 from smg_grpc_servicer.vllm.mm_salt import has_preprocessed_mm_payload, mm_identity_cache_salt
+
+from ..pd_pairing import pairing_protocol_from_env
+from .mm_keys import modality_key, primary_encoder_key
 
 logger = init_logger(__name__)
 SAMPLING_DEFAULT_KEYS = (
@@ -524,6 +528,8 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             kv_engine_id=kv_engine_id,
             data_parallel_size=parallel.data_parallel_size,
             shm_namespace_id=mm_shm.shm_namespace_id(),
+            pairing_protocol=pairing_protocol_from_env(),
+            **pairing_fields(self.engine.vllm_config),
         )
 
     async def GetLoads(
@@ -659,15 +665,17 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         mm_modality = "video" if is_video else "image"
 
         def mm_key(key: str) -> str:
-            if is_video and key == "pixel_values":
-                return "pixel_values_videos"
-            return key
+            return modality_key(key, is_video)
 
         # Deserialize all tensors from proto. The PD decode leg carries no
         # pixel_values (KV arrives via the P/D transfer), only grid tensors.
+        # The primary tensor is registered under the model's forward kwarg
+        # (``encoder_input_key``; DeepSeek-V4.1 takes ``patches``), the same
+        # name the router uses in ``batched_keys`` / ``flat_keys``.
         hf_dict: dict[str, torch.Tensor] = {}
         if mm_proto.HasField("pixel_values"):
-            hf_dict[mm_key("pixel_values")] = _tensor_from_proto(mm_proto.pixel_values)
+            primary_key = mm_key(primary_encoder_key(mm_proto))
+            hf_dict[primary_key] = _tensor_from_proto(mm_proto.pixel_values)
         for key, td in mm_proto.model_specific_tensors.items():
             hf_dict[mm_key(key)] = _tensor_from_proto(td)
 
@@ -1049,6 +1057,10 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             else:
                 stop_kwargs["matched_stop_str"] = str(completion.stop_reason)
 
+        # Per-request speculative counts; needs vLLM's --per-request-spec-decode-metrics.
+        spec = getattr(completion, "spec_decode_metrics", None)
+        spec_accepted = sum(j * n for j, n in enumerate(spec.histogram)) if spec else 0
+
         # Build complete response
         # When streaming (DELTA mode): completion.token_ids will be empty/last delta
         # When non-streaming (FINAL_ONLY mode): completion.token_ids has all tokens
@@ -1057,6 +1069,8 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             complete=vllm_engine_pb2.GenerateComplete(
                 output_ids=completion.token_ids,
                 finish_reason=completion.finish_reason or "stop",
+                spec_accepted_tokens=spec_accepted,
+                spec_draft_tokens=spec.num_draft_tokens if spec else 0,
                 prompt_tokens=len(output.prompt_token_ids) if output.prompt_token_ids else 0,
                 completion_tokens=len(completion.token_ids),
                 cached_tokens=output.num_cached_tokens,
