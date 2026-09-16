@@ -180,6 +180,7 @@ mod tests {
             worker_service: Arc::new(WorkerService::new(registry, job_queue, router_config)),
             inflight_tracker: InFlightRequestTracker::new(),
             kv_event_monitor: None,
+            rl: None,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
@@ -194,7 +195,6 @@ mod tests {
         let data = WorkerRemovalWorkflowData {
             config: super::super::find_workers_to_remove::WorkerRemovalRequest {
                 url: worker_urls.first().cloned().unwrap_or_default(),
-                dp_aware: false,
                 expected_revision: None,
             },
             workers_to_remove: Some(WorkerList::from_workers(&workers)),

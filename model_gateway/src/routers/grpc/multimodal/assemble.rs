@@ -100,13 +100,9 @@ async fn assemble_multimodal_data_impl(
                     )
                 })
                 .collect::<Vec<_>>();
-            let batches = intermediate.into_batches();
-            let pending = tokio::task::spawn_blocking(move || {
-                assemble_tokenspeed_batches(&batches, options).map(PendingTokenSpeedAssembly::new)
-            })
-            .await
-            .context("TokenSpeed multimodal assembly task failed")??;
-            Ok(MultimodalData::TokenSpeed(pending.into_inner()?))
+            Ok(MultimodalData::TokenSpeed(
+                spawn_tokenspeed_assembly(intermediate, options).await?,
+            ))
         }
         BackendClient::Grpc(GrpcClient::Mlx(_)) => {
             anyhow::bail!("MLX does not support multimodal inputs")
@@ -123,11 +119,52 @@ async fn assemble_multimodal_data_impl(
                 data.rdma_enabled = false;
                 Ok(MultimodalData::Vllm(data))
             }
+            RuntimeType::TokenSpeed => {
+                let options = intermediate
+                    .batches()
+                    .iter()
+                    .map(|batch| TokenSpeedAssemblyOptions {
+                        // The ZMQ translate sends tensor bytes inline
+                        // (ext-encoded msgpack): assemble without /dev/shm so no
+                        // handle ever needs re-inlining at conversion. The wire
+                        // does support ShmTensorHandle; wiring that up is a
+                        // follow-up optimization.
+                        shm_enabled: false,
+                        ..tokenspeed_assembly_options(
+                            batch.media.modality(),
+                            workers,
+                            omit_prefill_pixels,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                Ok(MultimodalData::TokenSpeed(
+                    spawn_tokenspeed_assembly(intermediate, options).await?,
+                ))
+            }
             runtime => anyhow::bail!(
                 "multimodal inputs are not supported over the {runtime} ZMQ backend yet"
             ),
         },
     }
+}
+
+/// Run TokenSpeed batch assembly on a blocking thread, guarding SHM output.
+///
+/// Both the gRPC and ZMQ TokenSpeed arms share this sequence; the
+/// [`PendingTokenSpeedAssembly`] guard is what unlinks `/dev/shm` segments if
+/// the request future is cancelled mid-assembly, so the dance must stay
+/// identical for every caller.
+async fn spawn_tokenspeed_assembly(
+    intermediate: MultimodalIntermediate,
+    options: Vec<TokenSpeedAssemblyOptions>,
+) -> Result<TokenSpeedMultimodalData> {
+    let batches = intermediate.into_batches();
+    let pending = tokio::task::spawn_blocking(move || {
+        assemble_tokenspeed_batches(&batches, options).map(PendingTokenSpeedAssembly::new)
+    })
+    .await
+    .context("TokenSpeed multimodal assembly task failed")??;
+    pending.into_inner()
 }
 
 /// Owns SHM-backed assembly output until the awaiting task accepts it.
@@ -230,7 +267,14 @@ fn assemble_vllm(
         }
     };
     let mm_placeholders = placeholders_for_bindings(&intermediate.bindings, false)?;
-    let (batched_keys, flat_keys) = vllm_field_layout_keys(&intermediate.field_layouts);
+    // The primary tensor travels in the proto's `pixel_values` field but is
+    // named by the model's forward kwarg in the layout keys and on the wire.
+    let primary_key = intermediate
+        .encoder_input_key
+        .clone()
+        .unwrap_or_else(|| "pixel_values".to_string());
+    let (batched_keys, flat_keys) =
+        vllm_field_layout_keys(&intermediate.field_layouts, &primary_key);
 
     Ok(VllmMultimodalData {
         pixel_values,
@@ -242,6 +286,7 @@ fn assemble_vllm(
         batched_keys,
         flat_keys,
         keep_on_cpu_keys: intermediate.keep_on_cpu_keys,
+        encoder_input_key: intermediate.encoder_input_key,
         modality,
         shm_enabled: resolve_mm_shm_enabled(workers, false),
         shm_min_bytes: resolve_mm_shm_min_bytes(workers),
@@ -250,14 +295,18 @@ fn assemble_vllm(
     })
 }
 
-/// Translate the neutral layout contract to vLLM's legacy HF field names.
-fn vllm_field_layout_keys(layouts: &EncoderFieldLayouts) -> (Vec<String>, HashMap<String, String>) {
+/// Translate the neutral layout contract to vLLM's HF field names, naming the
+/// primary tensor `primary_key` (`pixel_values` unless the spec renames it).
+fn vllm_field_layout_keys(
+    layouts: &EncoderFieldLayouts,
+    primary_key: &str,
+) -> (Vec<String>, HashMap<String, String>) {
     let mut batched_keys = PreprocessedEncoderInputs::batched_keys(&layouts.model_specific);
     let mut flat_keys = PreprocessedEncoderInputs::flat_keys(&layouts.model_specific);
     match &layouts.encoder_input {
-        FieldLayout::Batched => batched_keys.push("pixel_values".to_string()),
+        FieldLayout::Batched => batched_keys.push(primary_key.to_string()),
         FieldLayout::Flat { sizes_key } => {
-            flat_keys.insert("pixel_values".to_string(), sizes_key.clone());
+            flat_keys.insert(primary_key.to_string(), sizes_key.clone());
         }
     }
     (batched_keys, flat_keys)
@@ -884,6 +933,7 @@ mod tests {
                 ]),
             ),
             keep_on_cpu_keys: vec![],
+            encoder_input_key: None,
         };
 
         let assembled = assemble_tokenspeed(&intermediate, None, false).unwrap();
@@ -919,6 +969,156 @@ mod tests {
             second.model_specific_tensors["image_grid_thw"].shape,
             vec![1, 3]
         );
+    }
+
+    #[test]
+    fn assemble_tokenspeed_v41_layouts_stay_inline_when_shm_disabled() {
+        use crate::routers::grpc::proto_wrapper::TokenSpeedTensorStorage;
+
+        // DeepSeek-V4.1-shaped batch: flat primary sliced by patches_per_image,
+        // batched int grids, and a second flat tensor (`types`) sliced by
+        // types_per_image. shm_min_bytes=0 would push every tensor to /dev/shm
+        // if SHM were on; the ZMQ arm assembles with SHM off and must keep all
+        // payloads inline.
+        let mut model_specific = HashMap::new();
+        model_specific.insert(
+            "patches_per_image".to_string(),
+            ModelSpecificValue::UintTensor {
+                data: vec![2, 2],
+                shape: vec![2],
+            },
+        );
+        model_specific.insert(
+            "types_per_image".to_string(),
+            ModelSpecificValue::UintTensor {
+                data: vec![3, 3],
+                shape: vec![2],
+            },
+        );
+        model_specific.insert(
+            "vit_grid".to_string(),
+            ModelSpecificValue::UintTensor {
+                data: vec![1, 2, 3, 4, 5, 6],
+                shape: vec![2, 3],
+            },
+        );
+        model_specific.insert(
+            "llm_grid".to_string(),
+            ModelSpecificValue::UintTensor {
+                data: vec![6, 5, 4, 3, 2, 1],
+                shape: vec![2, 3],
+            },
+        );
+        model_specific.insert(
+            "types".to_string(),
+            ModelSpecificValue::UintTensor {
+                data: vec![0, 1, 0, 1, 0, 1],
+                shape: vec![6],
+            },
+        );
+
+        let preprocessed = PreprocessedEncoderInputs {
+            encoder_input: ArrayD::from_shape_vec(IxDyn(&[4, 2]), vec![1.0; 8]).unwrap(),
+            feature_token_counts: vec![2, 2],
+            item_sizes: vec![(1, 1), (1, 1)],
+            model_specific,
+        };
+
+        let images = vec![
+            Arc::new(ImageFrame::new(
+                image::DynamicImage::new_rgb8(1, 1),
+                bytes::Bytes::from_static(b"a"),
+                ImageDetail::Auto,
+                llm_multimodal::ImageSource::InlineBytes,
+                "hash-a".to_string(),
+            )),
+            Arc::new(ImageFrame::new(
+                image::DynamicImage::new_rgb8(1, 1),
+                bytes::Bytes::from_static(b"b"),
+                ImageDetail::Auto,
+                llm_multimodal::ImageSource::InlineBytes,
+                "hash-b".to_string(),
+            )),
+        ];
+
+        let intermediate = PrecomputedMultimodalIntermediate {
+            preprocessed,
+            media: MediaBatch::Images(images),
+            bindings: vec![
+                PromptBinding {
+                    item_index: 0,
+                    prompt_ordinal: 0,
+                    structural: PlaceholderRange {
+                        offset: 10,
+                        length: 2,
+                    },
+                    patches: vec![PlaceholderRange {
+                        offset: 10,
+                        length: 2,
+                    }],
+                },
+                PromptBinding {
+                    item_index: 1,
+                    prompt_ordinal: 1,
+                    structural: PlaceholderRange {
+                        offset: 20,
+                        length: 2,
+                    },
+                    patches: vec![PlaceholderRange {
+                        offset: 20,
+                        length: 2,
+                    }],
+                },
+            ],
+            placeholder_token_id: Some(129264),
+            field_layouts: EncoderFieldLayouts::new(
+                FieldLayout::flat("patches_per_image"),
+                HashMap::from([
+                    ("vit_grid".to_string(), FieldLayout::Batched),
+                    ("llm_grid".to_string(), FieldLayout::Batched),
+                    ("types".to_string(), FieldLayout::flat("types_per_image")),
+                    ("patches_per_image".to_string(), FieldLayout::Batched),
+                    ("types_per_image".to_string(), FieldLayout::Batched),
+                ]),
+            ),
+            keep_on_cpu_keys: vec![
+                "vit_grid".to_string(),
+                "llm_grid".to_string(),
+                "types".to_string(),
+            ],
+            encoder_input_key: Some("patches".to_string()),
+        };
+
+        let assembled = assemble_tokenspeed_with_options(
+            &intermediate,
+            TokenSpeedAssemblyOptions {
+                shm_enabled: false,
+                shm_min_bytes: 0,
+                encoder_input_dtype: "bfloat16".to_string(),
+                skip_pixel_values: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(assembled.items.len(), 2);
+        assert!(!assembled.shm_enabled);
+        for item in &assembled.items {
+            assert_eq!(item.encoder_input.shape, vec![2, 2]);
+            assert!(matches!(
+                item.encoder_input.storage,
+                TokenSpeedTensorStorage::Inline(_)
+            ));
+            assert_eq!(item.model_specific_tensors["vit_grid"].shape, vec![1, 3]);
+            assert_eq!(item.model_specific_tensors["llm_grid"].shape, vec![1, 3]);
+            assert_eq!(item.model_specific_tensors["types"].shape, vec![3]);
+            // Grid/type metadata must keep the exact integer wire dtype that
+            // `model_specific_to_tensor_bytes` assigns to `UintTensor`; casting
+            // to the encoder dtype would corrupt the values. (Side tensors are
+            // `TensorBytes` — always inline by construction.)
+            for key in ["vit_grid", "llm_grid", "types"] {
+                assert_eq!(item.model_specific_tensors[key].dtype, "uint32", "{key}");
+            }
+        }
     }
 
     #[test]
@@ -1003,6 +1203,7 @@ mod tests {
                 ]),
             ),
             keep_on_cpu_keys: vec![],
+            encoder_input_key: None,
         };
 
         let assembled = assemble_tokenspeed(&intermediate, None, false).unwrap();
@@ -1118,6 +1319,7 @@ mod tests {
                 HashMap::from([("row_lengths".to_string(), FieldLayout::Batched)]),
             ),
             keep_on_cpu_keys: vec![],
+            encoder_input_key: None,
         };
 
         let assembled = assemble_tokenspeed(&intermediate, None, false).unwrap();
@@ -1175,6 +1377,7 @@ mod tests {
             placeholder_token_id: Some(10),
             field_layouts: EncoderFieldLayouts::default(),
             keep_on_cpu_keys: vec![],
+            encoder_input_key: None,
         };
         let video_batch = PrecomputedMultimodalIntermediate {
             preprocessed: one_item_inputs(),
@@ -1196,6 +1399,7 @@ mod tests {
             placeholder_token_id: Some(30),
             field_layouts: EncoderFieldLayouts::default(),
             keep_on_cpu_keys: vec![],
+            encoder_input_key: None,
         };
         let audio_batch = PrecomputedMultimodalIntermediate {
             preprocessed: one_item_inputs(),
@@ -1220,6 +1424,7 @@ mod tests {
             placeholder_token_id: Some(20),
             field_layouts: EncoderFieldLayouts::default(),
             keep_on_cpu_keys: vec![],
+            encoder_input_key: None,
         };
         let intermediate =
             MultimodalIntermediate::try_new(vec![image_batch, video_batch, audio_batch]).unwrap();
@@ -1295,7 +1500,7 @@ mod tests {
             FieldLayout::flat("patches_per_image"),
             HashMap::from([("image_grid_thw".to_string(), FieldLayout::Batched)]),
         );
-        let (batched_keys, flat_keys) = vllm_field_layout_keys(&flat);
+        let (batched_keys, flat_keys) = vllm_field_layout_keys(&flat, "pixel_values");
         assert_eq!(batched_keys, vec!["image_grid_thw"]);
         assert_eq!(
             flat_keys.get("pixel_values").map(String::as_str),
@@ -1303,8 +1508,32 @@ mod tests {
         );
 
         let batched = EncoderFieldLayouts::default();
-        let (batched_keys, flat_keys) = vllm_field_layout_keys(&batched);
+        let (batched_keys, flat_keys) = vllm_field_layout_keys(&batched, "pixel_values");
         assert_eq!(batched_keys, vec!["pixel_values"]);
         assert!(flat_keys.is_empty());
+    }
+
+    /// DeepSeek-V4.1's forward pops `patches`: the layout keys and the wire
+    /// key name the primary tensor by the spec's `encoder_input_key_for`.
+    #[test]
+    fn vllm_layout_adapter_names_the_primary_tensor_by_the_spec_key() {
+        let layouts = EncoderFieldLayouts::new(
+            FieldLayout::flat("patches_per_image"),
+            HashMap::from([
+                ("vit_grid".to_string(), FieldLayout::Batched),
+                ("types".to_string(), FieldLayout::flat("types_per_image")),
+            ]),
+        );
+        let (batched_keys, flat_keys) = vllm_field_layout_keys(&layouts, "patches");
+        assert_eq!(batched_keys, vec!["vit_grid"]);
+        assert_eq!(
+            flat_keys.get("patches").map(String::as_str),
+            Some("patches_per_image")
+        );
+        assert_eq!(
+            flat_keys.get("types").map(String::as_str),
+            Some("types_per_image")
+        );
+        assert!(!flat_keys.contains_key("pixel_values"));
     }
 }

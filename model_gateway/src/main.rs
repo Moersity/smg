@@ -14,9 +14,10 @@ use smg::{
     config::{
         resolve_worker_auto_recovery, validate_mesh_server_name, CacheIndexKind,
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-        HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig, PolicyConfig,
-        PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig,
-        RoutingMode, SchemaConfig, TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
+        HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig, PdPairingMode,
+        PolicyConfig, PostgresConfig, RedisConfig, RetryConfig, RouterConfig,
+        RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, TenantApiKeyEntry,
+        TokenizerCacheConfig, TraceConfig,
     },
     observability::{
         metrics::{register_jemalloc_as_global_allocator, PrometheusConfig},
@@ -440,6 +441,19 @@ struct CliArgs {
     )]
     routing_key_override: bool,
 
+    /// How strictly PD placement pairs a prefill with a decode on their KV
+    /// transfer protocol. `lenient` refuses only a known difference in
+    /// runtime, transport or KV layout (unknown components and engine
+    /// versions pair with anything); `strict` also refuses unknown
+    /// components and version differences; `off` pairs on nothing.
+    #[arg(
+        long,
+        value_parser = ["off", "lenient", "strict"],
+        default_value = "lenient",
+        help_heading = "Routing Policy"
+    )]
+    pd_pairing_mode: String,
+
     /// Ordered header names checked for the routing key; the first header
     /// present with a valid value wins. Header keys get the same
     /// per-turn/per-retry suffix stripping as rid-derived keys when the
@@ -454,6 +468,22 @@ struct CliArgs {
     /// Enable minimum tokens scheduler for data parallel group
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     dp_minimum_tokens_scheduler: bool,
+
+    // ==================== RL Control Plane ====================
+    /// Mount the RL control plane under /v1/rl (worker discovery,
+    /// engine-route passthrough, fan-out). Off by default; when off, no RL
+    /// code path is reachable.
+    #[arg(long, default_value_t = false, help_heading = "RL Control Plane")]
+    enable_rl: bool,
+
+    /// Total timeout for one proxied engine control call (weight refits can
+    /// take minutes)
+    #[arg(long, default_value_t = 600, help_heading = "RL Control Plane")]
+    rl_control_timeout_secs: u64,
+
+    /// Maximum concurrent engine calls in one fan-out
+    #[arg(long, default_value_t = 32, help_heading = "RL Control Plane")]
+    rl_fanout_concurrency: usize,
 
     // ==================== PD Disaggregation ====================
     /// Enable PD (Prefill-Decode) disaggregated mode
@@ -1907,6 +1937,7 @@ impl CliArgs {
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
             .maybe_mcp_config_path(self.mcp_config_path.as_ref())
             .dp_aware(self.dp_aware)
+            .pd_pairing_mode(PdPairingMode::parse(&self.pd_pairing_mode).unwrap_or_default())
             .routing_key_override(RoutingKeyOverrideConfig {
                 enabled: self.routing_key_override,
                 eviction_interval_secs: self.eviction_interval,
@@ -1923,6 +1954,11 @@ impl CliArgs {
             .enable_wasm(self.enable_wasm)
             .maybe_storage_hook_wasm_path(self.storage_hook_wasm_path.as_deref())
             .igw(self.enable_igw)
+            .rl(smg_rl::RlConfig {
+                enabled: self.enable_rl,
+                control_timeout_secs: self.rl_control_timeout_secs,
+                fanout_concurrency: self.rl_fanout_concurrency,
+            })
             .dp_minimum_tokens_scheduler(self.dp_minimum_tokens_scheduler)
             .maybe_server_cert_and_key(self.tls_cert_path.as_ref(), self.tls_key_path.as_ref());
 

@@ -5,8 +5,8 @@ use smg_mcp::McpConfig;
 
 use super::{
     CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig,
-    RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
+    HealthCheckConfig, HistoryBackend, MetricsConfig, OracleConfig, PdPairingMode, PolicyConfig,
+    PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
     TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
 };
 use crate::worker::{ConnectionMode, RuntimeType};
@@ -668,6 +668,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn pd_pairing_mode(mut self, mode: PdPairingMode) -> Self {
+        self.config.pd_pairing_mode = mode;
+        self
+    }
+
     /// Inverse of disable_retries field
     pub fn retries(mut self, enable: bool) -> Self {
         self.config.disable_retries = !enable;
@@ -682,6 +687,11 @@ impl RouterConfigBuilder {
 
     pub fn igw(mut self, enable: bool) -> Self {
         self.config.enable_igw = enable;
+        self
+    }
+
+    pub fn rl(mut self, rl: smg_rl::RlConfig) -> Self {
+        self.config.rl = rl;
         self
     }
 
