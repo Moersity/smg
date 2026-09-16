@@ -306,7 +306,8 @@ impl GrpcClient {
         match self {
             Self::Sglang(client) => client.flush_cache(timeout_s).await,
             Self::TokenSpeed(client) => client.flush_cache(timeout_s).await,
-            Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => Err(tonic::Status::unimplemented(
+            Self::Vllm(client) => client.flush_cache(timeout_s).await,
+            Self::Trtllm(_) | Self::Mlx(_) => Err(tonic::Status::unimplemented(
                 "FlushCache RPC not supported for this backend",
             )),
         }
