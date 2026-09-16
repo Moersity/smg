@@ -245,9 +245,7 @@ impl NativeLoadsPath {
         match self {
             // Sections beyond `core` degrade gracefully: an engine that does
             // not report them omits the fields, which deserialize to `None`.
-            Self::Engine => {
-                worker.endpoint_url("/v1/loads?include=core,disagg,queues,memory")
-            }
+            Self::Engine => worker.endpoint_url("/v1/loads?include=core,disagg,queues,memory"),
             // A gateway serves a whole fleet, so an unscoped `/loads` blends
             // every model it fronts. A worker registered for exactly one
             // model must be asked about that model alone.
