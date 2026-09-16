@@ -117,14 +117,7 @@ impl ResponseProcessor {
             ) {
                 // If the template injected `<think>` in the prefill (thinking toggle
                 // is supported and effectively ON), start in reasoning mode.
-                if utils::should_mark_reasoning_started(
-                    utils::resolve_user_thinking(
-                        original_request.chat_template_kwargs.as_ref(),
-                        original_request.reasoning_effort.as_deref(),
-                        tokenizer.as_ref(),
-                    ),
-                    tokenizer.as_ref(),
-                ) {
+                if original_request.reasoning_starts_in_prefill(tokenizer.as_ref()) {
                     parser.mark_reasoning_started();
                 }
 
@@ -151,11 +144,13 @@ impl ResponseProcessor {
 
         if tool_choice_enabled && original_request.tools.is_some() {
             // Check if JSON schema constraint was used (specific function or required mode)
-            let has_structural_tag = self
-                .tool_parser_factory
-                .registry()
-                .has_structural_tag_for_parser(tool_parser_name);
-            let used_json_schema = if has_structural_tag {
+            let native_tool_format = utils::uses_native_chat_tool_format(
+                &self.tool_parser_factory,
+                tool_parser_name,
+                original_request.tools.as_deref().unwrap_or_default(),
+                original_request.tool_choice.as_ref(),
+            );
+            let used_json_schema = if native_tool_format {
                 false
             } else {
                 match &original_request.tool_choice {
@@ -826,6 +821,8 @@ impl ResponseProcessor {
 
         let mut total_prompt = 0u32;
         let mut total_completion = 0u32;
+        let mut total_spec_accepted = 0u32;
+        let mut total_spec_drafted = 0u32;
         let mut choices = Vec::new();
 
         for (prompt_index, all_responses) in collected.into_iter().enumerate() {
@@ -876,6 +873,8 @@ impl ResponseProcessor {
 
                 prompt_tokens = prompt_tokens.max(complete.prompt_tokens());
                 total_completion += complete.completion_tokens();
+                total_spec_accepted += complete.spec_accepted_tokens();
+                total_spec_drafted += complete.spec_draft_tokens();
 
                 // A local stop-decoder match takes precedence over the engine's
                 // reason (which is "length" when stop strings are enforced
@@ -940,7 +939,10 @@ impl ResponseProcessor {
             created: dispatch.created,
             model: dispatch.model.clone(),
             choices,
-            usage: Some(Usage::from_counts(total_prompt, total_completion)),
+            usage: Some(
+                Usage::from_counts(total_prompt, total_completion)
+                    .with_speculative_tokens(total_spec_accepted, total_spec_drafted),
+            ),
             system_fingerprint: dispatch.weight_version.clone(),
         })
     }

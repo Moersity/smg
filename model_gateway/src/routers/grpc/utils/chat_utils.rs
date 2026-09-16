@@ -16,12 +16,16 @@ use llm_tokenizer::{
     StopSequenceDecoder,
 };
 use openai_protocol::{
-    chat::{ChatCompletionRequest, ChatMessage},
-    common::{FunctionCallResponse, StringOrArray, Tool, ToolCall, ToolChoice, ToolChoiceValue},
+    chat::{ChatCompletionRequest, ChatMessage, MessageContent},
+    common::{
+        ContentPart, FunctionCallResponse, StringOrArray, Tool, ToolCall, ToolChoice,
+        ToolChoiceValue,
+    },
     generate::GenerateFinishReason,
 };
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
+use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::error;
 use uuid::Uuid;
 
@@ -247,6 +251,35 @@ fn build_chat_template_kwargs(request: &ChatCompletionRequest) -> HashMap<String
     combined
 }
 
+/// gRPC backends require content parts the gateway knows how to render.
+pub(crate) fn validate_chat_content_parts(messages: &[ChatMessage]) -> Result<(), String> {
+    for message in messages {
+        let content = match message {
+            ChatMessage::System { content, .. }
+            | ChatMessage::Root { content, .. }
+            | ChatMessage::User { content, .. }
+            | ChatMessage::Tool { content, .. }
+            | ChatMessage::Developer { content, .. } => Some(content),
+            ChatMessage::Assistant { content, .. } => content.as_ref(),
+            ChatMessage::Function { .. } => None,
+        };
+        if let Some(MessageContent::Parts(parts)) = content {
+            for part in parts {
+                if let ContentPart::Unknown(fields) = part {
+                    let type_name = fields
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("<missing>");
+                    return Err(format!(
+                        "Unsupported chat content part type {type_name:?} for gRPC backends"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn process_content_format_with_order(
     messages: &[ChatMessage],
     content_format: ChatTemplateContentFormat,
@@ -441,6 +474,22 @@ pub(crate) fn filter_tools_by_tool_choice(
     }
 }
 
+pub(crate) fn uses_native_chat_tool_format(
+    factory: &ToolParserFactory,
+    configured_parser: Option<&str>,
+    tools: &[Tool],
+    tool_choice: Option<&ToolChoice>,
+) -> bool {
+    let filtered = filter_tools_by_tool_choice(tools, tool_choice);
+    let tools = filtered.as_deref().unwrap_or(tools);
+    factory
+        .registry()
+        .has_structural_tag_for_parser(configured_parser)
+        || factory
+            .registry()
+            .uses_full_assistant_constraint(configured_parser, tools)
+}
+
 /// Filter ChatCompletionRequest by tool_choice
 ///
 /// Returns a reference to the original request if no filtering needed,
@@ -476,6 +525,8 @@ pub fn process_chat_messages(
     tokenizer: &dyn Tokenizer,
     image_placeholder: Option<&str>,
 ) -> Result<ProcessedMessages, String> {
+    // Bindings call this entry point without the gRPC preparation stage.
+    validate_chat_content_parts(&request.messages)?;
     let placeholder_tokens = image_placeholder.map(|token| {
         let mut placeholders = PlaceholderTokens::default();
         placeholders.insert(Modality::Image, token.to_string());
@@ -519,8 +570,13 @@ pub(crate) fn process_chat_messages_with_placeholders(
             media_order,
         )?;
 
-        // Process tool call arguments in assistant messages
-        process_tool_call_arguments(&mut transformed_messages)?;
+        // Process tool call arguments in assistant messages. Renderers that
+        // parse `arguments` strings themselves with the reference's tolerance
+        // (DeepSeek-V4.1) get them as written; every other template gets the
+        // parsed object the Transformers docs expect.
+        if !tokenizer.renderer_capabilities().raw_tool_call_arguments {
+            process_tool_call_arguments(&mut transformed_messages)?;
+        }
 
         // Convert tools to JSON values for template processing
         let tools_json: Option<Vec<Value>> = request
@@ -543,8 +599,24 @@ pub(crate) fn process_chat_messages_with_placeholders(
             Some(&combined_template_kwargs)
         };
 
+        let continues_final_assistant = request.continue_final_message
+            && transformed_messages
+                .last()
+                .and_then(|msg| msg.get("role"))
+                .and_then(|v| v.as_str())
+                == Some("assistant");
+        // Renderers that continue a trailing assistant message natively
+        // (DeepSeek-V4.1: rendered without EOS and without a generation
+        // header) keep the message and are called without a generation
+        // prompt; other templates get the message popped and its content
+        // appended after the generation prompt as a prefix.
+        let native_continuation = continues_final_assistant
+            && tokenizer
+                .renderer_capabilities()
+                .native_assistant_continuation;
+
         let params = ChatTemplateParams {
-            add_generation_prompt: true,
+            add_generation_prompt: !native_continuation,
             tools: tools_json.as_deref(),
             template_kwargs: final_template_kwargs,
             // Project OpenAI `reasoning_effort` (none/minimal) onto the model's
@@ -557,15 +629,10 @@ pub(crate) fn process_chat_messages_with_placeholders(
         };
 
         // Handle assistant prefix for continue_final_message
-        let assistant_prefix = if request.continue_final_message
-            && !transformed_messages.is_empty()
-            && transformed_messages
-                .last()
-                .and_then(|msg| msg.get("role"))
-                .and_then(|v| v.as_str())
-                == Some("assistant")
-        {
-            // Pop the last message to handle it separately — guarded by !is_empty() check above
+        let assistant_prefix = if continues_final_assistant && !native_continuation {
+            // Pop the last message to render it as the prefix. A trailing
+            // assistant role implies a non-empty list, so the `else` arm is
+            // only defensive.
             let Some(last_msg) = transformed_messages.pop() else {
                 return Ok((
                     ProcessedMessages {
@@ -857,8 +924,60 @@ mod tests {
     }
 
     #[test]
+    fn unknown_chat_content_parts_are_rejected_in_every_role() {
+        for role in ["system", "user", "assistant", "tool", "developer"] {
+            let message: ChatMessage = serde_json::from_value(json!({
+                "role": role,
+                "tool_call_id": "call_1",
+                "content": [
+                    {"type": "text", "text": "hello"},
+                    {"type": "vendor_media", "payload": {"id": "media_1"}}
+                ]
+            }))
+            .unwrap();
+            let error = validate_chat_content_parts(&[message]).unwrap_err();
+            assert!(error.contains("vendor_media"), "{role}: {error}");
+            assert!(error.contains("gRPC"), "{role}: {error}");
+        }
+    }
+
+    #[test]
+    fn process_chat_messages_rejects_unknown_content_parts() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "Describe this attachment"},
+                {"type": "vendor_media", "payload": "media_1"}
+            ]}]
+        }))
+        .unwrap();
+        let tokenizer = llm_tokenizer::MockTokenizer::new();
+        let error = process_chat_messages(&request, &tokenizer, None).unwrap_err();
+        assert!(error.contains("vendor_media"));
+    }
+
+    #[test]
+    fn known_chat_content_parts_are_accepted() {
+        let messages: Vec<ChatMessage> = serde_json::from_value(json!([
+            {"role": "system", "content": "system prompt"},
+            {"role": "user", "content": [
+                {"type": "text", "text": "hello"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}},
+                {"type": "audio_url", "audio_url": {"url": "https://example.com/audio.wav"}},
+                {"type": "input_audio", "input_audio": {"data": "UklGRg==", "format": "wav"}},
+                {"type": "video_url", "video_url": {"url": "https://example.com/video.mp4"}}
+            ]},
+            {"role": "assistant", "content": null},
+            {"role": "function", "name": "lookup", "content": "result"}
+        ]))
+        .unwrap();
+        assert!(validate_chat_content_parts(&messages).is_ok());
+    }
+
+    #[test]
     fn test_transform_messages_string_format() {
         let messages = vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Parts(vec![
                 ContentPart::Text {
                     text: "Hello".to_string(),
@@ -896,6 +1015,7 @@ mod tests {
     #[test]
     fn test_transform_messages_string_format_without_placeholders_omits_media() {
         let messages = vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Parts(vec![
                 ContentPart::Text {
                     text: "Describe this".to_string(),
@@ -920,6 +1040,7 @@ mod tests {
     #[test]
     fn test_transform_messages_string_format_with_video_placeholder() {
         let messages = vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Parts(vec![
                 ContentPart::Text {
                     text: "Watch this".to_string(),
@@ -950,6 +1071,7 @@ mod tests {
     #[test]
     fn test_transform_messages_string_format_uses_per_modality_placeholders() {
         let messages = vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Parts(vec![
                 ContentPart::Text {
                     text: "Describe and transcribe".to_string(),
@@ -996,6 +1118,7 @@ mod tests {
     #[test]
     fn test_transform_messages_input_audio_uses_audio_placeholder() {
         let messages = vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Parts(vec![
                 ContentPart::Text {
                     text: "Transcribe this".to_string(),
@@ -1031,6 +1154,7 @@ mod tests {
     #[test]
     fn test_transform_messages_string_format_rejects_missing_modality_placeholder() {
         let messages = vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Parts(vec![ContentPart::AudioUrl {
                 audio_url: AudioUrl {
                     url: "audio".to_string(),
@@ -1050,6 +1174,7 @@ mod tests {
     #[test]
     fn test_transform_messages_openai_format() {
         let messages = vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Parts(vec![
                 ContentPart::Text {
                     text: "Describe this image:".to_string(),
@@ -1088,6 +1213,7 @@ mod tests {
     #[test]
     fn test_transform_messages_simple_string_content() {
         let messages = vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("Simple text message".to_string()),
             name: None,
         }];
@@ -1111,10 +1237,12 @@ mod tests {
     fn test_transform_messages_multiple_messages() {
         let messages = vec![
             ChatMessage::System {
+                ext: Default::default(),
                 content: MessageContent::Text("System prompt".to_string()),
                 name: None,
             },
             ChatMessage::User {
+                ext: Default::default(),
                 content: MessageContent::Parts(vec![
                     ContentPart::Text {
                         text: "User message".to_string(),
@@ -1153,6 +1281,7 @@ mod tests {
     #[test]
     fn test_transform_messages_empty_text_parts() {
         let messages = vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Parts(vec![ContentPart::ImageUrl {
                 image_url: ImageUrl {
                     url: "https://example.com/image.jpg".to_string(),
@@ -1178,10 +1307,12 @@ mod tests {
     fn test_transform_messages_mixed_content_types() {
         let messages = vec![
             ChatMessage::User {
+                ext: Default::default(),
                 content: MessageContent::Text("Plain text".to_string()),
                 name: None,
             },
             ChatMessage::User {
+                ext: Default::default(),
                 content: MessageContent::Parts(vec![
                     ContentPart::Text {
                         text: "With image".to_string(),
@@ -1227,6 +1358,7 @@ mod tests {
     fn test_media_hoisted_before_text_openai() {
         // Real MMBench shape: [question text, image] must render image-first.
         let messages = vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Parts(vec![
                 ContentPart::Text {
                     text: "Question: ...\nAnswer with only the option letter.".to_string(),
@@ -1253,6 +1385,7 @@ mod tests {
     fn test_media_hoisted_before_text_string() {
         // String-format template: placeholder prepended, matching vLLM exactly.
         let messages = vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Parts(vec![
                 ContentPart::Text {
                     text: "Question?".to_string(),
@@ -1282,6 +1415,7 @@ mod tests {
     fn test_media_first_stable_and_multi() {
         // Multiple media + text keep relative order within each group, media first.
         let messages = vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Parts(vec![
                 ContentPart::Text {
                     text: "a".to_string(),
@@ -1319,6 +1453,7 @@ mod tests {
     #[test]
     fn test_tml_preserves_authored_multipart_order_openai() {
         let messages = vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Parts(vec![
                 ContentPart::Text {
                     text: "question".to_string(),
@@ -1351,6 +1486,7 @@ mod tests {
     #[test]
     fn test_absent_assistant_content_renders_null() {
         let messages = vec![ChatMessage::Assistant {
+            ext: Default::default(),
             content: None,
             name: None,
             tool_calls: None,
@@ -1370,6 +1506,7 @@ mod tests {
     #[test]
     fn test_tml_preserves_authored_multipart_order_string() {
         let messages = vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Parts(vec![
                 ContentPart::Text {
                     text: "question".to_string(),
@@ -1401,6 +1538,7 @@ mod tests {
         ChatCompletionRequest {
             model: "inkling-chat".to_string(),
             messages: vec![ChatMessage::User {
+                ext: Default::default(),
                 content: MessageContent::Text("hello".to_string()),
                 name: None,
             }],
@@ -1481,6 +1619,7 @@ mod tests {
         let format = detect_chat_template_content_format(&template);
 
         let messages = vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Parts(vec![
                 ContentPart::Text {
                     text: "Question: Which description is correct?\n\
@@ -1630,6 +1769,109 @@ mod tests {
                 .encode(&processed.text, false)
                 .unwrap()
                 .token_ids()
+        );
+    }
+
+    // --- renderer-capability gates on the render path ------------------------
+
+    /// Render `request` through a mock that declares `capabilities` and
+    /// hands back the message list it received as JSON, so both gates are
+    /// observable without a checkpoint: which messages reach the template,
+    /// whether a generation prompt was requested, and whether tool-call
+    /// `arguments` arrive as written.
+    fn render_with(
+        capabilities: llm_tokenizer::traits::RendererCapabilities,
+        request: &ChatCompletionRequest,
+    ) -> Value {
+        let tokenizer = llm_tokenizer::MockTokenizer::new()
+            .with_renderer_capabilities(capabilities)
+            .with_json_chat_template();
+        let (processed, _) = process_chat_messages_with_placeholders(
+            request,
+            &tokenizer,
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .unwrap();
+        // The default `apply_chat_template_with_encoding` appends the
+        // assistant prefix after the rendered text, so a prefill that was
+        // popped shows up as a suffix on the JSON document.
+        let split = processed.text.rfind('}').unwrap() + 1;
+        let (rendered, suffix) = processed.text.split_at(split);
+        let mut value: Value = serde_json::from_str(rendered).unwrap();
+        value["assistant_prefix"] = json!(suffix);
+        value
+    }
+
+    const NATIVE_CONTINUATION: llm_tokenizer::traits::RendererCapabilities =
+        llm_tokenizer::traits::RendererCapabilities {
+            enable_thinking_alias: false,
+            native_assistant_continuation: true,
+            raw_tool_call_arguments: false,
+        };
+    const RAW_ARGUMENTS: llm_tokenizer::traits::RendererCapabilities =
+        llm_tokenizer::traits::RendererCapabilities {
+            enable_thinking_alias: false,
+            native_assistant_continuation: false,
+            raw_tool_call_arguments: true,
+        };
+
+    /// Without the capability the trailing assistant message is popped and its
+    /// content is appended after a generation prompt; with it the message
+    /// stays in the list and no generation prompt is requested (the renderer
+    /// continues the turn itself).
+    #[test]
+    fn native_continuation_keeps_the_trailing_assistant_message_instead_of_prefixing_it() {
+        let request = prefill_request();
+
+        let default = render_with(Default::default(), &request);
+        assert_eq!(default["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(default["messages"][0]["role"], "user");
+        assert_eq!(default["add_generation_prompt"], json!(true));
+        assert_eq!(default["assistant_prefix"], json!("Sure"));
+
+        let native = render_with(NATIVE_CONTINUATION, &request);
+        assert_eq!(native["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(native["messages"][1]["role"], "assistant");
+        assert_eq!(native["messages"][1]["content"], "Sure");
+        assert_eq!(native["add_generation_prompt"], json!(false));
+        assert_eq!(native["assistant_prefix"], json!(""));
+    }
+
+    /// Without the capability a tool call's `arguments` string is parsed into
+    /// an object before rendering (what Transformers templates expect); with
+    /// it the string reaches the renderer as written, so a native renderer can
+    /// apply the reference's own tolerance.
+    #[test]
+    fn raw_tool_call_arguments_reach_the_renderer_as_written() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "Hello"},
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "f", "arguments": "{\"city\": \"Hangzhou\"}"}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "ok"}
+            ]
+        }))
+        .unwrap();
+
+        let parsed = render_with(Default::default(), &request);
+        assert_eq!(
+            parsed["messages"][1]["tool_calls"][0]["function"]["arguments"],
+            json!({"city": "Hangzhou"})
+        );
+
+        let raw = render_with(RAW_ARGUMENTS, &request);
+        assert_eq!(
+            raw["messages"][1]["tool_calls"][0]["function"]["arguments"],
+            json!("{\"city\": \"Hangzhou\"}")
         );
     }
 

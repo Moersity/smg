@@ -16,14 +16,16 @@ use tracing::debug;
 
 use crate::{
     config::RouterConfig,
-    middleware::TokenBucket,
+    middleware::{AuthConfig, TokenBucket},
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
     rate_limit::RateLimitManager,
     routers::{
-        common::{openai_bridge::FormatRegistry, overload, realtime::RealtimeRegistry},
+        common::{
+            openai_bridge::FormatRegistry, overload, pd_admission, realtime::RealtimeRegistry,
+        },
+        gateway::Gateway,
         grpc::multimodal::MultimodalConfigRegistry,
-        router_manager::RouterManager,
     },
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
     worker::{KvEventMonitor, WorkerHttpClientCache, WorkerMonitor, WorkerRegistry, WorkerService},
@@ -52,6 +54,11 @@ impl std::error::Error for AppContextBuildError {}
 pub struct AppContext {
     pub client: Client,
     pub router_config: RouterConfig,
+    /// Every credential that authenticates as this gateway: the shared
+    /// `api_key` plus any per-tenant keys, derived once from `router_config`.
+    /// The serving auth layer and the `/v1/models` BYOK short-circuit both
+    /// read this set, so they cannot drift apart.
+    pub gateway_auth: AuthConfig,
     pub rate_limiter: Option<Arc<TokenBucket>>,
     pub rate_limit_manager: Option<Arc<RateLimitManager>>,
     pub tokenizer_registry: Arc<TokenizerRegistry>,
@@ -60,7 +67,7 @@ pub struct AppContext {
     pub tool_parser_factory: Option<ToolParserFactory>,
     pub worker_registry: Arc<WorkerRegistry>,
     pub policy_registry: Arc<PolicyRegistry>,
-    pub router_manager: Option<Arc<RouterManager>>,
+    pub gateway: Option<Arc<Gateway>>,
     pub response_storage: Arc<dyn ResponseStorage>,
     pub conversation_storage: Arc<dyn ConversationStorage>,
     pub conversation_item_storage: Arc<dyn ConversationItemStorage>,
@@ -78,6 +85,8 @@ pub struct AppContext {
     pub worker_client_cache: Arc<WorkerHttpClientCache>,
     pub inflight_tracker: Arc<InFlightRequestTracker>,
     pub kv_event_monitor: Option<Arc<KvEventMonitor>>,
+    /// RL control plane state; `None` unless `router_config.rl.enabled`.
+    pub rl: Option<Arc<smg_rl::RlState>>,
     pub realtime_registry: Arc<RealtimeRegistry>,
     /// Bind address for WebRTC UDP sockets (`None` = `0.0.0.0`, auto-detect).
     pub webrtc_bind_addr: Option<std::net::IpAddr>,
@@ -103,7 +112,7 @@ pub struct AppContextBuilder {
     tool_parser_factory: Option<ToolParserFactory>,
     worker_registry: Option<Arc<WorkerRegistry>>,
     policy_registry: Option<Arc<PolicyRegistry>>,
-    router_manager: Option<Arc<RouterManager>>,
+    gateway: Option<Arc<Gateway>>,
     response_storage: Option<Arc<dyn ResponseStorage>>,
     conversation_storage: Option<Arc<dyn ConversationStorage>>,
     conversation_item_storage: Option<Arc<dyn ConversationItemStorage>>,
@@ -157,7 +166,7 @@ impl AppContextBuilder {
             tool_parser_factory: None,
             worker_registry: None,
             policy_registry: None,
-            router_manager: None,
+            gateway: None,
             response_storage: None,
             conversation_storage: None,
             conversation_item_storage: None,
@@ -235,8 +244,8 @@ impl AppContextBuilder {
         self
     }
 
-    pub fn router_manager(mut self, router_manager: Option<Arc<RouterManager>>) -> Self {
-        self.router_manager = router_manager;
+    pub fn gateway(mut self, gateway: Option<Arc<Gateway>>) -> Self {
+        self.gateway = gateway;
         self
     }
 
@@ -359,8 +368,15 @@ impl AppContextBuilder {
         ));
 
         let worker_client_cache = Arc::new(WorkerHttpClientCache::new(&router_config));
+        let gateway_auth = AuthConfig::with_tenant_keys(
+            router_config.api_key.clone(),
+            &router_config.tenant_api_keys,
+        );
+
+        let rl = crate::rl_adapter::build_rl_state(&worker_registry, &router_config);
 
         Ok(AppContext {
+            gateway_auth,
             client: self
                 .client
                 .ok_or(AppContextBuildError::MissingField("client"))?,
@@ -377,7 +393,7 @@ impl AppContextBuilder {
             policy_registry: self
                 .policy_registry
                 .ok_or(AppContextBuildError::MissingField("policy_registry"))?,
-            router_manager: self.router_manager,
+            gateway: self.gateway,
             response_storage: self
                 .response_storage
                 .ok_or(AppContextBuildError::MissingField("response_storage"))?,
@@ -403,6 +419,7 @@ impl AppContextBuilder {
             worker_client_cache,
             inflight_tracker: InFlightRequestTracker::new(),
             kv_event_monitor: self.kv_event_monitor,
+            rl,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: self.webrtc_bind_addr,
             webrtc_stun_server: self.webrtc_stun_server,
@@ -557,10 +574,13 @@ impl AppContextBuilder {
 
     /// Create policy registry
     fn with_policy_registry(mut self, config: &RouterConfig) -> Self {
-        self.policy_registry = Some(Arc::new(PolicyRegistry::with_override(
-            config.policy.clone(),
-            config.routing_key_override.clone(),
-        )));
+        self.policy_registry = Some(Arc::new(
+            PolicyRegistry::with_override(
+                config.policy.clone(),
+                config.routing_key_override.clone(),
+            )
+            .with_pd_pairing_mode(config.pd_pairing_mode),
+        ));
         self
     }
 
@@ -621,6 +641,9 @@ impl AppContextBuilder {
         // The overload shed advertises the poll interval as Retry-After — the
         // veto cannot clear between polls.
         overload::set_shed_retry_after_secs(config.load_monitor_interval_secs);
+        // PD dispatch waits here, not in the decode engine's queue, when the
+        // pair's running window is full.
+        pd_admission::set_pd_admission_wait_secs(config.pd_admission_wait_secs);
         // Wire the backend load-snapshot feed into every policy that consumes
         // it; the monitor polls every group by default, conditionally under
         // `--disable-load-monitoring`.
