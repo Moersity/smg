@@ -17,6 +17,9 @@ service VllmEngine {
   // Health check
   rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
 
+  // Invalidate the local KV prefix cache without preempting requests.
+  rpc FlushCache(smg.grpc.common.FlushCacheRequest) returns (smg.grpc.common.FlushCacheResponse);
+
   // Abort a running request
   rpc Abort(AbortRequest) returns (AbortResponse);
 
