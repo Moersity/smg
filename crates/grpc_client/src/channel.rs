@@ -304,16 +304,18 @@ mod tests {
     {
         use tonic::codegen::{http, Bytes};
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind loopback");
-        let addr = listener.local_addr().expect("local addr");
-        let endpoint = build(format!("http://{addr}"));
+        // Keep the HTTP/2 exchange in memory: closing TCP with unread DATA
+        // can surface as a connection reset on macOS instead of the GOAWAY.
+        // Buffer the entire blast (including frame headers) so the peer can
+        // finish writing before reading the client's GOAWAY.
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let endpoint = build("http://unused.invalid".to_owned());
 
         #[expect(clippy::disallowed_methods, reason = "test-only h2 peer, joined below")]
         let server = tokio::spawn(async move {
-            let (sock, _) = listener.accept().await.expect("accept");
-            let mut conn = h2::server::handshake(sock).await.expect("h2 handshake");
+            let mut conn = h2::server::handshake(server_io)
+                .await
+                .expect("h2 handshake");
             let (_request, mut respond) = conn
                 .accept()
                 .await
@@ -345,7 +347,16 @@ mod tests {
             }
         });
 
-        let mut channel = endpoint.connect().await.expect("connect");
+        let mut client_io = Some(client_io);
+        let mut channel = endpoint
+            .connect_with_connector(tower::service_fn(move |_uri: Uri| {
+                let io = client_io.take().map(TokioIo::new).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotConnected, "test connection already used")
+                });
+                std::future::ready(io)
+            }))
+            .await
+            .expect("connect");
         std::future::poll_fn(|cx| channel.poll_ready(cx))
             .await
             .expect("channel ready");
