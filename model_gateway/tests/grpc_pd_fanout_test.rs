@@ -360,6 +360,7 @@ async fn chat_continuous_usage_is_opt_in_for_single_and_multiple_choices() {
                 .map(|payload| serde_json::from_str(payload).unwrap())
                 .collect();
             let mut previous_completion = 0;
+            let mut saw_completion_progress = false;
             let mut roles = BTreeSet::new();
             let mut finishes = BTreeSet::new();
             let mut contents = BTreeSet::new();
@@ -375,6 +376,7 @@ async fn chat_continuous_usage_is_opt_in_for_single_and_multiple_choices() {
                     let completion = usage["completion_tokens"].as_u64().unwrap();
                     assert!(completion >= previous_completion, "{event}");
                     previous_completion = completion;
+                    saw_completion_progress |= !choices.is_empty() && completion > 0;
                     assert_eq!(usage["prompt_tokens"], 1, "shared prompt counted once");
                     assert_eq!(usage["total_tokens"], 1 + completion);
                 }
@@ -398,6 +400,12 @@ async fn chat_continuous_usage_is_opt_in_for_single_and_multiple_choices() {
             assert_eq!(roles, expected, "{body}");
             assert_eq!(contents, expected, "{body}");
             assert_eq!(finishes, expected, "{body}");
+            if continuous {
+                assert!(
+                    saw_completion_progress,
+                    "no progress before final usage: {body}"
+                );
+            }
             if include {
                 assert_eq!(previous_completion, u64::from(OUTPUT_TOKENS) * n);
                 assert!(events.last().unwrap()["choices"]

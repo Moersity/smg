@@ -597,7 +597,11 @@ impl StreamingProcessor {
                 }
             };
 
-            let usage = continuous_usage.as_ref().map(ChatStreamUsage::snapshot);
+            let usage = continuous_usage.as_ref().map(|tracker| {
+                tracker
+                    .snapshot()
+                    .with_unbilled_prompt_tokens(original_request.unbilled_prompt_tokens)
+            });
             let Some((index, text, choice_logprobs)) = pending else {
                 continue;
             };
@@ -727,7 +731,11 @@ impl StreamingProcessor {
             }
         }
 
-        let usage = continuous_usage.as_ref().map(ChatStreamUsage::snapshot);
+        let usage = continuous_usage.as_ref().map(|tracker| {
+            tracker
+                .snapshot()
+                .with_unbilled_prompt_tokens(original_request.unbilled_prompt_tokens)
+        });
 
         // Phase 3: End-of-stream parser flush: first any text still buffered
         // as a prospective tool call that never materialized (dropping it
