@@ -196,8 +196,14 @@ impl MinimaxM3Parser {
 
     /// Parse the body of one element (recursively), returning its value and the
     /// number of bytes consumed up to and including the matching close tag.
-    /// `name` is the element name whose close tag terminates this body.
-    fn parse_element_body(input: &str, name: &str) -> Option<(ParamValue, usize)> {
+    /// An empty schema-declared container may omit its close immediately before
+    /// its parent closes; in that case the parent marker remains unconsumed.
+    fn parse_element_body(
+        input: &str,
+        name: &str,
+        schema: Option<&Value>,
+        parent_name: Option<&str>,
+    ) -> Option<(ParamValue, usize)> {
         let close_tag = format!("{ELEMENT_END_START}{name}>");
         let mut pos = 0;
         let mut text = String::new();
@@ -216,9 +222,21 @@ impl MinimaxM3Parser {
                 pos += close_tag.len();
                 break;
             }
+            if text.trim().is_empty()
+                && children.is_empty()
+                && matches!(Self::schema_type(schema), Some("array" | "object"))
+                && parent_name.is_some_and(|parent| {
+                    rest.starts_with(&format!("{ELEMENT_END_START}{parent}>"))
+                })
+            {
+                // The parent consumes its own close; the empty child's close
+                // was omitted by the model.
+                break;
+            }
             if rest.starts_with(ELEMENT_START) {
                 // Child element.
-                let (child_name, child_value, consumed) = Self::parse_element(rest)?;
+                let (child_name, child_value, consumed) =
+                    Self::parse_element(rest, schema, Some(name))?;
                 children.push((child_name, child_value));
                 pos += consumed;
                 continue;
@@ -241,7 +259,11 @@ impl MinimaxM3Parser {
 
     /// Parse a complete element starting at `input` (which must begin with
     /// `]<]minimax[>[<name>`). Returns `(name, value, consumed_bytes)`.
-    fn parse_element(input: &str) -> Option<(String, ParamValue, usize)> {
+    fn parse_element(
+        input: &str,
+        parent_schema: Option<&Value>,
+        parent_name: Option<&str>,
+    ) -> Option<(String, ParamValue, usize)> {
         let after_start = input.strip_prefix(ELEMENT_START)?;
         let gt = after_start.find('>')?;
         let name = after_start[..gt].trim().to_string();
@@ -249,7 +271,13 @@ impl MinimaxM3Parser {
             return None;
         }
         let body_start = ELEMENT_START.len() + gt + 1;
-        let (value, body_consumed) = Self::parse_element_body(&input[body_start..], &name)?;
+        let schema = if Self::schema_type(parent_schema) == Some("array") {
+            parent_schema.and_then(|schema| schema.get("items"))
+        } else {
+            Self::property_schema(parent_schema, &name)
+        };
+        let (value, body_consumed) =
+            Self::parse_element_body(&input[body_start..], &name, schema, parent_name)?;
         Some((name, value, body_start + body_consumed))
     }
 
@@ -353,7 +381,7 @@ impl MinimaxM3Parser {
                 break;
             }
             pos += trim_len;
-            let (name, value, consumed) = Self::parse_element(&body[pos..])?;
+            let (name, value, consumed) = Self::parse_element(&body[pos..], params_schema, None)?;
             pos += consumed;
             let json = Self::value_to_json(value, Self::property_schema(params_schema, &name));
             match map.get_mut(&name) {
