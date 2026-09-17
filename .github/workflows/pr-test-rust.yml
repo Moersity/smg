@@ -249,7 +249,7 @@ jobs:
       - name: Run Python unit tests
         run: |
           cd bindings/python
-          python3 -m pip install pytest pytest-cov pytest-xdist
+          python3 -m pip install pytest pytest-asyncio pytest-cov pytest-xdist
           pytest -q tests --cov=smg --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=80
 
       - name: Run grpc_servicer unit tests
@@ -530,6 +530,7 @@ jobs:
               - 'scripts/ci_setup_python_venv.sh'
               - 'scripts/ci_retry.sh'
               - 'scripts/ci_apt_mirror.sh'
+              - 'scripts/ci_ensure_python_headers.sh'
               - 'scripts/ci_install_sglang.sh'
               - 'scripts/ci_install_vllm.sh'
               - 'scripts/ci_install_tokenspeed.sh'
