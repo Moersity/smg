@@ -410,13 +410,11 @@ impl StreamingProcessor {
         let think_in_prefill = tokenizer.think_in_prefill();
 
         // Check if JSON schema constraint was used (specific function or required mode)
-        let native_tool_format = utils::uses_native_chat_tool_format(
-            &self.tool_parser_factory,
-            tool_parser_name.as_deref(),
-            original_request.tools.as_deref().unwrap_or_default(),
-            original_request.tool_choice.as_ref(),
-        );
-        let used_json_schema = if native_tool_format {
+        let has_structural_tag = self
+            .tool_parser_factory
+            .registry()
+            .has_structural_tag_for_parser(tool_parser_name.as_deref());
+        let used_json_schema = if has_structural_tag {
             false
         } else {
             match tool_choice {
@@ -835,7 +833,8 @@ impl StreamingProcessor {
                         Usage::from_counts(total_prompt, total_completion)
                             .with_cached_tokens(total_cached)
                             .with_reasoning_tokens(total_reasoning)
-                            .with_speculative_tokens(total_spec_accepted, total_spec_drafted),
+                            .with_speculative_tokens(total_spec_accepted, total_spec_drafted)
+                            .with_unbilled_prompt_tokens(original_request.unbilled_prompt_tokens),
                     )
                     .maybe_system_fingerprint(system_fingerprint)
                     .build();
