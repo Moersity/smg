@@ -1339,3 +1339,116 @@ async fn test_m3_empty_container_recovery_requires_schema_and_parent_close() {
         }
     }
 }
+
+#[tokio::test]
+async fn test_m3_composed_container_recovery() {
+    for keyword in ["oneOf", "anyOf", "allOf"] {
+        let wrap = |schema: serde_json::Value| {
+            let branches = if keyword == "allOf" {
+                vec![schema]
+            } else {
+                vec![json!({"type": "null"}), schema]
+            };
+            json!({keyword: branches})
+        };
+        let item_schema = wrap(json!({"type": "object", "properties": {
+            "values": wrap(json!({"type": "array", "items": {"type": "string"}})),
+            "options": wrap(json!({"type": "object"}))
+        }}));
+        let tools = vec![Tool {
+            tool_type: "function".into(),
+            function: Function {
+                name: "test".into(),
+                description: None,
+                parameters: json!({"type": "object", "properties": {
+                    "rows": wrap(json!({"type": "array", "items": item_schema}))
+                }}),
+                strict: None,
+            },
+        }];
+        let rows = format!(
+            "{}{}{}",
+            element("item", &format!("{NS}<values>")),
+            element("item", &format!("{NS}<options> \n")),
+            element("item", &element("values", &element("item", "001")))
+        );
+        let text = tool_block(&[("test", element("rows", &rows))]);
+        let expected = json!({"rows": [
+            {"values": []}, {"options": {}}, {"values": ["001"]}
+        ]});
+        let (normal, calls) = MinimaxM3Parser::new()
+            .parse_complete_with_tools(&text, &tools)
+            .await
+            .unwrap();
+        assert!(normal.is_empty(), "{keyword}");
+        assert_eq!(calls.len(), 1, "{keyword}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&calls[0].function.arguments).unwrap(),
+            expected,
+            "{keyword}"
+        );
+
+        let mut parser = MinimaxM3Parser::new();
+        let mut arguments = String::new();
+        for ch in text.chars() {
+            let result = parser
+                .parse_incremental(&ch.to_string(), &tools)
+                .await
+                .unwrap();
+            assert!(result.normal_text.is_empty(), "{keyword}");
+            for call in result.calls {
+                arguments.push_str(&call.parameters);
+            }
+        }
+        assert!(parser.take_unstreamed_normal_text().is_empty());
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&arguments).unwrap(),
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_m3_composed_container_recovery_rejects_ambiguous_schemas() {
+    for schema in [
+        json!({"anyOf": [{"type": "array"}, {"type": "object"}]}),
+        json!({"oneOf": [{"type": "array"}, {"type": "array", "items": {"type": "string"}}]}),
+        json!({"anyOf": [{"type": "array"}, {"type": "string"}]}),
+        json!({"anyOf": [{"type": "array"}, {}]}),
+        json!({"allOf": [{"type": "array"}, {"type": "null"}]}),
+        json!({"allOf": [{"type": "array"}, {"items": {"type": "string"}}]}),
+        json!({"anyOf": [{"type": "array"}, {"$ref": "#/$defs/other"}]}),
+        json!({"anyOf": [{"type": "array"}], "not": {"type": "array"}}),
+    ] {
+        let tools = vec![Tool {
+            tool_type: "function".into(),
+            function: Function {
+                name: "test".into(),
+                description: None,
+                parameters: json!({"type": "object", "properties": {
+                    "parent": {"type": "object", "properties": {"empty": schema}}
+                }}),
+                strict: None,
+            },
+        }];
+        let text = tool_block(&[("test", format!("{NS}<parent>{NS}<empty>{NS}</parent>"))]);
+        let (normal, calls) = MinimaxM3Parser::new()
+            .parse_complete_with_tools(&text, &tools)
+            .await
+            .unwrap();
+        assert_eq!(normal, text, "{schema}");
+        assert!(calls.is_empty(), "{schema}");
+        let mut parser = MinimaxM3Parser::new();
+        let mut normal = String::new();
+        for ch in text.chars() {
+            let result = parser
+                .parse_incremental(&ch.to_string(), &tools)
+                .await
+                .unwrap();
+            assert!(result.calls.is_empty(), "{schema}");
+            normal.push_str(&result.normal_text);
+        }
+        normal.push_str(&parser.take_unstreamed_normal_text());
+        assert_eq!(normal, text, "{schema}");
+    }
+}

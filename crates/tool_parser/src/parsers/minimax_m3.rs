@@ -271,11 +271,13 @@ impl MinimaxM3Parser {
             return None;
         }
         let body_start = ELEMENT_START.len() + gt + 1;
+        let parent_schema = Self::container_schema(parent_schema).or(parent_schema);
         let schema = if Self::schema_type(parent_schema) == Some("array") {
             parent_schema.and_then(|schema| schema.get("items"))
         } else {
             Self::property_schema(parent_schema, &name)
         };
+        let schema = Self::container_schema(schema).or(schema);
         let (value, body_consumed) =
             Self::parse_element_body(&input[body_start..], &name, schema, parent_name)?;
         Some((name, value, body_start + body_consumed))
@@ -294,6 +296,58 @@ impl MinimaxM3Parser {
     /// The scalar `type` declared by a schema node, when it has one.
     fn schema_type(schema: Option<&Value>) -> Option<&str> {
         schema?.get("type")?.as_str()
+    }
+
+    /// Resolve a direct container or a transparent composition wrapper.
+    /// Nullable unions must have exactly one container branch; scalar/unknown
+    /// alternatives are ambiguous. Only singleton allOf wrappers are unwrapped:
+    /// choosing one of several conjuncts would discard the others' constraints.
+    fn container_schema(schema: Option<&Value>) -> Option<&Value> {
+        let schema = schema?;
+        if schema.get("type").is_some() {
+            return matches!(Self::schema_type(Some(schema)), Some("array" | "object"))
+                .then_some(schema);
+        }
+
+        let mut compositions = ["oneOf", "anyOf", "allOf"]
+            .into_iter()
+            .filter_map(|key| schema.get(key).map(|branches| (key, branches)));
+        let (keyword, branches) = compositions.next()?;
+        if compositions.next().is_some() {
+            return None;
+        }
+        // Unwrapping must not drop sibling validation or structural keywords.
+        if schema.as_object()?.keys().any(|key| {
+            key != keyword
+                && !matches!(
+                    key.as_str(),
+                    "title"
+                        | "description"
+                        | "default"
+                        | "examples"
+                        | "deprecated"
+                        | "readOnly"
+                        | "writeOnly"
+                        | "$comment"
+                )
+        }) {
+            return None;
+        }
+        let branches = branches.as_array()?;
+        if keyword == "allOf" && branches.len() != 1 {
+            return None;
+        }
+        let mut container = None;
+        for branch in branches {
+            if keyword != "allOf" && Self::schema_type(Some(branch)) == Some("null") {
+                continue;
+            }
+            let resolved = Self::container_schema(Some(branch))?;
+            if container.replace(resolved).is_some() {
+                return None;
+            }
+        }
+        container
     }
 
     /// Find a named property in this schema or a nested composition branch.
@@ -323,6 +377,7 @@ impl MinimaxM3Parser {
     /// the schema node they sit under: array elements descend into `items`,
     /// object members into their `properties` entry.
     fn value_to_json(value: ParamValue, schema: Option<&Value>) -> Value {
+        let schema = Self::container_schema(schema).or(schema);
         match value {
             ParamValue::Text(text) => {
                 let decoded = Self::decode_xml_entities(&text);
