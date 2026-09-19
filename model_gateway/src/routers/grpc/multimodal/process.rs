@@ -9,9 +9,10 @@ use std::{collections::HashMap, sync::Arc, time::Instant};
 use anyhow::{Context, Result};
 use futures::future::try_join_all;
 use llm_multimodal::{
-    AsyncMultiModalTracker, AudioClip, EncoderFieldLayouts, ImageFrame, Modality, ModelMetadata,
-    ModelProcessorSpec, PlaceholderRange, PreProcessorConfig, PreprocessedEncoderInputs,
-    PromptReplacement, TrackedMedia, TrackerOutput, VideoClip, VisionProcessorRegistry,
+    AsyncMultiModalTracker, AudioClip, EncoderFieldLayouts, ImageFrame, MediaItemInfo, Modality,
+    ModelMetadata, ModelProcessorSpec, PlaceholderRange, PreProcessorConfig,
+    PreprocessedEncoderInputs, PromptReplacement, TrackedMedia, TrackerOutput, VideoClip,
+    VisionProcessorRegistry,
 };
 use llm_tokenizer::TokenizerTrait;
 use tracing::{debug, info, warn};
@@ -212,8 +213,15 @@ pub(crate) async fn process_multimodal_plan(
             "Multimodal preprocessing complete"
         );
 
+        let media_info = media_item_infos(&media);
         let prompt_replacements = spec
-            .prompt_replacements_for(&metadata, &preprocessed, modality)
+            .prompt_replacements_with_media(
+                &metadata,
+                &preprocessed,
+                modality,
+                &media_info,
+                preprocessor_config_for(&model_config, modality),
+            )
             .map_err(|e| anyhow::anyhow!("Failed to compute prompt replacements: {e}"))?;
 
         let media_count = media.len();
@@ -346,13 +354,7 @@ async fn preprocess_modality(
     // block the tokio async runtime under concurrent load.
     // TODO: consider making the thread pool size configurable.
     let modality = media.modality();
-    let pp_config = match modality {
-        Modality::Video => model_config
-            .video_preprocessor_config
-            .clone()
-            .unwrap_or_else(|| model_config.preprocessor_config.clone()),
-        _ => model_config.preprocessor_config.clone(),
-    };
+    let pp_config = preprocessor_config_for(model_config, modality).clone();
 
     if let MediaBatch::Images(images) = media {
         if let (Some(cache), [image]) = (components.pixel_cache.clone(), images.as_slice()) {
@@ -473,6 +475,35 @@ fn with_video_sample_fps(mut config: PreProcessorConfig, video: &VideoClip) -> P
         .extra
         .insert("fps".to_string(), serde_json::json!(video.sample_fps()));
     config
+}
+
+/// The config a modality is preprocessed with: video's own when the checkpoint ships one.
+fn preprocessor_config_for(
+    model_config: &MultimodalModelConfig,
+    modality: Modality,
+) -> &PreProcessorConfig {
+    match modality {
+        Modality::Video => model_config
+            .video_preprocessor_config
+            .as_ref()
+            .unwrap_or(&model_config.preprocessor_config),
+        _ => &model_config.preprocessor_config,
+    }
+}
+
+/// One descriptor per media item, in batch order; only decoded clips carry sampling.
+fn media_item_infos(media: &MediaBatch) -> Vec<MediaItemInfo> {
+    match media {
+        MediaBatch::Videos(videos) => videos
+            .iter()
+            .map(|clip| MediaItemInfo {
+                video_sampling: clip.sampling().cloned(),
+            })
+            .collect(),
+        MediaBatch::Images(_) | MediaBatch::Audios(_) => {
+            vec![MediaItemInfo::default(); media.len()]
+        }
+    }
 }
 
 /// Pixel-cache image preprocessing for single-image requests.
@@ -734,7 +765,7 @@ fn explicit_feature_ranges(
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use llm_multimodal::VideoSource;
+    use llm_multimodal::{ImageDetail, ImageSource, VideoSamplingInfo, VideoSource};
 
     use super::*;
 
@@ -751,6 +782,140 @@ mod tests {
         let config = with_video_sample_fps(PreProcessorConfig::default(), &video);
 
         assert!((config.get_extra::<f32>("fps").unwrap() - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn media_item_infos_carry_video_sampling_per_clip() {
+        let sampling = VideoSamplingInfo {
+            source_fps: 30.0,
+            frame_indices: vec![0, 15, 30],
+        };
+        let sampled = VideoClip::new(
+            Vec::new(),
+            Bytes::new(),
+            VideoSource::InlineBytes,
+            "sampled".to_string(),
+        )
+        .with_sampling(Some(sampling.clone()));
+        let unsampled = VideoClip::new(
+            Vec::new(),
+            Bytes::new(),
+            VideoSource::InlineBytes,
+            "unsampled".to_string(),
+        );
+
+        let infos = media_item_infos(&MediaBatch::Videos(vec![
+            Arc::new(sampled),
+            Arc::new(unsampled),
+        ]));
+
+        assert_eq!(
+            infos,
+            vec![
+                MediaItemInfo {
+                    video_sampling: Some(sampling)
+                },
+                MediaItemInfo::default()
+            ]
+        );
+    }
+
+    #[test]
+    fn media_item_infos_default_for_every_image() {
+        let image = || {
+            Arc::new(ImageFrame::new(
+                image::DynamicImage::new_rgb8(1, 1),
+                Bytes::new(),
+                ImageDetail::Auto,
+                ImageSource::InlineBytes,
+                "hash".to_string(),
+            ))
+        };
+
+        let infos = media_item_infos(&MediaBatch::Images(vec![image(), image(), image()]));
+
+        assert_eq!(infos, vec![MediaItemInfo::default(); 3]);
+    }
+
+    #[test]
+    fn preprocessor_config_for_video_is_the_video_config_when_shipped() {
+        let image_config = PreProcessorConfig {
+            temporal_patch_size: Some(2),
+            ..Default::default()
+        };
+        let video_config = PreProcessorConfig {
+            temporal_patch_size: Some(4),
+            ..Default::default()
+        };
+        let with_video = MultimodalModelConfig {
+            config: serde_json::json!({}),
+            preprocessor_config: image_config.clone(),
+            video_preprocessor_config: Some(video_config),
+        };
+        let without_video = MultimodalModelConfig {
+            config: serde_json::json!({}),
+            preprocessor_config: image_config,
+            video_preprocessor_config: None,
+        };
+
+        let temporal = |config: &MultimodalModelConfig, modality| {
+            preprocessor_config_for(config, modality).temporal_patch_size
+        };
+        assert_eq!(temporal(&with_video, Modality::Video), Some(4));
+        assert_eq!(temporal(&with_video, Modality::Image), Some(2));
+        assert_eq!(temporal(&with_video, Modality::Audio), Some(2));
+        assert_eq!(temporal(&without_video, Modality::Video), Some(2));
+    }
+
+    #[test]
+    fn test_explicit_feature_ranges_keep_non_uniform_strides() {
+        let replacements =
+            vec![
+                PromptReplacement::sequence(Modality::Video, "<video>", vec![7; 48])
+                    .with_feature_ranges(vec![
+                        PlaceholderRange {
+                            offset: 5,
+                            length: 4,
+                        },
+                        PlaceholderRange {
+                            offset: 19,
+                            length: 4,
+                        },
+                        PlaceholderRange {
+                            offset: 40,
+                            length: 4,
+                        },
+                    ]),
+            ];
+        let expansion = ModalityExpansion {
+            modality: Modality::Video,
+            search_token_id: Some(100),
+            placeholder_token_id: Some(7),
+            replacements: &replacements,
+        };
+
+        let result = expand_tokens_for_modalities(&[1, 2, 100, 3], &[expansion]).unwrap();
+
+        assert_eq!(result.token_ids.len(), 3 + 48);
+        assert_eq!(result.bindings[0][0].structural.offset, 2);
+        assert_eq!(result.bindings[0][0].structural.length, 48);
+        assert_eq!(
+            result.bindings[0][0].patches,
+            vec![
+                PlaceholderRange {
+                    offset: 7,
+                    length: 4,
+                },
+                PlaceholderRange {
+                    offset: 21,
+                    length: 4,
+                },
+                PlaceholderRange {
+                    offset: 42,
+                    length: 4,
+                },
+            ]
+        );
     }
 
     #[test]
