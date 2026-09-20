@@ -413,6 +413,11 @@ fn assemble_tokenspeed_with_options(
     // cleanup, leaking files until the next sweep.
     let mut ordered_bindings = intermediate.bindings.iter().collect::<Vec<_>>();
     ordered_bindings.sort_by_key(|binding| binding.prompt_ordinal);
+    // Checked before the item loop, while a plain `?` still costs nothing: no
+    // /dev/shm segment has been created yet.
+    for binding in &ordered_bindings {
+        ensure_structural_fallback_covers_features(intermediate, binding)?;
+    }
     let mut items: Vec<TokenSpeedMultimodalItem> = Vec::with_capacity(item_count);
     for binding in ordered_bindings {
         let item_index = binding.item_index;
@@ -619,6 +624,39 @@ fn validate_precomputed_batch(intermediate: &PrecomputedMultimodalIntermediate) 
         "precomputed multimodal binding count mismatch: modality={modality}, binding_count={binding_count}, media_count={media_count}"
     );
 
+    let encoder_rows = intermediate
+        .preprocessed
+        .encoder_input
+        .shape()
+        .first()
+        .copied()
+        .unwrap_or_default();
+    match &intermediate.field_layouts.encoder_input {
+        FieldLayout::Batched => anyhow::ensure!(
+            encoder_rows == media_count,
+            "precomputed {modality} batch carries {encoder_rows} encoder rows for {media_count} media items"
+        ),
+        FieldLayout::Flat { sizes_key } => {
+            let sizes = tensor_sizes_from_model_specific(
+                &intermediate.preprocessed.model_specific,
+                sizes_key,
+            )?;
+            anyhow::ensure!(
+                sizes.len() == media_count,
+                "precomputed {modality} batch declares {} item sizes for {media_count} media items",
+                sizes.len()
+            );
+            let covered = sizes
+                .iter()
+                .try_fold(0usize, |acc, &size| acc.checked_add(size))
+                .context("flat encoder size total overflow")?;
+            anyhow::ensure!(
+                covered == encoder_rows,
+                "precomputed {modality} item sizes cover {covered} of {encoder_rows} encoder rows"
+            );
+        }
+    }
+
     let mut item_indices = HashSet::with_capacity(binding_count);
     for binding in &intermediate.bindings {
         anyhow::ensure!(
@@ -641,6 +679,7 @@ fn validate_precomputed_batch(intermediate: &PrecomputedMultimodalIntermediate) 
             .offset
             .checked_add(binding.structural.length)
             .context("structural prompt range overflow")?;
+        let mut reserved = 0usize;
         for patch in &binding.patches {
             let patch_end = patch
                 .offset
@@ -655,6 +694,26 @@ fn validate_precomputed_batch(intermediate: &PrecomputedMultimodalIntermediate) 
                 patch.length,
                 binding.structural.offset,
                 binding.structural.length
+            );
+            reserved = reserved
+                .checked_add(patch.length)
+                .context("patch prompt length overflow")?;
+        }
+        if !binding.patches.is_empty() {
+            let features = *intermediate
+                .preprocessed
+                .feature_token_counts
+                .get(binding.item_index)
+                .with_context(|| {
+                    format!(
+                        "missing {modality} feature count for item {}",
+                        binding.item_index
+                    )
+                })?;
+            anyhow::ensure!(
+                features_fit_reservation(reserved, features),
+                "precomputed {modality} item {} reserves {reserved} prompt positions for {features} encoder features",
+                binding.item_index
             );
         }
     }
@@ -737,6 +796,52 @@ fn placeholders_for_bindings(
         })
         .map(placeholder_range_to_u32)
         .collect()
+}
+
+/// Check the ranges an item falls back to when it declares no patches.
+///
+/// An item without patches is sent as its whole structural range, so that
+/// range has to hold exactly as many prompt positions as the item has encoder
+/// features. Items that do declare patches are already covered by
+/// [`validate_precomputed_batch`], and the vLLM path is exempt: it sends the
+/// structural range on purpose and lets the backend pick the feature positions
+/// out of it.
+fn ensure_structural_fallback_covers_features(
+    intermediate: &PrecomputedMultimodalIntermediate,
+    binding: &PromptBinding,
+) -> Result<()> {
+    if !binding.patches.is_empty() {
+        return Ok(());
+    }
+    let modality = intermediate.media.modality();
+    let features = *intermediate
+        .preprocessed
+        .feature_token_counts
+        .get(binding.item_index)
+        .with_context(|| {
+            format!(
+                "missing {modality} feature count for item {}",
+                binding.item_index
+            )
+        })?;
+    anyhow::ensure!(
+        features_fit_reservation(binding.structural.length, features),
+        "precomputed {modality} item {} covers {} prompt positions for {features} encoder features",
+        binding.item_index,
+        binding.structural.length
+    );
+    Ok(())
+}
+
+/// Whether `features` encoder outputs can land in `reserved` prompt positions.
+///
+/// Usually one feature takes one position. Some models pack a fixed number of
+/// encoder outputs into each embedding before placing it, so they reserve fewer
+/// positions than they carry features, by a whole factor. Anything that is not
+/// a whole factor is a genuine mismatch, which the engine answers by ending the
+/// process rather than the request.
+fn features_fit_reservation(reserved: usize, features: usize) -> bool {
+    reserved > 0 && features >= reserved && features.is_multiple_of(reserved)
 }
 
 fn placeholders_for_binding(
@@ -988,6 +1093,89 @@ mod tests {
             second.model_specific_tensors["image_grid_thw"].shape,
             vec![1, 3]
         );
+    }
+
+    /// One image with two encoder features, bound to a structural range of
+    /// `structural_length` and the given patch ranges.
+    fn one_image_intermediate(
+        structural_length: usize,
+        patches: Vec<PlaceholderRange>,
+    ) -> PrecomputedMultimodalIntermediate {
+        let mut model_specific = HashMap::new();
+        model_specific.insert(
+            "patches_per_image".to_string(),
+            ModelSpecificValue::UintTensor {
+                data: vec![2],
+                shape: vec![1],
+            },
+        );
+
+        PrecomputedMultimodalIntermediate {
+            preprocessed: PreprocessedEncoderInputs {
+                encoder_input: ArrayD::from_shape_vec(IxDyn(&[2, 2]), vec![1.0, 2.0, 3.0, 4.0])
+                    .unwrap(),
+                feature_token_counts: vec![2],
+                item_sizes: vec![(1, 1)],
+                model_specific,
+            },
+            media: MediaBatch::Images(vec![Arc::new(ImageFrame::new(
+                image::DynamicImage::new_rgb8(1, 1),
+                bytes::Bytes::from_static(b"a"),
+                ImageDetail::Auto,
+                llm_multimodal::ImageSource::InlineBytes,
+                "hash-a".to_string(),
+            ))]),
+            bindings: vec![PromptBinding {
+                item_index: 0,
+                prompt_ordinal: 0,
+                structural: PlaceholderRange {
+                    offset: 10,
+                    length: structural_length,
+                },
+                patches,
+            }],
+            placeholder_token_id: Some(151655),
+            field_layouts: EncoderFieldLayouts::new(
+                FieldLayout::flat("patches_per_image"),
+                HashMap::from([("patches_per_image".to_string(), FieldLayout::Batched)]),
+            ),
+            keep_on_cpu_keys: vec![],
+            encoder_input_key: None,
+        }
+    }
+
+    /// An item with no patches is sent as its whole structural range, so a
+    /// range that does not match the item's feature count would hand the
+    /// backend the wrong prompt positions.
+    #[test]
+    fn a_patchless_item_is_rejected_when_its_range_misses_the_features() {
+        let good = one_image_intermediate(2, vec![]);
+        let assembled = assemble_tokenspeed(&good, None, false).unwrap();
+        assert_eq!(assembled.items[0].mm_placeholders, vec![(10, 2)]);
+
+        let bad = one_image_intermediate(3, vec![]);
+        let error = assemble_tokenspeed(&bad, None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("3 prompt positions for 2 encoder features"),
+            "{error}"
+        );
+    }
+
+    /// The same mismatch is fine once the item declares patches: those are the
+    /// ranges that get sent, and they already carry the feature count.
+    #[test]
+    fn a_patched_item_may_span_a_wider_structural_range() {
+        let intermediate = one_image_intermediate(
+            5,
+            vec![PlaceholderRange {
+                offset: 11,
+                length: 2,
+            }],
+        );
+        let assembled = assemble_tokenspeed(&intermediate, None, false).unwrap();
+        assert_eq!(assembled.items[0].mm_placeholders, vec![(11, 2)]);
     }
 
     #[test]
@@ -1258,6 +1446,109 @@ mod tests {
             second.model_specific_tensors["video_grid_thw"].shape,
             vec![1, 3]
         );
+    }
+
+    /// One clip, two encoder rows, sized and bound however the caller asks.
+    fn one_video_intermediate(
+        item_size: u32,
+        prompt_positions: usize,
+    ) -> PrecomputedMultimodalIntermediate {
+        let model_specific = HashMap::from([(
+            "patches_per_video".to_string(),
+            ModelSpecificValue::UintTensor {
+                data: vec![item_size],
+                shape: vec![1],
+            },
+        )]);
+
+        PrecomputedMultimodalIntermediate {
+            preprocessed: PreprocessedEncoderInputs {
+                encoder_input: ArrayD::from_shape_vec(IxDyn(&[2, 2]), vec![1.0, 2.0, 3.0, 4.0])
+                    .unwrap(),
+                feature_token_counts: vec![2],
+                item_sizes: vec![(1, 1)],
+                model_specific,
+            },
+            media: MediaBatch::Videos(vec![Arc::new(VideoClip::new(
+                vec![image::DynamicImage::new_rgb8(1, 1)],
+                bytes::Bytes::from_static(b"a"),
+                llm_multimodal::VideoSource::InlineBytes,
+                "video-hash-a".to_string(),
+            ))]),
+            bindings: vec![PromptBinding {
+                item_index: 0,
+                prompt_ordinal: 0,
+                structural: PlaceholderRange {
+                    offset: 30,
+                    length: prompt_positions,
+                },
+                patches: vec![PlaceholderRange {
+                    offset: 30,
+                    length: prompt_positions,
+                }],
+            }],
+            placeholder_token_id: Some(151656),
+            field_layouts: EncoderFieldLayouts::new(
+                FieldLayout::flat("patches_per_video"),
+                HashMap::from([("patches_per_video".to_string(), FieldLayout::Batched)]),
+            ),
+            keep_on_cpu_keys: vec![],
+            encoder_input_key: None,
+        }
+    }
+
+    #[test]
+    fn a_prompt_that_reserves_more_room_than_the_media_fills_is_refused() {
+        assert!(validate_precomputed_batch(&one_video_intermediate(2, 2)).is_ok());
+
+        let error = validate_precomputed_batch(&one_video_intermediate(2, 3))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("reserves 3 prompt positions for 2"),
+            "{error}"
+        );
+    }
+
+    fn intermediate_with_features(
+        features: usize,
+        prompt_positions: usize,
+    ) -> PrecomputedMultimodalIntermediate {
+        let mut intermediate = one_video_intermediate(2, prompt_positions);
+        intermediate.preprocessed.feature_token_counts = vec![features];
+        intermediate
+    }
+
+    /// A model that packs several encoder outputs into each placed embedding
+    /// reserves fewer positions than it has features, and must still be sent.
+    /// The ratios here are the ones a 336px tile produces at the shuffle
+    /// settings a shipped vision model uses.
+    #[test]
+    fn a_prompt_that_packs_several_features_into_each_position_is_sent() {
+        for (features, reserved) in [(576, 144), (288, 144), (2, 2)] {
+            assert!(
+                validate_precomputed_batch(&intermediate_with_features(features, reserved)).is_ok(),
+                "{reserved} positions for {features} features"
+            );
+        }
+
+        // Part of a feature cannot be placed anywhere, so a count that does not
+        // divide is still the mismatch this guards against.
+        let error = validate_precomputed_batch(&intermediate_with_features(500, 144))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("reserves 144 prompt positions for 500"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn media_the_engine_would_not_read_in_full_is_refused() {
+        let error = validate_precomputed_batch(&one_video_intermediate(1, 2))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cover 1 of 2 encoder rows"), "{error}");
     }
 
     #[test]
