@@ -495,7 +495,7 @@ impl RequestPipeline {
             dctx.workers.as_ref(),
         ));
 
-        execute_plan(dctx, attempt_plan).await?;
+        execute_plan(dctx, attempt_plan, last_attempt).await?;
         self.stages
             .response_processing
             .process(dctx, spec.clone())
@@ -2178,7 +2178,7 @@ mod request_release_tests {
             .expect("register the DeepSeek-V4.1 tokenizer");
         let multimodal = with_multimodal.then(|| {
             Arc::new(
-                MultimodalComponents::new(Arc::new(MultimodalConfigRegistry::new()), None)
+                MultimodalComponents::new(Arc::new(MultimodalConfigRegistry::new()), None, None)
                     .expect("multimodal components"),
             )
         });

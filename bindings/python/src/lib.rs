@@ -534,6 +534,7 @@ struct Router {
     enable_rl: bool,
     rl_control_timeout_secs: u64,
     rl_fanout_concurrency: usize,
+    multimodal_max_inflight_bytes: Option<usize>,
 }
 
 impl Router {
@@ -928,6 +929,7 @@ impl Router {
             .stream_body_stall_timeout_secs(self.stream_body_stall_timeout_secs)
             .multimodal_tensor_transport(multimodal_tensor_transport)
             .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
+            .multimodal_max_inflight_bytes(self.multimodal_max_inflight_bytes)
             .mm_per_request_image_limit(self.mm_per_request_image_limit)
             .routing_key_override(config::RoutingKeyOverrideConfig {
                 enabled: self.routing_key_override,
@@ -1117,6 +1119,7 @@ impl Router {
         enable_rl = false,
         rl_control_timeout_secs = 600,
         rl_fanout_concurrency = 32,
+        multimodal_max_inflight_bytes = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1276,6 +1279,7 @@ impl Router {
         enable_rl: bool,
         rl_control_timeout_secs: u64,
         rl_fanout_concurrency: usize,
+        multimodal_max_inflight_bytes: Option<usize>,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1447,6 +1451,7 @@ impl Router {
             enable_rl,
             rl_control_timeout_secs,
             rl_fanout_concurrency,
+            multimodal_max_inflight_bytes,
         })
     }
 

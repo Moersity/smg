@@ -257,6 +257,9 @@ class RouterArgs:
     enable_rl: bool = False  # Mount the RL control plane under /v1/rl
     rl_control_timeout_secs: int = 600  # Timeout for one proxied engine control call
     rl_fanout_concurrency: int = 32  # Max concurrent engine calls in one fan-out
+    # Appended last so callers that build RouterArgs positionally keep
+    # their existing field order.
+    multimodal_max_inflight_bytes: int | None = None
 
     @staticmethod
     def add_cli_args(
@@ -918,6 +921,18 @@ class RouterArgs:
             type=int,
             default=RouterArgs.multimodal_shm_min_bytes,
             help="Minimum multimodal tensor size (bytes) before the SHM transport is used",
+        )
+        parser.add_argument(
+            f"--{prefix}multimodal-max-inflight-bytes",
+            type=int,
+            default=RouterArgs.multimodal_max_inflight_bytes,
+            help=(
+                "Most bytes of preprocessed media held in flight for engines at"
+                " once; a request that fits waits briefly for room, then gets"
+                " 429, and one larger than the whole budget gets 413 straight"
+                " away. A waiting request still holds its media, so size memory"
+                " for about twice this value. Zero is refused, not read as unset"
+            ),
         )
         parser.add_argument(
             f"--{prefix}mm-per-request-image-limit",

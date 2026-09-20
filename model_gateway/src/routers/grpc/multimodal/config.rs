@@ -17,6 +17,7 @@ use openai_protocol::worker::MmProcessingMode;
 use tracing::{debug, warn};
 
 use super::{
+    inflight::MultimodalInflight,
     pixel_cache::{pixel_cache_from_env, PixelCache},
     refs::MmProcessing,
 };
@@ -255,6 +256,8 @@ pub(crate) struct MultimodalComponents {
     pub processing: MmProcessingMode,
     /// Last resolved (location, reason) per model, to warn once per change.
     pub mm_mode_log: Mutex<HashMap<String, (MmProcessing, &'static str)>>,
+    /// Cap on preprocessed media bytes in flight; `None` leaves it unbounded.
+    pub inflight: Option<Arc<MultimodalInflight>>,
 }
 
 /// Router-wide multimodal processing mode from `SMG_MM_PROCESSING` (default `auto`).
@@ -282,6 +285,7 @@ impl MultimodalComponents {
     pub fn new(
         config_registry: Arc<MultimodalConfigRegistry>,
         image_limit_override: Option<usize>,
+        max_inflight_bytes: Option<usize>,
     ) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -292,6 +296,22 @@ impl MultimodalComponents {
 
         let processing = mm_processing_from_env()?;
         tracing::info!(mode = %processing, "multimodal processing mode");
+
+        let inflight = max_inflight_bytes
+            .map(|bytes| {
+                let inflight = MultimodalInflight::new(bytes);
+                // Zero is not how an operator asks for no limit: it would
+                // refuse every request carrying media. Leaving the setting
+                // off is, so a budget too small to admit anything is more
+                // likely a mistake than an intent to serve nothing.
+                anyhow::ensure!(
+                    inflight.budget_bytes() > 0,
+                    "multimodal_max_inflight_bytes is {bytes}, too little to admit any request \
+                     carrying media; leave it unset to hold an unbounded amount"
+                );
+                Ok(Arc::new(inflight))
+            })
+            .transpose()?;
 
         Ok(Self {
             media_connector: Arc::new(media_connector),
@@ -304,6 +324,7 @@ impl MultimodalComponents {
                 .unwrap_or_default(),
             processing,
             mm_mode_log: Mutex::new(HashMap::new()),
+            inflight,
         })
     }
 }
@@ -495,5 +516,27 @@ mod tests {
             MmProcessingMode::Auto
         );
         assert!(mm_processing_from_value(Some("routers")).is_err());
+    }
+
+    fn components(max_inflight_bytes: Option<usize>) -> Result<MultimodalComponents> {
+        MultimodalComponents::new(
+            Arc::new(MultimodalConfigRegistry::new()),
+            None,
+            max_inflight_bytes,
+        )
+    }
+
+    /// A budget too small to admit anything would turn every request carrying
+    /// media away. Read as "no limit" it would do the opposite instead, so it
+    /// is refused and the operator is told which one to ask for.
+    #[test]
+    fn a_budget_that_admits_nothing_stops_startup() {
+        assert!(components(None).unwrap().inflight.is_none());
+        assert!(components(Some(0)).is_err());
+        assert!(components(Some(1)).is_err());
+
+        let sized = components(Some(8192)).unwrap();
+        let inflight = sized.inflight.expect("a usable budget is kept");
+        assert_eq!(inflight.budget_bytes(), 8192);
     }
 }

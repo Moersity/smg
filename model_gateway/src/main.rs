@@ -599,6 +599,14 @@ struct CliArgs {
     #[arg(long, help_heading = "Multimodal")]
     multimodal_shm_min_bytes: Option<usize>,
 
+    /// Most bytes of preprocessed media the gateway holds in flight for engines
+    /// at once; a request that fits waits briefly, then gets 429, and one
+    /// larger than the whole budget gets 413 straight away. A waiting request
+    /// still holds its media, so size memory for about twice this value.
+    /// Unset: unbounded. Zero is refused rather than read as unset.
+    #[arg(long, help_heading = "Multimodal")]
+    multimodal_max_inflight_bytes: Option<usize>,
+
     /// Per-request image-count limit applied to every model, replacing each
     /// spec's built-in limit (e.g. to match the engine's `--limit-mm-per-prompt`).
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..), help_heading = "Multimodal")]
@@ -1864,6 +1872,7 @@ impl CliArgs {
             .engine_metrics(self.engine_metrics)
             .multimodal_tensor_transport(self.multimodal_tensor_transport)
             .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
+            .multimodal_max_inflight_bytes(self.multimodal_max_inflight_bytes)
             .mm_per_request_image_limit(self.mm_per_request_image_limit.map(|v| v as usize))
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
@@ -2758,6 +2767,8 @@ mod tests {
             "shm",
             "--multimodal-shm-min-bytes",
             "1024",
+            "--multimodal-max-inflight-bytes",
+            "2048",
             "--mm-per-request-image-limit",
             "128",
         ]);
@@ -2769,6 +2780,7 @@ mod tests {
             "transport mode must reach RouterConfig via to_router_config"
         );
         assert_eq!(router_config.multimodal_shm_min_bytes, Some(1024));
+        assert_eq!(router_config.multimodal_max_inflight_bytes, Some(2048));
         assert_eq!(router_config.mm_per_request_image_limit, Some(128));
 
         let server_config = cli.to_server_config(router_config).unwrap();
@@ -2780,6 +2792,10 @@ mod tests {
         assert_eq!(
             server_config.router_config.multimodal_shm_min_bytes,
             Some(1024)
+        );
+        assert_eq!(
+            server_config.router_config.multimodal_max_inflight_bytes,
+            Some(2048)
         );
         assert_eq!(
             server_config.router_config.mm_per_request_image_limit,
