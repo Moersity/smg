@@ -7,7 +7,7 @@
 use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use anyhow::{Context, Result};
-use futures::future::try_join_all;
+use futures::{future::try_join_all, StreamExt, TryStreamExt};
 use llm_multimodal::{
     AsyncMultiModalTracker, AudioClip, EncoderFieldLayouts, ImageFrame, MediaItemInfo, Modality,
     ModelMetadata, ModelProcessorSpec, PlaceholderRange, PreProcessorConfig,
@@ -362,17 +362,89 @@ async fn preprocess_modality(
     let pp_config = preprocessor_config_for(model_config, modality).clone();
 
     if let MediaBatch::Images(images) = media {
-        if let (Some(cache), [image]) = (components.pixel_cache.clone(), images.as_slice()) {
-            return preprocess_image_cached(
-                cache,
-                image,
-                components.vision_processor_registry.clone(),
-                model_id.to_string(),
-                model_type.map(String::from),
-                pp_config,
-                config_fingerprint(tokenizer_id, &model_config.config),
-            )
-            .await;
+        if let Some(cache) = &components.pixel_cache {
+            let processor = components
+                .vision_processor_registry
+                .find(model_id, model_type);
+            // Retaining individual tensors plus their concatenation is costly
+            // for large requests. Keep their whole-batch allocation path.
+            if images.len() == 1
+                || (images.len() < 32
+                    && processor.is_some_and(|p| p.supports_per_image_preprocessing()))
+            {
+                let mut config = serde_json::json!({
+                    "model_id": model_id,
+                    "model_type": model_type,
+                    "model_config": model_config.config,
+                    "preprocessor_config": pp_config,
+                });
+                config.sort_all_objects();
+                let fingerprint = config_fingerprint(tokenizer_id, &config);
+                // Deduplicate within the request even if the result cannot fit
+                // in the cache. Record every position before scheduling work.
+                let mut unique = HashMap::new();
+                let mut positions: Vec<Vec<usize>> = Vec::new();
+                let tasks = images
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(position, image)| {
+                        let next = unique.len();
+                        let index = *unique
+                            .entry(PixelCacheKey {
+                                image_hash: image.hash.clone(),
+                                config_fingerprint: fingerprint,
+                            })
+                            .or_insert(next);
+                        if index == next {
+                            positions.push(vec![position]);
+                            Some(image)
+                        } else {
+                            positions[index].push(position);
+                            None
+                        }
+                    })
+                    .map(|image| {
+                        preprocess_image_cached(
+                            cache.clone(),
+                            image.clone(),
+                            components.vision_processor_registry.clone(),
+                            model_id.to_string(),
+                            model_type.map(String::from),
+                            pp_config.clone(),
+                            fingerprint,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let parts = futures::stream::iter(tasks)
+                    // Keep unique results aligned with their recorded positions.
+                    .buffered(4)
+                    .try_collect::<Vec<_>>()
+                    .await?;
+                let layouts = spec
+                    .encoder_field_layouts_for(Modality::Image)
+                    .model_specific;
+                let image_count = images.len();
+                return tokio::task::spawn_blocking(move || -> Result<_> {
+                    let mut ordered = vec![None; image_count];
+                    for (part, positions) in parts.into_iter().zip(positions) {
+                        let (&last, repeats) = positions
+                            .split_last()
+                            .context("Unique image has no position")?;
+                        for &position in repeats {
+                            ordered[position] = Some(part.clone());
+                        }
+                        ordered[last] = Some(part);
+                    }
+                    let parts = ordered
+                        .into_iter()
+                        .collect::<Option<Vec<_>>>()
+                        .context("Missing image output position")?;
+                    PreprocessedEncoderInputs::concat(parts, &layouts)
+                })
+                .await
+                .context("Image batch assembly task panicked")?
+                .context("Image batch assembly failed");
+            }
         }
     }
 
@@ -526,10 +598,10 @@ fn media_item_infos(media: &MediaBatch) -> Vec<MediaItemInfo> {
     }
 }
 
-/// Pixel-cache image preprocessing for single-image requests.
+/// Pixel-cache lookup and preprocessing for one image.
 async fn preprocess_image_cached(
     cache: Arc<PixelCache>,
-    image: &Arc<ImageFrame>,
+    image: Arc<ImageFrame>,
     registry: Arc<VisionProcessorRegistry>,
     model_id: String,
     model_type: Option<String>,
@@ -549,7 +621,7 @@ async fn preprocess_image_cached(
         model_id,
         model_type,
         pp_config,
-        std::slice::from_ref(image),
+        std::slice::from_ref(&image),
     )
     .await?;
     cache.insert(
@@ -568,8 +640,9 @@ async fn preprocess_image_batch(
     pp_config: PreProcessorConfig,
     images: &[Arc<ImageFrame>],
 ) -> Result<PreprocessedEncoderInputs> {
-    let raw_images: Vec<image::DynamicImage> = images.iter().map(|f| f.image.clone()).collect();
+    let images = images.to_vec();
     tokio::task::spawn_blocking(move || {
+        let raw_images: Vec<image::DynamicImage> = images.iter().map(|f| f.image.clone()).collect();
         let processor = registry
             .find(&model_id, model_type.as_deref())
             .ok_or_else(|| anyhow::anyhow!("No vision processor found for model: {model_id}"))?;
@@ -1438,3 +1511,7 @@ mod tests {
         assert!(error.to_string().contains("Invalid negative token ID"));
     }
 }
+
+#[cfg(test)]
+#[path = "image_cache_tests.rs"]
+mod image_cache_tests;
