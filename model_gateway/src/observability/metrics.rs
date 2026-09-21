@@ -3,6 +3,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::{borrow::Cow, sync::Arc, time::Duration};
 
 use dashmap::DashMap;
+use llm_tokenizer::cache::{cache_activity_stats, CacheActivityStats};
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use once_cell::sync::Lazy;
@@ -150,6 +151,13 @@ pub fn register_jemalloc_as_global_allocator() {
 }
 
 pub(crate) fn init_metrics() {
+    describe_counter!("smg_tokenizer_cache_lookups_total", "Tokenizer cache lookups by layer and result; L1 includes inputs without cacheable boundaries and excludes L0 hits");
+    describe_counter!(
+        "smg_tokenizer_cache_evictions_total",
+        "Tokenizer cache entries removed for capacity; excludes clear, drop and replacement"
+    );
+    describe_counter!("smg_tokenizer_cache_reused_bytes_total", "UTF-8 input bytes served by tokenizer cache hits: whole inputs for L0, matched prefixes for L1; not memory usage");
+
     #[cfg(all(
         feature = "jemalloc-stats",
         not(target_env = "msvc"),
@@ -500,6 +508,24 @@ pub(crate) fn init_metrics() {
     // is enabled and recording).
     use crate::middleware::scheduler::metrics as scheduler_metrics;
     scheduler_metrics::describe();
+}
+
+/// Publish process-lifetime totals without scanning or retaining tokenizer instances.
+pub(super) fn record_tokenizer_cache_activity() {
+    for stats in cache_activity_stats() {
+        record_tokenizer_cache_activity_snapshot(stats);
+    }
+}
+
+fn record_tokenizer_cache_activity_snapshot(stats: CacheActivityStats) {
+    counter!("smg_tokenizer_cache_lookups_total", "layer" => stats.layer, "result" => "hit")
+        .absolute(stats.hits);
+    counter!("smg_tokenizer_cache_lookups_total", "layer" => stats.layer, "result" => "miss")
+        .absolute(stats.misses);
+    counter!("smg_tokenizer_cache_evictions_total", "layer" => stats.layer)
+        .absolute(stats.evictions);
+    counter!("smg_tokenizer_cache_reused_bytes_total", "layer" => stats.layer)
+        .absolute(stats.reused_bytes);
 }
 
 #[expect(
@@ -1755,6 +1781,75 @@ mod tests {
         let handle = recorder.handle();
         metrics::with_local_recorder(&recorder, f);
         handle.render()
+    }
+
+    #[test]
+    fn tokenizer_activity_registers_both_layers_on_scrape() {
+        let rendered = render_with_recorder(|| {
+            init_metrics();
+            record_tokenizer_cache_activity();
+        });
+        for layer in ["l0", "l1"] {
+            for name in [
+                "smg_tokenizer_cache_lookups_total",
+                "smg_tokenizer_cache_evictions_total",
+                "smg_tokenizer_cache_reused_bytes_total",
+            ] {
+                assert!(rendered
+                    .lines()
+                    .any(|line| line.starts_with(&format!("{name}{{"))
+                        && line.contains(&format!("layer=\"{layer}\""))));
+            }
+        }
+    }
+
+    #[test]
+    fn tokenizer_activity_exports_monotonic_totals_without_double_counting() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            init_metrics();
+            for layer in ["l0", "l1"] {
+                for (hits, misses, evictions, reused_bytes) in [(7, 3, 2, 1024), (9, 4, 3, 2048)] {
+                    let snapshot = CacheActivityStats {
+                        layer,
+                        hits,
+                        misses,
+                        evictions,
+                        reused_bytes,
+                    };
+                    record_tokenizer_cache_activity_snapshot(snapshot);
+                    record_tokenizer_cache_activity_snapshot(snapshot);
+                    // An older concurrent scrape must not decrease counters either.
+                    record_tokenizer_cache_activity_snapshot(CacheActivityStats {
+                        hits: 0,
+                        misses: 0,
+                        evictions: 0,
+                        reused_bytes: 0,
+                        ..snapshot
+                    });
+                    let rendered = handle.render();
+                    for (name, result, value) in [
+                        ("smg_tokenizer_cache_lookups_total", Some("hit"), hits),
+                        ("smg_tokenizer_cache_lookups_total", Some("miss"), misses),
+                        ("smg_tokenizer_cache_evictions_total", None, evictions),
+                        ("smg_tokenizer_cache_reused_bytes_total", None, reused_bytes),
+                    ] {
+                        assert!(rendered.contains(&format!("# TYPE {name} counter")));
+                        assert!(
+                            rendered.lines().any(|line| {
+                                line.starts_with(&format!("{name}{{"))
+                                    && line.contains(&format!("layer=\"{layer}\""))
+                                    && result
+                                        .is_none_or(|r| line.contains(&format!("result=\"{r}\"")))
+                                    && line.ends_with(&format!(" {value}"))
+                            }),
+                            "missing {name} for {layer}: {rendered}"
+                        );
+                    }
+                }
+            }
+        });
     }
 
     /// Core engine gauges share these labels for the snapshot fixtures.
