@@ -14,12 +14,14 @@
 //! let encoding = cached.encode("Hello world")?;
 //! ```
 
+mod activity;
 mod fingerprint;
 mod l0;
 mod l1;
 
 use std::sync::Arc;
 
+pub use activity::{cache_activity_stats, CacheActivityStats};
 use anyhow::Result;
 pub use fingerprint::TokenizerFingerprint;
 pub use l0::{CacheStats, L0Cache};
