@@ -380,8 +380,29 @@ async fn preprocess_modality(
                 });
                 config.sort_all_objects();
                 let fingerprint = config_fingerprint(tokenizer_id, &config);
+                // Deduplicate within the request even if the result cannot fit
+                // in the cache. Record every position before scheduling work.
+                let mut unique = HashMap::new();
+                let mut positions: Vec<Vec<usize>> = Vec::new();
                 let tasks = images
                     .iter()
+                    .enumerate()
+                    .filter_map(|(position, image)| {
+                        let next = unique.len();
+                        let index = *unique
+                            .entry(PixelCacheKey {
+                                image_hash: image.hash.clone(),
+                                config_fingerprint: fingerprint,
+                            })
+                            .or_insert(next);
+                        if index == next {
+                            positions.push(vec![position]);
+                            Some(image)
+                        } else {
+                            positions[index].push(position);
+                            None
+                        }
+                    })
                     .map(|image| {
                         preprocess_image_cached(
                             cache.clone(),
@@ -395,15 +416,29 @@ async fn preprocess_modality(
                     })
                     .collect::<Vec<_>>();
                 let parts = futures::stream::iter(tasks)
-                    // Bounded work, with results retained in request order even
-                    // when blocking tasks finish out of order.
+                    // Keep unique results aligned with their recorded positions.
                     .buffered(4)
                     .try_collect::<Vec<_>>()
                     .await?;
                 let layouts = spec
                     .encoder_field_layouts_for(Modality::Image)
                     .model_specific;
-                return tokio::task::spawn_blocking(move || {
+                let image_count = images.len();
+                return tokio::task::spawn_blocking(move || -> Result<_> {
+                    let mut ordered = vec![None; image_count];
+                    for (part, positions) in parts.into_iter().zip(positions) {
+                        let (&last, repeats) = positions
+                            .split_last()
+                            .context("Unique image has no position")?;
+                        for &position in repeats {
+                            ordered[position] = Some(part.clone());
+                        }
+                        ordered[last] = Some(part);
+                    }
+                    let parts = ordered
+                        .into_iter()
+                        .collect::<Option<Vec<_>>>()
+                        .context("Missing image output position")?;
                     PreprocessedEncoderInputs::concat(parts, &layouts)
                 })
                 .await

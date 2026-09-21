@@ -174,13 +174,22 @@ async fn mixed_hits_and_out_of_order_misses_preserve_order() {
 
 #[tokio::test]
 async fn repeated_cold_images_keep_every_occurrence() {
-    let (components, calls, config) = setup(true, false);
-    let result = run(&components, &config, &[4, 4, 4], "tok").await;
-    assert_eq!(result.encoder_input.as_slice().unwrap(), [4.0; 3]);
-    assert_eq!(result.feature_token_counts, [4; 3]);
-    calls.batches.lock().unwrap().clear();
-    run(&components, &config, &[4, 4], "tok").await;
-    assert!(calls.batches.lock().unwrap().is_empty());
+    for budget in [0, 1024 * 1024] {
+        let (mut components, calls, config) = setup(true, true);
+        components.pixel_cache = Some(Arc::new(PixelCache::new(budget)));
+        let result = run(&components, &config, &[1, 2, 1, 2, 1], "tok").await;
+        assert_eq!(*calls.batches.lock().unwrap(), vec![vec![2], vec![1]]);
+        assert_eq!(
+            result.encoder_input.as_slice().unwrap(),
+            [1.0, 2.0, 1.0, 2.0, 1.0]
+        );
+        assert_eq!(result.feature_token_counts, [1, 2, 1, 2, 1]);
+        assert_eq!(result.item_sizes, [(1, 1), (2, 1), (1, 1), (2, 1), (1, 1)]);
+        calls.batches.lock().unwrap().clear();
+        run(&components, &config, &[2; 31], "tok").await;
+        let expected = if budget == 0 { vec![vec![2]] } else { vec![] };
+        assert_eq!(*calls.batches.lock().unwrap(), expected);
+    }
 }
 
 #[tokio::test]
