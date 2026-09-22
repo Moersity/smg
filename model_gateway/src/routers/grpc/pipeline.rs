@@ -425,6 +425,20 @@ impl RequestPipeline {
                 "Worker selection not completed",
             )
         })?;
+        // The window is a property of the selected worker's model card, so
+        // this has to follow selection; it precedes client acquisition so a
+        // request no engine could accept never reaches one (#2380).
+        let prep = ctx.state.preparation.as_ref().ok_or_else(|| {
+            error!(function = "run_ingress", "Preparation stage not completed");
+            error::internal_error(
+                "preparation_stage_not_completed",
+                "Preparation stage not completed",
+            )
+        })?;
+        step!(
+            "ContextLength",
+            enforce_context_length(prep, workers, &ctx.input.model_id)
+        )?;
         ctx.state.clients = Some(step!(
             "ClientAcquisition",
             acquire_clients(workers, &ctx.input.model_id).await
@@ -495,7 +509,7 @@ impl RequestPipeline {
             dctx.workers.as_ref(),
         ));
 
-        execute_plan(dctx, attempt_plan).await?;
+        execute_plan(dctx, attempt_plan, last_attempt).await?;
         self.stages
             .response_processing
             .process(dctx, spec.clone())
@@ -769,7 +783,10 @@ impl RequestPipeline {
                     let usage = response.usage.as_ref();
                     Self::settle_reservation(
                         dctx.rate_limit_cell.as_deref(),
-                        usage.map_or(0, |u| u.prompt_tokens),
+                        // The engine's count: the usage shown excludes the unbilled stub.
+                        usage.map_or(0, |u| {
+                            u.prompt_tokens + dctx.response.unbilled_prompt_tokens
+                        }),
                         usage.map_or(0, |u| u.completion_tokens),
                     )
                     .await;
@@ -2175,7 +2192,7 @@ mod request_release_tests {
             .expect("register the DeepSeek-V4.1 tokenizer");
         let multimodal = with_multimodal.then(|| {
             Arc::new(
-                MultimodalComponents::new(Arc::new(MultimodalConfigRegistry::new()), None)
+                MultimodalComponents::new(Arc::new(MultimodalConfigRegistry::new()), None, None)
                     .expect("multimodal components"),
             )
         });

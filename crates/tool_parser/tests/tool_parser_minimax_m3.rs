@@ -1452,3 +1452,45 @@ async fn test_m3_composed_container_recovery_rejects_ambiguous_schemas() {
         assert_eq!(normal, text, "{schema}");
     }
 }
+
+/// A call to a tool the request never declared (the conversation established
+/// it) still parses, complete and streaming, with no schema to coerce by.
+#[tokio::test]
+async fn test_m3_undeclared_tool_parses_without_a_tool_inventory() {
+    let text = tool_block(&[("list_skills", String::new())]);
+    let (normal, calls) = MinimaxM3Parser::new()
+        .parse_complete_with_tools(&text, &[])
+        .await
+        .unwrap();
+    assert_eq!(normal, "");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].function.name, "list_skills");
+    assert_eq!(calls[0].function.arguments, "{}");
+
+    let mut parser = MinimaxM3Parser::new();
+    let mut streamed = Vec::new();
+    let mut normal = String::new();
+    for ch in text.chars() {
+        let result = parser
+            .parse_incremental(&ch.to_string(), &[])
+            .await
+            .unwrap();
+        streamed.extend(result.calls);
+        normal.push_str(&result.normal_text);
+    }
+    normal.push_str(&parser.take_unstreamed_normal_text());
+    assert_eq!(normal, "");
+    let names: Vec<&str> = streamed
+        .iter()
+        .filter_map(|call| call.name.as_deref())
+        .collect();
+    assert_eq!(names, ["list_skills"]);
+    // The name arrives on its own and the arguments follow, so the pieces have
+    // to add back up to what the one-shot parse returned. Checking the name
+    // alone would also pass on a call that streamed no arguments at all.
+    let arguments: String = streamed
+        .iter()
+        .map(|call| call.parameters.as_str())
+        .collect();
+    assert_eq!(arguments, "{}");
+}

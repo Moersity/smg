@@ -12,6 +12,8 @@
 //! - [`serialize`]: tensor byte/dtype serialization used by assembly.
 //! - [`transport`]: SHM-vs-inline transport resolution and `/dev/shm`
 //!   namespace verification.
+//! - [`refs`]: router-vs-worker processing resolution and the media-reference
+//!   payload for workers that process media themselves.
 
 use std::{
     collections::HashSet,
@@ -50,9 +52,11 @@ mod assemble;
 mod capability;
 mod config;
 mod detect;
+mod inflight;
 mod pixel_cache;
 mod plan;
 mod process;
+mod refs;
 mod serialize;
 mod transport;
 
@@ -66,11 +70,16 @@ pub(crate) use config::{
     MultimodalConfigRegistry, MultimodalModelConfig,
 };
 pub(crate) use detect::{media_plan_chat, media_plan_messages};
+pub(crate) use inflight::{reserve_multimodal_inflight, InflightPermit};
 pub(crate) use plan::{
     prepare_placeholder_tokens, resolve_media_part_order, validate_rendered_media_anchors,
-    PlaceholderTokens,
+    MediaPlan, PlaceholderTokens,
 };
 pub(crate) use process::process_multimodal_plan;
+pub(crate) use refs::{
+    assemble_media_refs, ensure_selection_supports_media_refs, resolve_mm_processing,
+    worker_accepts_media_refs, MmProcessing, MmRefsError,
+};
 pub(crate) use transport::{init_mm_transport_defaults, mm_rdma_exporter};
 
 /// Whether verbose multimodal timing logs are enabled via `SMG_LOG_MM_TIMING`.

@@ -292,6 +292,16 @@ impl fmt::Debug for WorkerRoutingKeyLoad {
     }
 }
 
+/// Context window advertised for `model_id` in `models`: the matching card's
+/// (aliases included), else the primary card's. Borrows only, so it is safe on
+/// the per-request path.
+fn context_length_from(models: &WorkerModels, model_id: &str) -> Option<u32> {
+    models
+        .find(model_id)
+        .or_else(|| models.primary())
+        .and_then(|card| card.context_length)
+}
+
 /// Core worker abstraction that represents a backend service
 #[async_trait]
 pub trait Worker: Send + Sync + fmt::Debug + 'static {
@@ -703,6 +713,17 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// Get all models this worker can serve.
     fn models(&self) -> Vec<ModelCard> {
         self.metadata().spec.models.all().to_vec()
+    }
+
+    /// Context window (in tokens) this worker advertises for `model_id`, from
+    /// the matching model card (falling back to the primary card). `None`
+    /// when the worker never advertised one; callers then leave the length
+    /// check to the engine.
+    ///
+    /// `BasicWorker` overrides this to consult its lazy-discovered
+    /// `models_override`, as `supports_model` does.
+    fn context_length(&self, model_id: &str) -> Option<u32> {
+        context_length_from(&self.metadata().spec.models, model_id)
     }
 
     /// Set models for this worker (for lazy discovery).
@@ -1725,6 +1746,15 @@ impl Worker for BasicWorker {
             overridden.all()
         };
         source.to_vec()
+    }
+
+    fn context_length(&self, model_id: &str) -> Option<u32> {
+        let overridden = self.models_override.load();
+        if overridden.is_wildcard() {
+            context_length_from(&self.metadata.spec.models, model_id)
+        } else {
+            context_length_from(&overridden, model_id)
+        }
     }
 
     fn set_models(&self, models: Vec<ModelCard>) {

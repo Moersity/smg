@@ -189,9 +189,14 @@ fn pd_leg_labels(workers: &WorkerSelection) -> (&'static str, &'static str) {
 /// Dispatch one attempt of the retained plan: create the attempt's load
 /// guards, fan out encode jobs on the first EPD dispatch, and store the
 /// execution result on the context for response processing.
+///
+/// `last_attempt` says whether a plan is still retained for a replay, which
+/// is what decides when the media bytes stop counting against the in-flight
+/// budget.
 pub(crate) async fn execute_plan(
     ctx: &mut DispatchContext,
     execution_plan: ExecutionPlan,
+    last_attempt: bool,
 ) -> Result<(), Response> {
     // One bootstrap room per backend request the plan will post: a batched
     // completion fans out one PD dispatch per sub-request, so admission has
@@ -291,7 +296,14 @@ pub(crate) async fn execute_plan(
         }
     }
     .instrument(span)
-    .await?;
+    .await;
+    // The engines hold the request bodies now. An earlier attempt keeps its
+    // share of the budget: the retained plan still owns the same media, and a
+    // replay would send it again.
+    if last_attempt {
+        ctx.multimodal_inflight.take();
+    }
+    let result = result?;
 
     // Store result in context for response processing
     ctx.response.execution_result = Some(result);
@@ -1434,6 +1446,31 @@ mod tests {
             "hash-less mm payload is dropped whole on the decode leg"
         );
         assert_eq!(decode.request_id, "pd-1");
+    }
+
+    #[test]
+    fn clone_without_mm_pixels_keeps_vllm_media_refs() {
+        // Both PD legs process the references themselves.
+        let refs = vllm::MediaRefs {
+            items: vec![vllm::MediaRef {
+                modality: smg_grpc_client::common_proto::Modality::Image as i32,
+                url: "https://a/1.png".to_string(),
+            }],
+        };
+        let mut request = ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
+            request_id: "pd-refs".to_string(),
+            ..Default::default()
+        }));
+        request
+            .set_vllm_media_refs(refs.clone())
+            .expect("vLLM request accepts media refs");
+        assert!(request.has_vllm_media_refs());
+        let clone = request.clone_without_mm_pixels();
+        let ProtoGenerateRequest::Vllm(decode) = clone else {
+            panic!("expected vLLM clone");
+        };
+        assert_eq!(decode.media_refs, Some(refs));
+        assert!(decode.mm_inputs.is_none());
     }
 
     #[test]

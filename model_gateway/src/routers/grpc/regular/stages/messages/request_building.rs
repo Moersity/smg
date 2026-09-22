@@ -13,7 +13,10 @@ use crate::routers::{
             AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan, ExecutionPlanKind,
             PreparationOutput, RequestContext,
         },
-        multimodal::{assemble_multimodal_data, assemble_multimodal_data_after_encode},
+        multimodal::{
+            assemble_media_refs, assemble_multimodal_data, assemble_multimodal_data_after_encode,
+            reserve_multimodal_inflight,
+        },
         spec::{MessagesResponseSpec, ResponseSpec},
         utils,
     },
@@ -115,6 +118,16 @@ impl BuildStage for MessageRequestBuildingStage {
         } else {
             None
         };
+        if let Some(data) = multimodal_data.as_ref() {
+            ctx.state.multimodal_inflight = reserve_multimodal_inflight(
+                ctx.components
+                    .multimodal
+                    .as_ref()
+                    .and_then(|multimodal| multimodal.inflight.as_deref()),
+                data.inline_bytes(),
+            )
+            .await?;
+        }
 
         // A structural tag that already opens with the reasoning block runs
         // from the first token; asking SGLang to also defer the grammar past
@@ -178,6 +191,23 @@ impl BuildStage for MessageRequestBuildingStage {
         // No-op unless the backend carries it in the request.
         if let Some(workers) = ctx.state.workers.as_ref() {
             helpers::maybe_inject_pd_rendezvous(&mut proto_request, workers);
+        }
+
+        // Worker-side multimodal processing: attach the media references now
+        // that the wire is known, before the PD clone so both legs carry them.
+        if let Some(plan) = ctx.state.multimodal_refs.take() {
+            if builder_client.is_zmq() {
+                return Err(error::bad_request(
+                    "multimodal_not_supported",
+                    "media references require a gRPC vLLM worker",
+                ));
+            }
+            let refs = assemble_media_refs(plan)
+                .map_err(|e| error::bad_request(e.code(), e.to_string()))?;
+            proto_request
+                .set_vllm_media_refs(refs)
+                .map_err(|e| error::bad_request("multimodal_not_supported", e))?;
+            ctx.state.media_refs_forwarded = true;
         }
 
         Ok(BuildOutput {

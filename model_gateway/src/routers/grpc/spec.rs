@@ -17,6 +17,7 @@ use openai_protocol::{
     completion::CompletionRequest,
     generate::GenerateRequest,
     messages::{self, CreateMessageRequest},
+    profile::ProviderProfile,
     responses::ResponsesRequest,
 };
 use serde_json::Value;
@@ -56,13 +57,19 @@ pub(crate) struct TranscriptionResponseSpec {
 
 #[derive(Clone)]
 pub(crate) struct ChatResponseSpec {
+    /// Provider dialect of the model the client asked for, as request
+    /// validation selects it; picks provider-specific response behaviour.
+    pub provider: ProviderProfile,
     pub separate_reasoning: bool,
     pub tool_choice: Option<ToolChoice>,
     pub tools: Option<Vec<Tool>>,
     pub history_tool_calls_count: usize,
     pub stream_options: Option<StreamOptions>,
     pub chat_template_kwargs: Option<HashMap<String, Value>>,
+    /// The effective effort (`thinking.effort` else `reasoning_effort`).
     pub reasoning_effort: Option<String>,
+    /// The typed `thinking.type` toggle.
+    pub thinking: Option<bool>,
     /// `continue_final_message` on a trailing assistant message.
     pub continues_final_assistant: bool,
     /// `n`, normalized.
@@ -74,18 +81,32 @@ pub(crate) struct ChatResponseSpec {
     pub ignore_eos: bool,
     /// Fallback when preparation derived no override.
     pub skip_special_tokens: bool,
+    /// Rendered prompt tokens the provider does not bill; set by request building.
+    pub unbilled_prompt_tokens: u32,
 }
 
 impl From<&ChatCompletionRequest> for ChatResponseSpec {
     fn from(request: &ChatCompletionRequest) -> Self {
         Self {
+            provider: ProviderProfile::for_model(&request.model),
             separate_reasoning: request.separate_reasoning,
             tool_choice: request.tool_choice.clone(),
-            tools: request.tools.clone(),
+            // Every tool the model may call, dynamic tools declared on messages
+            // included. `None` when the response is not scanned for tool calls:
+            // the request declares no tools anywhere and the provider does not
+            // parse tool calls without them.
+            tools: {
+                let tools: Vec<Tool> = request.effective_tools().cloned().collect();
+                let scanned = request.tools.is_some()
+                    || !tools.is_empty()
+                    || ProviderProfile::for_model(&request.model).parses_tool_calls_without_tools();
+                scanned.then_some(tools)
+            },
             history_tool_calls_count: utils::get_history_tool_calls_count(request),
             stream_options: request.stream_options.clone(),
             chat_template_kwargs: request.chat_template_kwargs.clone(),
-            reasoning_effort: request.reasoning_effort.clone(),
+            reasoning_effort: request.effective_reasoning_effort().map(str::to_string),
+            thinking: request.thinking_toggle(),
             continues_final_assistant: utils::continues_final_assistant(request),
             expected_choices: request.n.unwrap_or(1).max(1),
             logprobs: request.logprobs,
@@ -94,6 +115,7 @@ impl From<&ChatCompletionRequest> for ChatResponseSpec {
             no_stop_trim: request.no_stop_trim,
             ignore_eos: request.ignore_eos,
             skip_special_tokens: request.skip_special_tokens,
+            unbilled_prompt_tokens: 0,
         }
     }
 }
@@ -105,6 +127,7 @@ impl ChatResponseSpec {
         utils::reasoning_starts_in_prefill(
             self.chat_template_kwargs.as_ref(),
             self.reasoning_effort.as_deref(),
+            self.thinking,
             self.continues_final_assistant,
             tokenizer,
         )
@@ -216,4 +239,104 @@ impl From<&CompletionRequest> for CompletionResponseSpec {
 pub(crate) enum HarmonyResponseSpec {
     Chat(Arc<ChatCompletionRequest>),
     Responses(Arc<ResponsesRequest>),
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn chat_request(value: Value) -> ChatCompletionRequest {
+        serde_json::from_value(value).expect("request deserializes")
+    }
+
+    fn tool(name: &str) -> Value {
+        json!({
+            "type": "function",
+            "function": {"name": name, "parameters": {"type": "object", "properties": {}}}
+        })
+    }
+
+    fn tool_names(spec: &ChatResponseSpec) -> Vec<String> {
+        spec.tools
+            .iter()
+            .flatten()
+            .map(|tool| tool.function.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn chat_spec_tools_include_dynamic_tools() {
+        let request = chat_request(json!({
+            "model": "kimi-k3",
+            "messages": [
+                {"role": "system", "content": "", "tools": [tool("get_weather")]},
+                {"role": "user", "content": "what is the weather in beijing?"}
+            ],
+            "tool_choice": "required"
+        }));
+
+        let spec = ChatResponseSpec::from(&request);
+
+        assert_eq!(tool_names(&spec), ["get_weather"]);
+    }
+
+    #[test]
+    fn chat_spec_tools_keep_request_tools_first() {
+        let request = chat_request(json!({
+            "model": "kimi-k3",
+            "messages": [
+                {"role": "system", "content": "", "tools": [tool("dynamic_a")]},
+                {"role": "user", "content": "hi"},
+                {"role": "developer", "content": "", "tools": [tool("dynamic_b")]}
+            ],
+            "tools": [tool("global")]
+        }));
+
+        let spec = ChatResponseSpec::from(&request);
+
+        assert_eq!(tool_names(&spec), ["global", "dynamic_a", "dynamic_b"]);
+    }
+
+    #[test]
+    fn chat_spec_tools_none_without_any_declaration() {
+        let request = chat_request(json!({
+            "model": "kimi-k3",
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+
+        assert!(ChatResponseSpec::from(&request).tools.is_none());
+    }
+
+    #[test]
+    fn chat_spec_provider_follows_the_requested_model() {
+        let minimax = chat_request(json!({
+            "model": "MiniMax-M3",
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        let openai = chat_request(json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+
+        assert_eq!(
+            ChatResponseSpec::from(&minimax).provider,
+            ProviderProfile::Minimax
+        );
+        assert_eq!(
+            ChatResponseSpec::from(&openai).provider,
+            ProviderProfile::OpenAi
+        );
+    }
+
+    #[test]
+    fn chat_spec_scans_minimax_responses_for_tool_calls_without_tools() {
+        let request = chat_request(json!({
+            "model": "MiniMax-M3",
+            "messages": [{"role": "user", "content": "try again"}]
+        }));
+
+        assert_eq!(ChatResponseSpec::from(&request).tools, Some(Vec::new()));
+    }
 }

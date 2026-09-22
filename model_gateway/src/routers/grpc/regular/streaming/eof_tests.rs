@@ -84,11 +84,15 @@ fn chunk(index: u32, text: &str) -> proto::GenerateResponse {
 }
 
 fn complete(index: u32, reason: &str) -> proto::GenerateResponse {
+    complete_with_prompt(index, reason, 1)
+}
+
+fn complete_with_prompt(index: u32, reason: &str, prompt_tokens: u32) -> proto::GenerateResponse {
     proto::GenerateResponse {
         response: Some(GenerationEvent::Complete(proto::GenerateComplete {
             index,
             finish_reason: reason.to_string(),
-            prompt_tokens: 1,
+            prompt_tokens,
             completion_tokens: 12,
             ..Default::default()
         })),
@@ -316,6 +320,80 @@ async fn chat_stream_error_does_not_flush_a_success_tail() {
     assert!(events
         .iter()
         .all(|event| event["choices"][0]["finish_reason"].is_null()));
+}
+
+#[tokio::test]
+async fn chat_usage_chunk_excludes_unbilled_prompt_tokens() {
+    for (unbilled, continuous) in [(0, false), (3, false), (0, true), (3, true)] {
+        let mut first = chunk(0, "hi");
+        if let Some(GenerationEvent::Chunk(chunk)) = &mut first.response {
+            chunk.prompt_tokens = 10;
+            chunk.cached_tokens = 10;
+        }
+        let mut last = complete_with_prompt(0, "stop", 10);
+        if let Some(GenerationEvent::Complete(complete)) = &mut last.response {
+            complete.cached_tokens = 10;
+        }
+        let (stream, server) = scripted_stream(vec![first, last], "0").await;
+        let (tx, rx) = sse_channel();
+        let request = serde_json::json!({
+            "model": "eof-test", "messages": [], "stream": true,
+            "stream_options": {"include_usage": true, "continuous_usage_stats": continuous}
+        });
+        let mut spec = ChatResponseSpec::from(
+            &serde_json::from_value::<ChatCompletionRequest>(request).expect("chat request"),
+        );
+        spec.unbilled_prompt_tokens = unbilled;
+        let result = processor(false)
+            .process_streaming_chunks(
+                stream,
+                dispatch(),
+                Arc::new(CharacterTokenizer::default()),
+                (None, None, false, false, false),
+                spec,
+                &tx,
+                None,
+            )
+            .await;
+        drop(tx);
+        let events = collect_events(rx).await;
+        server.abort();
+        assert!(result.is_ok(), "{result:?}");
+
+        let final_event = events.last().expect("final usage event");
+        assert!(final_event["choices"].as_array().unwrap().is_empty());
+        let usage = &final_event["usage"];
+        for event in &events[..events.len() - 1] {
+            let snapshot = &event["usage"];
+            if continuous {
+                assert_eq!(snapshot["prompt_tokens"], 10 - unbilled, "{event}");
+                assert_eq!(
+                    snapshot["prompt_tokens_details"]["cached_tokens"],
+                    10 - unbilled
+                );
+                assert_eq!(
+                    snapshot["total_tokens"].as_u64().unwrap(),
+                    u64::from(10 - unbilled) + snapshot["completion_tokens"].as_u64().unwrap()
+                );
+                if !event["choices"][0]["finish_reason"].is_null() {
+                    assert_eq!(snapshot, usage, "finish and final usage must agree");
+                }
+            } else {
+                assert!(snapshot.is_null(), "{event}");
+            }
+        }
+        assert!(events
+            .iter()
+            .any(|event| event["choices"][0]["delta"]["content"] == "hi"));
+        assert!(events
+            .iter()
+            .any(|event| event["choices"][0]["finish_reason"] == "stop"));
+        assert_eq!(usage["prompt_tokens"], 10 - unbilled);
+        assert_eq!(
+            usage["total_tokens"],
+            usage["prompt_tokens"].as_u64().unwrap() + usage["completion_tokens"].as_u64().unwrap()
+        );
+    }
 }
 
 #[tokio::test]

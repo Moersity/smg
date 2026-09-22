@@ -534,6 +534,7 @@ struct Router {
     enable_rl: bool,
     rl_control_timeout_secs: u64,
     rl_fanout_concurrency: usize,
+    multimodal_max_inflight_bytes: Option<usize>,
 }
 
 impl Router {
@@ -928,6 +929,7 @@ impl Router {
             .stream_body_stall_timeout_secs(self.stream_body_stall_timeout_secs)
             .multimodal_tensor_transport(multimodal_tensor_transport)
             .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
+            .multimodal_max_inflight_bytes(self.multimodal_max_inflight_bytes)
             .mm_per_request_image_limit(self.mm_per_request_image_limit)
             .routing_key_override(config::RoutingKeyOverrideConfig {
                 enabled: self.routing_key_override,
@@ -1117,6 +1119,7 @@ impl Router {
         enable_rl = false,
         rl_control_timeout_secs = 600,
         rl_fanout_concurrency = 32,
+        multimodal_max_inflight_bytes = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1276,6 +1279,7 @@ impl Router {
         enable_rl: bool,
         rl_control_timeout_secs: u64,
         rl_fanout_concurrency: usize,
+        multimodal_max_inflight_bytes: Option<usize>,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1447,6 +1451,7 @@ impl Router {
             enable_rl,
             rl_control_timeout_secs,
             rl_fanout_concurrency,
+            multimodal_max_inflight_bytes,
         })
     }
 
@@ -1488,9 +1493,20 @@ impl Router {
                 worker_ports_annotation: self.worker_ports_annotation.clone(),
                 kv_connector_annotation: self.kv_connector_annotation.clone(),
                 kv_engine_id_annotation: self.kv_engine_id_annotation.clone(),
+                model_id_source,
+            })
+        } else {
+            None
+        };
+
+        // Mesh-router discovery now has its own task and lifetime, but stays
+        // gated on the legacy service-discovery flag until it gains its own
+        // config surface with the tagged provider configuration.
+        let mesh_discovery_config = if self.service_discovery && !self.router_selector.is_empty() {
+            Some(mesh_discovery::MeshDiscoveryConfig {
+                namespace: self.service_discovery_namespace.clone(),
                 router_selector: self.router_selector.clone(),
                 router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
-                model_id_source,
             })
         } else {
             None
@@ -1522,6 +1538,7 @@ impl Router {
                 log_level: self.log_level.clone(),
                 log_json: self.log_json,
                 service_discovery_config,
+                mesh_discovery_config,
                 prometheus_config,
                 request_timeout_secs: self.request_timeout_secs,
                 request_id_headers: self.request_id_headers.clone(),
@@ -1549,6 +1566,16 @@ impl Router {
                             })
                         })
                         .transpose()?;
+                    // Mirrors the CLI check in `main.rs`: port 0 parses as a
+                    // socket address but is undialable once gossiped to peers,
+                    // and reaches router discovery as the fallback mesh port
+                    // for Pods with no usable annotation.
+                    if self.mesh_port == 0 {
+                        return Err(pyo3::exceptions::PyValueError::new_err(
+                            "Invalid value for mesh_port='0': mesh port cannot be 0; peers dial \
+                             the advertised port, so it must be a fixed, routable one",
+                        ));
+                    }
                     let bind_addr =
                         Self::parse_mesh_socket_addr(&self.mesh_host, self.mesh_port, "mesh_host")?;
                     let (advertise_host, advertise_field) =

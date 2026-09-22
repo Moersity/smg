@@ -6,7 +6,6 @@ for orchestration without tokenization.
 """
 
 import asyncio
-import dataclasses
 import hashlib
 import json
 import logging
@@ -18,9 +17,7 @@ from pathlib import Path
 
 import grpc
 import msgspec
-import numpy as np
 import sglang
-import torch
 import zmq
 import zmq.asyncio
 from google.protobuf.json_format import MessageToDict
@@ -60,6 +57,7 @@ from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
 from smg_grpc_servicer.sglang.loads import convert_loads_to_protobuf
 from smg_grpc_servicer.sglang.request_manager import GrpcRequestManager
 from smg_grpc_servicer.sglang.utils import abort_code_from_output, to_token_id_array
+from smg_grpc_servicer.tensor_wire import tensor_from_parts
 from smg_grpc_servicer.tokenizer_bundle import CHUNK_SIZE, build_tokenizer_zip
 
 from ..pd_pairing import pairing_protocol_from_env
@@ -479,7 +477,13 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         """Get server information."""
         logger.debug("Receive server info request")
 
-        server_args_dict = dataclasses.asdict(self.server_args)
+        # 0.5.20 turned ServerArgs from a dataclass into a msgspec Struct, so
+        # dataclasses.asdict() raises. A Struct keeps its declared fields OUT
+        # of __dict__ (upstream carries `dict=True` only so the underscore
+        # extras have somewhere to live), which is why vars() returns those
+        # extras and none of the fields the gateway reads. msgspec's own
+        # asdict is the conversion upstream uses on this type.
+        server_args_dict = msgspec.structs.asdict(self.server_args)
         server_args_struct = Struct()
 
         def make_serializable(obj):
@@ -948,11 +952,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
     @staticmethod
     def _decode_tensor_data(tensor_data):
         """Decode a proto TensorData message into a torch.Tensor."""
-        dtype_map = {"float32": np.float32, "int64": np.int64}
-        np_dtype = dtype_map.get(tensor_data.dtype, np.float32)
-        shape = list(tensor_data.shape)
-        arr = np.frombuffer(tensor_data.data, dtype=np_dtype).reshape(shape)
-        return torch.from_numpy(arr)
+        return tensor_from_parts(tensor_data.data, tensor_data.shape, tensor_data.dtype)
 
     def _parse_mm_inputs(self, mm_proto) -> MultimodalProcessorOutput:
         """Parse proto MultimodalInputs into a MultimodalProcessorOutput for the scheduler."""

@@ -30,7 +30,7 @@ use super::{
         helpers::{IdStamp, SamplingBaseline, SamplingDefaultsMask},
         RateLimitCell,
     },
-    multimodal::{MultimodalComponents, MultimodalIntermediate},
+    multimodal::{InflightPermit, MediaPlan, MultimodalComponents, MultimodalIntermediate},
     proto_wrapper::{
         EncodeItemBootstrapInfo, ProtoEmbedComplete, ProtoEmbedRequest, ProtoGenerateRequest,
         ProtoRequest, ProtoStream,
@@ -187,10 +187,22 @@ pub(crate) struct ProcessingState {
     /// building `take()`s it for the prefill serialization.
     pub multimodal_intermediate: Option<MultimodalIntermediate>,
 
+    /// Media references kept for a worker that processes them itself; never
+    /// `Some` together with `multimodal_intermediate`. Request building takes it.
+    pub multimodal_refs: Option<MediaPlan>,
+
+    /// Set once request building attached media references, so retry
+    /// re-selection stays pinned to workers that accept them.
+    pub media_refs_forwarded: bool,
+
     /// `Some` iff the request is multimodal EPD and worker selection produced
     /// encode assignments. Request building injects the bootstrap info and drops
     /// prefill pixels; request execution `take()`s the dispatch plan.
     pub encode_outputs: Option<EncodeOutputs>,
+
+    /// Share of the in-flight media budget this request holds until the
+    /// engines have its body.
+    pub multimodal_inflight: Option<InflightPermit>,
 
     /// Resolved tokenizer (set once in preparation, reused in response processing)
     /// This avoids redundant registry lookups across pipeline stages.
@@ -231,16 +243,18 @@ pub(crate) struct RoutingSnapshot {
 pub(crate) use crate::routers::common::placement::WireConstraint;
 
 impl WireConstraint {
-    fn of(workers: &WorkerSelection) -> Self {
+    fn of(workers: &WorkerSelection, requires_media_refs: bool) -> Self {
         match workers {
             WorkerSelection::Single { worker } => Self {
                 runtime: worker.metadata().spec.runtime_type,
                 connection: *worker.connection_mode(),
+                requires_media_refs,
             },
             // Disaggregated legs are gRPC-only.
             WorkerSelection::Disaggregated { runtime_type, .. } => Self {
                 runtime: *runtime_type,
                 connection: ConnectionMode::Grpc,
+                requires_media_refs,
             },
         }
     }
@@ -271,6 +285,7 @@ pub(crate) struct DispatchContext {
     /// Consumed by the first dispatch; retries re-dispatch only the
     /// prefill/decode legs against the already-running encode jobs.
     pub encode_outputs: Option<EncodeOutputs>,
+    pub multimodal_inflight: Option<InflightPermit>,
     pub dispatch: Option<DispatchMetadata>,
     pub load_guards: Option<LoadGuards>,
     pub response: ResponseState,
@@ -539,6 +554,20 @@ impl PreparationOutput {
         }
     }
 
+    /// Longest single input in tokens -- what the engine's context window
+    /// bounds. Every prompt of a batched `Completion` is dispatched as its own
+    /// engine request, so the window applies per item, not to their sum.
+    pub fn max_input_token_count(&self) -> usize {
+        match self {
+            Self::Completion { items, .. } => items
+                .iter()
+                .map(|item| item.token_ids.len())
+                .max()
+                .unwrap_or(0),
+            other => other.token_ids().len(),
+        }
+    }
+
     /// Text for worker routing: original_text for regular pipelines, selection_text for Harmony.
     /// Chat/Messages borrow from processed_messages.text to avoid a redundant clone.
     pub fn routing_text(&self) -> Option<&str> {
@@ -701,6 +730,9 @@ pub(crate) struct ResponseState {
     /// Final processed response
     pub final_response: Option<FinalResponse>,
 
+    /// Rendered prompt tokens the client-facing usage drops; settlement adds them back.
+    pub unbilled_prompt_tokens: u32,
+
     /// Responses API iteration result (Harmony only, for tool loop orchestration)
     pub responses_iteration_result: Option<super::harmony::ResponsesIterationResult>,
 }
@@ -806,7 +838,7 @@ impl RequestContext {
         let wire = state
             .workers
             .as_ref()
-            .map(WireConstraint::of)
+            .map(|workers| WireConstraint::of(workers, state.media_refs_forwarded))
             .ok_or_else(|| {
                 error!(
                     function = "RequestContext::into_dispatch",
@@ -830,6 +862,7 @@ impl RequestContext {
             sticky_key: state.sticky_key,
             clients: state.clients,
             encode_outputs: state.encode_outputs,
+            multimodal_inflight: state.multimodal_inflight,
             dispatch: None,
             load_guards: None,
             response: state.response,
@@ -1309,6 +1342,43 @@ mod tests {
 
         let scalar = completion_prep(&["hello"], None);
         assert_eq!(scalar.total_input_token_count(), scalar.token_ids().len());
+    }
+
+    /// The context window bounds each engine request, and a batched
+    /// Completion dispatches one per prompt: the length check must see the
+    /// longest item, not the batch total (which would reject a batch of
+    /// short prompts) nor the first item (which would miss a long later one).
+    #[test]
+    fn max_input_token_count_is_the_longest_batched_completion_item() {
+        let batch = PreparationOutput::Completion {
+            items: vec![
+                CompletionItem {
+                    text: "short".to_string(),
+                    token_ids: vec![1],
+                },
+                CompletionItem {
+                    text: "much longer prompt".to_string(),
+                    token_ids: vec![2, 3, 4, 5, 6],
+                },
+            ],
+            joined_routing_text: Some("short much longer prompt".to_string()),
+        };
+
+        assert_eq!(batch.max_input_token_count(), 5);
+        assert_ne!(batch.max_input_token_count(), batch.token_ids().len());
+        assert_ne!(
+            batch.max_input_token_count(),
+            batch.total_input_token_count()
+        );
+
+        let scalar = completion_prep(&["hello"], None);
+        assert_eq!(scalar.max_input_token_count(), scalar.token_ids().len());
+
+        let empty = PreparationOutput::Completion {
+            items: vec![],
+            joined_routing_text: None,
+        };
+        assert_eq!(empty.max_input_token_count(), 0);
     }
 
     #[test]

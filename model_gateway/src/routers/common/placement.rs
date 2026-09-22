@@ -37,6 +37,10 @@ use crate::{
 pub(crate) struct WireConstraint {
     pub runtime: RuntimeType,
     pub connection: ConnectionMode,
+    /// The retained plan carries media references. Placement pins only the
+    /// runtime and transport; the gRPC selection helpers derive their
+    /// candidate predicate from this flag.
+    pub requires_media_refs: bool,
 }
 
 /// Everything a single-worker placement reads from the request.
@@ -52,6 +56,9 @@ pub(crate) struct PlacementInputs<'a> {
     pub rid_key: Option<&'a str>,
     /// The request's cache partition, when set.
     pub cache_namespace: Option<CacheNamespace>,
+    /// Extra per-request candidate predicate; a worker it rejects is never
+    /// selected (e.g. only workers that process media references themselves).
+    pub candidate_filter: Option<fn(&dyn Worker) -> bool>,
 }
 
 /// The pool a placement draws from, before the availability filter.
@@ -161,6 +168,21 @@ pub(crate) fn select_from(
 ) -> Option<Arc<dyn Worker>> {
     let policy = policies.get_policy_or_default(model_id);
 
+    // The per-request predicate applies to every entry point, so a caller
+    // that sets it can never dispatch to a worker it rejects.
+    let accepted;
+    let candidates: &[Arc<dyn Worker>] = match inputs.candidate_filter {
+        Some(accepts) => {
+            accepted = candidates
+                .iter()
+                .filter(|w| accepts(w.as_ref()))
+                .cloned()
+                .collect::<Vec<_>>();
+            &accepted
+        }
+        None => candidates,
+    };
+
     // Most policies already apply the complete availability predicate. Give
     // them the shared snapshot directly instead of cloning every available
     // worker into a second per-request Vec. Hash policies use a weaker health
@@ -185,8 +207,9 @@ pub(crate) fn select_from(
 
     // The registry applies the routing-key sticky override when enabled and
     // otherwise delegates to the configured policy.
-    let idx = policies.select_worker(
+    let idx = policies.select_worker_for_model(
         &policy,
+        model_id,
         available,
         &SelectWorkerInfo {
             request_text: inputs.text,
@@ -261,6 +284,9 @@ pub(crate) fn select_pair(
                 w.metadata().spec.runtime_type == wire.runtime
                     && *w.connection_mode() == wire.connection
             })
+            && inputs
+                .candidate_filter
+                .is_none_or(|accepts| accepts(w.as_ref()))
     };
     let fail = |leg: WorkerLeg, verdict: PlacementFailure| Box::new(PairFailure { leg, verdict });
 
@@ -382,7 +408,9 @@ pub(crate) fn select_pair(
             verdict: PlacementFailure::PolicyDeclined(policy),
         })
     };
-    let Some(prefill_idx) = policies.select_worker(&prefill_policy, &prefill, &info) else {
+    let Some(prefill_idx) =
+        policies.select_worker_for_model(&prefill_policy, model_id, &prefill, &info)
+    else {
         return Err(declined(WorkerLeg::Prefill, prefill_policy.name()));
     };
     let selected_prefill = prefill[prefill_idx].clone();
@@ -401,7 +429,9 @@ pub(crate) fn select_pair(
         return Err(fail(WorkerLeg::Decode, PlacementFailure::Unavailable));
     }
     info.leg = WorkerLeg::Decode;
-    let Some(decode_idx) = policies.select_worker(&decode_policy, &decode, &info) else {
+    let Some(decode_idx) =
+        policies.select_worker_for_model(&decode_policy, model_id, &decode, &info)
+    else {
         return Err(declined(WorkerLeg::Decode, decode_policy.name()));
     };
     let selected_decode = decode[decode_idx].clone();
@@ -826,6 +856,7 @@ mod tests {
         let wire = Some(WireConstraint {
             runtime: RuntimeType::Vllm,
             connection: ConnectionMode::Grpc,
+            requires_media_refs: false,
         });
 
         assert_eq!(
@@ -942,6 +973,7 @@ mod tests {
             Some(WireConstraint {
                 runtime: RuntimeType::Sglang,
                 connection: ConnectionMode::Grpc,
+                requires_media_refs: false,
             }),
             false,
             PlacementInputs::default(),
