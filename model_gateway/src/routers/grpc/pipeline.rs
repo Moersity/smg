@@ -425,6 +425,20 @@ impl RequestPipeline {
                 "Worker selection not completed",
             )
         })?;
+        // The window is a property of the selected worker's model card, so
+        // this has to follow selection; it precedes client acquisition so a
+        // request no engine could accept never reaches one (#2380).
+        let prep = ctx.state.preparation.as_ref().ok_or_else(|| {
+            error!(function = "run_ingress", "Preparation stage not completed");
+            error::internal_error(
+                "preparation_stage_not_completed",
+                "Preparation stage not completed",
+            )
+        })?;
+        step!(
+            "ContextLength",
+            enforce_context_length(prep, workers, &ctx.input.model_id)
+        )?;
         ctx.state.clients = Some(step!(
             "ClientAcquisition",
             acquire_clients(workers, &ctx.input.model_id).await

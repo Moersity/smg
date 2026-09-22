@@ -554,6 +554,20 @@ impl PreparationOutput {
         }
     }
 
+    /// Longest single input in tokens -- what the engine's context window
+    /// bounds. Every prompt of a batched `Completion` is dispatched as its own
+    /// engine request, so the window applies per item, not to their sum.
+    pub fn max_input_token_count(&self) -> usize {
+        match self {
+            Self::Completion { items, .. } => items
+                .iter()
+                .map(|item| item.token_ids.len())
+                .max()
+                .unwrap_or(0),
+            other => other.token_ids().len(),
+        }
+    }
+
     /// Text for worker routing: original_text for regular pipelines, selection_text for Harmony.
     /// Chat/Messages borrow from processed_messages.text to avoid a redundant clone.
     pub fn routing_text(&self) -> Option<&str> {
@@ -1328,6 +1342,43 @@ mod tests {
 
         let scalar = completion_prep(&["hello"], None);
         assert_eq!(scalar.total_input_token_count(), scalar.token_ids().len());
+    }
+
+    /// The context window bounds each engine request, and a batched
+    /// Completion dispatches one per prompt: the length check must see the
+    /// longest item, not the batch total (which would reject a batch of
+    /// short prompts) nor the first item (which would miss a long later one).
+    #[test]
+    fn max_input_token_count_is_the_longest_batched_completion_item() {
+        let batch = PreparationOutput::Completion {
+            items: vec![
+                CompletionItem {
+                    text: "short".to_string(),
+                    token_ids: vec![1],
+                },
+                CompletionItem {
+                    text: "much longer prompt".to_string(),
+                    token_ids: vec![2, 3, 4, 5, 6],
+                },
+            ],
+            joined_routing_text: Some("short much longer prompt".to_string()),
+        };
+
+        assert_eq!(batch.max_input_token_count(), 5);
+        assert_ne!(batch.max_input_token_count(), batch.token_ids().len());
+        assert_ne!(
+            batch.max_input_token_count(),
+            batch.total_input_token_count()
+        );
+
+        let scalar = completion_prep(&["hello"], None);
+        assert_eq!(scalar.max_input_token_count(), scalar.token_ids().len());
+
+        let empty = PreparationOutput::Completion {
+            items: vec![],
+            joined_routing_text: None,
+        };
+        assert_eq!(empty.max_input_token_count(), 0);
     }
 
     #[test]
