@@ -6,7 +6,6 @@ for orchestration without tokenization.
 """
 
 import asyncio
-import dataclasses
 import hashlib
 import json
 import logging
@@ -478,7 +477,13 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         """Get server information."""
         logger.debug("Receive server info request")
 
-        server_args_dict = dataclasses.asdict(self.server_args)
+        # 0.5.20 turned ServerArgs from a dataclass into a msgspec Struct, so
+        # dataclasses.asdict() raises. A Struct keeps its declared fields OUT
+        # of __dict__ (upstream carries `dict=True` only so the underscore
+        # extras have somewhere to live), which is why vars() returns those
+        # extras and none of the fields the gateway reads. msgspec's own
+        # asdict is the conversion upstream uses on this type.
+        server_args_dict = msgspec.structs.asdict(self.server_args)
         server_args_struct = Struct()
 
         def make_serializable(obj):
