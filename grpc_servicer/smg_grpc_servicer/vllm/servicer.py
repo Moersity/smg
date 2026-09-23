@@ -9,7 +9,6 @@ import asyncio
 import hashlib
 import itertools
 import json
-import os
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from datetime import datetime, timezone
@@ -56,12 +55,10 @@ from smg_grpc_servicer.vllm.kv_transfer import (
 )
 from smg_grpc_servicer.vllm.media_refs import parse_media_refs, validate_schemes
 from smg_grpc_servicer.vllm.mm_processor import (
-    DEFAULT_MAX_INFLIGHT,
-    ENV_MAX_INFLIGHT,
     ENV_PROCESSOR,
     MmProcessorUnavailable,
+    MmSettings,
     build_mm_processor,
-    env_int,
 )
 from smg_grpc_servicer.vllm.mm_salt import (
     engine_accepts_mm_inputs,
@@ -157,21 +154,30 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
     - GetTokenizer: Stream tokenizer artifacts
     """
 
-    def __init__(self, async_llm: EngineClient, start_time: float):
+    def __init__(
+        self,
+        async_llm: EngineClient,
+        start_time: float,
+        mm_settings: MmSettings | None = None,
+    ):
         """
         Initialize the servicer.
 
         Args:
             async_llm: The EngineClient instance (e.g. AsyncLLM)
             start_time: The server start time, in seconds since epoch
+            mm_settings: The launcher's `--mm-*` flags; None (an older
+                launcher) resolves everything from the environment
         """
         self.engine = async_llm
         self.start_time = start_time
         # Resolve KV-event publishing config from the engine. Non-None only when
         # vLLM was started with --kv-events-config enabling the ZMQ publisher.
         self._kv_events_config = resolve_kv_events_config(async_llm)
+        # Flag > env > default, resolved once so each value names its source.
+        self._mm_settings = (mm_settings or MmSettings()).resolve()
         # Worker-side media processing (media_refs); None keeps refs rejected.
-        self._mm_processor = build_mm_processor(async_llm)
+        self._mm_processor = build_mm_processor(async_llm, settings=self._mm_settings)
         # One cap over all the multimodal work this servicer runs off the event
         # loop, whether it fetches the media itself or converts tensors the
         # router already prepared. Both are sized by the same setting, so a
@@ -179,14 +185,15 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         self._mm_limit = (
             self._mm_processor.max_inflight
             if self._mm_processor is not None
-            else env_int(os.environ, ENV_MAX_INFLIGHT, DEFAULT_MAX_INFLIGHT)
+            else self._mm_settings.max_inflight
         )
         self._mm_inflight = asyncio.Semaphore(self._mm_limit)
         self._mm_waiting = 0
         self._unhealthy_logged = False
         logger.info(
-            "VllmEngineServicer initialized (mm_processor=%s)",
+            "VllmEngineServicer initialized (mm_processor=%s, source=%s)",
             self._mm_processor.name if self._mm_processor is not None else "off",
+            self._mm_settings.source,
         )
 
     async def _acquire_mm_slot(self) -> None:
@@ -688,7 +695,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             mm_processor = self._mm_processor.name
             mm_media_ref_schemes = self._mm_processor.schemes
 
-        return vllm_engine_pb2.GetServerInfoResponse(
+        info = vllm_engine_pb2.GetServerInfoResponse(
             kv_connector=kv_connector,
             kv_role=kv_role,
             kv_engine_id=kv_engine_id,
@@ -699,6 +706,11 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             pairing_protocol=pairing_protocol_from_env(),
             **pairing_fields(self.engine.vllm_config),
         )
+        # Where the processor mode came from, for the gateway's /workers; a
+        # proto package predating the field simply leaves it out.
+        if mm_processor and "mm_processor_source" in info.DESCRIPTOR.fields_by_name:
+            info.mm_processor_source = self._mm_settings.source
+        return info
 
     async def GetLoads(
         self,

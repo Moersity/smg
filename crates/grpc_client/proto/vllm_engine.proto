@@ -420,6 +420,11 @@ message GetServerInfoResponse {
   // or "http,https,data,file" (file only with --allowed-local-media-path).
   // Flattened into the `mm_media_ref_schemes` worker label.
   string mm_media_ref_schemes = 17;
+
+  // Where the worker's mm_processor setting came from: "flag" (the launcher's
+  // --mm-processor), "env" (SMG_VLLM_MM_PROCESSOR) or "default"; "" when
+  // mm_processor is empty. Flattened into the `mm_processor_source` label.
+  string mm_processor_source = 18;
 }
 
 // =====================

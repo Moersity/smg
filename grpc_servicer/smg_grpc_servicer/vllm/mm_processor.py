@@ -16,7 +16,7 @@ import logging
 import os
 import time
 import uuid
-from collections.abc import Awaitable, Mapping, Sequence
+from collections.abc import Awaitable, Iterable, Mapping, Sequence
 from typing import Any
 
 from smg_grpc_servicer.mm_sidecar_protocol import (
@@ -630,35 +630,165 @@ def _redis_client(redis_url: str):
     )
 
 
-def build_mm_processor(engine, *, env: Mapping[str, str] = os.environ):
-    """Construct the configured backend, or None when worker-side processing is off."""
-    mode = resolve_mm_processor_mode(env)
+SOURCE_FLAG = "flag"
+SOURCE_ENV = "env"
+SOURCE_DEFAULT = "default"
+
+# Setting name -> (launcher flag, env var, default). `None` defaults are
+# settings that may legitimately stay unset.
+_MM_SETTING_SPECS: dict[str, tuple[str, str, Any]] = {
+    "processor": ("--mm-processor", ENV_PROCESSOR, MODE_OFF),
+    "max_inflight": ("--mm-max-inflight", ENV_MAX_INFLIGHT, DEFAULT_MAX_INFLIGHT),
+    "max_item_bytes": ("--mm-max-item-bytes", ENV_MAX_ITEM_BYTES, DEFAULT_MAX_ITEM_BYTES),
+    "max_items": ("--mm-max-items", ENV_MAX_ITEMS, None),
+    "redis_url": ("--mm-redis-url", ENV_REDIS_URL, DEFAULT_REDIS_URL),
+    "sidecar_timeout_ms": ("--mm-sidecar-timeout-ms", ENV_TIMEOUT_MS, DEFAULT_TIMEOUT_MS),
+    "sidecar_max_queue": ("--mm-sidecar-max-queue", ENV_MAX_QUEUE, DEFAULT_MAX_QUEUE),
+    "sidecar_namespace": ("--mm-sidecar-namespace", ENV_NAMESPACE, None),
+}
+_MM_INT_SETTINGS = frozenset(
+    {"max_inflight", "max_item_bytes", "max_items", "sidecar_timeout_ms", "sidecar_max_queue"}
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class MmSettings:
+    """The engine-side media settings, as requested or as resolved.
+
+    A field left `None` was not asked for; `resolve` fills it as flag > env >
+    default and records each value's source. `sources` is empty until then.
+    """
+
+    processor: str | None = None
+    max_inflight: int | None = None
+    max_item_bytes: int | None = None
+    max_items: int | None = None
+    redis_url: str | None = None
+    sidecar_timeout_ms: int | None = None
+    sidecar_max_queue: int | None = None
+    sidecar_namespace: str | None = None
+    sources: Mapping[str, str] = dataclasses.field(default_factory=dict, compare=False)
+
+    @classmethod
+    def from_args(cls, args) -> MmSettings:
+        """The `--mm-*` values of a launcher namespace; absent flags ask for nothing."""
+        return cls(**{name: getattr(args, f"mm_{name}", None) for name in _MM_SETTING_SPECS})
+
+    @property
+    def resolved(self) -> bool:
+        """Resolved at least once; `sources` names which settings, so a
+        subset-resolved object is not a full one (see `build_mm_processor`)."""
+        return bool(self.sources)
+
+    @property
+    def source(self) -> str:
+        """Where the processor mode came from."""
+        return self.sources.get("processor", SOURCE_DEFAULT)
+
+    def resolve(
+        self,
+        env: Mapping[str, str] = os.environ,
+        *,
+        only: Iterable[str] | None = None,
+        flags: Mapping[str, str] | None = None,
+    ) -> MmSettings:
+        """Flag > env > default; already resolved settings come back unchanged.
+
+        `only` limits resolution to the named settings (the rest stay unset
+        and unvalidated), for a process that uses a subset; `flags` renames
+        the flag a deprecation line points at, for a parser with its own.
+        """
+        if self.resolved:
+            return self
+        values: dict[str, Any] = {}
+        sources: dict[str, str] = {}
+        wanted = set(_MM_SETTING_SPECS if only is None else only)
+        if unknown := wanted - _MM_SETTING_SPECS.keys():
+            raise ValueError(f"unknown mm settings: {sorted(unknown)}")
+        for name, (flag, env_name, default) in _MM_SETTING_SPECS.items():
+            if name not in wanted:
+                continue
+            flag = (flags or {}).get(name, flag)
+            requested = getattr(self, name)
+            if requested is not None:
+                values[name] = _validate_flag(name, flag, requested)
+                sources[name] = SOURCE_FLAG
+                continue
+            from_env = _read_env(name, env, env_name)
+            if from_env is not None:
+                logger.warning(
+                    "%s is deprecated in favour of %s; env support ends in the next minor release",
+                    env_name,
+                    flag,
+                )
+                values[name] = from_env
+                sources[name] = SOURCE_ENV
+                continue
+            values[name] = default
+            sources[name] = SOURCE_DEFAULT
+        return MmSettings(**values, sources=sources)
+
+
+def _validate_flag(name: str, flag: str, value: Any) -> Any:
+    if name == "processor":
+        mode = str(value).strip().lower()
+        if mode not in VALID_MODES:
+            raise ValueError(f"{flag}={value!r} is not one of {'|'.join(VALID_MODES)}")
+        return mode
+    if name in _MM_INT_SETTINGS:
+        if int(value) <= 0:
+            raise ValueError(f"{flag}={value} must be positive")
+        return int(value)
+    return value
+
+
+def _read_env(name: str, env: Mapping[str, str], env_name: str) -> Any:
+    """The env's value for `name`, validated as before; `None` when unset."""
+    if name == "processor":
+        raw = env.get(env_name)
+        return resolve_mm_processor_mode(env) if raw is not None and raw.strip() else None
+    if name in _MM_INT_SETTINGS:
+        return env_int_opt(env, env_name)
+    raw = env.get(env_name)
+    return raw if raw else None
+
+
+def build_mm_processor(
+    engine, *, env: Mapping[str, str] = os.environ, settings: MmSettings | None = None
+):
+    """Construct the configured backend, or None when worker-side processing is off.
+
+    `settings` are the launcher's flags (already resolved or not); without them
+    everything comes from the env, as before.
+    """
+    resolved = (settings or MmSettings()).resolve(env)
+    if missing := _MM_SETTING_SPECS.keys() - resolved.sources.keys():
+        raise ValueError(f"mm settings resolved without {sorted(missing)}")
+    mode = resolved.processor
     if mode == MODE_OFF:
         return None
     model_config = getattr(engine, "model_config", None)
     if model_config is None or not getattr(model_config, "is_multimodal_model", False):
-        logger.warning("%s=%s ignored: the served model is not multimodal", ENV_PROCESSOR, mode)
+        logger.warning("mm_processor=%s ignored: the served model is not multimodal", mode)
         return None
-    max_item_bytes = env_int(env, ENV_MAX_ITEM_BYTES, DEFAULT_MAX_ITEM_BYTES)
-    max_inflight = env_int(env, ENV_MAX_INFLIGHT, DEFAULT_MAX_INFLIGHT)
-    max_items = env_int_opt(env, ENV_MAX_ITEMS)
+    # The frame budget is not one of the eight launcher flags yet: env only.
     max_video_frames = env_int(env, ENV_MAX_VIDEO_FRAMES, DEFAULT_MAX_VIDEO_FRAMES, minimum=0)
     if mode == MODE_INPROCESS:
         return InProcessMediaProcessor(
             engine,
-            max_item_bytes=max_item_bytes,
-            max_inflight=max_inflight,
-            max_items=max_items,
+            max_item_bytes=resolved.max_item_bytes,
+            max_inflight=resolved.max_inflight,
+            max_items=resolved.max_items,
             max_video_frames=max_video_frames,
         )
     return RedisMediaProcessor(
         engine,
         engine_fingerprint(engine),
-        redis_url=env.get(ENV_REDIS_URL) or DEFAULT_REDIS_URL,
-        timeout_ms=env_int(env, ENV_TIMEOUT_MS, DEFAULT_TIMEOUT_MS),
-        max_queue=env_int(env, ENV_MAX_QUEUE, DEFAULT_MAX_QUEUE),
-        namespace=env.get(ENV_NAMESPACE),
-        max_item_bytes=max_item_bytes,
-        max_inflight=max_inflight,
-        max_items=max_items,
+        redis_url=resolved.redis_url,
+        timeout_ms=resolved.sidecar_timeout_ms,
+        max_queue=resolved.sidecar_max_queue,
+        namespace=resolved.sidecar_namespace,
+        max_item_bytes=resolved.max_item_bytes,
+        max_inflight=resolved.max_inflight,
+        max_items=resolved.max_items,
     )

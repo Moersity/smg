@@ -260,6 +260,7 @@ def sidecar(client):
     s._accepted = {"http", "https", "data"}
     s._started_at = time.time()
     s._concurrency = 1
+    s._settings_sources = {"redis_url": "flag", "sidecar_namespace": "env"}
     s._max_result_bytes = proto.DEFAULT_MAX_RESULT_BYTES
     s._max_video_frames = proto.DEFAULT_MAX_VIDEO_FRAMES
     return s
@@ -545,6 +546,7 @@ class TestHeartbeat:
         assert ops[0][0] == "hset" and ops[0][1] == s._keys.hello
         assert ops[0][2]["schemes"] == "http,https,data"
         assert ops[0][2]["model"] == "m"
+        assert ops[0][2]["settings_source"] == "redis_url=flag,sidecar_namespace=env"
         assert ops[0][2]["max_result_bytes"] == str(proto.DEFAULT_MAX_RESULT_BYTES)
         assert ops[1] == ("expire", s._keys.hello, proto.HELLO_TTL_S)
 
@@ -598,7 +600,11 @@ class TestServe:
             monkeypatch.setitem(sys.modules, name, mod)
             return mod
 
-        redis_asyncio = module("redis.asyncio", from_url=lambda url, **kw: seen.update(kw))
+        def from_url(url, **kw):
+            seen.update(kw)
+            seen["url"] = url
+
+        redis_asyncio = module("redis.asyncio", from_url=from_url)
         module("redis", asyncio=redis_asyncio)
         module("vllm")
         module("vllm.renderers")
@@ -607,19 +613,89 @@ class TestServe:
         async def returns_at_once():
             return None
 
+        def sidecar(*a, **kw):
+            seen["sidecar_kwargs"] = kw
+            return types.SimpleNamespace(run=returns_at_once)
+
         monkeypatch.setattr(mm_sidecar, "build_config", lambda args: object())
-        monkeypatch.setattr(
-            mm_sidecar, "Sidecar", lambda *a, **kw: types.SimpleNamespace(run=returns_at_once)
-        )
+        monkeypatch.setattr(mm_sidecar, "Sidecar", sidecar)
         return seen
 
-    def _serve(self, monkeypatch):
+    def _serve(self, monkeypatch, args=None, env=None):
         seen = self._stub(monkeypatch)
-        args = types.SimpleNamespace(
-            redis_url="redis://cache:6379/0", namespace="ns", concurrency=2
-        )
+        # Hermetic: none of the worker's variables may leak in from the machine.
+        for _flag, env_name, _default in mm_processor._MM_SETTING_SPECS.values():
+            monkeypatch.delenv(env_name, raising=False)
+        for name, value in (env or {}).items():
+            monkeypatch.setenv(name, value)
+        if args is None:
+            args = types.SimpleNamespace(
+                redis_url="redis://cache:6379/0", namespace="ns", concurrency=2
+            )
         run(mm_sidecar.serve(args))
         return seen
+
+    def test_flags_reach_the_client_and_the_sidecar(self, monkeypatch):
+        seen = self._serve(
+            monkeypatch,
+            env={
+                "SMG_VLLM_MM_REDIS_URL": "redis://env:6379/3",
+                "SMG_VLLM_MM_SIDECAR_NAMESPACE": "ns-env",
+                # Worker-only, unreadable: the sidecar never reads it.
+                "SMG_VLLM_MM_MAX_INFLIGHT": "sixty-four",
+            },
+        )
+        assert seen["url"] == "redis://cache:6379/0"
+        assert seen["sidecar_kwargs"]["namespace"] == "ns"
+        assert seen["sidecar_kwargs"]["settings"].sources == {
+            "redis_url": "flag",
+            "sidecar_namespace": "flag",
+            "sidecar_timeout_ms": "default",
+        }
+
+    def test_the_startup_log_hides_redis_credentials(self, monkeypatch, caplog):
+        args = types.SimpleNamespace(
+            redis_url="redis://user:s3cret@cache:6379/0", namespace=None, concurrency=1
+        )
+        with caplog.at_level("INFO", logger="smg_grpc_servicer.vllm.mm_sidecar"):
+            seen = self._serve(monkeypatch, args=args)
+        assert seen["url"] == "redis://user:s3cret@cache:6379/0", "the client gets the real url"
+        settings_lines = [
+            r.getMessage() for r in caplog.records if "sidecar settings" in r.getMessage()
+        ]
+        assert settings_lines and "s3cret" not in settings_lines[0]
+        assert "redis_url=redis://***@cache:6379/0" in settings_lines[0]
+        assert mm_sidecar.redacted_url("redis://cache:6379/0") == "redis://cache:6379/0"
+        # redis-py also reads credentials from the query string.
+        assert (
+            mm_sidecar.redacted_url("redis://cache:6379/0?password=s3cret&db=1")
+            == "redis://cache:6379/0"
+        )
+        assert mm_sidecar.redacted_url("rediss://u:p@cache:6380/2#x") == "rediss://***@cache:6380/2"
+
+    def test_env_fills_in_for_absent_flags(self, monkeypatch):
+        # An older namespace without the timeout flag, and no url/namespace given.
+        args = types.SimpleNamespace(redis_url=None, namespace=None, concurrency=1)
+        seen = self._serve(
+            monkeypatch,
+            args=args,
+            env={
+                "SMG_VLLM_MM_REDIS_URL": "redis://env:6379/3",
+                "SMG_VLLM_MM_SIDECAR_NAMESPACE": "ns-env",
+            },
+        )
+        assert seen["url"] == "redis://env:6379/3"
+        assert seen["sidecar_kwargs"]["namespace"] == "ns-env"
+        settings = seen["sidecar_kwargs"]["settings"]
+        assert settings.sources["redis_url"] == "env"
+        assert settings.sidecar_timeout_ms == proto.DEFAULT_TIMEOUT_MS
+        assert settings.sources["sidecar_timeout_ms"] == "default"
+
+    def test_the_parser_takes_the_timeout_flag(self, monkeypatch):
+        parser = mm_sidecar.build_parser(lambda parser: parser)
+        args = parser.parse_args(["--mm-sidecar-timeout-ms", "250"])
+        assert args.mm_sidecar_timeout_ms == 250
+        assert args.redis_url is None and args.namespace is None
 
     def test_waiting_for_a_job_has_no_read_deadline(self, monkeypatch):
         # The wait for the next job is meant to sit on the socket for JOB_WAIT_S.

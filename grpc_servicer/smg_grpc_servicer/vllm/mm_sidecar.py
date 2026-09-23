@@ -18,13 +18,13 @@ import asyncio
 import logging
 import os
 import time
+from urllib.parse import urlsplit, urlunsplit
 
 from smg_grpc_servicer.mm_sidecar_protocol import (
     CODE_RESULT_PUSH_FAILED,
     CODE_RESULT_TOO_LARGE,
     DEFAULT_MAX_RESULT_BYTES,
     DEFAULT_MAX_VIDEO_FRAMES,
-    DEFAULT_REDIS_URL,
     ENV_MAX_RESULT_BYTES,
     ENV_MAX_VIDEO_FRAMES,
     HELLO_REFRESH_S,
@@ -44,6 +44,7 @@ from smg_grpc_servicer.mm_sidecar_protocol import (
 )
 from smg_grpc_servicer.vllm.media_refs import advertised_schemes, parse_scheme_list, url_scheme
 from smg_grpc_servicer.vllm.mm_processor import (
+    MmSettings,
     clamp_video_frames,
     env_int,
     fingerprint_from_model_config,
@@ -59,6 +60,13 @@ JOB_WAIT_S = 5
 JOB_WAIT_MARGIN_S = 2
 # How long a worker holds off after a refused or unanswered wait.
 RECONNECT_PAUSE_S = 1
+# The worker settings this process runs on, and the flags it spells them as.
+SIDECAR_SETTINGS = ("redis_url", "sidecar_namespace", "sidecar_timeout_ms")
+SIDECAR_FLAGS = {
+    "redis_url": "--redis-url",
+    "sidecar_namespace": "--namespace",
+    "sidecar_timeout_ms": "--mm-sidecar-timeout-ms",
+}
 # The least time a finished job's answer gets to reach the requester.
 PUSH_FLOOR_S = 5
 # A failure notice is small; the second push gets at most this long.
@@ -103,7 +111,16 @@ def classify_process_error(exc: BaseException) -> str:
 
 
 class Sidecar:
-    def __init__(self, vllm_config, renderer, client, *, namespace: str | None, concurrency: int):
+    def __init__(
+        self,
+        vllm_config,
+        renderer,
+        client,
+        *,
+        namespace: str | None,
+        concurrency: int,
+        settings: MmSettings | None = None,
+    ):
         from vllm import TokensPrompt, envs
         from vllm.multimodal.media.connector import MEDIA_CONNECTOR_REGISTRY
         from vllm.transformers_utils.processor import get_video_processor_cls_name
@@ -117,6 +134,8 @@ class Sidecar:
         self._encoder = MsgpackEncoder(size_threshold=2**62)
         self._client = client
         self._concurrency = max(1, concurrency)
+        # Where each setting this process runs on came from, for the hello hash.
+        self._settings_sources = dict(settings.sources) if settings is not None else {}
         self._fingerprint = config_fingerprint(vllm_config)
         self._keys = Keys.for_namespace(resolve_namespace(self._fingerprint, namespace))
         # Lowered further by redis's own cap once connected (`_learn_result_limit`).
@@ -187,6 +206,9 @@ class Sidecar:
             "schema": str(SCHEMA_VERSION),
             "schemes": self._schemes,
             "started_at": str(int(self._started_at)),
+            "settings_source": ",".join(
+                f"{name}={source}" for name, source in sorted(self._settings_sources.items())
+            ),
             "max_result_bytes": str(self._max_result_bytes),
         }
         while True:
@@ -392,6 +414,21 @@ async def serve(args: argparse.Namespace) -> None:
     import redis.asyncio as redis_asyncio
     from vllm.renderers.registry import renderer_from_config
 
+    # The same flag > env > default resolution as the worker, for the three
+    # settings this process runs on, so the two cannot disagree on the
+    # namespace or the timeout.
+    settings = MmSettings(
+        redis_url=getattr(args, "redis_url", None),
+        sidecar_namespace=getattr(args, "namespace", None),
+        sidecar_timeout_ms=getattr(args, "mm_sidecar_timeout_ms", None),
+    ).resolve(only=SIDECAR_SETTINGS, flags=SIDECAR_FLAGS)
+    logger.info(
+        "media sidecar settings: redis_url=%s namespace=%s sidecar_timeout_ms=%d (%s)",
+        redacted_url(settings.redis_url),
+        settings.sidecar_namespace or "<derived>",
+        settings.sidecar_timeout_ms,
+        ", ".join(f"{name}={source}" for name, source in sorted(settings.sources.items())),
+    )
     vllm_config = build_config(args)
     renderer = renderer_from_config(vllm_config)
     # No read deadline of the client's own: waiting for the next job is meant
@@ -401,12 +438,51 @@ async def serve(args: argparse.Namespace) -> None:
     # default it to five seconds. Reaching the server in the first place is a
     # different question and stays bounded: there is nothing to wait for yet.
     client = redis_asyncio.from_url(
-        args.redis_url, decode_responses=False, socket_connect_timeout=1.0, socket_timeout=None
+        settings.redis_url,
+        decode_responses=False,
+        socket_connect_timeout=1.0,
+        socket_timeout=None,
     )
     sidecar = Sidecar(
-        vllm_config, renderer, client, namespace=args.namespace, concurrency=args.concurrency
+        vllm_config,
+        renderer,
+        client,
+        namespace=settings.sidecar_namespace,
+        concurrency=args.concurrency,
+        settings=settings,
     )
     await sidecar.run()
+
+
+def redacted_url(url: str) -> str:
+    """The URL's scheme, host and db for logs: userinfo is masked and the
+    query and fragment dropped, since redis-py also takes `?password=`."""
+    parts = urlsplit(url)
+    host = parts.netloc.rsplit("@", 1)[-1]
+    userinfo = "***@" if "@" in parts.netloc else ""
+    return urlunsplit((parts.scheme, f"{userinfo}{host}", parts.path, "", ""))
+
+
+def build_parser(add_engine_args, parser_cls=argparse.ArgumentParser):
+    """The sidecar's parser; `add_engine_args` appends vLLM's own flags."""
+    parser = parser_cls(description="smg media-processing sidecar for vLLM")
+    parser.add_argument(
+        "--redis-url", default=None, help="falls back to SMG_VLLM_MM_REDIS_URL, then localhost"
+    )
+    parser.add_argument(
+        "--namespace",
+        default=None,
+        help="override the derived key namespace (falls back to SMG_VLLM_MM_SIDECAR_NAMESPACE)",
+    )
+    parser.add_argument(
+        "--mm-sidecar-timeout-ms",
+        type=int,
+        default=None,
+        help="the worker's job timeout, for the startup log (falls back to "
+        "SMG_VLLM_MM_SIDECAR_TIMEOUT_MS)",
+    )
+    parser.add_argument("--concurrency", type=int, default=2)
+    return add_engine_args(parser)
 
 
 def main() -> None:
@@ -414,11 +490,7 @@ def main() -> None:
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
     logging.basicConfig(level=logging.INFO)
-    parser = FlexibleArgumentParser(description="smg media-processing sidecar for vLLM")
-    parser.add_argument("--redis-url", default=DEFAULT_REDIS_URL)
-    parser.add_argument("--namespace", default=None, help="override the derived key namespace")
-    parser.add_argument("--concurrency", type=int, default=2)
-    parser = AsyncEngineArgs.add_cli_args(parser)
+    parser = build_parser(AsyncEngineArgs.add_cli_args, FlexibleArgumentParser)
     args = parser.parse_args()
     asyncio.run(serve(args))
 

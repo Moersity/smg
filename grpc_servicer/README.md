@@ -43,9 +43,16 @@ pixel tensors. A vLLM gRPC worker can instead accept media references (URLs)
 and run vLLM's own multimodal processor:
 
 ```bash
-SMG_VLLM_MM_PROCESSOR=inprocess vllm serve Qwen/Qwen3-VL-8B-Instruct --grpc \
+vllm serve Qwen/Qwen3-VL-8B-Instruct --grpc --mm-processor inprocess \
     --allowed-media-domains example.com
 ```
+
+The `--mm-*` flags come from a vLLM launcher that knows them (it hands an
+`MmSettings` to `VllmEngineServicer`); an older launcher, or a flag left out,
+falls back to the matching `SMG_VLLM_MM_*` variable, which logs a deprecation
+line and goes away in the next minor release. The startup line
+`VllmEngineServicer initialized (mm_processor=inprocess, source=flag)` and the
+`mm_processor_source` label name where the value came from.
 
 The worker then advertises `mm_processor=inprocess` and `mm_media_ref_schemes`
 through `GetServerInfo`; a router with media-reference support forwards
@@ -54,11 +61,15 @@ labels and keeps sending preprocessed tensors. vLLM's `--allowed-media-domains`,
 `--allowed-local-media-path`, `--media-io-kwargs`, `--limit-mm-per-prompt` and
 `VLLM_*_FETCH_TIMEOUT` govern fetching on the worker; without
 `--allowed-media-domains` the worker fetches from any host the router forwards.
-Related knobs: `SMG_VLLM_MM_MAX_INFLIGHT` (default 64) bounds concurrent media
-jobs; `SMG_VLLM_MM_MAX_ITEMS` (default 16) caps references per request;
-`SMG_VLLM_MM_MAX_ITEM_BYTES` (default 32 MiB) caps inline `data:` payloads;
-`SMG_VLLM_MM_MAX_VIDEO_FRAMES` (default 0, meaning vLLM's own `--media-io-kwargs`
-decide) caps the frames a video is sampled to, so long clips stay bounded.
+Related knobs: `--mm-max-inflight` (`SMG_VLLM_MM_MAX_INFLIGHT`, default 64)
+bounds concurrent media jobs; `--mm-max-items` (`SMG_VLLM_MM_MAX_ITEMS`, unset
+by default) overrides the model's per-modality reference limits;
+`--mm-max-item-bytes` (`SMG_VLLM_MM_MAX_ITEM_BYTES`, default 32 MiB) caps inline
+`data:` payloads; `SMG_VLLM_MM_MAX_VIDEO_FRAMES` (env only for now; default 0,
+meaning vLLM's own `--media-io-kwargs` decide) caps the frames a video is
+sampled to, so long clips stay bounded. All eight flag-backed settings are
+validated when the servicer starts, whatever the processor mode, so a stale
+unreadable value fails loudly.
 
 On the router side, `--mm-processing` selects `auto` (default: forward when
 the model's spec opts in and every registered worker of the model advertises
@@ -84,8 +95,8 @@ sidecar next to a private Redis and point the worker at it
 ```bash
 python -m smg_grpc_servicer.vllm.mm_sidecar --model Qwen/Qwen3-VL-8B-Instruct \
     --redis-url redis://127.0.0.1:6379/0 --allowed-media-domains example.com
-SMG_VLLM_MM_PROCESSOR=redis SMG_VLLM_MM_REDIS_URL=redis://127.0.0.1:6379/0 \
-    vllm serve Qwen/Qwen3-VL-8B-Instruct --grpc
+vllm serve Qwen/Qwen3-VL-8B-Instruct --grpc --mm-processor redis \
+    --mm-redis-url redis://127.0.0.1:6379/0
 ```
 
 The sidecar and the worker must agree on model, vLLM version, dtype, video
@@ -96,11 +107,14 @@ namespace is derived from all of these): the worker advertises
 `mm_processor=redis` only while a sidecar with a matching fingerprint keeps its
 `hello` key alive, and rejects results that disagree. Jobs and results travel over Redis lists under
 `smg:mm:v1:{namespace}`; results carry full tensors keyed by a per-attempt job
-id and expire after 120 s. Knobs: `SMG_VLLM_MM_SIDECAR_TIMEOUT_MS` (30000),
-`SMG_VLLM_MM_SIDECAR_MAX_QUEUE` (256, fail fast when the queue is deeper),
-`SMG_VLLM_MM_SIDECAR_NAMESPACE` (override the derived namespace). On the sidecar,
-`SMG_VLLM_MM_MAX_RESULT_BYTES` (default 512 MiB, lowered to Redis's
-`proto-max-bulk-len` when that is smaller) caps an encoded result and
+id and expire after 120 s. Knobs: `--mm-sidecar-timeout-ms`
+(`SMG_VLLM_MM_SIDECAR_TIMEOUT_MS`, 30000), `--mm-sidecar-max-queue`
+(`SMG_VLLM_MM_SIDECAR_MAX_QUEUE`, 256, fail fast when the queue is deeper),
+`--mm-sidecar-namespace` (`SMG_VLLM_MM_SIDECAR_NAMESPACE`, override the derived
+namespace). The sidecar resolves `--redis-url`, `--namespace` and
+`--mm-sidecar-timeout-ms` the same way, so the two processes cannot disagree.
+On the sidecar, `SMG_VLLM_MM_MAX_RESULT_BYTES` (default 512 MiB, lowered to
+Redis's `proto-max-bulk-len` when that is smaller) caps an encoded result and
 `SMG_VLLM_MM_MAX_VIDEO_FRAMES` caps video sampling as above. A result over the
 cap is answered as a 400 `media_too_large` instead of being pushed, and a result
 Redis refuses is reported to the worker at once; a sidecar timeout is not

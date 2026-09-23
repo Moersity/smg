@@ -343,3 +343,26 @@ class TestBuild:
         assert p._timeout_ms == 1000
         assert p._max_queue == 8
         assert p._keys.prefix == "smg:mm:v1:ns-1"
+
+    def test_flag_settings_reach_the_redis_processor(self, monkeypatch):
+        monkeypatch.setattr(mm_processor, "engine_fingerprint", lambda engine: fingerprint())
+        urls = []
+        monkeypatch.setattr(mm_processor, "_redis_client", lambda url: urls.append(url))
+        env = {
+            "SMG_VLLM_MM_PROCESSOR": "off",
+            "SMG_VLLM_MM_SIDECAR_TIMEOUT_MS": "1000",
+            "SMG_VLLM_MM_SIDECAR_NAMESPACE": "ns-env",
+        }
+        settings = mm_processor.MmSettings(
+            processor="redis",
+            redis_url="redis://cache:6379/2",
+            sidecar_timeout_ms=250,
+            sidecar_max_queue=4,
+            sidecar_namespace="ns-flag",
+        )
+        p = mm_processor.build_mm_processor(_Engine(), env=env, settings=settings)
+        assert p.name == "redis"
+        assert urls == ["redis://cache:6379/2"]
+        assert p._timeout_ms == 250
+        assert p._max_queue == 4
+        assert p._keys.prefix == "smg:mm:v1:ns-flag"
