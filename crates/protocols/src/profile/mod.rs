@@ -16,6 +16,7 @@
 
 mod kimi;
 mod minimax;
+mod zai;
 
 use crate::{
     chat::{ChatCompletionRequest, ChatMessage},
@@ -32,6 +33,8 @@ pub enum ProviderProfile {
     Kimi,
     /// MiniMax contract (MiniMax-Provider-Verifier).
     Minimax,
+    /// z.ai / GLM contract (providers-verifier `golden/zai`).
+    Zai,
 }
 
 impl ProviderProfile {
@@ -45,7 +48,9 @@ impl ProviderProfile {
     ) -> Box<dyn Iterator<Item = &'a Tool> + 'a> {
         match self {
             ProviderProfile::Kimi => Box::new(kimi::dynamic_tools(req)),
-            ProviderProfile::Minimax | ProviderProfile::OpenAi => Box::new(std::iter::empty()),
+            ProviderProfile::Minimax | ProviderProfile::Zai | ProviderProfile::OpenAi => {
+                Box::new(std::iter::empty())
+            }
         }
     }
 
@@ -81,6 +86,12 @@ impl ProviderProfile {
             {
                 return ProviderProfile::Minimax;
             }
+            if starts_with_ignore_ascii_case(segment, "glm")
+                || starts_with_ignore_ascii_case(segment, "zai")
+                || starts_with_ignore_ascii_case(segment, "z-ai")
+            {
+                return ProviderProfile::Zai;
+            }
         }
         ProviderProfile::OpenAi
     }
@@ -99,7 +110,7 @@ impl ProviderProfile {
     pub fn normalize_chat(self, req: &mut ChatCompletionRequest) {
         match self {
             ProviderProfile::Minimax => minimax::normalize_chat(req),
-            ProviderProfile::Kimi | ProviderProfile::OpenAi => {}
+            ProviderProfile::Kimi | ProviderProfile::Zai | ProviderProfile::OpenAi => {}
         }
         let mut dropped: Vec<&'static str> = Vec::new();
         for message in &mut req.messages {
@@ -132,6 +143,7 @@ impl ProviderProfile {
         }
         match self {
             ProviderProfile::Kimi => kimi::normalize_chat(req),
+            ProviderProfile::Zai => zai::normalize_chat(req),
             ProviderProfile::OpenAi | ProviderProfile::Minimax => {}
         }
     }
@@ -147,6 +159,10 @@ impl ProviderProfile {
                 kimi::validate_chat(req)
             }
             ProviderProfile::Minimax => minimax::validate_chat(req),
+            ProviderProfile::Zai => {
+                reject_root(req)?;
+                zai::validate_chat(req)
+            }
             ProviderProfile::OpenAi => reject_root(req),
         }
     }
@@ -218,6 +234,7 @@ mod tests {
     fn only_the_minimax_profile_parses_tool_calls_without_tools() {
         assert!(ProviderProfile::Minimax.parses_tool_calls_without_tools());
         assert!(!ProviderProfile::Kimi.parses_tool_calls_without_tools());
+        assert!(!ProviderProfile::Zai.parses_tool_calls_without_tools());
         assert!(!ProviderProfile::OpenAi.parses_tool_calls_without_tools());
     }
 
@@ -250,11 +267,27 @@ mod tests {
             );
         }
         for model in [
+            "glm-5.3-flash",
+            "GLM-5.3-Flash",
+            "zai-org/GLM-5.3-Flash",
+            "/models/glm-4.7",
+            "z-ai/glm-5",
+        ] {
+            assert_eq!(
+                ProviderProfile::for_model(model),
+                ProviderProfile::Zai,
+                "{model}"
+            );
+        }
+        for model in [
             "gpt-4o-mini",
             "",
             "/models/llama-3",
             "my-kimi-alias",
             "openai/gpt-4o",
+            "my-glm-alias",
+            // ChatGLM predates the z.ai chat contract.
+            "THUDM/chatglm3-6b",
         ] {
             assert_eq!(
                 ProviderProfile::for_model(model),

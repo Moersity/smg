@@ -439,6 +439,10 @@ impl RequestPipeline {
             "ContextLength",
             enforce_context_length(prep, workers, &ctx.input.model_id)
         )?;
+        step!(
+            "OutputBudget",
+            enforce_output_budget(&ctx.input.request_type, workers, &ctx.input.model_id)
+        )?;
         ctx.state.clients = Some(step!(
             "ClientAcquisition",
             acquire_clients(workers, &ctx.input.model_id).await

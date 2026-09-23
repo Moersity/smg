@@ -11,11 +11,12 @@
 //! the chosen worker's model card) and before any client is acquired.
 
 use axum::response::Response;
+use openai_protocol::profile::ProviderProfile;
 use tracing::debug;
 
 use crate::routers::{
     error,
-    grpc::context::{PreparationOutput, WorkerSelection},
+    grpc::context::{PreparationOutput, RequestType, WorkerSelection},
 };
 
 /// Error code for an input that does not fit the model's window; matches the
@@ -51,6 +52,51 @@ pub(crate) fn enforce_context_length(
         format!(
             "This model's maximum context length is {limit} tokens. However, your request has \
              {input_tokens} input tokens. Please reduce the length of the input."
+        ),
+    ))
+}
+
+/// Reject a chat completion budget the model's window could never hold.
+///
+/// Only under the z.ai profile, whose vendor rejects such a request; every
+/// other profile keeps the engine's own policy (vLLM rejects at admission,
+/// SGLang clamps), as the input check above leaves `input + max_tokens`
+/// to the engine. As above, only a known window is enforced, and like the
+/// input check this runs on the gRPC pipeline only: the HTTP router forwards
+/// the body and leaves the budget to the engine.
+pub(crate) fn enforce_output_budget(
+    request_type: &RequestType,
+    workers: &WorkerSelection,
+    model_id: &str,
+) -> Result<(), Response> {
+    let RequestType::Chat(request) = request_type else {
+        return Ok(());
+    };
+    if ProviderProfile::for_model(&request.model) != ProviderProfile::Zai {
+        return Ok(());
+    }
+    let Some(limit) = selection_context_length(workers, model_id) else {
+        return Ok(());
+    };
+    #[expect(deprecated, reason = "the request may predate normalization")]
+    let Some(max_tokens) = request.max_completion_tokens.or(request.max_tokens) else {
+        return Ok(());
+    };
+    if max_tokens <= limit {
+        return Ok(());
+    }
+    debug!(
+        function = "enforce_output_budget",
+        max_tokens,
+        limit,
+        model_id,
+        "Rejecting a completion budget larger than the model's context window"
+    );
+    Err(error::bad_request(
+        CONTEXT_LENGTH_EXCEEDED,
+        format!(
+            "This model's maximum context length is {limit} tokens. However, you requested \
+             {max_tokens} tokens for the completion. Please reduce max_tokens."
         ),
     ))
 }
@@ -140,6 +186,68 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some(CONTEXT_LENGTH_EXCEEDED)
         );
+    }
+
+    fn chat(model: &str, max_tokens: Option<u32>) -> RequestType {
+        let mut body = serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        if let Some(max_tokens) = max_tokens {
+            body["max_tokens"] = serde_json::json!(max_tokens);
+        }
+        RequestType::Chat(Arc::new(
+            serde_json::from_value(body).expect("chat request deserializes"),
+        ))
+    }
+
+    #[test]
+    fn a_zai_budget_beyond_the_window_is_a_400_context_length_exceeded() {
+        assert_rejected(enforce_output_budget(
+            &chat("glm-5.3-flash", Some(10_000_000)),
+            &single(Some(131_072)),
+            MODEL,
+        ));
+        assert_rejected(enforce_output_budget(
+            &chat("zai-org/GLM-5.3-Flash", Some(131_073)),
+            &pd(Some(1_000_000), Some(131_072)),
+            MODEL,
+        ));
+    }
+
+    #[test]
+    fn a_zai_budget_within_the_window_or_without_a_window_passes() {
+        assert!(enforce_output_budget(
+            &chat("glm-5.3-flash", Some(131_072)),
+            &single(Some(131_072)),
+            MODEL
+        )
+        .is_ok());
+        assert!(
+            enforce_output_budget(&chat("glm-5.3-flash", None), &single(Some(131_072)), MODEL)
+                .is_ok()
+        );
+        assert!(enforce_output_budget(
+            &chat("glm-5.3-flash", Some(10_000_000)),
+            &single(None),
+            MODEL
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn other_profiles_leave_the_budget_to_the_engine() {
+        for model in ["gpt-4o", "kimi-k3", "MiniMax-M3"] {
+            assert!(
+                enforce_output_budget(
+                    &chat(model, Some(10_000_000)),
+                    &single(Some(131_072)),
+                    MODEL
+                )
+                .is_ok(),
+                "{model}"
+            );
+        }
     }
 
     #[test]

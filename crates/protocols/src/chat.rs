@@ -372,7 +372,7 @@ pub enum ThinkingType {
     Adaptive,
 }
 
-/// The `thinking` object shared by the Kimi and MiniMax chat APIs.
+/// The `thinking` object shared by the Kimi, MiniMax and z.ai chat APIs.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ThinkingParam {
@@ -382,6 +382,9 @@ pub struct ThinkingParam {
     pub keep: Option<String>,
     /// Vendor effort level; more specific than the top-level `reasoning_effort`.
     pub effort: Option<String>,
+    /// z.ai `clear_thinking`: whether the history's reasoning is dropped from
+    /// the rendered prompt (`true`, the vendor default) or kept (`false`).
+    pub clear_thinking: Option<bool>,
 }
 
 impl ThinkingParam {
@@ -1074,6 +1077,7 @@ mod tests {
                 r#type: Some(ThinkingType::Disabled),
                 keep: Some("all".to_string()),
                 effort: Some("high".to_string()),
+                clear_thinking: None,
             })
         );
         assert!(!request.other.contains_key("thinking"));
