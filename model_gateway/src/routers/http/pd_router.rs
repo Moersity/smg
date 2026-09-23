@@ -907,6 +907,47 @@ impl PDRouter {
             decode_head_elapsed,
         );
 
+        // A streamed response that needs nothing from the prefill body (no
+        // logprob merge) is committed to the client as soon as both heads are
+        // 2xx. The prefill body completes only when prefill finishes, and
+        // waiting for it held back every decode chunk (and SSE keepalive)
+        // until then. A non-2xx prefill head still takes the error path below
+        // so it stays a retryable status rather than an in-band stream error.
+        if context.is_stream && !context.return_logprob && prefill_response.status().is_success() {
+            let model_id = context.model_id.to_string();
+            let mut load_guards = load_guards;
+            let prefill_load_guard = load_guards.remove(0);
+            // The body must still be read to the end: dropping a response with
+            // an unread body closes the connection, which the prefill engine
+            // treats as a client disconnect and aborts mid KV transfer,
+            // leaving the decode leg waiting for KV that never arrives.
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "drains a prefill body the gateway has already committed past; shutdown need not wait for it"
+            )]
+            tokio::spawn(async move {
+                let _prefill_load_guard = prefill_load_guard;
+                let prefill_drain_start = Instant::now();
+                let mut chunks = prefill_response.bytes_stream();
+                while let Some(chunk) = chunks.next().await {
+                    if let Err(e) = chunk {
+                        warn!("Error consuming prefill response: {e}");
+                        prefill.record_outcome(StatusCode::BAD_GATEWAY.as_u16());
+                        break;
+                    }
+                }
+                Metrics::record_pd_prefill_duration(
+                    metrics_labels::BACKEND_PD,
+                    &model_id,
+                    runtime,
+                    prefill_head_elapsed + prefill_drain_start.elapsed(),
+                );
+            });
+            return self
+                .forward_decode_body(decode_response, status, &context, decode, load_guards, None)
+                .await;
+        }
+
         // Process prefill response
         let prefill_drain_start = Instant::now();
         let prefill_body = match self
@@ -2212,6 +2253,7 @@ impl RouterTrait for PDRouter {
 #[cfg(test)]
 mod tests {
     use openai_protocol::model_card::ModelCard;
+    use tokio::sync::oneshot;
 
     use super::*;
     use crate::{
@@ -2745,6 +2787,204 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_empty());
+    }
+
+    /// Serves `app` on an ephemeral loopback port.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test stub server lives for the duration of the test process"
+    )]
+    async fn spawn_stub(app: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    fn register_pd_pair(router: &PDRouter, prefill_url: String, decode_url: String) {
+        for (url, worker_type) in [
+            (prefill_url, WorkerType::Prefill),
+            (decode_url, WorkerType::Decode),
+        ] {
+            router
+                .worker_registry
+                .register_or_replace(Arc::from(create_test_worker(url, worker_type, true)));
+        }
+    }
+
+    fn streaming_chat() -> ChatCompletionRequest {
+        serde_json::from_value(json!({
+            "model": "m",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .expect("valid chat request")
+    }
+
+    const DECODE_SSE: &str = "data: {\"choices\":[]}\n\ndata: [DONE]\n\n";
+
+    /// Reports on drop whether the prefill SSE body was read to its end. A
+    /// body dropped early means the gateway closed the prefill connection.
+    struct PrefillBodyProbe {
+        completed: bool,
+        report: Option<oneshot::Sender<bool>>,
+    }
+
+    impl PrefillBodyProbe {
+        fn mark_completed(&mut self) {
+            self.completed = true;
+        }
+    }
+
+    impl Drop for PrefillBodyProbe {
+        fn drop(&mut self) {
+            if let Some(report) = self.report.take() {
+                let _ = report.send(self.completed);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_commits_on_decode_head_and_drains_prefill_body() {
+        check_prefill_drain(false).await;
+        check_prefill_drain(true).await;
+    }
+
+    async fn check_prefill_drain(fail_body: bool) {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (report_tx, report_rx) = oneshot::channel();
+        let report_tx = Arc::new(std::sync::Mutex::new(Some(report_tx)));
+        let prefill_release = Arc::clone(&release);
+        // Prefill answers 200 at once but holds its body open until released,
+        // like an engine that streams only once prefill and KV transfer end.
+        let prefill = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || {
+                let release = Arc::clone(&prefill_release);
+                let probe = PrefillBodyProbe {
+                    completed: false,
+                    report: report_tx.lock().unwrap().take(),
+                };
+                async move {
+                    let body = futures_util::stream::unfold(
+                        (0u8, probe, release),
+                        move |(step, mut probe, release)| async move {
+                            match step {
+                                0 => Some((
+                                    Ok::<_, std::io::Error>(Bytes::from_static(b": keepalive\n\n")),
+                                    (1, probe, release),
+                                )),
+                                1 => {
+                                    release.notified().await;
+                                    if fail_body {
+                                        return Some((
+                                            Err(std::io::Error::other("prefill body failed")),
+                                            (2, probe, release),
+                                        ));
+                                    }
+                                    Some((
+                                        Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+                                        (2, probe, release),
+                                    ))
+                                }
+                                _ => {
+                                    probe.mark_completed();
+                                    None
+                                }
+                            }
+                        },
+                    );
+                    (
+                        [(CONTENT_TYPE, "text/event-stream")],
+                        Body::from_stream(body),
+                    )
+                }
+            }),
+        );
+        let decode = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async { ([(CONTENT_TYPE, "text/event-stream")], DECODE_SSE) }),
+        );
+        let router = create_test_pd_router();
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(spawn_stub(prefill).await)
+                .worker_type(WorkerType::Prefill)
+                .circuit_breaker_config(crate::worker::CircuitBreakerConfig {
+                    failure_threshold: 1,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        prefill.set_status(openai_protocol::worker::WorkerStatus::Ready);
+        let decode: Arc<dyn Worker> = Arc::from(create_test_worker(
+            spawn_stub(decode).await,
+            WorkerType::Decode,
+            true,
+        ));
+        router.worker_registry.register_or_replace(prefill.clone());
+        router.worker_registry.register_or_replace(decode.clone());
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            router.route_chat(None, &tenant, streaming_chat(), UNKNOWN_MODEL_ID),
+        )
+        .await
+        .expect("the client stream must not wait for the prefill body");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("decode stream must complete while prefill is still open")
+        .expect("response body");
+        assert_eq!(&body[..], DECODE_SSE.as_bytes());
+        assert_eq!(prefill.load(), 1);
+        assert_eq!(decode.load(), 0);
+
+        release.notify_one();
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(5), report_rx)
+            .await
+            .expect("prefill body must be released")
+            .expect("probe report");
+        assert_eq!(completed, !fail_body);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while prefill.load() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("prefill load must be released after draining");
+        assert_eq!(prefill.circuit_breaker_can_execute(), !fail_body);
+    }
+
+    #[tokio::test]
+    async fn stream_prefill_error_head_is_not_committed() {
+        let prefill = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async {
+                (StatusCode::SERVICE_UNAVAILABLE, r#"{"error":"busy"}"#)
+            }),
+        );
+        let decode = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async { ([(CONTENT_TYPE, "text/event-stream")], DECODE_SSE) }),
+        );
+        let mut router = create_test_pd_router();
+        router.retry_config.max_retries = 1;
+        register_pd_pair(&router, spawn_stub(prefill).await, spawn_stub(decode).await);
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+        let response = router
+            .route_chat(None, &tenant, streaming_chat(), UNKNOWN_MODEL_ID)
+            .await;
+
+        // A prefill 5xx stays a status the retry layer and the client can act
+        // on, not a 200 carrying an in-band stream error.
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
