@@ -63,8 +63,7 @@ pub(crate) const STREAM_UPSTREAM_BODY_OVER: usize = 1 << 20;
 
 /// Buffer capacity for reserializing a parsed request of `raw_len` incoming
 /// bytes: the round trip stays close to raw size, and the 1/16 + 512B slack
-/// absorbs injected fields (bootstrap, kv_transfer_params, dp ranks) and
-/// widened floats.
+/// absorbs injected fields (bootstrap, kv_transfer_params, dp ranks).
 pub(crate) fn serialized_capacity(raw_len: usize) -> usize {
     raw_len + raw_len / 16 + 512
 }
@@ -78,6 +77,18 @@ pub(crate) fn serialize_json_sized<T: serde::Serialize>(
     let mut buf = Vec::with_capacity(raw_len.map_or(128, serialized_capacity));
     serde_json::to_writer(&mut buf, value)?;
     Ok(buf)
+}
+
+/// A typed request as a `Value`, for the forwarding paths that edit it.
+/// `serde_json::to_value` stores an `f32` widened to `f64`, so a client's
+/// `"top_p": 0.95` would reach the engine as `0.949999988079071`. The writer
+/// prints each `f32` in its shortest round-trip form, so encode with it and
+/// parse that back: every number goes out as the client wrote it.
+pub(crate) fn request_to_value<T: serde::Serialize>(
+    value: &T,
+    raw_len: Option<usize>,
+) -> serde_json::Result<serde_json::Value> {
+    serde_json::from_slice(&serialize_json_sized(value, raw_len)?)
 }
 
 /// `Bytes::from(Vec)` keeps the Vec's capacity, so unshrunk doubling growth

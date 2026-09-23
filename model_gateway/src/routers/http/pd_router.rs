@@ -44,6 +44,7 @@ use crate::{
             overload,
             placement::{self, PairFailure, PlacementFailure, PlacementInputs},
             request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
+            request_to_value,
             retry::{is_retryable_response, RetryExecutor},
             serialize_json_sized,
             sse::{SseEncoder, SSE_CHANNEL_BUFFER},
@@ -516,7 +517,7 @@ impl PDRouter {
             };
             let legs =
                 lease.serialize_legs_with(|view| -> Result<(Vec<u8>, Vec<u8>), Box<Response>> {
-                    let mut json_request = serde_json::to_value(view.request)
+                    let mut json_request = request_to_value(view.request, raw_body_len)
                         .map_err(|e| Box::new(Self::handle_serialization_error(e)))?;
                     super::set_request_model(&mut json_request, context.model_id);
 
@@ -572,7 +573,7 @@ impl PDRouter {
         }
 
         let legs = lease.serialize_legs_with(|view| -> Result<(Vec<u8>, Vec<u8>), Box<Response>> {
-            let mut json_request = serde_json::to_value(view.request)
+            let mut json_request = request_to_value(view.request, raw_body_len)
                 .map_err(|e| Box::new(Self::handle_serialization_error(e)))?;
             // The prefill and decode workers only know the canonical name, so
             // forward that, not the alias the client sent.
@@ -2475,6 +2476,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn both_legs_forward_client_numbers_exactly() {
+        let (prefill_url, prefill_seen) = spawn_recording_stub("{}").await;
+        let (decode_url, decode_seen) = spawn_recording_stub("{}").await;
+
+        let router = create_test_pd_router();
+        for (url, worker_type) in [
+            (prefill_url, WorkerType::Prefill),
+            (decode_url, WorkerType::Decode),
+        ] {
+            router
+                .worker_registry
+                .register_or_replace(Arc::from(create_test_worker(url, worker_type, true)));
+        }
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+        let chat: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 0.7,
+            "top_p": 0.95,
+        }))
+        .expect("valid chat request");
+        let response = router
+            .route_chat(None, &tenant, chat, UNKNOWN_MODEL_ID)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // The typed request stores these as f32; 0.95f32 widened to f64 is
+        // 0.949999988079071, which is not the number the client sent.
+        for seen in [&prefill_seen, &decode_seen] {
+            let seen = seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (_, body) = &seen[0];
+            assert_eq!(body["temperature"], json!(0.7));
+            assert_eq!(body["top_p"], json!(0.95));
+            assert!(body.get("bootstrap_room").is_some());
+        }
+    }
+
+    #[tokio::test]
     async fn vllm_pd_dispatches_sequentially_with_nixl_relay() {
         let (prefill_url, prefill_seen) = spawn_recording_stub(
             r#"{"kv_transfer_params":{"remote_engine_id":"eng0","remote_block_ids":[1,2]}}"#,
@@ -2504,6 +2546,7 @@ mod tests {
         let chat: ChatCompletionRequest = serde_json::from_value(json!({
             "model": "m",
             "max_tokens": 50,
+            "top_p": 0.95,
             "stream_options": {"include_usage": true},
             "messages": [{"role": "user", "content": "hi"}],
         }))
@@ -2522,6 +2565,7 @@ mod tests {
         let (path, body) = &prefill_seen[0];
         assert_eq!(path, "/v1/chat/completions");
         assert_eq!(body.get("max_tokens"), Some(&Value::from(1)));
+        assert_eq!(body.get("top_p"), Some(&json!(0.95)));
         assert_eq!(body.get("stream"), Some(&Value::Bool(false)));
         assert_eq!(body.get("stream_options"), None);
         assert_eq!(
@@ -2538,6 +2582,7 @@ mod tests {
         let (path, body) = &decode_seen[0];
         assert_eq!(path, "/v1/chat/completions");
         assert_eq!(body.get("max_tokens"), Some(&Value::from(50)));
+        assert_eq!(body.get("top_p"), Some(&json!(0.95)));
         assert_eq!(
             body.pointer("/kv_transfer_params/remote_engine_id"),
             Some(&Value::from("eng0"))

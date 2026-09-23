@@ -16,7 +16,7 @@ use serde_json::value::{to_raw_value, RawValue};
 
 use crate::{
     routers::common::{
-        serialize_json_sized, serialized_capacity,
+        request_to_value, serialize_json_sized,
         sglang_fields::{is_stripped_sglang_default, strip_default_sglang_fields, SGLANG_FIELDS},
     },
     worker::{Worker, WorkerError},
@@ -41,7 +41,7 @@ pub(crate) fn serialize_request_body<T: Serialize>(
         return value_request_body(typed_req, canonical_model, worker, raw_len);
     }
 
-    let bytes = to_vec_value_compatible(typed_req, raw_len).map_err(RequestBodyError::Serialize)?;
+    let bytes = serialize_json_sized(typed_req, raw_len).map_err(RequestBodyError::Serialize)?;
     let canonical_raw = canonical_model
         .map(to_raw_value)
         .transpose()
@@ -78,7 +78,7 @@ fn value_request_body<T: Serialize>(
     worker: &dyn Worker,
     raw_len: Option<usize>,
 ) -> Result<Vec<u8>, RequestBodyError> {
-    let mut json_val = serde_json::to_value(typed_req).map_err(RequestBodyError::Serialize)?;
+    let mut json_val = request_to_value(typed_req, raw_len).map_err(RequestBodyError::Serialize)?;
     if let Some(canonical_model) = canonical_model {
         super::set_request_model(&mut json_val, canonical_model);
     }
@@ -87,31 +87,6 @@ fn value_request_body<T: Serialize>(
         .map_err(RequestBodyError::Prepare)?;
     strip_default_sglang_fields(&mut json_val);
     serialize_json_sized(&json_val, raw_len).map_err(RequestBodyError::Serialize)
-}
-
-/// `serde_json::to_value` stores `f32` widened to `f64`, so the `Value`
-/// pipeline has always emitted the widened decimal form. The plain writer
-/// emits the shorter `f32` form instead; widen here to keep wire bytes
-/// identical.
-struct F32WideningFormatter;
-
-impl serde_json::ser::Formatter for F32WideningFormatter {
-    fn write_f32<W>(&mut self, writer: &mut W, value: f32) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        self.write_f64(writer, f64::from(value))
-    }
-}
-
-fn to_vec_value_compatible<T: Serialize>(
-    value: &T,
-    raw_len: Option<usize>,
-) -> Result<Vec<u8>, serde_json::Error> {
-    let mut buf = Vec::with_capacity(raw_len.map_or(128, serialized_capacity));
-    let mut ser = serde_json::Serializer::with_formatter(&mut buf, F32WideningFormatter);
-    value.serialize(&mut ser)?;
-    Ok(buf)
 }
 
 /// Top-level fields of a serialized request; values stay borrowed raw JSON.
@@ -214,14 +189,14 @@ mod tests {
             .build()
     }
 
-    /// The pre-existing pipeline, verbatim: the produced bytes are the wire
+    /// The `Value` pipeline, verbatim: the produced bytes are the wire
     /// contract the fast path must reproduce.
     fn value_path_bytes<T: Serialize>(
         typed_req: &T,
         canonical_model: Option<&str>,
         worker: &dyn Worker,
     ) -> Vec<u8> {
-        let mut json_val = serde_json::to_value(typed_req).unwrap();
+        let mut json_val = request_to_value(typed_req, None).unwrap();
         if let Some(canonical_model) = canonical_model {
             set_request_model(&mut json_val, canonical_model);
         }
@@ -320,7 +295,7 @@ mod tests {
         let body = serialize_request_body(&req, None, &worker, None).unwrap();
 
         assert_eq!(body, value_path_bytes(&req, None, &worker));
-        assert_eq!(body, to_vec_value_compatible(&req, None).unwrap());
+        assert_eq!(body, serialize_json_sized(&req, None).unwrap());
     }
 
     #[test]
@@ -333,22 +308,35 @@ mod tests {
         let body = serialize_request_body(&req, None, &worker, None).unwrap();
 
         assert_eq!(body, value_path_bytes(&req, None, &worker));
-        assert_eq!(body, to_vec_value_compatible(&req, None).unwrap());
+        assert_eq!(body, serialize_json_sized(&req, None).unwrap());
     }
 
     #[test]
-    fn f32_fields_keep_the_value_path_widening() {
-        let worker = worker();
-        let req = generate_request(json!({}));
+    fn f32_fields_are_forwarded_as_the_client_wrote_them() {
+        let generate = generate_request(json!({}));
+        let chat: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "alias-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "temperature": 0.7,
+            "top_p": 0.95,
+            "min_p": 0.05
+        }))
+        .unwrap();
 
-        let body =
-            String::from_utf8(serialize_request_body(&req, None, &worker, None).unwrap()).unwrap();
+        // `f32` fields must not widen (0.95f32 is 0.949999988079071 as f64)
+        // on the direct path or on the Value path `prepare_request` uses.
+        for worker in [worker(), dp_worker()] {
+            let body = serialize_request_body(&generate, None, &worker, None).unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["sampling_params"]["temperature"], json!(0.7));
+            assert_eq!(body["sampling_params"]["top_p"], json!(0.9));
 
-        // `to_value` widens `f32` to `f64`; the plain writer would emit the
-        // shorter `0.7` and change wire bytes.
-        let widened = serde_json::to_string(&Value::from(0.7f32)).unwrap();
-        assert_ne!(widened, "0.7");
-        assert!(body.contains(&widened));
+            let body = serialize_request_body(&chat, None, &worker, None).unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["temperature"], json!(0.7));
+            assert_eq!(body["top_p"], json!(0.95));
+            assert_eq!(body["min_p"], json!(0.05));
+        }
     }
 
     #[test]
@@ -365,7 +353,7 @@ mod tests {
         assert_eq!(plain, value_path_bytes(&req, None, &worker));
         // Default-noise flags are omitted at serialization, so the strip is a
         // no-op and the first serialization goes out as-is.
-        assert_eq!(plain, to_vec_value_compatible(&req, None).unwrap());
+        assert_eq!(plain, serialize_json_sized(&req, None).unwrap());
         let parsed: Value = serde_json::from_slice(&plain).unwrap();
         assert!(parsed.get("separate_reasoning").is_none());
         assert_eq!(parsed["skip_special_tokens"], true);
@@ -415,7 +403,7 @@ mod tests {
         let body = serialize_request_body(&req, None, &worker, None).unwrap();
 
         assert_eq!(body, value_path_bytes(&req, None, &worker));
-        assert_eq!(body, to_vec_value_compatible(&req, None).unwrap());
+        assert_eq!(body, serialize_json_sized(&req, None).unwrap());
     }
 
     #[test]
@@ -424,7 +412,7 @@ mod tests {
         let req = vec![1, 2, 3];
 
         // The raw editor rejects the shape, so this exercises the fallback.
-        let direct = to_vec_value_compatible(&req, None).unwrap();
+        let direct = serialize_json_sized(&req, None).unwrap();
         assert!(serde_json::from_slice::<RawBody>(&direct).is_err());
 
         let body = serialize_request_body(&req, Some("canonical-model"), &worker, None).unwrap();
