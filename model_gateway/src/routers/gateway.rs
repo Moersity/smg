@@ -25,7 +25,7 @@ use openai_protocol::{
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
     interactions::InteractionsRequest,
-    messages::CreateMessageRequest,
+    messages::{CountMessageTokensRequest, CreateMessageRequest},
     realtime_session::{
         RealtimeClientSecretCreateRequest, RealtimeSessionCreateRequest,
         RealtimeTranscriptionSessionCreateRequest,
@@ -485,6 +485,44 @@ impl RouterTrait for Gateway {
         .await
     }
 
+    async fn route_messages_count_tokens(
+        &self,
+        headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
+        body: CountMessageTokensRequest,
+        model_id: &str,
+    ) -> Response {
+        let router = if self.enable_igw {
+            let snapshot = self.worker_registry.get_routing_snapshot(model_id);
+            if snapshot.pool(RoutingPool::External).is_empty() {
+                // Counting needs only a tokenizer: no gRPC route or decode leg.
+                self.pick_router_by_weights(
+                    0,
+                    0,
+                    snapshot.pool(RoutingPool::HttpPrefill).len(),
+                    0,
+                    snapshot.pool(RoutingPool::HttpRegular).len(),
+                )
+            } else {
+                self.select_router_for_request(Some(model_id))
+            }
+        } else {
+            self.select_router_for_request(Some(model_id))
+        };
+        match router {
+            Some(router) => {
+                router
+                    .route_messages_count_tokens(headers, tenant_meta, body, model_id)
+                    .await
+            }
+            None => (
+                StatusCode::NOT_IMPLEMENTED,
+                "No HTTP worker available for Messages token counting",
+            )
+                .into_response(),
+        }
+    }
+
     async fn route_responses(
         &self,
         headers: Option<&HeaderMap>,
@@ -709,6 +747,16 @@ mod tests {
             self
         }
 
+        async fn route_messages_count_tokens(
+            &self,
+            _headers: Option<&HeaderMap>,
+            _tenant_meta: &TenantRequestMeta,
+            _body: CountMessageTokensRequest,
+            _model_id: &str,
+        ) -> Response {
+            StatusCode::OK.into_response()
+        }
+
         async fn route_generate(
             &self,
             _headers: Option<&HeaderMap>,
@@ -843,6 +891,52 @@ mod tests {
 
     fn test_tenant_meta() -> TenantRequestMeta {
         RouteRequestMeta::new(TenantKey::from("test-tenant"))
+    }
+
+    #[tokio::test]
+    async fn count_tokens_selects_http_workers_without_a_decode_leg() {
+        for (role, router_id) in [
+            (WorkerType::Regular, router_ids::HTTP_REGULAR),
+            (WorkerType::Prefill, router_ids::HTTP_PD),
+        ] {
+            let gateway = test_gateway(true);
+            gateway.register_router(router_ids::GRPC_REGULAR, Arc::new(PdStubRouter));
+            gateway.set_default_router(router_ids::GRPC_REGULAR);
+            gateway.register_router(router_id, Arc::new(StubRouter));
+            for (url, mode, worker_type) in [
+                (
+                    "http://grpc:8080",
+                    ConnectionMode::Grpc,
+                    WorkerType::Regular,
+                ),
+                ("http://http:8080", ConnectionMode::Http, role),
+            ] {
+                gateway
+                    .worker_registry
+                    .register(Arc::new(
+                        BasicWorkerBuilder::new(url)
+                            .connection_mode(mode)
+                            .worker_type(worker_type)
+                            .model(ModelCard::new("m"))
+                            .build(),
+                    ))
+                    .unwrap();
+            }
+            let tenant = test_tenant_meta();
+            for (model, expected) in [
+                ("m", StatusCode::OK),
+                ("missing", StatusCode::NOT_IMPLEMENTED),
+            ] {
+                let body = serde_json::from_value(serde_json::json!({
+                    "model": model, "messages": []
+                }))
+                .unwrap();
+                let response = gateway
+                    .route_messages_count_tokens(None, &tenant, body, model)
+                    .await;
+                assert_eq!(response.status(), expected);
+            }
+        }
     }
 
     fn generate_request_without_model() -> GenerateRequest {

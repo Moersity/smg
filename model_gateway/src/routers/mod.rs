@@ -16,7 +16,7 @@ use openai_protocol::{
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
     interactions::InteractionsRequest,
-    messages::CreateMessageRequest,
+    messages::{CountMessageTokensRequest, CreateMessageRequest},
     realtime_session::{
         RealtimeClientSecretCreateRequest, RealtimeSessionCreateRequest,
         RealtimeTranscriptionSessionCreateRequest,
@@ -218,6 +218,21 @@ pub trait RouterTrait: Send + Sync + Debug {
         (
             StatusCode::NOT_IMPLEMENTED,
             "Messages API not yet implemented for this router",
+        )
+            .into_response()
+    }
+
+    /// Route Anthropic Messages token counting (/v1/messages/count_tokens)
+    async fn route_messages_count_tokens(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
+        _body: CountMessageTokensRequest,
+        _model_id: &str,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Messages token counting not implemented for this router",
         )
             .into_response()
     }

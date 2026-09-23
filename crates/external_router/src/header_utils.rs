@@ -395,6 +395,10 @@ pub fn should_forward_request_header(name: &str) -> bool {
     const REQUEST_ID_PREFIX: &str = "x-request-id-";
 
     name.eq_ignore_ascii_case("authorization")
+        // Anthropic Messages protocol headers: engines serving /v1/messages
+        // select API version and beta behavior from them.
+        || name.eq_ignore_ascii_case("anthropic-version")
+        || name.eq_ignore_ascii_case("anthropic-beta")
         || name.eq_ignore_ascii_case("x-request-id")
         || name.eq_ignore_ascii_case("x-correlation-id")
         || name.eq_ignore_ascii_case("traceparent")
@@ -535,6 +539,8 @@ mod tests {
         assert!(should_forward_request_header("x-request-id-123"));
         assert!(should_forward_request_header("x-smg-routing-key"));
         assert!(should_forward_request_header("X-SMG-Routing-Key"));
+        assert!(should_forward_request_header("anthropic-version"));
+        assert!(should_forward_request_header("Anthropic-Beta"));
     }
 
     #[test]
