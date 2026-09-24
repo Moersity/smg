@@ -139,25 +139,7 @@ python -m smg_grpc_servicer.tokenspeed --model meta-llama/Llama-2-7b-hf --host 0
 sglang serve --model-path meta-llama/Llama-2-7b-hf --grpc-mode
 ```
 
-## Architecture
-
-```
-smg-grpc-servicer[vllm]    ──optional dep──>  vllm       (lazy import)
-smg-grpc-servicer[mlx]     ──optional dep──>  mlx-lm     (lazy import)
-smg-grpc-servicer          ──external runtime──>  tokenspeed (lazy import)
-smg-grpc-servicer[sglang]  ──optional dep──>  sglang     (lazy import)
-smg-grpc-servicer          ──depends on────>  smg-grpc-proto  (hard dependency)
-vllm                       ──optional──────>  smg-grpc-servicer (via vllm serve --grpc)
-sglang                     ──optional──────>  smg-grpc-servicer (via --grpc-mode)
-```
-
-Backend dependencies are isolated via extras or runtime installs to avoid conflicts between vLLM, MLX, TokenSpeed, and SGLang.
-
-## Development
-
-See [DEVELOPMENT.md](DEVELOPMENT.md) for local development setup, CI, and release workflows.
-
-### SGLang KV-event recovery
+#### KV-event recovery
 
 To retain cache knowledge across a recoverable event gap, configure SGLang's
 `--kv-events-config` with both a PUB endpoint and a replay endpoint, for example:
@@ -177,3 +159,21 @@ Without replay, or when history is expired, empty, malformed, or unavailable
 resubscribes with zero. A zero cursor rebuilds knowledge from subsequent live
 events; it is not a complete cache snapshot. An empty replay is conservatively
 reset because it cannot distinguish an idle publisher from a restarted one.
+
+## Architecture
+
+```
+smg-grpc-servicer[vllm]    ──optional dep──>  vllm       (lazy import)
+smg-grpc-servicer[mlx]     ──optional dep──>  mlx-lm     (lazy import)
+smg-grpc-servicer          ──external runtime──>  tokenspeed (lazy import)
+smg-grpc-servicer[sglang]  ──optional dep──>  sglang     (lazy import)
+smg-grpc-servicer          ──depends on────>  smg-grpc-proto  (hard dependency)
+vllm                       ──optional──────>  smg-grpc-servicer (via vllm serve --grpc)
+sglang                     ──optional──────>  smg-grpc-servicer (via --grpc-mode)
+```
+
+Backend dependencies are isolated via extras or runtime installs to avoid conflicts between vLLM, MLX, TokenSpeed, and SGLang.
+
+## Development
+
+See [DEVELOPMENT.md](DEVELOPMENT.md) for local development setup, CI, and release workflows.
