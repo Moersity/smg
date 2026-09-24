@@ -351,3 +351,29 @@ async def test_decode_failure_closes_both_sockets(bridge, replay, monkeypatch):
     assert error.value.code() == grpc.StatusCode.OUT_OF_RANGE
     assert len(sockets) == 2
     assert all(socket.closed for socket in sockets)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hwm", [None, 4096, 0])
+async def test_live_backlog_survives_replay_with_publisher_hwm(bridge, replay, monkeypatch, hwm):
+    if hwm is not None:
+        bridge.config.hwm = hwm
+    # In-process transport makes queue capacity deterministic, without TCP
+    # kernel buffers masking a too-small SUB HWM. Limit the sender's share.
+    bridge.pub.setsockopt(zmq.SNDHWM, 1)
+    bridge.config.endpoint = "inproc://kv-replay-backlog"
+    bridge.pub.bind(bridge.config.endpoint)
+    monkeypatch.setattr(zmq.asyncio.Context, "instance", lambda: bridge.ctx)
+
+    call = bridge.subscribe(100)
+    identity = await replay.request(100)
+    await bridge.subscribed()
+    await replay.send(identity, 101)
+    assert (await read(call)).sequence_number == 101
+    # Keep replay open while more than the default 1000 live batches queue.
+    for seq in range(102, 2150):
+        await bridge.publish(seq)
+    await replay.send(identity, -1)
+    for seq in range(102, 2150):
+        assert (await read(call)).sequence_number == seq
+    call.cancel()

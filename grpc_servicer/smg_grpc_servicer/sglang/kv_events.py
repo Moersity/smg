@@ -86,6 +86,7 @@ async def subscribe_kv_events(
     sent_headers = False
     replayed_seq = None
     try:
+        sub.setsockopt(zmq.RCVHWM, getattr(config, "hwm", 100_000))
         sub.subscribe(config.topic.encode("utf-8"))
         sub.connect(endpoint)
         logger.info("SubscribeKvEvents: connected to ZMQ endpoint %s", endpoint)
