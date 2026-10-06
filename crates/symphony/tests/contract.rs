@@ -19,15 +19,17 @@
 //!
 //! The design's "committed stays committed" is not a separate check: `Events` is append-only and
 //! conservation forbids saying a byte twice, so nothing a parser pushed can be taken back through
-//! the event list. The fifth property, token identity, comes with token attribution. A format joins
-//! the contract with one entry in [`FORMATS`], its constructor and its corpus.
+//! the event list. The fifth property, token identity (every token counted once, in the event that
+//! carries its first byte, whatever the cuts), is checked event by event with a synthetic
+//! tokenization of each output. A format joins the contract with one entry in [`FORMATS`], its
+//! constructor and its corpus.
 
 mod common;
 
 use common::{bytes_of, chunkings, delta, prompt};
 use symphony::{
     json::PartialJson, DropReason, EngineFinish, Event, Events, FinishReason, Input,
-    MalformedReason, ParseError, Parser, Qwen3,
+    MalformedReason, ParseError, Parser, Qwen3, TokenSpan,
 };
 
 /// A format under test: how to make its parser, and the outputs it is checked over.
@@ -320,6 +322,167 @@ fn calls_are_numbered_from_zero_in_order_with_ids_that_follow_the_index() {
         for (position, (index, id, _)) in Said::of(&events).calls.iter().enumerate() {
             assert_eq!(*index as usize, position, "{}: {text:?}", format.name);
             assert_eq!(id, &format!("call_{index}"), "{}: {text:?}", format.name);
+        }
+    }
+}
+
+/// A synthetic tokenization of `text`: token boundaries at character offsets, one to three
+/// characters per token, deterministic in the text.
+fn token_boundaries(text: &str) -> Vec<usize> {
+    let chars: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+    let mut boundaries = vec![0];
+    let mut at = 0;
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    while at < chars.len() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        at += 1 + (state % 3) as usize;
+        if at < chars.len() {
+            boundaries.push(chars[at]);
+        }
+    }
+    boundaries.push(text.len());
+    boundaries.dedup();
+    boundaries
+}
+
+/// Replay `text` through a new parser of `format` cut at `cuts`, after the prompt, each delta
+/// carrying the spans of the synthetic tokens it holds, a token cut by a delta boundary continuing
+/// into the next delta, and a byte-less token at the very end, as an end-of-turn token would be.
+fn replay_counted(format: &Format, text: &str, cuts: &[usize]) -> Result<Vec<Event>, ParseError> {
+    let boundaries = token_boundaries(text);
+    let mut tokens: Vec<(usize, usize)> = boundaries.windows(2).map(|w| (w[0], w[1])).collect();
+    tokens.push((text.len(), text.len()));
+    let mut parser = (format.new)();
+    let mut out = Events::new();
+    parser.feed(prompt(), &mut out)?;
+    let mut from = 0;
+    for &cut in cuts.iter().chain(std::iter::once(&text.len())) {
+        if cut > from {
+            let spans: Vec<TokenSpan> = tokens
+                .iter()
+                .filter(|&&(start, end)| {
+                    (end > from && start < cut)
+                        || (start == end && start == cut && cut == text.len())
+                })
+                .map(|&(start, end)| TokenSpan {
+                    token_id: 0,
+                    start: start.max(from) - from,
+                    end: end.min(cut) - from,
+                    continued: start < from,
+                })
+                .collect();
+            parser.feed(
+                Input::Delta {
+                    token_ids: &[],
+                    text: &text[from..cut],
+                    spans: &spans,
+                },
+                &mut out,
+            )?;
+            from = cut;
+        }
+    }
+    if text.is_empty() {
+        // No delta carried text, so the byte-less token arrives in an empty one.
+        parser.feed(
+            Input::Delta {
+                token_ids: &[],
+                text: "",
+                spans: &[TokenSpan {
+                    token_id: 0,
+                    start: 0,
+                    end: 0,
+                    continued: false,
+                }],
+            },
+            &mut out,
+        )?;
+    }
+    parser.feed(
+        Input::End {
+            finish: EngineFinish::Stop,
+        },
+        &mut out,
+    )?;
+    Ok(out.drain())
+}
+
+fn tokens_of(event: &Event) -> Option<u32> {
+    match event {
+        Event::Content(t) | Event::Reasoning(t) => t.tokens,
+        Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.tokens,
+        Event::ToolCallStart { source, .. }
+        | Event::ToolCallArguments { source, .. }
+        | Event::ToolCallEnd { source, .. } => source.tokens,
+        Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => None,
+    }
+}
+
+#[test]
+fn every_token_is_counted_in_the_event_that_carries_its_first_byte_whatever_the_cuts() {
+    for (format, text) in corpus() {
+        let boundaries = token_boundaries(text);
+        // Where each synthetic token starts, and the byte-less one at the end.
+        let mut starts: Vec<usize> = boundaries[..boundaries.len() - 1].to_vec();
+        starts.push(text.len());
+        for cuts in chunkings(text) {
+            let events = replay_counted(format, text, &cuts)
+                .unwrap_or_else(|e| panic!("{}: {text:?}: {e}", format.name));
+            let place = || format!("{}: {text:?} cut at {cuts:?}", format.name);
+            let mut at = 0;
+            let mut total = 0;
+            for event in &events {
+                if matches!(
+                    event,
+                    Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. }
+                ) {
+                    continue;
+                }
+                let tokens =
+                    tokens_of(event).unwrap_or_else(|| panic!("{}: uncounted {event:?}", place()));
+                let length = bytes_of(event).len();
+                let expected = match event {
+                    // The byte-less token at the end has no byte to follow it.
+                    Event::Dropped {
+                        why: DropReason::ControlToken,
+                        ..
+                    } if length == 0 => starts.iter().filter(|&&start| start >= text.len()).count(),
+                    _ => starts
+                        .iter()
+                        .filter(|&&start| start >= at && start < at + length)
+                        .count(),
+                };
+                assert_eq!(
+                    tokens as usize,
+                    expected,
+                    "{}: {event:?} at byte {at}",
+                    place()
+                );
+                at += length;
+                total += tokens as usize;
+            }
+            assert_eq!(total, starts.len(), "{}: every token counted once", place());
+            let reasoning: u32 = events
+                .iter()
+                .filter_map(|e| match e {
+                    Event::Reasoning(t) => t.tokens,
+                    _ => None,
+                })
+                .sum();
+            let Some(Event::Finish {
+                reasoning_tokens, ..
+            }) = events.last()
+            else {
+                panic!("{}: Finish is last", place());
+            };
+            assert_eq!(
+                *reasoning_tokens,
+                reasoning,
+                "{}: Finish counts the reasoning tokens",
+                place()
+            );
         }
     }
 }
