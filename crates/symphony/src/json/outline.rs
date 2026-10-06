@@ -1,15 +1,16 @@
 //! The outline of a tool-call object as it arrives: where its name is and where its arguments are.
 //!
-//! A model writes a call as a JSON object, `{"name": "get_weather", "arguments": {"city": "Paris"}}`
-//! in some order and with its own spacing, and the object arrives in pieces. [`outline`] reads the
-//! object so far and reports the call's name once its string is complete, the byte span of the
-//! arguments value from the moment its first byte has arrived, and whether the object has closed.
-//! Because the span is a range into the model's own text, an argument stream can emit exactly the
-//! bytes the model wrote, as they arrive, and nothing it emitted ever has to change: a byte of the
-//! value, once there, stays. That replaces the old crate's way of streaming arguments, which parsed
-//! the partial object, re-serialized the arguments and emitted the difference to the previous
-//! serialization, so that clients saw `{"city":"Paris"}` where the model had written
-//! `{"city": "Paris"}`.
+//! A model writes a call as a JSON object,
+//! `{"name": "get_weather", "arguments": {"city": "Paris"}}` in some order and with its own
+//! spacing, and the object arrives in pieces. [`outline`] reads the object so far and reports the
+//! call's name once its string is complete, the byte span of the arguments value from the moment
+//! its first byte has arrived, and where the object closed, so the caller knows how many of its
+//! bytes the object took. Because the span is a range into the model's own text, an argument stream
+//! can emit exactly the bytes the model wrote, as they arrive, and nothing it emitted ever has to
+//! change: a byte of the value, once there, stays. That replaces the old crate's way of streaming
+//! arguments, which parsed the partial object, re-serialized the arguments and emitted the
+//! difference to the previous serialization, so that clients saw `{"city":"Paris"}` where the model
+//! had written `{"city": "Paris"}`.
 //!
 //! The member names a call uses are the ones the old crate accepted: `name` or `tool_name` for the
 //! name, `arguments` or `parameters` for the arguments; the first of each that appears counts. The
@@ -25,8 +26,15 @@ pub struct Outline {
     pub name: Option<String>,
     /// The arguments value's bytes, from its first byte to where it ends or to where the text ends.
     pub arguments: Option<Span>,
+    /// One past the object's closing brace, once it has arrived.
+    pub close: Option<usize>,
+}
+
+impl Outline {
     /// Whether the object's closing brace has arrived.
-    pub complete: bool,
+    pub fn complete(&self) -> bool {
+        self.close.is_some()
+    }
 }
 
 /// A value's place in the text the outline was taken from: byte offsets, the end exclusive and
@@ -73,7 +81,7 @@ pub fn outline(text: &str) -> Outline {
             return found;
         };
         if text[key_start..].starts_with('}') {
-            found.complete = true;
+            found.close = Some(key_start + 1);
             return found;
         }
         if text[key_start..].starts_with(',') {
@@ -207,7 +215,7 @@ mod tests {
             "the model's own bytes, spacing included"
         );
         assert_eq!(arguments.end, Some(CALL.len() - 1));
-        assert!(found.complete);
+        assert_eq!(found.close, Some(CALL.len()));
     }
 
     #[test]
@@ -236,7 +244,7 @@ mod tests {
                     "cut at {cut}: the bytes so far are a prefix of the final bytes"
                 );
             }
-            assert_eq!(found.complete, cut == CALL.len(), "cut at {cut}");
+            assert_eq!(found.complete(), cut == CALL.len(), "cut at {cut}");
         }
     }
 
@@ -283,7 +291,7 @@ mod tests {
             found.arguments.expect("arguments").text(text),
             r#"{"city": "Paris"}"#
         );
-        assert!(found.complete);
+        assert_eq!(found.close, Some(text.len()));
         let cut = &text[..r#"{"arguments": {"city": "Paris"}, "na"#.len()];
         let found = outline(cut);
         assert_eq!(found.name, None);
@@ -332,7 +340,7 @@ mod tests {
             found.arguments.expect("arguments").text(text),
             r#"{"q": "a } ] \" {", "n": [1, "]"]}"#
         );
-        assert!(found.complete);
+        assert_eq!(found.close, Some(text.len()));
     }
 
     #[test]
@@ -346,11 +354,19 @@ mod tests {
             let found = outline(text);
             assert_eq!(found.arguments, None, "{text:?}: no value, so no span");
             assert!(
-                !found.complete,
+                !found.complete(),
                 "{text:?}: a malformed object does not close"
             );
         }
         assert_eq!(outline(r#"{"name": }"#).name, None);
+    }
+
+    #[test]
+    fn the_close_offset_says_how_many_bytes_the_object_took() {
+        let text = r#"{"name": "f", "arguments": {}}  </tool_call> more"#;
+        let found = outline(text);
+        assert_eq!(found.close, Some(r#"{"name": "f", "arguments": {}}"#.len()));
+        assert_eq!(&text[found.close.expect("closed")..], "  </tool_call> more");
     }
 
     #[test]
