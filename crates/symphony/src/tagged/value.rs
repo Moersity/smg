@@ -55,7 +55,7 @@
 //! - The old functions had a rule each for `number`, `boolean`, `array` and `object`. Each gave
 //!   exactly what inference gives, so they are not carried over.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use openai_protocol::common::Tool;
 use serde_json::Value;
@@ -90,9 +90,12 @@ impl Kind {
     /// The kind a parameter's schema declares. A schema that admits a string declares a string,
     /// nullable when it admits `null` too; one that admits an integer, an array or an object alone
     /// declares that; any other schema declares nothing here.
-    fn of(schema: &Value) -> Option<Self> {
+    fn of(root: &Value, schema: &Value) -> Option<Self> {
         let mut admitted = Vec::new();
-        admitted_types(schema, &mut admitted);
+        admitted_types(root, schema, &mut admitted);
+        // A type named twice (`"type": "integer"` beside a reference to an integer) is one type.
+        admitted.sort_unstable();
+        admitted.dedup();
         if admitted.contains(&"string") {
             Some(if admitted.contains(&"null") {
                 Self::NullableString
@@ -113,8 +116,27 @@ impl Kind {
 
 /// The type names `schema` admits: its `type`, as one name or a list; the types of its `anyOf` or
 /// `oneOf` members; and, when it has no `type`, `string` for an `enum` of strings, and `null` too
-/// when `null` is among them (what Pydantic writes for `Literal["a", "b", None]`).
-fn admitted_types<'a>(schema: &'a Value, into: &mut Vec<&'a str>) {
+/// when `null` is among them (what Pydantic writes for `Literal["a", "b", None]`). A `$ref` into
+/// `root` admits what its target admits.
+fn admitted_types<'a>(root: &'a Value, schema: &'a Value, into: &mut Vec<&'a str>) {
+    admitted_types_within(root, schema, into, &mut HashSet::new());
+}
+
+/// `seen` holds the nodes this lookup has read, so a definition that refers to itself, however
+/// many times over, is read once: without it the walk would branch at every reference and cost
+/// the power of the fan-out.
+fn admitted_types_within<'a>(
+    root: &'a Value,
+    schema: &'a Value,
+    into: &mut Vec<&'a str>,
+    seen: &mut HashSet<*const Value>,
+) {
+    let Some(schema) = resolve(root, schema) else {
+        return;
+    };
+    if !seen.insert(std::ptr::from_ref(schema)) {
+        return;
+    }
     let typed = match schema.get("type") {
         Some(Value::String(name)) => {
             into.push(name);
@@ -126,11 +148,8 @@ fn admitted_types<'a>(schema: &'a Value, into: &mut Vec<&'a str>) {
         }
         _ => false,
     };
-    for key in ["anyOf", "oneOf"] {
-        let members = schema.get(key).and_then(Value::as_array);
-        for member in members.into_iter().flatten() {
-            admitted_types(member, into);
-        }
+    for member in members(schema) {
+        admitted_types_within(root, member, into, seen);
     }
     if typed {
         return;
@@ -184,18 +203,108 @@ impl Declared {
     /// property may be named `item` too, so the schema's shape decides, not the segment). Nothing
     /// when the path leads nowhere in the schema.
     pub fn kind_at(&self, function: &str, path: &[&str]) -> Option<Kind> {
-        let mut schema = self.schemas.get(function)?;
+        let root = self.schemas.get(function)?;
+        let mut schema = root;
         for segment in path {
-            let mut admitted = Vec::new();
-            admitted_types(schema, &mut admitted);
-            schema = if admitted.contains(&"array") {
-                schema.get("items")?
-            } else {
-                schema.get("properties")?.get(*segment)?
-            };
+            schema = below(root, schema, segment)?;
         }
-        Kind::of(schema)
+        Kind::of(root, schema)
     }
+}
+
+/// How many `$ref`s in a row [`resolve`] follows before it gives up: a reference to a reference
+/// to a reference must end somewhere.
+const HOPS: usize = 16;
+
+/// `schema` with its `$ref` followed into `root`: a JSON pointer such as `#/$defs/Meta`, which is
+/// how Pydantic writes a model a field refers to, or `#/definitions/Meta`; `root` is the
+/// function's whole `parameters` schema, where the definitions live. A reference that leads
+/// nowhere, or one that refers to a reference past the hop limit, is nothing: it admits no type
+/// and has no members, whatever else stands beside it.
+fn resolve<'a>(root: &'a Value, schema: &'a Value) -> Option<&'a Value> {
+    let mut schema = schema;
+    for _ in 0..HOPS {
+        let Some(pointer) = schema.get("$ref").and_then(Value::as_str) else {
+            return Some(schema);
+        };
+        schema = root.pointer(pointer.strip_prefix('#')?)?;
+    }
+    schema.get("$ref").is_none().then_some(schema)
+}
+
+/// The schema one level below `schema` at `segment`: an array's items, or an object's property
+/// `segment`. A schema that admits the array or the object through `anyOf` or `oneOf` (Pydantic
+/// writes `Optional[List[T]]` so, with the array inline, and `Optional[Model]` with a `$ref` into
+/// `$defs`) is looked into for the member that has the items or the properties, since the wrapper
+/// itself has neither; a `$ref` is followed into `root` wherever it stands.
+fn below<'a>(root: &'a Value, schema: &'a Value, segment: &str) -> Option<&'a Value> {
+    let mut admitted = Vec::new();
+    admitted_types(root, schema, &mut admitted);
+    let (array, object) = (admitted.contains(&"array"), admitted.contains(&"object"));
+    if array && object {
+        // A schema that admits an array and an object alike says nothing about what is below:
+        // the segment could be a list's `item` or a property, so the value is inferred.
+        return None;
+    }
+    let mut shapes = Vec::new();
+    with_members(root, schema, &mut shapes, &mut HashSet::new());
+    if array {
+        shapes
+            .iter()
+            .filter(|shape| may_be(shape, "array"))
+            .find_map(|shape| shape.get("items"))
+    } else {
+        shapes
+            .iter()
+            .filter(|shape| may_be(shape, "object"))
+            .find_map(|shape| shape.get("properties")?.get(segment))
+    }
+}
+
+/// Whether `shape`'s own `type` leaves room for `name`: it names it, lists it, or says nothing
+/// (a schema with `items` and no `type` constrains an array when the value is one). A shape typed
+/// as something else does not lend its `items` or `properties` to the value.
+fn may_be(shape: &Value, name: &str) -> bool {
+    match shape.get("type") {
+        None => true,
+        Some(Value::String(typed)) => typed == name,
+        Some(Value::Array(typed)) => typed.iter().any(|typed| typed.as_str() == Some(name)),
+        Some(_) => false,
+    }
+}
+
+/// `schema` and, below it, every member of its `anyOf`, `oneOf` and one-member `allOf`,
+/// wrappers inside wrappers included, outermost first, each with its `$ref` followed and each
+/// read once (`seen` holds the nodes read; a wide union stays linear in its members).
+fn with_members<'a>(
+    root: &'a Value,
+    schema: &'a Value,
+    into: &mut Vec<&'a Value>,
+    seen: &mut HashSet<*const Value>,
+) {
+    let Some(schema) = resolve(root, schema) else {
+        return;
+    };
+    if !seen.insert(std::ptr::from_ref(schema)) {
+        return;
+    }
+    into.push(schema);
+    for member in members(schema) {
+        with_members(root, member, into, seen);
+    }
+}
+
+/// The members a wrapper has: those of its `anyOf` and `oneOf`, and the one of an `allOf` with a
+/// single member, which Pydantic v1 writes around a reference to carry a description beside it.
+fn members(schema: &Value) -> impl Iterator<Item = &Value> {
+    let listed = |key: &str| schema.get(key).and_then(Value::as_array);
+    let any = listed("anyOf").into_iter().flatten();
+    let one = listed("oneOf").into_iter().flatten();
+    let all = listed("allOf")
+        .filter(|members| members.len() == 1)
+        .into_iter()
+        .flatten();
+    any.chain(one).chain(all)
 }
 
 fn parameters_of(schema: &Value) -> HashMap<String, Kind> {
@@ -204,7 +313,7 @@ fn parameters_of(schema: &Value) -> HashMap<String, Kind> {
     };
     properties
         .iter()
-        .filter_map(|(name, schema)| Some((name.clone(), Kind::of(schema)?)))
+        .filter_map(|(name, property)| Some((name.clone(), Kind::of(schema, property)?)))
         .collect()
 }
 
@@ -1132,5 +1241,228 @@ mod tests {
             json_but_for_a_surrogate > 0,
             "the generator never wrote text that only a surrogate escape keeps from being JSON"
         );
+    }
+
+    #[test]
+    fn a_kind_below_a_wrapped_array_or_object_comes_from_the_member_that_has_the_shape() {
+        // Pydantic's `Optional[List[str]]`, an object inline under `anyOf` (Pydantic refers to a
+        // model through `$defs`, which the `$ref` test covers), and a wrapper inside a wrapper.
+        let declared = Declared::of(&[tool(
+            "f",
+            value!({
+                "tags": {"anyOf": [
+                    {"type": "array", "items": {"type": "string"}},
+                    {"type": "null"}
+                ]},
+                "meta": {"anyOf": [
+                    {"type": "object", "properties": {"id": {"type": "integer"}}},
+                    {"type": "null"}
+                ]},
+                "deep": {"anyOf": [
+                    {"anyOf": [{"type": "array", "items": {"type": "integer"}}]},
+                    {"type": "null"}
+                ]},
+                "either": {"oneOf": [
+                    {"type": "object", "properties": {"n": {"type": "string"}}},
+                    {"type": "null"}
+                ]},
+            }),
+        )]);
+        assert_eq!(declared.kind_at("f", &["tags", "item"]), Some(Kind::String));
+        assert_eq!(declared.kind_at("f", &["meta", "id"]), Some(Kind::Integer));
+        assert_eq!(
+            declared.kind_at("f", &["deep", "item"]),
+            Some(Kind::Integer)
+        );
+        assert_eq!(declared.kind_at("f", &["either", "n"]), Some(Kind::String));
+        assert_eq!(declared.kind_at("f", &["meta", "missing"]), None);
+    }
+
+    #[test]
+    fn a_union_of_an_array_and_an_object_leaves_what_is_below_it_to_inference() {
+        let declared = Declared::of(&[tool(
+            "f",
+            value!({
+                "x": {"anyOf": [
+                    {"type": "array", "items": {"type": "string"}},
+                    {"type": "object", "properties": {"id": {"type": "integer"}}}
+                ]},
+            }),
+        )]);
+        assert_eq!(declared.kind_at("f", &["x", "id"]), None);
+        assert_eq!(declared.kind_at("f", &["x", "item"]), None);
+    }
+
+    #[test]
+    fn a_kind_through_a_ref_into_the_definitions_is_the_targets() {
+        // Pydantic writes `Optional[Model]` as a `$ref` under `anyOf`, a `Model` field as a
+        // bare `$ref`, an enum as a `$ref` to an `enum` definition, and a recursive model as a
+        // `$ref` to itself.
+        let parameters = value!({
+            "type": "object",
+            "properties": {
+                "meta": {"anyOf": [{"$ref": "#/$defs/Meta"}, {"type": "null"}]},
+                "owner": {"$ref": "#/$defs/Meta"},
+                "color": {"$ref": "#/$defs/Color"},
+                "tree": {"$ref": "#/$defs/Node"},
+                "old": {"$ref": "#/definitions/Old"},
+                "nowhere": {"$ref": "#/$defs/Missing"},
+            },
+            "$defs": {
+                "Meta": {"type": "object", "properties": {
+                    "id": {"type": "integer"},
+                    "tags": {"type": "array", "items": {"type": "string"}}}},
+                "Color": {"enum": ["red", "blue"]},
+                "Node": {"type": "object", "properties": {
+                    "name": {"type": "string"},
+                    "children": {"type": "array", "items": {"$ref": "#/$defs/Node"}}}},
+                "Loop": {"$ref": "#/$defs/Loop"},
+            },
+            "definitions": {"Old": {"type": "integer"}},
+        });
+        let declared = Declared::of(&[Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "f".to_string(),
+                description: None,
+                parameters,
+                strict: None,
+            },
+        }]);
+        assert_eq!(declared.kind("f", "owner"), Some(Kind::Object));
+        assert_eq!(declared.kind("f", "color"), Some(Kind::String));
+        assert_eq!(declared.kind("f", "old"), Some(Kind::Integer));
+        assert_eq!(declared.kind("f", "nowhere"), None);
+        assert_eq!(declared.kind_at("f", &["meta", "id"]), Some(Kind::Integer));
+        assert_eq!(
+            declared.kind_at("f", &["meta", "tags", "item"]),
+            Some(Kind::String)
+        );
+        assert_eq!(declared.kind_at("f", &["owner", "id"]), Some(Kind::Integer));
+        assert_eq!(
+            declared.kind_at(
+                "f",
+                &["tree", "children", "item", "children", "item", "name"]
+            ),
+            Some(Kind::String)
+        );
+        assert_eq!(declared.kind_at("f", &["nowhere", "x"]), None);
+        // A definition that refers to itself ends at the hop limit and admits nothing.
+        let looped = value!({"$ref": "#/$defs/Loop"});
+        assert_eq!(Kind::of(&declared.schemas["f"], &looped), None);
+    }
+
+    #[test]
+    fn a_definition_that_refers_to_itself_many_times_over_is_read_once_per_lookup() {
+        // Four references to itself at every level: read once, this is a handful of steps; read
+        // again at every reference, the walk would branch four ways sixteen times.
+        let parameters = value!({
+            "type": "object",
+            "properties": {"a": {"$ref": "#/$defs/A"}},
+            "$defs": {"A": {"anyOf": [
+                {"$ref": "#/$defs/A"}, {"$ref": "#/$defs/A"},
+                {"$ref": "#/$defs/A"}, {"$ref": "#/$defs/A"},
+                {"type": "string"}
+            ]}},
+        });
+        let started = std::time::Instant::now();
+        let declared = Declared::of(&[Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "f".to_string(),
+                description: None,
+                parameters,
+                strict: None,
+            },
+        }]);
+        assert_eq!(declared.kind("f", "a"), Some(Kind::String));
+        assert_eq!(declared.kind_at("f", &["a", "x"]), None);
+        assert!(
+            started.elapsed().as_secs() < 2,
+            "{:?} for a self-referring definition",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_one_member_all_of_around_a_reference_is_the_reference() {
+        // Pydantic v1 writes a field with a description so, under `definitions`.
+        let parameters = value!({
+            "type": "object",
+            "properties": {
+                "meta": {"allOf": [{"$ref": "#/definitions/Meta"}], "description": "the meta"},
+                "both": {"allOf": [{"type": "string"}, {"minLength": 1}]},
+            },
+            "definitions": {"Meta": {"type": "object", "properties": {"id": {"type": "integer"}}}},
+        });
+        let declared = Declared::of(&[Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "f".to_string(),
+                description: None,
+                parameters,
+                strict: None,
+            },
+        }]);
+        assert_eq!(declared.kind("f", "meta"), Some(Kind::Object));
+        assert_eq!(declared.kind_at("f", &["meta", "id"]), Some(Kind::Integer));
+        // An `allOf` with more than one member is a conjunction the crate does not read.
+        assert_eq!(declared.kind("f", "both"), None);
+    }
+
+    #[test]
+    fn a_wide_union_costs_its_size() {
+        // Twenty thousand members: read once each, a lookup is a few milliseconds; searched
+        // again for every member, it would be the square of that.
+        let member = value!({"type": "object", "properties": {"id": {"type": "integer"}}});
+        let members: Vec<Value> = std::iter::repeat_n(member, 20_000).collect();
+        let parameters = value!({
+            "type": "object",
+            "properties": {"x": {"anyOf": members}},
+        });
+        let started = std::time::Instant::now();
+        let declared = Declared::of(&[tool_with(parameters)]);
+        assert_eq!(declared.kind("f", "x"), Some(Kind::Object));
+        assert_eq!(declared.kind_at("f", &["x", "id"]), Some(Kind::Integer));
+        assert!(
+            started.elapsed().as_secs() < 2,
+            "{:?} for a wide union",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_type_named_twice_is_one_type_and_an_unresolved_reference_is_nothing() {
+        let declared = Declared::of(&[tool_with(value!({
+            "type": "object",
+            "properties": {
+                "twice": {"type": "integer", "allOf": [{"$ref": "#/$defs/Int"}]},
+                "nowhere": {"$ref": "#/$defs/Missing", "type": "string"},
+                "mixed": {"anyOf": [
+                    {"type": "array"},
+                    {"type": "integer", "items": {"type": "string"}}
+                ]},
+            },
+            "$defs": {"Int": {"type": "integer"}},
+        }))]);
+        assert_eq!(declared.kind("f", "twice"), Some(Kind::Integer));
+        // A reference that leads nowhere admits nothing, whatever stands beside it.
+        assert_eq!(declared.kind("f", "nowhere"), None);
+        assert_eq!(declared.kind_at("f", &["nowhere", "x"]), None);
+        // The items of a member typed as something else are not the array's.
+        assert_eq!(declared.kind_at("f", &["mixed", "item"]), None);
+    }
+
+    /// The function `f` with `parameters`.
+    fn tool_with(parameters: Value) -> Tool {
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "f".to_string(),
+                description: None,
+                parameters,
+                strict: None,
+            },
+        }
     }
 }

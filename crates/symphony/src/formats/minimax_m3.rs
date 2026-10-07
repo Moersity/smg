@@ -677,4 +677,30 @@ mod tests {
         let events = run("", &[item]);
         assert_eq!(arguments(&events), value!({"tags": [null]}));
     }
+
+    #[test]
+    fn a_leaf_below_a_nullable_list_or_object_keeps_its_declared_type() {
+        // Pydantic writes `Optional[List[str]]` as an `anyOf` around the inline array and
+        // `Optional[Model]` as an `anyOf` around a `$ref` into `$defs`; the declared types reach
+        // the leaves below both, so `1234` under a list of strings stays the string it is (main
+        // made it the number).
+        let output = concat!(
+            "</mm:think>]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"f\">",
+            "]<]minimax[>[<tags>]<]minimax[>[<item>1234]<]minimax[>[</item>]<]minimax[>[</tags>",
+            "]<]minimax[>[<meta>]<]minimax[>[<id>7]<]minimax[>[</id>]<]minimax[>[<flag>true",
+            "]<]minimax[>[</flag>]<]minimax[>[</meta>]<]minimax[>[</invoke>\n",
+            "]<]minimax[>[</tool_call>"
+        );
+        let tools = value!({"type": "object", "properties": {
+        "tags": {"anyOf": [{"type": "array", "items": {"type": "string"}}, {"type": "null"}]},
+        "meta": {"anyOf": [{"$ref": "#/$defs/Meta"}, {"type": "null"}]}},
+        "$defs": {"Meta": {"type": "object", "properties": {
+            "id": {"type": "integer"}, "flag": {"type": "string"}}}}});
+        let events = run_with(declared("f", tools), "", &[output]);
+        assert_eq!(bytes(&events), output);
+        assert_eq!(
+            arguments(&events),
+            value!({"tags": ["1234"], "meta": {"id": 7, "flag": "true"}})
+        );
+    }
 }
