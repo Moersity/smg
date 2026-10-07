@@ -4,9 +4,12 @@
 //! output text, its token ids, chunk plans, and the reference assistant message from the round trip
 //! through the checkpoint's template. This test replays every Qwen3-8B parse case through the
 //! Qwen3 table ([`qwen3()`]), folds the events into the assistant message with
-//! [`adapt::chat::message`], and compares it with the reference: whole, at every byte split, byte
-//! by byte, and on thirty seeded byte plans. Every replay also has to conserve the output's bytes
-//! across its events and agree with every other replay of the same case.
+//! [`adapt::chat::message`], and compares it with the reference: whole, character by character,
+//! on thirty seeded byte plans, and on the token-level chunk plans bellwether recorded with the
+//! case, each delta carrying its tokens' ids and pieces. Every replay also has to conserve the
+//! output's bytes across its events and agree with the whole one. An output of at most 256 bytes
+//! also replays at every two-way split; past that the set is linear in the output's length, so
+//! a case of any size replays forty-odd times.
 //!
 //! The run is opt-in: `BELLWETHER_FIXTURES` points at the `fixtures/` directory of a bellwether
 //! checkout; without it the test prints a skip notice and passes. A second parity test replays
@@ -55,6 +58,10 @@ use symphony::{
 };
 
 const FIXTURES_ENV: &str = "BELLWETHER_FIXTURES";
+/// Up to this many bytes an output is also replayed at every two-way split, which costs as many
+/// replays as it has characters; past it the sampled plans alone keep a case's cost linear in
+/// its size (a 252 KB swebench case took 80 minutes and 13 GB under every split).
+const EVERY_SPLIT_UP_TO: usize = 256;
 const SLUG: &str = "qwen3-8b";
 /// bellwether's slugs for the checkpoints the tables read, in its manifests' spelling, each with
 /// the table that reads it and how its template ends the generation prompt. The fixtures carry
@@ -860,48 +867,88 @@ fn parity(
     };
     let mut failures = Vec::new();
     let (mut bitwise, mut separators_only, mut listed, mut allowed_count) = (0, 0, 0, 0);
+    let (mut token_plans_run, mut without_pieces) = (0, 0);
     for fixture in fixtures {
         let text = fixture.reference.text.as_str();
         let expected = Said::of_reference(&fixture.reference);
-        let mut saids = Vec::new();
         let finish = engine_finish(&fixture.reference.finish_reason);
-        for plan in chunkings(text) {
-            let events = replay_after(
+        // The whole replay comes first; every other replay is checked against it as it is made,
+        // so a case holds one `Said` at a time however many plans it has.
+        let plans = chunkings(text, EVERY_SPLIT_UP_TO);
+        let replay_text = |cuts: &[usize], plan: &str| {
+            replay_after(
                 &mut new_parser(fixture),
                 &prompt_tail(fixture),
                 text,
-                &plan,
+                cuts,
                 &finish,
                 false,
             )
-            .unwrap_or_else(|e| panic!("{}: plan {plan:?}: {e}", fixture.id));
-            let conserved: String = events.iter().map(bytes_of).collect();
-            if conserved != text {
+            .unwrap_or_else(|e| panic!("{}: {plan} replay: {e}", fixture.id))
+        };
+        let said = checked(
+            fixture,
+            "whole",
+            &replay_text(&plans[0].1, "whole"),
+            &mut failures,
+        );
+        for (plan, cuts) in plans.iter().skip(1) {
+            if checked(fixture, plan, &replay_text(cuts, plan), &mut failures) != said {
                 failures.push(format!(
-                    "{}: bytes not conserved on plan {plan:?}",
+                    "{}: the {plan} replay disagrees with the whole one",
                     fixture.id
                 ));
             }
-            let mut index = 0;
-            for event in &events {
-                if let Event::ToolCallStart { index: i, id, .. } = event {
-                    if *i != index || *id != format!("call_{index}") {
-                        failures.push(format!(
-                            "{}: call index {i} / id {id} on plan {plan:?}",
-                            fixture.id
-                        ));
-                    }
-                    index += 1;
+        }
+        // The token plans need the pieces bellwether records with the case: one per id, giving
+        // back the text. A case that lacks them is counted, and one whose pieces are wrong is a
+        // failure of the fixture, not of the parser.
+        let pieces = match fixture.output_pieces.as_deref() {
+            None => {
+                without_pieces += 1;
+                None
+            }
+            Some(pieces) if pieces.len() != fixture.output_ids.len() => {
+                failures.push(format!(
+                    "{}: {} output_pieces for {} output_ids",
+                    fixture.id,
+                    pieces.len(),
+                    fixture.output_ids.len()
+                ));
+                None
+            }
+            Some(pieces) if pieces.concat() != text => {
+                failures.push(format!(
+                    "{}: the output_pieces do not give back the text",
+                    fixture.id
+                ));
+                None
+            }
+            Some(pieces) => Some(pieces),
+        };
+        if let Some(pieces) = pieces {
+            for (name, sizes) in token_plans(fixture) {
+                token_plans_run += 1;
+                let plan = format!("token plan {name}");
+                let events = replay_tokens(
+                    &mut new_parser(fixture),
+                    Input::Prompt {
+                        token_ids: &[],
+                        text: &prompt_tail(fixture),
+                    },
+                    &fixture.output_ids,
+                    pieces,
+                    &sizes,
+                    &finish,
+                )
+                .unwrap_or_else(|e| panic!("{}: {plan} replay: {e}", fixture.id));
+                if checked(fixture, &plan, &events, &mut failures) != said {
+                    failures.push(format!(
+                        "{}: the {plan} replay disagrees with the whole one",
+                        fixture.id
+                    ));
                 }
             }
-            saids.push(Said::of(&events));
-        }
-        let said = saids[0].clone();
-        if saids.iter().any(|s| *s != said) {
-            failures.push(format!(
-                "{}: the replays disagree with each other",
-                fixture.id
-            ));
         }
         let verdict = if said == expected {
             bitwise += 1;
@@ -965,7 +1012,8 @@ fn parity(
     }
     println!(
         "{} cases: {bitwise} bitwise, {separators_only} separators only, {listed} listed, \
-         {allowed_count} allowed for the corpus",
+         {allowed_count} allowed for the corpus; {token_plans_run} token plans replayed, \
+         {without_pieces} cases without output_pieces",
         fixtures.len()
     );
     failures
@@ -1188,8 +1236,15 @@ fn qwen3_token_plans_count_every_token_where_its_first_byte_lands() {
         );
         for (name, sizes) in token_plans(fixture) {
             let place = format!("{} plan {name}", fixture.id);
-            let events = replay_tokens(&fixture.output_ids, pieces, &sizes, &finish)
-                .unwrap_or_else(|e| panic!("{place}: {e}"));
+            let events = replay_tokens(
+                &mut Engine::new(qwen3(CallSyntax::Json), Declared::default()),
+                prompt(),
+                &fixture.output_ids,
+                pieces,
+                &sizes,
+                &finish,
+            )
+            .unwrap_or_else(|e| panic!("{place}: {e}"));
             let conserved: String = events.iter().map(bytes_of).collect();
             assert_eq!(conserved, text, "{place}: bytes conserved");
             let mut at = 0;
@@ -1301,18 +1356,44 @@ fn reasoning_oracle(text: &str, starts: &[usize]) -> usize {
         .count()
 }
 
+/// One replay's events checked: every output byte in exactly one event, and the calls indexed
+/// and named in order; what it said, for the comparison with the whole replay.
+fn checked(fixture: &Fixture, plan: &str, events: &[Event], failures: &mut Vec<String>) -> Said {
+    let conserved: String = events.iter().map(bytes_of).collect();
+    if conserved != fixture.reference.text {
+        failures.push(format!(
+            "{}: bytes not conserved on the {plan} replay",
+            fixture.id
+        ));
+    }
+    let mut index = 0;
+    for event in events {
+        if let Event::ToolCallStart { index: i, id, .. } = event {
+            if *i != index || *id != format!("call_{index}") {
+                failures.push(format!(
+                    "{}: call index {i} / id {id} on the {plan} replay",
+                    fixture.id
+                ));
+            }
+            index += 1;
+        }
+    }
+    Said::of(events)
+}
+
 /// Feed the output token by token as the plan `sizes` groups them, each delta carrying its tokens'
-/// ids and the span of each token's piece, after the prompt, then the end with the engine's
+/// ids and the span of each token's piece, after `prompt`, then the end with the engine's
 /// `finish`.
 fn replay_tokens(
+    parser: &mut dyn Parser,
+    prompt: Input<'_>,
     ids: &[u32],
     pieces: &[String],
     sizes: &[usize],
     finish: &EngineFinish,
 ) -> Result<Vec<Event>, ParseError> {
-    let mut parser = Engine::new(qwen3(CallSyntax::Json), Declared::default());
     let mut out = Events::new();
-    parser.feed(prompt(), &mut out)?;
+    parser.feed(prompt, &mut out)?;
     let mut first = 0;
     for &size in sizes {
         let last = (first + size).min(ids.len());
