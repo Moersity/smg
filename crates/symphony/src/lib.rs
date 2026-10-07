@@ -18,7 +18,7 @@
 //!
 //! Status: the public types below are the contract, [`adapt`] renders them for the Chat
 //! Completions, Responses and Messages APIs, streamed and whole, and [`Engine`] runs a [`Format`]
-//! table: the Qwen family's tables are in, the other families follow one table each.
+//! table: the tables in [`formats`] are the families recorded so far, and more follow.
 
 #![forbid(unsafe_code)]
 
@@ -37,7 +37,7 @@ pub mod tokens;
 pub use engine::Engine;
 pub use event::{DropReason, Event, Events, FinishReason, MalformedReason, Text};
 pub use format::{CallSyntax, Emits, Format};
-pub use formats::{qwen2_5, qwen3};
+pub use formats::{deepseek_v4_1, qwen2_5, qwen3};
 pub use input::{EngineFinish, Input, TokenSpan};
 pub use markers::{Piece, Scanner};
 pub use parser::{ParseError, Parser};
