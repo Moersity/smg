@@ -47,7 +47,7 @@ use openai_protocol::common::Tool;
 use serde::Deserialize;
 use symphony::{
     adapt,
-    formats::{deepseek_v4_1, qwen2_5, qwen3},
+    formats::{deepseek_v4_1, qwen2_5, qwen3, seed_oss},
     CallSyntax, Declared, DropReason, Engine, EngineFinish, Event, Events, Input, ParseError,
     Parser, TokenSpan,
 };
@@ -57,9 +57,8 @@ const SLUG: &str = "qwen3-8b";
 /// bellwether's slugs for the checkpoints the tables read, in its manifests' spelling, each with
 /// the table that reads it and how its template ends the generation prompt. The fixtures carry
 /// the request and the output, not the rendered prompt, so the prompt's tail is stated here until
-/// bellwether records it (noted for Simo in STATE.md). A slug bellwether has not recorded is
-/// skipped with a notice; `qwen3-8b` is the one set bellwether's main always holds, and has its
-/// own test.
+/// bellwether records it. A slug bellwether has not recorded is skipped with a notice; `qwen3-8b`
+/// is the one set bellwether's main always holds, and has its own test.
 const MODELS: &[(&str, Family, GenerationPrompt)] = &[
     // Qwen3: the model writes its own `<think>`; thinking off closes it in the prompt.
     (
@@ -256,6 +255,65 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         Family::DeepSeekV4_1,
         GenerationPrompt::OpensTheThought,
     ),
+    // Other families that write Qwen's syntaxes, each as its own template spells the thought.
+    (
+        "webworld-32b",
+        Family::Qwen3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "webworld-14b",
+        Family::Qwen3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "k-exaone-236b-a23b",
+        Family::Qwen3,
+        GenerationPrompt::OpensTheThought,
+    ),
+    ("hermes-4-14b", Family::Qwen2_5, GenerationPrompt::Plain),
+    ("granite-4.1-3b", Family::Qwen2_5, GenerationPrompt::Plain),
+    ("ai21-jamba2-3b", Family::Qwen2_5, GenerationPrompt::Plain),
+    (
+        "step-3.5-flash",
+        Family::Qwen3Tagged,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    (
+        "nanbeige4.2-3b",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "mimo-v2.5",
+        Family::Qwen3Tagged,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "nvidia-nemotron-3-nano-30b-a3b-bf16",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "seed-oss-36b-instruct",
+        Family::SeedOss,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+];
+
+/// The turn opener a model's own chat template writes, for a model that reads another family's
+/// table: the opener is the template's, not the table's, so the prompt's replay has to start at
+/// the model's own. K-EXAONE writes Qwen3's markers under its own template, Granite 4.1 Qwen2.5's;
+/// every other recorded model renders `<|im_start|>assistant` or its own table's opener. The
+/// replay below feeds only the generation prompt's tail, so it does not check these spellings:
+/// they were measured against the templates' rendered prompts (smg #2841, Alex's probes), and
+/// `formats/qwen3.rs` holds the K-EXAONE shape as a test.
+const OPENERS: &[(&str, &str)] = &[
+    ("k-exaone-236b-a23b", "<|assistant|>"),
+    (
+        "granite-4.1-3b",
+        "<|start_of_role|>assistant<|end_of_role|>",
+    ),
 ];
 
 /// The table that reads a checkpoint's output.
@@ -269,19 +327,31 @@ enum Family {
     Qwen2_5,
     /// [`deepseek_v4_1`]: DSML, whose parameter tags type their own values.
     DeepSeekV4_1,
+    /// [`seed_oss`]: the tagged syntax under Seed-OSS's markers, typed by the request tools.
+    SeedOss,
 }
 
 /// How the Qwen tables spell the thought's markers, for the reasoning allowance's guard.
 const THINK_MARKERS: (&str, &str) = ("<think>", "</think>");
 
 impl Family {
-    fn engine(self, fixture: &Fixture) -> Engine {
-        let declared = Declared::of(&fixture.request.tools);
+    /// The engine for one of the model's cases: the family's table, with the model's own turn
+    /// opener when its template is not the table's ([`OPENERS`]), and the case's tools.
+    fn engine(self, slug: &str, fixture: &Fixture) -> Engine {
+        let mut format = self.format();
+        if let Some((_, opener)) = OPENERS.iter().find(|(model, _)| *model == slug) {
+            format = format.opens_turn(opener);
+        }
+        Engine::new(format, Declared::of(&fixture.request.tools))
+    }
+
+    fn format(self) -> symphony::Format {
         match self {
-            Self::Qwen3 => Engine::new(qwen3(CallSyntax::Json), declared),
-            Self::Qwen3Tagged => Engine::new(qwen3(CallSyntax::Tagged), declared),
-            Self::Qwen2_5 => Engine::new(qwen2_5(), declared),
-            Self::DeepSeekV4_1 => Engine::new(deepseek_v4_1(), declared),
+            Self::Qwen3 => qwen3(CallSyntax::Json),
+            Self::Qwen3Tagged => qwen3(CallSyntax::Tagged),
+            Self::Qwen2_5 => qwen2_5(),
+            Self::DeepSeekV4_1 => deepseek_v4_1(),
+            Self::SeedOss => seed_oss(),
         }
     }
 
@@ -292,12 +362,15 @@ impl Family {
         let list = match self {
             Self::Qwen3 | Self::Qwen2_5 => KNOWN_DIFFERENCES,
             Self::Qwen3Tagged => KNOWN_TAGGED_DIFFERENCES,
+            // Seed-OSS reads neither of the probes' Qwen markers: `</think>` stays reasoning text
+            // and the fenced `<tool_call>` block stays content, as the reference says.
+            Self::SeedOss => &[],
             Self::DeepSeekV4_1 => KNOWN_DSML_DIFFERENCES,
         };
         // A template without a thought leaves the reasoning out, so the marker inside it is never
         // read; that case falls under the reasoning allowance instead of the list.
         match prompt {
-            GenerationPrompt::Plain => &list[1..],
+            GenerationPrompt::Plain => list.get(1..).unwrap_or(&[]),
             _ => list,
         }
     }
@@ -311,7 +384,7 @@ impl Family {
             return Vec::new();
         }
         let mut allowed = Vec::new();
-        if self == Self::Qwen3Tagged {
+        if matches!(self, Self::Qwen3Tagged | Self::SeedOss) {
             allowed.push(Allowance::DeclaredTypeConflict);
         }
         if prompt == GenerationPrompt::Plain {
@@ -612,7 +685,7 @@ fn qwen3_parse_fixtures_match_the_reference() {
     );
     let failures = parity(
         &fixtures,
-        &|fixture| Family::Qwen3.engine(fixture),
+        &|fixture| Family::Qwen3.engine(SLUG, fixture),
         &|_| "",
         KNOWN_DIFFERENCES,
         &[],
@@ -647,7 +720,7 @@ fn every_recorded_qwen_model_parses_like_its_reference() {
         println!("{slug} ({family:?}, {prompt:?}):");
         failures.extend(parity(
             &fixtures,
-            &|fixture| family.engine(fixture),
+            &|fixture| family.engine(slug, fixture),
             &|fixture| prompt.tail(fixture),
             family.known_differences(prompt),
             &family.allowances(slug, prompt),
