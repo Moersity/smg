@@ -60,6 +60,7 @@ use crate::{
     json,
     markers::{Piece, Scanner},
     parser::{ParseError, Parser},
+    pythonic,
     tagged::{self, Declared},
     tokens::Ledger,
 };
@@ -101,6 +102,7 @@ enum Call {
     Tagged(tagged::Assembler),
     Dsml(tagged::dsml::Assembler),
     Keyed(tagged::keyed::Assembler),
+    Pythonic(pythonic::Assembler),
 }
 
 impl Call {
@@ -115,6 +117,7 @@ impl Call {
             Some(CallSyntax::Keyed(tags)) => {
                 Self::Keyed(tagged::keyed::Assembler::new(index, id, tags))
             }
+            Some(CallSyntax::Pythonic) => Self::Pythonic(pythonic::Assembler::new(index)),
         }
     }
 
@@ -130,15 +133,10 @@ impl Call {
                 assembler.feed(text, declared, out);
                 text.len()
             }
-        }
-    }
-
-    fn started(&self) -> bool {
-        match self {
-            Self::Json(assembler) => assembler.started(),
-            Self::Tagged(assembler) => assembler.started(),
-            Self::Dsml(assembler) => assembler.started(),
-            Self::Keyed(assembler) => assembler.started(),
+            Self::Pythonic(assembler) => {
+                assembler.feed(text, out);
+                text.len()
+            }
         }
     }
 
@@ -170,6 +168,9 @@ impl Call {
                 return true;
             }
             (Self::Keyed(assembler), Closed::ByEnd) => assembler.finish(out),
+            // The region's marker belongs to the region, not to its last call.
+            (Self::Pythonic(assembler), Closed::ByMarker) => assembler.close(out),
+            (Self::Pythonic(assembler), Closed::ByEnd) => assembler.finish(out),
         }
         false
     }
@@ -246,9 +247,7 @@ impl Engine {
                 };
                 let mut assembled = Events::new();
                 let taken = call.feed(text, &self.declared, &mut assembled);
-                for event in assembled.drain() {
-                    out.push(self.tokens.relabel(event));
-                }
+                self.push_call_events(assembled, out);
                 self.wrapping(&text[taken..], TEXT_AFTER_THE_OBJECT, out);
             }
             Emits::Wrapper => self.wrapping(text, TEXT_BETWEEN_CALLS, out),
@@ -320,8 +319,8 @@ impl Engine {
         self.state = next;
     }
 
-    /// The next call takes the next free index; the index is spent only if the region produces a
-    /// call, so a `<tool_call>` block that held no call does not count and does not leave a gap.
+    /// The next call takes the next free index; the index is spent only when a call starts, so a
+    /// `<tool_call>` block that held no call does not count and does not leave a gap.
     fn open_call(&mut self) {
         self.call = Some(Call::new(self.format.call_syntax().copied(), self.calls));
     }
@@ -334,31 +333,38 @@ impl Engine {
         let Some(call) = self.call.take() else {
             return false;
         };
-        let started_before = call.started();
         let mut finished = Events::new();
         let taken = call.end(closed, terminal, &mut finished);
-        let finished = finished.drain();
-        // A keyed call with no arguments is named only at its end, so the end's events count too.
-        let started_at_the_end = finished
-            .iter()
-            .any(|event| matches!(event, Event::ToolCallStart { .. }));
-        if started_before || started_at_the_end {
-            self.calls += 1;
+        if closed == Closed::ByMarker {
+            let mut renamed = Events::new();
+            for event in finished.drain() {
+                renamed.push(match event {
+                    Event::Malformed {
+                        text,
+                        why: MalformedReason::UnterminatedRegion,
+                    } => Event::Malformed {
+                        text,
+                        why: MalformedReason::Other(BLOCK_WITHOUT_A_COMPLETE_CALL.to_string()),
+                    },
+                    event => event,
+                });
+            }
+            finished = renamed;
         }
-        for event in finished {
-            let event = match event {
-                Event::Malformed {
-                    text,
-                    why: MalformedReason::UnterminatedRegion,
-                } if closed == Closed::ByMarker => Event::Malformed {
-                    text,
-                    why: MalformedReason::Other(BLOCK_WITHOUT_A_COMPLETE_CALL.to_string()),
-                },
-                event => event,
-            };
+        self.push_call_events(finished, out);
+        taken
+    }
+
+    /// Pushes a call's events with their tokens counted, and counts each call that starts: the
+    /// index the next call takes, and `Finish::tool_calls`. A syntax that writes several calls in
+    /// one region starts each of them here.
+    fn push_call_events(&mut self, mut events: Events, out: &mut Events) {
+        for event in events.drain() {
+            if matches!(event, Event::ToolCallStart { .. }) {
+                self.calls += 1;
+            }
             out.push(self.tokens.relabel(event));
         }
-        taken
     }
 
     /// Where the prompt leaves the engine: its terminals replayed over the table from the initial
