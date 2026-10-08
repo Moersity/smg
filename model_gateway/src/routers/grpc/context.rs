@@ -13,6 +13,7 @@ use openai_protocol::{
     chat::{ChatCompletionRequest, ChatCompletionResponse},
     classify::{ClassifyRequest, ClassifyResponse},
     completion::{CompletionRequest, CompletionResponse},
+    decisions::{DecisionResponse, DecisionsRequest},
     embedding::{EmbeddingRequest, EmbeddingResponse},
     generate::{GenerateRequest, GenerateResponse},
     messages::{CreateMessageRequest, Message},
@@ -35,6 +36,7 @@ use super::{
         EncodeItemBootstrapInfo, ProtoEmbedComplete, ProtoEmbedRequest, ProtoGenerateRequest,
         ProtoInputLogProbs, ProtoRequest, ProtoStream,
     },
+    regular::stages::decisions::scoring::{DecisionPrompt, DecisionScoring},
     spec::ResponseSpec,
     utils::ParserResolver,
 };
@@ -84,6 +86,7 @@ pub(crate) enum RequestType {
     Responses(Arc<ResponsesRequest>),
     Embedding(Arc<EmbeddingRequest>),
     Classify(Arc<ClassifyRequest>),
+    Decisions(Arc<DecisionsRequest>),
     Messages(Arc<CreateMessageRequest>),
     /// Audio transcription: the request plus its uploaded audio. The
     /// preparation stage turns these into a chat-shaped backend request
@@ -114,6 +117,7 @@ impl RequestType {
             Self::Responses(request) => replace(&mut Arc::make_mut(request).model, model_id),
             Self::Embedding(request) => replace(&mut Arc::make_mut(request).model, model_id),
             Self::Classify(request) => replace(&mut Arc::make_mut(request).model, model_id),
+            Self::Decisions(request) => replace(&mut Arc::make_mut(request).model, model_id),
             Self::Messages(request) => replace(&mut Arc::make_mut(request).model, model_id),
             Self::Transcription { request, .. } => {
                 replace(&mut Arc::make_mut(request).model, model_id);
@@ -131,7 +135,7 @@ impl RequestType {
             Self::Embedding(r) => r.rid.as_deref(),
             Self::Classify(r) => r.rid.as_deref(),
             Self::Messages(r) => r.rid.as_deref(),
-            Self::Responses(_) | Self::Transcription { .. } => None,
+            Self::Responses(_) | Self::Decisions(_) | Self::Transcription { .. } => None,
         }
     }
 }
@@ -145,6 +149,7 @@ impl std::fmt::Display for RequestType {
             Self::Responses(_) => write!(f, "Responses"),
             Self::Embedding(_) => write!(f, "Embedding"),
             Self::Classify(_) => write!(f, "Classify"),
+            Self::Decisions(_) => write!(f, "Decisions"),
             Self::Messages(_) => write!(f, "Messages"),
             Self::Transcription { .. } => write!(f, "Transcription"),
         }
@@ -159,6 +164,7 @@ impl std::fmt::Display for FinalResponse {
             Self::Completion(_) => write!(f, "Completion"),
             Self::Embedding(_) => write!(f, "Embedding"),
             Self::Classify(_) => write!(f, "Classify"),
+            Self::Decisions(_) => write!(f, "Decisions"),
             Self::Messages(_) => write!(f, "Messages"),
             Self::Transcription { .. } => write!(f, "Transcription"),
         }
@@ -484,6 +490,10 @@ impl ExecutionPlan {
 /// Each request type produces its own variant, eliminating optional fields
 /// that are always None for certain pipelines.
 pub(crate) enum PreparationOutput {
+    Decisions {
+        items: Vec<DecisionPrompt>,
+        scoring: DecisionScoring,
+    },
     Chat {
         token_ids: Vec<u32>,
         processed_messages: super::ProcessedMessages,
@@ -544,6 +554,9 @@ impl PreparationOutput {
     /// first prompt's tokens as the routing-affinity proxy.
     pub fn token_ids(&self) -> &[u32] {
         match self {
+            Self::Decisions { items, .. } => {
+                items.first().map_or(&[], |item| item.token_ids.as_slice())
+            }
             Self::Chat { token_ids, .. }
             | Self::Messages { token_ids, .. }
             | Self::Transcription { token_ids, .. }
@@ -562,6 +575,7 @@ impl PreparationOutput {
     /// request's real input cost is the sum of every prompt in the batch.
     pub fn total_input_token_count(&self) -> usize {
         match self {
+            Self::Decisions { items, .. } => items.iter().map(|item| item.token_ids.len()).sum(),
             Self::Completion { items, .. } => items.iter().map(|item| item.token_ids.len()).sum(),
             other => other.token_ids().len(),
         }
@@ -572,6 +586,11 @@ impl PreparationOutput {
     /// engine request, so the window applies per item, not to their sum.
     pub fn max_input_token_count(&self) -> usize {
         match self {
+            Self::Decisions { items, .. } => items
+                .iter()
+                .map(|item| item.token_ids.len())
+                .max()
+                .unwrap_or(0),
             Self::Completion { items, .. } => items
                 .iter()
                 .map(|item| item.token_ids.len())
@@ -585,6 +604,7 @@ impl PreparationOutput {
     /// Chat/Messages borrow from processed_messages.text to avoid a redundant clone.
     pub fn routing_text(&self) -> Option<&str> {
         match self {
+            Self::Decisions { items, .. } => items.first().map(|item| item.text.as_str()),
             Self::Chat {
                 processed_messages, ..
             }
@@ -780,7 +800,9 @@ impl RequestContext {
             // preparation by capability check, never handed off here.
             RequestType::Transcription { .. } => false,
             // Embeddings and classification never stream.
-            RequestType::Embedding(_) | RequestType::Classify(_) => false,
+            RequestType::Embedding(_) | RequestType::Classify(_) | RequestType::Decisions(_) => {
+                false
+            }
         };
         Self {
             input: RequestInput {
@@ -829,6 +851,7 @@ impl RequestContext {
             RequestType::Responses(req) => req.model.clone(),
             RequestType::Embedding(req) => req.model.clone(),
             RequestType::Classify(req) => req.model.clone(),
+            RequestType::Decisions(req) => req.model.clone(),
             RequestType::Messages(req) => req.model.clone(),
             RequestType::Transcription { request, .. } => request.model.clone(),
         };
@@ -952,6 +975,21 @@ impl RequestContext {
     ) -> Self {
         Self::new(
             RequestType::Responses(request),
+            headers,
+            model_id,
+            components,
+        )
+    }
+
+    /// Create context for a Decisions scoring request.
+    pub fn for_decisions(
+        request: Arc<DecisionsRequest>,
+        headers: Option<HeaderMap>,
+        model_id: String,
+        components: Arc<SharedComponents>,
+    ) -> Self {
+        Self::new(
+            RequestType::Decisions(request),
             headers,
             model_id,
             components,
@@ -1296,6 +1334,7 @@ pub(crate) struct PdTiming {
 /// Final processed response
 #[derive(Debug)]
 pub(crate) enum FinalResponse {
+    Decisions(DecisionResponse),
     Chat(ChatCompletionResponse),
     /// Generate response is a Vec of GenerateResponse (n=1 returns single item, n>1 returns multiple)
     Generate(Vec<GenerateResponse>),
