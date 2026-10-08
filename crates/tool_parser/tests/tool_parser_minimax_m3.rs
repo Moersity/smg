@@ -1523,7 +1523,10 @@ async fn test_m3_empty_container_recovery_requires_schema_and_parent_close() {
         }];
         let text = tool_block(&[(
             "test",
-            format!("{NS}<parent>{NS}<empty>{content}{NS}</{close}>"),
+            format!(
+                "{}{NS}<parent>{NS}<empty>{content}{NS}</{close}>",
+                element("before", "kept")
+            ),
         )]);
         let (_, calls) = MinimaxM3Parser::new()
             .parse_complete_with_tools(&text, &tools)
@@ -1560,14 +1563,13 @@ async fn test_m3_empty_container_recovery_requires_schema_and_parent_close() {
                 }
             }
             normal.push_str(&parser.take_unstreamed_normal_text());
-            assert_eq!(
-                normal,
-                if recover && !supplied_tools.is_empty() {
-                    ""
-                } else {
-                    &text
-                }
-            );
+            // The header has already announced the call. Rejected invokes
+            // must stay incomplete rather than being replayed as normal text.
+            assert!(normal.is_empty());
+            assert!(arguments.starts_with(r#"{"before":"kept""#));
+            if !recover || supplied_tools.is_empty() {
+                assert_eq!(arguments, r#"{"before":"kept""#);
+            }
             assert_eq!(
                 serde_json::from_str::<serde_json::Value>(&arguments).is_ok(),
                 recover && !supplied_tools.is_empty()
@@ -1676,16 +1678,24 @@ async fn test_m3_composed_container_recovery_rejects_ambiguous_schemas() {
         assert!(calls.is_empty(), "{schema}");
         let mut parser = MinimaxM3Parser::new();
         let mut normal = String::new();
+        let mut arguments = String::new();
+        let mut names = Vec::new();
         for ch in text.chars() {
             let result = parser
                 .parse_incremental(&ch.to_string(), &tools)
                 .await
                 .unwrap();
-            assert!(result.calls.is_empty(), "{schema}");
+            for call in result.calls {
+                assert_eq!(call.tool_index, 0);
+                names.extend(call.name);
+                arguments.push_str(&call.parameters);
+            }
             normal.push_str(&result.normal_text);
         }
         normal.push_str(&parser.take_unstreamed_normal_text());
-        assert_eq!(normal, text, "{schema}");
+        assert!(normal.is_empty(), "{schema}");
+        assert_eq!(names, ["test"]);
+        assert!(arguments.is_empty(), "{schema}");
     }
 }
 

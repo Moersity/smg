@@ -207,6 +207,7 @@ impl MinimaxM3Parser {
     fn advance_streaming_element(
         buffer: &mut String,
         element: &mut StreamingElement,
+        params_schema: Option<&Value>,
     ) -> ElementProgress {
         loop {
             let Some(namespace_pos) = buffer.find(NAMESPACE) else {
@@ -247,7 +248,33 @@ impl MinimaxM3Parser {
             if let Some(close_name) = tag.strip_prefix('/') {
                 let close_name = close_name.trim();
                 if element.stack.last().map(|frame| frame.name.as_str()) != Some(close_name) {
-                    return ElementProgress::Malformed;
+                    // Match complete parsing: only a schema-declared empty
+                    // container may omit its close immediately before its parent.
+                    let mut schema = params_schema;
+                    for frame in &element.stack {
+                        schema = Self::child_schema(schema, &frame.name);
+                    }
+                    let recover = element.stack.len() >= 2
+                        && element.stack[element.stack.len() - 2].name == close_name
+                        && element.stack.last().is_some_and(|frame| {
+                            frame.text.trim().is_empty()
+                                && frame.children.is_empty()
+                                && matches!(Self::schema_type(schema), Some("array" | "object"))
+                        });
+                    if !recover {
+                        return ElementProgress::Malformed;
+                    }
+                    let Some(frame) = element.stack.pop() else {
+                        return ElementProgress::Malformed;
+                    };
+                    let Some(parent) = element.stack.last_mut() else {
+                        return ElementProgress::Malformed;
+                    };
+                    parent
+                        .children
+                        .push((frame.name, ParamValue::Text(frame.text)));
+                    // The parent consumes its own closing marker next.
+                    continue;
                 }
                 buffer.drain(..consumed);
                 let Some(mut frame) = element.stack.pop() else {
@@ -479,16 +506,21 @@ impl MinimaxM3Parser {
             return None;
         }
         let body_start = ELEMENT_START.len() + gt + 1;
+        let schema = Self::child_schema(parent_schema, &name);
+        let (value, body_consumed) =
+            Self::parse_element_body(&input[body_start..], &name, schema, parent_name)?;
+        Some((name, value, body_start + body_consumed))
+    }
+
+    /// Resolve an element schema identically for complete and streaming parsing.
+    fn child_schema<'a>(parent_schema: Option<&'a Value>, name: &str) -> Option<&'a Value> {
         let parent_schema = Self::container_schema(parent_schema).or(parent_schema);
         let schema = if Self::schema_type(parent_schema) == Some("array") {
             parent_schema.and_then(|schema| schema.get("items"))
         } else {
-            Self::property_schema(parent_schema, &name)
+            Self::property_schema(parent_schema, name)
         };
-        let schema = Self::container_schema(schema).or(schema);
-        let (value, body_consumed) =
-            Self::parse_element_body(&input[body_start..], &name, schema, parent_name)?;
-        Some((name, value, body_start + body_consumed))
+        Self::container_schema(schema).or(schema)
     }
 
     /// Preserve mixed text content under a reserved object field, avoiding a
@@ -804,7 +836,13 @@ impl ToolParser for MinimaxM3Parser {
             if self.current_function_name.is_some() {
                 if self.active_element.is_some() {
                     let progress = match self.active_element.as_mut() {
-                        Some(element) => Self::advance_streaming_element(&mut self.buffer, element),
+                        Some(element) => {
+                            let schema = Self::tool_schema(
+                                tools,
+                                self.current_function_name.as_deref().unwrap_or_default(),
+                            );
+                            Self::advance_streaming_element(&mut self.buffer, element, schema)
+                        }
                         None => ElementProgress::Incomplete,
                     };
                     match progress {
