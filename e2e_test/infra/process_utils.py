@@ -194,6 +194,47 @@ def gpu_memory_used_mib(gpu_ids: list[int]) -> dict[int, int] | None:
     return used
 
 
+def gpu_compute_apps(gpu_ids: list[int]) -> dict[int, list[tuple[int, int | None]]] | None:
+    """Compute processes ``nvidia-smi`` lists on each GPU: ``(pid, used MiB)``.
+
+    Only a non-empty list says anything. Inside a job container ``nvidia-smi``
+    can list nothing while workers hold contexts, or list the host's PIDs, so
+    an empty list does not show that the memory belongs to an exited process.
+    ``used`` is ``None`` when the driver withholds the figure. ``None`` overall
+    when ``nvidia-smi`` is unavailable.
+    """
+    apps: dict[int, list[tuple[int, int | None]]] = {}
+    for gpu in gpu_ids:
+        try:
+            out = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-compute-apps=pid,used_memory",
+                    "--format=csv,noheader,nounits",
+                    "-i",
+                    str(gpu),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=True,
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            return None
+        rows: list[tuple[int, int | None]] = []
+        for line in out.splitlines():
+            parts = [part.strip() for part in line.split(",")]
+            if len(parts) != 2:
+                continue
+            try:
+                pid = int(parts[0])
+            except ValueError:
+                continue
+            rows.append((pid, int(parts[1]) if parts[1].isdigit() else None))
+        apps[gpu] = rows
+    return apps
+
+
 def wait_for_gpu_memory_release(
     gpu_ids: list[int],
     baseline: dict[int, int],
