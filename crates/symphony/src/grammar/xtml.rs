@@ -25,8 +25,9 @@ use openai_protocol::common::Tool;
 use serde_json::Value;
 
 use super::{
-    schema::{shape, Definitions},
-    CallMarkers, Grammar, Tag, WayIn,
+    block_of,
+    schema::{self, shape, Definitions},
+    CallMarkers, Grammar, WayIn,
 };
 
 const OPEN: &str = "<|open|>";
@@ -51,21 +52,7 @@ pub(super) fn calls(
             .collect(),
     );
     let content = Grammar::Plus(Box::new(one_call));
-    let tags = ways_in
-        .iter()
-        .map(|way| Tag::new(way.begin(), content.clone(), block.close))
-        .collect();
-    let mut triggers: Vec<String> = Vec::new();
-    for trigger in ways_in.iter().map(WayIn::trigger) {
-        if !triggers.iter().any(|known| known == trigger) {
-            triggers.push(trigger.to_string());
-        }
-    }
-    Some(Grammar::TriggeredTags {
-        triggers,
-        tags,
-        at_least_one,
-    })
+    Some(block_of(ways_in, content, block.close, at_least_one))
 }
 
 /// One call: the call's opener and the tool's name, its index, the arguments and the call's close.
@@ -82,32 +69,9 @@ fn call(markers: &CallMarkers<'_>, name: &str, parameters: &Value) -> Grammar {
 /// The arguments the tool's schema asks for: one tag per property, in the schema's order, each
 /// optional unless required; any arguments at all for a schema without properties.
 fn arguments(parameters: &Value) -> Grammar {
-    let properties = parameters
-        .get("properties")
-        .and_then(Value::as_object)
-        .filter(|properties| !properties.is_empty());
-    let Some(properties) = properties else {
-        return Grammar::Star(Box::new(any_argument()));
-    };
-    let required: Vec<&str> = parameters
-        .get("required")
-        .and_then(Value::as_array)
-        .map(|names| names.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default();
-    let definitions = Definitions::of(parameters);
-    Grammar::Sequence(
-        properties
-            .iter()
-            .map(|(key, schema)| {
-                let tag = argument(key, schema, definitions);
-                if required.contains(&key.as_str()) {
-                    tag
-                } else {
-                    Grammar::Optional(Box::new(tag))
-                }
-            })
-            .collect(),
-    )
+    schema::arguments(parameters, argument, || {
+        Grammar::Star(Box::new(any_argument()))
+    })
 }
 
 /// One argument tag: the key, the type the property's schema pins and a value of that type, or
