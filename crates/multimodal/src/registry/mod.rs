@@ -31,8 +31,8 @@ use qwen3_vl::Qwen3VLVisionSpec;
 use qwen_vl::QwenVLVisionSpec;
 // Re-export public API from traits.
 pub use traits::{
-    MediaPartOrder, ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult,
-    Tokenizer,
+    MediaItemInfo, MediaPartOrder, ModelMetadata, ModelProcessorSpec, ModelRegistryError,
+    RegistryResult, Tokenizer,
 };
 
 pub struct ModelRegistry {
@@ -164,7 +164,7 @@ pub(super) mod test_helpers {
     ) -> PreprocessedEncoderInputs {
         let sizes: Vec<(u32, u32)> = item_sizes.iter().map(|s| (s.height, s.width)).collect();
         PreprocessedEncoderInputs {
-            encoder_input: ndarray::ArrayD::zeros(vec![1, 3, 336, 336]),
+            encoder_input: ndarray::ArrayD::<f32>::zeros(vec![1, 3, 336, 336]).into(),
             feature_token_counts: feature_token_counts.to_vec(),
             item_sizes: sizes,
             model_specific: HashMap::new(),
@@ -191,7 +191,7 @@ pub(super) mod test_helpers {
             },
         );
         PreprocessedEncoderInputs {
-            encoder_input: ndarray::ArrayD::zeros(vec![1, 3, 336, 336]),
+            encoder_input: ndarray::ArrayD::<f32>::zeros(vec![1, 3, 336, 336]).into(),
             feature_token_counts: vec![0; sizes.len()],
             item_sizes: sizes,
             model_specific,

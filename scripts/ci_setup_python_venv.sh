@@ -31,8 +31,7 @@ HOST_VERSION="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.ve
 # downstream step (the GITHUB_PATH entry below, pip installs, pytest) uses the
 # baked interpreter + packages transparently. Adoption is conditional on the
 # interpreter matching the pin: a stale image falls through to a fresh venv
-# here, and scripts/ci_install_tokenspeed.sh then rebuilds from source — slow
-# but correct, never silently broken.
+# here, and scripts/ci_install_tokenspeed.sh installs nightly wheels.
 ADOPTED_VENV=""
 if [ -n "${SMG_BAKED_VENV:-}" ] && [ -x "${SMG_BAKED_VENV}/bin/python" ]; then
     BAKED_VERSION="$("${SMG_BAKED_VENV}/bin/python" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
@@ -106,6 +105,18 @@ echo "venv interpreter: $ACTUAL_VERSION (pinned)"
 if [ -n "${GITHUB_PATH:-}" ]; then
     echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
     echo "CUDA_HOME=/usr/local/cuda" >> "$GITHUB_ENV"
+    # Expose the host CUDA toolkit when there is one. vLLM only enables its
+    # FlashInfer paths when `nvcc` is on PATH (or flashinfer-cubin is installed,
+    # which no longer ships for current FlashInfer releases); the pip
+    # nvidia-cuda-nvcc wheel lands under site-packages, where shutil.which never
+    # looks. With the toolkit installed but off PATH, a bare-metal runner runs
+    # every lane with FlashInfer silently disabled, and vLLM 0.27.1's MXFP8
+    # kernel selector then picks a FlashInfer kernel it cannot run
+    # ("module 'vllm.utils.flashinfer' has no attribute 'mm_mxfp8'"). The k8s
+    # GPU images ship the CUDA runtime but no toolkit, so this is a no-op there.
+    if [ -x /usr/local/cuda/bin/nvcc ]; then
+        echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
+    fi
 else
     echo "Activate venv with: source .venv/bin/activate"
 fi

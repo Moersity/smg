@@ -58,15 +58,15 @@ Key env knobs for `launch_arm.sh`: `BFCL_GPU` (CUDA_VISIBLE_DEVICES, e.g. `0,1`)
 
 `run_ab.py` exits non-zero if the candidate's overall accuracy drops more than `--tolerance` (default 2pp) below the baseline.
 
-## Per-model parser flags (the nightly matrix)
+## Per-model parser flags (the weekly matrix)
 
 | model (matrix leg) | runner | TP/arm | pure-vLLM `--tool-call-parser` / `--reasoning-parser` | SMG `--tool-call-parser` / `--reasoning-parser` |
 |---|---|---|---|---|
 | Qwen3.8-27B (`qwen3.8`) | `4-gpu-h100` | 2 | `qwen3_xml` / `qwen3` | `qwen_xml` / `qwen3` |
 | gpt-oss-120b (`gpt-oss`) | `4-gpu-h100` | 2 | `openai` / — | _(none — SMG auto-routes harmony)_ / — |
 | DeepSeek-V4.1-Flash (`deepseek-v4.1`) | `blackwell` | 8 (seq) | `deepseek_v41` / `deepseek_v41` (+`--tokenizer-mode deepseek_v41 --trust-remote-code`; per-commit vLLM main wheel) | `deepseek_v41` / `deepseek_v41` |
-| MiniMax-M2.7 (`minimax-m2.7`) | `blackwell` | 4 | `minimax_m2` / `minimax_m2` (+`--trust-remote-code`) | `minimax_m2` / `minimax` |
-| Kimi-K2.6 int4 (`kimi-k2.6`) | `blackwell` | 4 | `kimi_k2` / `kimi_k2` (+`--trust-remote-code`) | `kimik2` / `kimi_k25`† |
+| MiniMax-M3 MXFP8 (`minimax-m3`) | `blackwell` | 4 | `minimax_m3` / `minimax_m3` (+`--trust-remote-code --block-size 128 --attention_config.indexer_kv_dtype fp8`) | `minimax_m3` / `minimax_m3` |
+| GLM-5.3-Flash (`glm-5.3-flash`) | `blackwell` | 4 | `glm47` / `glm45` (+`--trust-remote-code --kv-cache-dtype fp8`; per-commit vLLM main wheel) | `glm47_moe` / `glm45` |
 
 > **gpt-oss has no SMG tool-call-parser.** SMG handles gpt-oss through its harmony
 > pipeline (`model_gateway/src/routers/grpc/harmony/`), auto-activated by
@@ -75,22 +75,20 @@ Key env knobs for `launch_arm.sh`: `BFCL_GPU` (CUDA_VISIBLE_DEVICES, e.g. `0,1`)
 > `—` in **both** reasoning-parser columns for gpt-oss is likewise intentional:
 > harmony carries its own reasoning channel, so neither arm sets a reasoning parser.
 >
-> **† Reasoning-parser fallbacks.** SMG's reasoning registry has no `kimi_k2` entry
-> yet; the closest existing parser (`kimi_k25`) is used. Confirm on the first
-> nightly; adding exact parsers to `crates/reasoning_parser` is a follow-up if
-> outputs diverge.
->
 > The mid-2026 SKU ids and a couple of vLLM parser names may shift; confirm against
 > the installed vLLM build: `vllm serve --help | grep -A40 tool-call-parser`.
 
 ## Matrix & runners
 
-The nightly (`.github/workflows/nightly-bfcl.yml`) runs the A/B as a GitHub Actions
-matrix — one leg per model, `fail-fast: false`, each on its own runner:
+The weekly run (`.github/workflows/nightly-bfcl.yml`, Mondays 07:17 UTC) runs the A/B as
+a GitHub Actions matrix — one leg per model, `fail-fast: false`, each on its own runner:
 
 - `4-gpu-h100` — Qwen3.8-27B and gpt-oss-120b, TP=2 per arm (GPUs 0,1 + 2,3).
-- `blackwell` (B200) — MiniMax-M2.7 and Kimi-K2.6 int4, TP=4 per arm (GPUs 0-3 + 4-7);
-  DeepSeek-V4.1-Flash and GLM-5.2-FP8 need the whole node (TP=8, arms sequential).
+- `blackwell` (B200) — MiniMax-M3 MXFP8 and GLM-5.3-Flash, TP=4 per arm (GPUs 0-3 +
+  4-7); DeepSeek-V4.1-Flash needs the whole node (TP=8, arms sequential). The
+  scheduled run skips these legs while the `blackwell` runner is offline (it has
+  served no job since 2026-09-18); a `workflow_dispatch`, with or without `only`,
+  still runs them.
 
 All legs use `max_model_len` **32768**: the `multi_turn` categories emit ~18k-token
 prompts that 400'd ("decoder prompt longer than the maximum model length") at 16384.
@@ -101,14 +99,16 @@ Each leg sets `arm_mode`:
 
 - **concurrent** (the half-node legs) — both arms serve at once on opposite GPU halves;
   `run_ab.py` scores them **in parallel** (separate servers/GPUs, no contention) and diffs.
-- **sequential** (`deepseek-v4.1`, `glm-5.2`) — for a model that needs the whole node (TP=8)
+- **sequential** (`deepseek-v4.1`) — for a model that needs the whole node (TP=8)
   so the arms can't coexist: `run_ab.py --score-arm` scores arm A alone → tears it
   down → scores arm B alone → `--diff-baseline/--diff-candidate` compares the two
   saved score files. Flip a leg's `arm_mode` to enable it.
 
 Per the A/B's premise, model size is irrelevant — a smaller same-family checkpoint
-exercises the identical parser — so the matrix uses DeepSeek-V4.1-Flash and int4
-Kimi-K2.6 to validate the `deepseek_v41` / `kimi_k2` parsers without the full weights.
+exercises the identical parser — so the matrix uses DeepSeek-V4.1-Flash to validate
+the `deepseek_v41` parser without the full V4.1 weights. There is no Kimi leg: the
+former Kimi-K2.6 leg exercised the K2 parser, not the K3 one SMG now ships, and every
+published Kimi-K3 checkpoint is about 1.5 TB, which does not fit a single 8-GPU node.
 
 `workflow_dispatch` can target one leg via the `only` input and override
 `model`/`bfcl_model`/parsers per run. PRs touching this pipeline run **all** legs
@@ -118,8 +118,8 @@ is a tiny non-live subset (`simple_python,irrelevance`) for every leg.
 A leg whose model the pinned vLLM release (`scripts/ci_install_vllm.sh`) cannot serve
 sets `vllm_commit` + `vllm_version` in its matrix entry; the job then swaps in that
 per-commit main wheel from `wheels.vllm.ai/<commit>` for **both** arms (the A/B stays
-engine-identical). `deepseek-v4.1` uses this until a vLLM release ships V4.1 and the
-CI pin moves; drop the two keys then.
+engine-identical). `deepseek-v4.1` and `glm-5.3-flash` share one such wheel until a
+vLLM release ships both models and the CI pin moves; drop the keys then.
 
 ## Gotchas discovered while bringing this up (read before debugging)
 

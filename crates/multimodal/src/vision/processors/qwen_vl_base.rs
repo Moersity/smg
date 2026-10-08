@@ -27,6 +27,7 @@ use image::{imageops::FilterType, DynamicImage, GenericImageView};
 use ndarray::{Array2, Array3};
 
 use crate::{
+    encoder_inputs::{EncoderInput, PixelNorm},
     types::RgbFrameRef,
     vision::{
         execution::{scope as parallel_scope, task_count},
@@ -105,14 +106,19 @@ struct QwenVideoPlan {
     second_per_grid: f32,
     filter: FilterType,
     do_resize: bool,
-    lut: [[f32; 256]; 3],
+    norm: PixelNorm,
 }
 
-fn normalization_lut(
+/// The per-channel normalization the patch bytes carry: HF order, rescale
+/// (x / 255) then normalize ((x - mean) / std), each step only when its flag
+/// is on, folded into one `scale`/`bias` pair. Both off leaves the raw 0..255
+/// values, what an engine that normalizes on device takes.
+fn pixel_norm(
     config: &PreProcessorConfig,
     default_mean: [f64; 3],
     default_std: [f64; 3],
-) -> [[f32; 256]; 3] {
+    channel_block: usize,
+) -> PixelNorm {
     let mean = config
         .image_mean
         .as_ref()
@@ -126,26 +132,30 @@ fn normalization_lut(
         .map(|values| [values[0], values[1], values[2]])
         .unwrap_or(default_std);
     let do_normalize = config.do_normalize.unwrap_or(true);
-    let scale: [f32; 3] = if do_normalize {
-        std::array::from_fn(|channel| 1.0 / (255.0 * std[channel] as f32))
-    } else {
-        [1.0 / 255.0; 3]
-    };
+    let do_rescale = config.do_rescale.unwrap_or(true);
+    let scale: [f32; 3] = std::array::from_fn(|channel| match (do_rescale, do_normalize) {
+        (true, true) => 1.0 / (255.0 * std[channel] as f32),
+        (true, false) => 1.0 / 255.0,
+        (false, true) => 1.0 / std[channel] as f32,
+        (false, false) => 1.0,
+    });
     let bias: [f32; 3] = if do_normalize {
         std::array::from_fn(|channel| -(mean[channel] as f32) / std[channel] as f32)
     } else {
         [0.0; 3]
     };
-    std::array::from_fn(|channel| {
-        std::array::from_fn(|value| value as f32 * scale[channel] + bias[channel])
-    })
+    PixelNorm {
+        scale,
+        bias,
+        channel_block,
+    }
 }
 
-fn dispatch_patch_blocks(
-    region: &mut [f32],
+fn dispatch_patch_blocks<T: Send + Sync>(
+    region: &mut [T],
     n_blocks: usize,
     block_out: usize,
-    write_blocks: impl Fn(usize, &mut [f32]) + Sync,
+    write_blocks: impl Fn(usize, &mut [T]) + Sync,
 ) {
     let nthreads = par_threads(size_of_val(region), n_blocks);
     if nthreads <= 1 {
@@ -300,12 +310,26 @@ fn resize_dynamic_frame_to_raw(
 #[derive(Debug, Clone)]
 pub struct QwenVLProcessorBase {
     config: QwenVLConfig,
+    allow_video_dimensions_below_factor: bool,
 }
 
 impl QwenVLProcessorBase {
     /// Create a new processor with the given configuration.
     pub fn new(config: QwenVLConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            allow_video_dimensions_below_factor: false,
+        }
+    }
+
+    /// Allow non-zero video dimensions below the patch-alignment factor.
+    ///
+    /// Some model families upscale these inputs to the minimum aligned size,
+    /// while Qwen processors reject them. This opt-in preserves the Qwen
+    /// default and lets wrappers select the model-specific behavior.
+    pub fn allow_video_dimensions_below_factor(mut self) -> Self {
+        self.allow_video_dimensions_below_factor = true;
+        self
     }
 
     /// Get the patch size.
@@ -396,13 +420,18 @@ impl QwenVLProcessorBase {
             second_per_grid: temporal_patch_size as f32 / sample_fps,
             filter: pil_to_filter(config.resampling.or(Some(3))),
             do_resize: config.do_resize.unwrap_or(true),
-            lut: normalization_lut(config, self.config.mean, self.config.std),
+            norm: pixel_norm(
+                config,
+                self.config.mean,
+                self.config.std,
+                self.channel_block(),
+            ),
         })
     }
 
     fn finish_video(
         plan: QwenVideoPlan,
-        patches: Vec<f32>,
+        patches: Vec<u8>,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         let encoder_input =
             Array2::from_shape_vec((plan.num_patches, plan.patch_features), patches).map_err(
@@ -415,7 +444,7 @@ impl QwenVLProcessorBase {
             )?;
 
         Ok(PreprocessedEncoderInputs::new(
-            encoder_input,
+            EncoderInput::bytes(encoder_input, plan.norm),
             vec![plan.tokens],
             vec![plan.original_size],
         )
@@ -429,10 +458,6 @@ impl QwenVLProcessorBase {
         )
         .with_extra(
             "patches_per_video",
-            ModelSpecificValue::int_1d(vec![plan.num_patches as i64]),
-        )
-        .with_extra(
-            "patches_per_image",
             ModelSpecificValue::int_1d(vec![plan.num_patches as i64]),
         )
         .with_extra(
@@ -450,6 +475,13 @@ impl QwenVLProcessorBase {
     #[inline]
     pub fn get_factor(&self) -> usize {
         self.config.patch_size * self.config.merge_size
+    }
+
+    /// Consecutive elements of one channel within a patch row
+    /// (`[C, temporal, patch_h, patch_w]`): temporal × patch_h × patch_w.
+    #[inline]
+    fn channel_block(&self) -> usize {
+        self.config.temporal_patch_size * self.config.patch_size * self.config.patch_size
     }
 
     /// Smart resize algorithm for Qwen VL models.
@@ -543,7 +575,14 @@ impl QwenVLProcessorBase {
             });
         }
 
-        if height < factor || width < factor {
+        if height == 0 || width == 0 {
+            return Err(TransformError::InvalidShape {
+                expected: "non-zero dimensions".to_string(),
+                actual: vec![height, width],
+            });
+        }
+
+        if !self.allow_video_dimensions_below_factor && (height < factor || width < factor) {
             return Err(TransformError::InvalidShape {
                 expected: format!("height and width >= factor ({factor})"),
                 actual: vec![height, width],
@@ -833,9 +872,8 @@ impl QwenVLProcessorBase {
         frames: &[VideoFrameRgb<'_>],
         grid_h: usize,
         grid_w: usize,
-        output: &mut [f32],
+        output: &mut [u8],
         out_idx: &mut usize,
-        lut: &[[f32; 256]; 3],
     ) -> Result<(), TransformError> {
         let patch_size = self.config.patch_size;
         let merge_size = self.config.merge_size;
@@ -885,7 +923,6 @@ impl QwenVLProcessorBase {
                 pc_blocks,
                 block_start,
                 band,
-                lut,
             );
         });
         *out_idx = end_idx;
@@ -905,8 +942,7 @@ impl QwenVLProcessorBase {
         merged_patch: usize,
         pc_blocks: usize,
         block_start: usize,
-        band: &mut [f32],
-        lut: &[[f32; 256]; 3],
+        band: &mut [u8],
     ) {
         let block_out = merge_size * merge_size * 3 * frames.len() * patch_size * patch_size;
         for (bi, chunk) in band.chunks_mut(block_out).enumerate() {
@@ -919,7 +955,7 @@ impl QwenVLProcessorBase {
 
             for mh in 0..merge_size {
                 for mw in 0..merge_size {
-                    for (c, lut_c) in lut.iter().enumerate().take(3) {
+                    for c in 0..3 {
                         for frame in frames {
                             let raw = frame.data.as_ref();
                             for py in 0..patch_size {
@@ -931,7 +967,7 @@ impl QwenVLProcessorBase {
                                     .iter_mut()
                                     .zip(raw[source_start..source_end].as_chunks::<3>().0.iter())
                                 {
-                                    *dst = lut_c[pixel[c] as usize];
+                                    *dst = pixel[c];
                                 }
                                 o += patch_size;
                             }
@@ -947,9 +983,8 @@ impl QwenVLProcessorBase {
         image: &DynamicImage,
         grid_h: usize,
         grid_w: usize,
-        output: &mut [f32],
+        output: &mut [u8],
         out_idx: &mut usize,
-        lut: &[[f32; 256]; 3],
     ) -> Result<(), TransformError> {
         let (width, height, data) = rgb_bytes(image);
         let patch_size = self.config.patch_size;
@@ -993,7 +1028,6 @@ impl QwenVLProcessorBase {
                 pc_blocks,
                 block_start,
                 band,
-                lut,
             );
         });
         *out_idx = end_idx;
@@ -1014,8 +1048,7 @@ impl QwenVLProcessorBase {
         merged_patch: usize,
         pc_blocks: usize,
         block_start: usize,
-        band: &mut [f32],
-        lut: &[[f32; 256]; 3],
+        band: &mut [u8],
     ) {
         let block_out = merge_size * merge_size * 3 * temporal_patch_size * patch_size * patch_size;
         for (bi, chunk) in band.chunks_mut(block_out).enumerate() {
@@ -1028,14 +1061,14 @@ impl QwenVLProcessorBase {
 
             for mh in 0..merge_size {
                 for mw in 0..merge_size {
-                    for (c, lut_c) in lut.iter().enumerate().take(3) {
+                    for c in 0..3 {
                         for _tp in 0..temporal_patch_size {
                             for py in 0..patch_size {
                                 let row =
                                     (y0 + mh * patch_size + py) * width + x0 + mw * patch_size;
                                 let mut src_idx = row * 3 + c;
                                 for dst in &mut chunk[o..o + patch_size] {
-                                    *dst = lut_c[raw[src_idx] as usize];
+                                    *dst = raw[src_idx];
                                     src_idx += 3;
                                 }
                                 o += patch_size;
@@ -1049,6 +1082,10 @@ impl QwenVLProcessorBase {
 }
 
 impl VisionPreProcessor for QwenVLProcessorBase {
+    fn emits_pixel_bytes(&self) -> bool {
+        true
+    }
+
     fn default_mean(&self) -> [f64; 3] {
         self.config.mean
     }
@@ -1076,7 +1113,12 @@ impl VisionPreProcessor for QwenVLProcessorBase {
         let temporal_patch_size = self.config.temporal_patch_size;
         let patch_features = 3 * temporal_patch_size * patch_size * patch_size;
         let do_resize = config.do_resize.unwrap_or(true);
-        let lut = normalization_lut(config, self.config.mean, self.config.std);
+        let norm = pixel_norm(
+            config,
+            self.config.mean,
+            self.config.std,
+            self.channel_block(),
+        );
 
         let mut image_plans = Vec::with_capacity(images.len());
         let mut item_sizes = Vec::with_capacity(images.len());
@@ -1124,49 +1166,65 @@ impl VisionPreProcessor for QwenVLProcessorBase {
             });
         }
 
-        let mut all_patches: Vec<f32> = Vec::with_capacity(total_patch_values);
         let mut patches_per_image: Vec<i64> = Vec::with_capacity(images.len());
         let mut grid_thw_data = Vec::with_capacity(images.len() * 3);
         let mut feature_token_counts = Vec::with_capacity(images.len());
-
-        for (image, plan) in images.iter().zip(image_plans) {
-            // Resize to the image's own target size (skip if dimensions match)
-            let resized;
-            let img_ref = if plan.needs_resize {
-                // BICUBIC (Qwen default) uses the PIL-compatible path; other
-                // filters keep the SIMD path.
-                resized = if filter == FilterType::CatmullRom {
-                    resize_bicubic_pil(image, plan.target_width, plan.target_height)
-                } else {
-                    resize(image, plan.target_width, plan.target_height, filter)
-                };
-                &resized
-            } else {
-                image
-            };
-
-            grid_thw_data.push(plan.grid_t as i64);
-            grid_thw_data.push(plan.grid_h as i64);
-            grid_thw_data.push(plan.grid_w as i64);
-
+        for plan in &image_plans {
+            grid_thw_data.extend([plan.grid_t as i64, plan.grid_h as i64, plan.grid_w as i64]);
             feature_token_counts.push(plan.tokens);
-
-            // Patchify directly from RGB bytes to avoid the intermediate
-            // [C,H,W] tensor allocation. This matches the tensor path's
-            // channel/temporal/spatial order.
-            let base_idx = all_patches.len();
-            all_patches.resize(base_idx + plan.patch_values, 0.0);
-            let mut out_idx = base_idx;
-            self.patchify_image_rgb_into(
-                img_ref,
-                plan.grid_h,
-                plan.grid_w,
-                &mut all_patches,
-                &mut out_idx,
-                &lut,
-            )?;
-            debug_assert_eq!(out_idx, all_patches.len());
             patches_per_image.push(plan.num_patches as i64);
+        }
+
+        // Each image owns a disjoint band of the patch buffer, so the images
+        // resize and patchify in parallel.
+        let mut all_patches: Vec<u8> = vec![0u8; total_patch_values];
+        let mut bands = Vec::with_capacity(images.len());
+        let mut remaining = all_patches.as_mut_slice();
+        for plan in &image_plans {
+            let (band, rest) = remaining.split_at_mut(plan.patch_values);
+            bands.push(band);
+            remaining = rest;
+        }
+        let mut errors: Vec<Option<TransformError>> = (0..images.len()).map(|_| None).collect();
+        parallel_scope(|scope| {
+            for (((image, plan), band), error_slot) in images
+                .iter()
+                .zip(&image_plans)
+                .zip(bands)
+                .zip(errors.iter_mut())
+            {
+                scope.spawn(move |_| {
+                    // BICUBIC (Qwen default) uses the PIL-compatible path; other
+                    // filters keep the SIMD path.
+                    let resized;
+                    let img_ref = if plan.needs_resize {
+                        resized = if filter == FilterType::CatmullRom {
+                            resize_bicubic_pil(image, plan.target_width, plan.target_height)
+                        } else {
+                            resize(image, plan.target_width, plan.target_height, filter)
+                        };
+                        &resized
+                    } else {
+                        image
+                    };
+                    // Patchify directly from RGB bytes to avoid the intermediate
+                    // [C,H,W] tensor allocation. This matches the tensor path's
+                    // channel/temporal/spatial order.
+                    let mut out_idx = 0;
+                    let outcome = self.patchify_image_rgb_into(
+                        img_ref,
+                        plan.grid_h,
+                        plan.grid_w,
+                        band,
+                        &mut out_idx,
+                    );
+                    debug_assert!(outcome.is_err() || out_idx == band.len());
+                    *error_slot = outcome.err();
+                });
+            }
+        });
+        if let Some(error) = errors.into_iter().flatten().next() {
+            return Err(error);
         }
 
         let encoder_input =
@@ -1176,16 +1234,19 @@ impl VisionPreProcessor for QwenVLProcessorBase {
                 ))
             })?;
 
-        let result =
-            PreprocessedEncoderInputs::new(encoder_input, feature_token_counts, item_sizes)
-                .with_extra(
-                    "image_grid_thw",
-                    ModelSpecificValue::int_2d(grid_thw_data, images.len(), 3),
-                )
-                .with_extra(
-                    "patches_per_image",
-                    ModelSpecificValue::int_1d(patches_per_image),
-                );
+        let result = PreprocessedEncoderInputs::new(
+            EncoderInput::bytes(encoder_input, norm),
+            feature_token_counts,
+            item_sizes,
+        )
+        .with_extra(
+            "image_grid_thw",
+            ModelSpecificValue::int_2d(grid_thw_data, images.len(), 3),
+        )
+        .with_extra(
+            "patches_per_image",
+            ModelSpecificValue::int_1d(patches_per_image),
+        );
 
         Ok(result)
     }
@@ -1202,7 +1263,7 @@ impl VisionPreProcessor for QwenVLProcessorBase {
         let (width, height) = frames[0].dimensions();
         let plan = self.plan_video(frames.len(), width, height, config)?;
         let temporal_patch_size = self.config.temporal_patch_size;
-        let mut all_patches = vec![0.0; plan.output_values];
+        let mut all_patches = vec![0u8; plan.output_values];
         let mut out_idx = 0;
         let mut frame_rgbs = Vec::with_capacity(temporal_patch_size);
         for gt in 0..plan.grid_t {
@@ -1245,7 +1306,6 @@ impl VisionPreProcessor for QwenVLProcessorBase {
                 plan.grid_w,
                 &mut all_patches,
                 &mut out_idx,
-                &plan.lut,
             )?;
         }
         debug_assert_eq!(out_idx, all_patches.len());
@@ -1263,7 +1323,7 @@ impl VisionPreProcessor for QwenVLProcessorBase {
 
         let plan = self.plan_video(frames.len(), frames[0].width, frames[0].height, config)?;
         let temporal_patch_size = self.config.temporal_patch_size;
-        let mut all_patches = vec![0.0; plan.output_values];
+        let mut all_patches = vec![0u8; plan.output_values];
         for frame in frames {
             let expected_len = (frame.width as usize)
                 .checked_mul(frame.height as usize)
@@ -1286,7 +1346,7 @@ impl VisionPreProcessor for QwenVLProcessorBase {
         }
 
         let values_per_group = plan.grid_h * plan.grid_w * plan.patch_features;
-        let parallel_tasks = task_count(all_patches.len() * size_of::<f32>(), plan.grid_t, 1);
+        let parallel_tasks = task_count(all_patches.len(), plan.grid_t, 1);
         let groups_per_task = plan.grid_t.div_ceil(parallel_tasks);
         let mut errors = (0..parallel_tasks).map(|_| None).collect::<Vec<_>>();
         parallel_scope(|scope| {
@@ -1318,7 +1378,6 @@ impl VisionPreProcessor for QwenVLProcessorBase {
                                 plan.grid_w,
                                 group_output,
                                 &mut output_index,
-                                &plan.lut,
                             )?;
                             debug_assert_eq!(output_index, group_output.len());
                         }
@@ -1367,6 +1426,80 @@ mod tests {
 
     use super::*;
     use crate::vision::transforms::to_tensor_and_normalize;
+
+    /// The opted-in Qwen processors must produce bit-identical pixels and
+    /// metadata when individual images are concatenated instead of batched.
+    #[test]
+    fn test_preprocess_per_image_concat_matches_batch() {
+        use crate::{
+            types::FieldLayout,
+            vision::processors::{Qwen2VLProcessor, Qwen3VLProcessor},
+        };
+
+        let processors: [&dyn VisionPreProcessor; 2] =
+            [&Qwen2VLProcessor::new(), &Qwen3VLProcessor::new()];
+        for processor in processors {
+            assert!(processor.supports_per_image_preprocessing());
+            let config = PreProcessorConfig {
+                image_mean: Some(processor.default_mean().to_vec()),
+                image_std: Some(processor.default_std().to_vec()),
+                min_pixels: Some(56 * 56),
+                max_pixels: Some(112 * 112),
+                ..Default::default()
+            };
+            let images = vec![
+                create_sized_pattern_frame(7, 9, 3),
+                create_sized_pattern_frame(12, 6, 42),
+                create_sized_pattern_frame(8, 8, 250),
+            ];
+
+            let batched = processor.preprocess(&images, &config).unwrap();
+
+            let layouts = std::collections::HashMap::from([
+                ("image_grid_thw".to_string(), FieldLayout::Batched),
+                ("patches_per_image".to_string(), FieldLayout::Batched),
+            ]);
+            let parts = images
+                .iter()
+                .map(|image| {
+                    processor
+                        .preprocess(std::slice::from_ref(image), &config)
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let merged = PreprocessedEncoderInputs::concat(parts, &layouts).unwrap();
+
+            assert_eq!(merged.encoder_input_shape(), batched.encoder_input_shape());
+            assert_eq!(merged.feature_token_counts, batched.feature_token_counts);
+            assert_eq!(merged.item_sizes, batched.item_sizes);
+            let merged_values = merged.encoder_input.flat_f32().into_owned();
+            let batched_values = batched.encoder_input.flat_f32().into_owned();
+            for (idx, (&got, &want)) in merged_values.iter().zip(batched_values.iter()).enumerate()
+            {
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "merged patch value differs at index {idx}: got {got}, want {want}"
+                );
+            }
+            for key in ["image_grid_thw", "patches_per_image"] {
+                let (merged_extra, batched_extra) = (
+                    merged.model_specific.get(key).unwrap(),
+                    batched.model_specific.get(key).unwrap(),
+                );
+                assert!(
+                    matches!(
+                        (merged_extra, batched_extra),
+                        (
+                            ModelSpecificValue::IntTensor { data: got, shape: got_shape },
+                            ModelSpecificValue::IntTensor { data: want, shape: want_shape },
+                        ) if got == want && got_shape == want_shape
+                    ),
+                    "model-specific value {key:?} differs between merged and batched outputs"
+                );
+            }
+        }
+    }
 
     fn create_test_config() -> QwenVLConfig {
         QwenVLConfig {
@@ -1475,7 +1608,7 @@ mod tests {
         let result = processor
             .preprocess(std::slice::from_ref(&image), &config)
             .unwrap();
-        let actual = result.encoder_input.as_slice_memory_order().unwrap();
+        let actual = result.encoder_input.flat_f32().into_owned();
 
         let resized = resize_bicubic_pil(&image, target_w as u32, target_h as u32);
         let tensor = to_tensor_and_normalize(
@@ -1534,10 +1667,14 @@ mod tests {
         let std = processor.default_std();
         let scale: [f32; 3] = std::array::from_fn(|c| 1.0 / (255.0 * std[c] as f32));
         let bias: [f32; 3] = std::array::from_fn(|c| -(mean[c] as f32) / (std[c] as f32));
-        let lut: [[f32; 256]; 3] =
-            std::array::from_fn(|c| std::array::from_fn(|v| v as f32 * scale[c] + bias[c]));
+        let patch_features = 3 * temporal_patch_size * patch_size * patch_size;
+        let norm = PixelNorm {
+            scale,
+            bias,
+            channel_block: temporal_patch_size * patch_size * patch_size,
+        };
 
-        let mut actual = vec![0.0; expected.len()];
+        let mut actual = vec![0u8; expected.len()];
         let split_blocks = n_blocks / 2;
         let split_at = split_blocks * block_out;
         let (first, second) = actual.split_at_mut(split_at);
@@ -1551,7 +1688,6 @@ mod tests {
             pc_blocks,
             0,
             first,
-            &lut,
         );
         QwenVLProcessorBase::patchify_image_rgb_block_band(
             raw.as_ref(),
@@ -1563,9 +1699,15 @@ mod tests {
             pc_blocks,
             split_blocks,
             second,
-            &lut,
         );
 
+        let actual = EncoderInput::bytes(
+            Array2::from_shape_vec((actual.len() / patch_features, patch_features), actual)
+                .expect("patch rows"),
+            norm,
+        )
+        .flat_f32()
+        .into_owned();
         assert_eq!(actual.len(), expected.len());
         for (idx, (&got, &want)) in actual.iter().zip(expected.iter()).enumerate() {
             assert_eq!(
@@ -1621,8 +1763,8 @@ mod tests {
             .preprocess_video_rgb(&rgb_frames, &config)
             .unwrap();
 
-        let a = dynamic.encoder_input.as_slice_memory_order().unwrap();
-        let b = rgb.encoder_input.as_slice_memory_order().unwrap();
+        let a = dynamic.encoder_input.flat_f32().into_owned();
+        let b = rgb.encoder_input.flat_f32().into_owned();
         assert_eq!(
             a.len(),
             b.len(),
@@ -1680,8 +1822,8 @@ mod tests {
             .preprocess_video_rgb(&rgb_frames, &config)
             .unwrap();
 
-        let a = dynamic.encoder_input.as_slice_memory_order().unwrap();
-        let b = rgb.encoder_input.as_slice_memory_order().unwrap();
+        let a = dynamic.encoder_input.flat_f32().into_owned();
+        let b = rgb.encoder_input.flat_f32().into_owned();
         assert_eq!(a.len(), b.len());
         for (idx, (&got, &want)) in a.iter().zip(b.iter()).enumerate() {
             assert_eq!(
@@ -1696,6 +1838,33 @@ mod tests {
     fn test_qwen_vl_base_factor() {
         let processor = QwenVLProcessorBase::new(create_test_config());
         assert_eq!(processor.get_factor(), 28); // 14 * 2
+    }
+
+    #[test]
+    fn test_video_dimension_guards() {
+        let qwen = QwenVLProcessorBase::new(create_test_config());
+        let permissive = qwen.clone().allow_video_dimensions_below_factor();
+        for (height, width) in [(20, 100), (100, 20), (1, 1), (27, 28), (28, 27)] {
+            assert!(matches!(
+                qwen.smart_resize_video(2, height, width),
+                Err(TransformError::InvalidShape { .. })
+            ));
+            assert!(permissive.smart_resize_video(2, height, width).is_ok());
+        }
+        for processor in [&qwen, &permissive] {
+            for (height, width) in [(0, 100), (100, 0), (0, 0)] {
+                assert!(matches!(
+                    processor.smart_resize_video(2, height, width),
+                    Err(TransformError::InvalidShape { .. })
+                ));
+            }
+        }
+        for (height, width) in [(28, 28), (100, 100), (720, 1280)] {
+            assert_eq!(
+                qwen.smart_resize_video(2, height, width).unwrap(),
+                permissive.smart_resize_video(2, height, width).unwrap()
+            );
+        }
     }
 
     #[test]
@@ -1767,7 +1936,7 @@ mod tests {
         let frames = vec![create_pattern_frame(3), create_pattern_frame(101)];
 
         let result = processor.preprocess_video(&frames, &config).unwrap();
-        let actual = result.encoder_input.as_slice_memory_order().unwrap();
+        let actual = result.encoder_input.flat_f32().into_owned();
 
         let tensors = frames
             .iter()
@@ -1834,11 +2003,8 @@ mod tests {
         rgb_keys.sort();
         assert_eq!(dynamic_keys, rgb_keys);
 
-        let dynamic_values = dynamic_result
-            .encoder_input
-            .as_slice_memory_order()
-            .unwrap();
-        let rgb_values = rgb_result.encoder_input.as_slice_memory_order().unwrap();
+        let dynamic_values = dynamic_result.encoder_input.flat_f32().into_owned();
+        let rgb_values = rgb_result.encoder_input.flat_f32().into_owned();
         for (idx, (&got, &want)) in rgb_values.iter().zip(dynamic_values.iter()).enumerate() {
             assert_eq!(
                 got.to_bits(),
@@ -1884,11 +2050,8 @@ mod tests {
             dynamic_result.encoder_input.shape(),
             rgb_result.encoder_input.shape()
         );
-        let dynamic_values = dynamic_result
-            .encoder_input
-            .as_slice_memory_order()
-            .unwrap();
-        let rgb_values = rgb_result.encoder_input.as_slice_memory_order().unwrap();
+        let dynamic_values = dynamic_result.encoder_input.flat_f32().into_owned();
+        let rgb_values = rgb_result.encoder_input.flat_f32().into_owned();
         for (idx, (&got, &want)) in rgb_values.iter().zip(dynamic_values.iter()).enumerate() {
             assert_eq!(
                 got.to_bits(),

@@ -24,11 +24,22 @@ COMMON_POLICY_CHOICES = [
 
 PREFILL_POLICY_CHOICES = [*COMMON_POLICY_CHOICES, "bucket"]
 ENCODE_POLICY_CHOICES = ["random", "round_robin", "consistent_hashing"]
+# Worker discovery providers --discovery-provider accepts.
+DISCOVERY_PROVIDER_CHOICES = ["kubernetes"]
 
 
 def _parse_int_csv(value: str) -> list[int]:
     """Parse a comma-separated integer list (mirrors the CLI value_delimiter)."""
     return [int(item) for item in value.split(",") if item]
+
+
+def _non_negative_int(value: str) -> int:
+    """argparse type for the unsigned Rust settings; rejects a minus sign here
+    rather than in the binding's conversion after parsing."""
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError(f"expected a non-negative integer, got {value!r}")
+    return number
 
 
 @dataclasses.dataclass
@@ -237,11 +248,13 @@ class RouterArgs:
     # Control-plane job queue sizing (worker registration/removal jobs)
     job_queue_capacity: int = 1000
     job_queue_concurrency: int = 200
-    # Absolute per-worker overload thresholds; both None disables the feature
-    worker_overload_waiting_requests: int | None = None
-    worker_overload_token_usage: float | None = None
-    # Enable overload protection with the gateway default token ceiling (0.9)
-    worker_overload_protection: bool = False
+    # Absolute per-worker overload thresholds, as the Rust CLI defaults them;
+    # None switches one signal off
+    worker_overload_waiting_requests: int | None = 8
+    worker_overload_token_usage: float | None = 0.8
+    # Worker overload protection is on by default; False switches both
+    # thresholds off (--disable-worker-overload-protection)
+    worker_overload_protection: bool = True
     # Restore the conditional load-monitor poll gate (default: poll always)
     disable_load_monitoring: bool = False
     # Most bytes the router may buffer for a request it holds only to keep
@@ -257,6 +270,48 @@ class RouterArgs:
     enable_rl: bool = False  # Mount the RL control plane under /v1/rl
     rl_control_timeout_secs: int = 600  # Timeout for one proxied engine control call
     rl_fanout_concurrency: int = 32  # Max concurrent engine calls in one fan-out
+    # Appended last so callers that build RouterArgs positionally keep
+    # their existing field order.
+    multimodal_max_inflight_bytes: int | None = None
+    # Where media for vLLM gRPC workers is fetched and preprocessed:
+    # auto | router | worker; None falls back to SMG_MM_PROCESSING, then auto
+    mm_processing: str | None = None
+    # Pixel cache budget (MiB) for router-side preprocessed media; None falls
+    # back to SMG_MM_PIXEL_CACHE_MB, then 0 (off)
+    mm_pixel_cache_mb: int | None = None
+    # Legacy switch for the RDMA pixel lane; False falls back to SMG_MM_PIXEL_RDMA
+    mm_pixel_rdma: bool = False
+    # Listener IP for the RDMA metadata exchange; None falls back to SMG_RDMA_LISTEN_IP
+    rdma_listen_ip: str | None = None
+    # Full-TTL override (seconds) for leased RDMA slots; None falls back to SMG_RDMA_SLOT_TTL_S
+    rdma_slot_ttl_s: int | None = None
+    # Per-request multimodal timing at INFO; False falls back to SMG_LOG_MM_TIMING
+    log_mm_timing: bool = False
+    prefill_max_inflight_requests_per_worker: int = -1
+    prefill_queue_size: int | None = None
+    prefill_queue_timeout_secs: int | None = None
+    # The worker discovery provider. service_discovery=True is the legacy
+    # spelling of discovery_provider="kubernetes"; set one or the other.
+    discovery_provider: str | None = None
+    # Refuse with a 503 when every worker a request could use is overloaded,
+    # instead of routing it to the least-loaded one
+    worker_overload_shed: bool = False
+    # The event-driven KV index behind cache-aware routing: "positional"
+    # (one entry per block position) or "chain" (chains as runs)
+    kv_index: str = "positional"
+    # Liveness: seconds without contact after a transport failure before a
+    # worker is vetoed; seconds without progress before a loaded one is wedged
+    worker_stall_secs: int = 2
+    worker_wedge_secs: int = 3
+    # Warm-up slice for cache-aware routing (see the --worker-warmup-* flags)
+    worker_warmup_secs: int = 60
+    worker_warmup_share: float = 0.25
+    worker_warmup_blocks: int = 1024
+    worker_warmup_thin_ratio: float = 0.5
+    worker_warmup_divert_every: int = 8
+    # The cache-aware selection policy and the optimistic accounting TTL
+    selection_policy: str = "cache-aware-default"
+    selection_accounting_ttl_ms: int = 0
 
     @staticmethod
     def add_cli_args(
@@ -573,12 +628,13 @@ class RouterArgs:
             default=RouterArgs.worker_overload_waiting_requests,
             help=(
                 "Queued-request count AT OR ABOVE which a worker is considered"
-                " overloaded and excluded from routing until the signal recovers;"
-                " when every worker is overloaded, requests are shed immediately"
-                " rather than queued. Unset disables overload protection. This"
-                " signal is the queued (waiting) request count, summed across DP"
-                " ranks. Must be >= 1: the comparison is inclusive, so 0 would veto"
-                " every worker unconditionally."
+                " overloaded and left out of routing while another worker is"
+                " under the thresholds; when every worker is over them the"
+                " request goes to the least-loaded one (see"
+                " --worker-overload-shed). The signal is the queued (waiting)"
+                " request count, summed across DP ranks. Must be >= 1: the"
+                " comparison is inclusive, so 0 would veto every worker"
+                " unconditionally. Defaults to 8."
             ),
         )
         routing_group.add_argument(
@@ -587,10 +643,10 @@ class RouterArgs:
             default=RouterArgs.worker_overload_token_usage,
             help=(
                 "KV-cache token usage AT OR ABOVE which a worker is considered"
-                " overloaded and excluded from routing until the signal recovers;"
-                " when every worker is overloaded, requests are shed immediately"
-                " rather than queued. Unset disables overload protection. This"
-                " signal is mean KV-cache token usage across DP ranks, the same one"
+                " overloaded and left out of routing while another worker is"
+                " under the thresholds (see --worker-overload-waiting-requests)."
+                " Defaults to 0.8. This signal is mean KV-cache token usage"
+                " across DP ranks, the same one"
                 " --balance-token-usage-threshold reads, applied as an absolute"
                 " per-worker CEILING rather than a fleet-relative spread. Backend"
                 " must report token_usage. Must be in (0.0, 1.0]: the comparison is"
@@ -603,16 +659,137 @@ class RouterArgs:
         routing_group.add_argument(
             f"--{prefix}worker-overload-protection",
             action="store_true",
+            default=None,
             help=(
-                "Enable worker overload protection with the gateway default"
-                " thresholds. This flag alone applies"
-                " --worker-overload-token-usage 0.9 and leaves"
-                " --worker-overload-waiting-requests unset: KV token usage means"
-                " the same thing on every engine, while a sensible"
-                " waiting-requests ceiling is workload-dependent, so it has no"
-                " universal default. Explicit thresholds override the default,"
-                " and either threshold set on its own enables protection without"
-                " this flag."
+                "Worker overload protection is on by default (8 waiting requests,"
+                " 0.8 KV usage); this flag keeps it on and is accepted so older"
+                " command lines still parse. --disable-worker-overload-protection"
+                " switches both thresholds off."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}disable-worker-overload-protection",
+            action="store_true",
+            default=None,
+            help=(
+                "Switch worker overload protection off: no worker is left out of"
+                " routing for its waiting queue or KV usage (per-worker overload"
+                " blocks on a WorkerSpec still apply)."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}worker-overload-shed",
+            action="store_true",
+            help=(
+                "Refuse a request with a 503 (worker_overload_protection_shed,"
+                " Retry-After the load poll interval) when every worker it could"
+                " use is overloaded, instead of routing it to the least-loaded one;"
+                " also sheds a worker that crossed a threshold between selection"
+                " and dispatch. Off by default."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}kv-index",
+            type=str,
+            default=RouterArgs.kv_index,
+            help=(
+                "The event-driven KV index behind cache-aware routing: 'positional'"
+                " (one entry per block position, the default) or 'chain' (chains as"
+                " runs with per-run worker coverage; lock-free, store-free lookups)."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}worker-stall-secs",
+            type=int,
+            default=RouterArgs.worker_stall_secs,
+            help=(
+                "Seconds without any contact from a worker (a load poll, a health"
+                " probe, a KV event, a response) after which a transport failure"
+                " excludes it from routing; the first successful contact re-admits"
+                " it. Defaults to 2."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}worker-wedge-secs",
+            type=int,
+            default=RouterArgs.worker_wedge_secs,
+            help=(
+                "Seconds without a token or a completion from a worker with requests"
+                " in flight whose waiting queue grows, or whose in-flight pile grows"
+                " or is four deep, after which new requests stop being routed to it"
+                " until it makes progress; the bound stretches to the time its"
+                " in-flight prompts may still need in prefill, up to 120 seconds."
+                " Defaults to 3."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}worker-warmup-secs",
+            type=int,
+            default=RouterArgs.worker_warmup_secs,
+            help=(
+                "Warm-up slice for cache-aware routing: for this many seconds after"
+                " a worker becomes routable, until its index has grown by"
+                " --worker-warmup-blocks blocks, one cache miss in"
+                " 1/--worker-warmup-share is routed to it so it builds a cache"
+                " instead of idling. 0 disables. Defaults to 60."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}worker-warmup-share",
+            type=float,
+            default=RouterArgs.worker_warmup_share,
+            help="Share of cache misses offered to warming workers (0.0 to 1.0). Defaults to 0.25.",
+        )
+        routing_group.add_argument(
+            f"--{prefix}worker-warmup-blocks",
+            type=int,
+            default=RouterArgs.worker_warmup_blocks,
+            help=(
+                "A worker whose index has grown by this many blocks since it became"
+                " thin is warm. Defaults to 1024."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}worker-warmup-thin-ratio",
+            type=float,
+            default=RouterArgs.worker_warmup_thin_ratio,
+            help=(
+                "A worker whose index holds less than this share of the fleet's"
+                " median (or nothing) is thin and receives the warm-up slice until"
+                " it has grown by --worker-warmup-blocks, whatever emptied it. 0"
+                " keeps the age rule alone. Defaults to 0.5."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}worker-warmup-divert-every",
+            type=int,
+            default=RouterArgs.worker_warmup_divert_every,
+            help=(
+                "One cache hit in this many is diverted to a thin worker although"
+                " another worker holds its prefix (shallow overlaps first, one in"
+                " flight per thin worker), so an index emptied by a resync refills"
+                " on a workload where every request has a holder. 0 disables."
+                " Defaults to 8."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}selection-policy",
+            type=str,
+            default=RouterArgs.selection_policy,
+            help=(
+                "The cache-aware worker selection policy. 'cache-aware-default', the"
+                " pre-policy decision, is the one policy."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}selection-accounting-ttl-ms",
+            type=int,
+            default=RouterArgs.selection_accounting_ttl_ms,
+            help=(
+                "Lifetime in milliseconds of optimistic dispatch bookings for"
+                " cache_aware: predicted prefill and prefix placement are charged to"
+                " the chosen worker until the engine reports them or the booking"
+                " expires. 0 disables; set a little above the engine's KV-event lag."
             ),
         )
         routing_group.add_argument(
@@ -772,8 +949,8 @@ class RouterArgs:
             action="store_true",
             help=(
                 "Sticky sessions: route every request of a conversation to the"
-                " same worker, on any policy (keys derived from the request-id"
-                " lineage, falling back to the routing-key headers)"
+                " same worker, on any policy (valid routing-key headers take"
+                " priority, falling back to the request-id lineage)"
             ),
         )
         routing_group.add_argument(
@@ -849,6 +1026,33 @@ class RouterArgs:
             help="Decode server URL. Can be specified multiple times.",
         )
         pd_group.add_argument(
+            f"--{prefix}prefill-max-inflight-requests-per-worker",
+            type=int,
+            default=RouterArgs.prefill_max_inflight_requests_per_worker,
+            help=(
+                "Maximum in-flight Prefill requests per worker in PD or EPD mode."
+                " A non-positive value disables the limit (default: -1)."
+            ),
+        )
+        pd_group.add_argument(
+            f"--{prefix}prefill-queue-size",
+            type=int,
+            default=RouterArgs.prefill_queue_size,
+            help=(
+                "Maximum number of requests waiting for Prefill admission."
+                " Defaults to 100 when Prefill admission is enabled; 0 disables waiting."
+            ),
+        )
+        pd_group.add_argument(
+            f"--{prefix}prefill-queue-timeout-secs",
+            type=int,
+            default=RouterArgs.prefill_queue_timeout_secs,
+            help=(
+                "Maximum time in seconds a request may wait for Prefill admission."
+                " Defaults to 60 when Prefill admission is enabled."
+            ),
+        )
+        pd_group.add_argument(
             f"--{prefix}worker-startup-timeout-secs",
             type=int,
             default=RouterArgs.worker_startup_timeout_secs,
@@ -920,6 +1124,18 @@ class RouterArgs:
             help="Minimum multimodal tensor size (bytes) before the SHM transport is used",
         )
         parser.add_argument(
+            f"--{prefix}multimodal-max-inflight-bytes",
+            type=int,
+            default=RouterArgs.multimodal_max_inflight_bytes,
+            help=(
+                "Most bytes of preprocessed media held in flight for engines at"
+                " once; a request that fits waits briefly for room, then gets"
+                " 429, and one larger than the whole budget gets 413 straight"
+                " away. A waiting request still holds its media, so size memory"
+                " for about twice this value. Zero is refused, not read as unset"
+            ),
+        )
+        parser.add_argument(
             f"--{prefix}mm-per-request-image-limit",
             type=int,
             default=RouterArgs.mm_per_request_image_limit,
@@ -928,6 +1144,63 @@ class RouterArgs:
                 " model spec's built-in limit (e.g. to match the engine's"
                 " --limit-mm-per-prompt). Must be >= 1; unset keeps spec limits."
             ),
+        )
+        parser.add_argument(
+            f"--{prefix}mm-processing",
+            type=str.lower,
+            choices=["auto", "router", "worker"],
+            default=RouterArgs.mm_processing,
+            help=(
+                "Where media for vLLM gRPC workers is fetched and preprocessed: auto"
+                " (worker when the model spec and the worker both allow it, else"
+                " router), router (always the gateway), worker (always the engine;"
+                " models without worker expansion are rejected). Falls back to"
+                " SMG_MM_PROCESSING, then auto"
+            ),
+        )
+        parser.add_argument(
+            f"--{prefix}mm-pixel-cache-mb",
+            type=_non_negative_int,
+            default=RouterArgs.mm_pixel_cache_mb,
+            help=(
+                "Pixel cache budget in MiB for router-side preprocessed media; 0 keeps"
+                " the cache off. Falls back to SMG_MM_PIXEL_CACHE_MB"
+            ),
+        )
+        parser.add_argument(
+            f"--{prefix}mm-pixel-rdma",
+            action="store_true",
+            default=RouterArgs.mm_pixel_rdma,
+            help=(
+                "Serve cached pixels over RDMA instead of inline bytes (the legacy"
+                " switch; --multimodal-tensor-transport rdma is the first-class one)."
+                " Falls back to SMG_MM_PIXEL_RDMA"
+            ),
+        )
+        parser.add_argument(
+            f"--{prefix}rdma-listen-ip",
+            type=str,
+            default=RouterArgs.rdma_listen_ip,
+            help=(
+                "Listener IP for the RDMA pixel lane's metadata exchange; without one"
+                " the lane stays on the inline path. Falls back to SMG_RDMA_LISTEN_IP"
+            ),
+        )
+        parser.add_argument(
+            f"--{prefix}rdma-slot-ttl-s",
+            type=_non_negative_int,
+            default=RouterArgs.rdma_slot_ttl_s,
+            help=(
+                "Seconds a leased RDMA pixel slot lives without a free notification;"
+                " must exceed the worker's hold or it is ignored. Falls back to"
+                " SMG_RDMA_SLOT_TTL_S"
+            ),
+        )
+        parser.add_argument(
+            f"--{prefix}log-mm-timing",
+            action="store_true",
+            default=RouterArgs.log_mm_timing,
+            help="Emit per-request multimodal timing at INFO. Falls back to SMG_LOG_MM_TIMING",
         )
 
         # Logging configuration
@@ -954,10 +1227,21 @@ class RouterArgs:
         )
 
         # Service discovery configuration
-        k8s_group.add_argument(
+        discovery_selection = k8s_group.add_mutually_exclusive_group()
+        discovery_selection.add_argument(
             f"--{prefix}service-discovery",
             action="store_true",
-            help="Enable Kubernetes service discovery",
+            help=(
+                "Enable Kubernetes service discovery (the legacy spelling of"
+                " --discovery-provider kubernetes)"
+            ),
+        )
+        discovery_selection.add_argument(
+            f"--{prefix}discovery-provider",
+            type=str,
+            choices=DISCOVERY_PROVIDER_CHOICES,
+            default=None,
+            help="Worker discovery provider. Give this or --service-discovery, not both",
         )
         k8s_group.add_argument(
             f"--{prefix}selector",
@@ -1367,8 +1651,9 @@ class RouterArgs:
             default=RouterArgs.backend,
             choices=["sglang", "openai", "anthropic", "vllm", "tokenspeed"],
             help=(
-                "Backend runtime to use (default: sglang). For ZMQ workers, vllm/"
-                "tokenspeed also pin the wire protocol (it cannot be auto-detected)"
+                "Backend runtime to use (default: sglang). Over ZMQ the backend names the "
+                "workers' engine and pins the wire protocol (it cannot be auto-detected): "
+                "pass vllm or tokenspeed for those engines; the default serves SGLang schedulers"
             ),
         )
         backend_group.add_argument(
@@ -1701,6 +1986,15 @@ class RouterArgs:
             # CLI args are tls_cert_path/tls_key_path
             # We need to manually map them if names don't match
 
+        # --disable-worker-overload-protection is the CLI spelling of
+        # worker_overload_protection=False; the prefixed form wins, the
+        # unprefixed one applies unless the fallback is disabled.
+        disable_protection = cli_args_dict.get(f"{prefix}disable_worker_overload_protection")
+        if disable_protection is None and not disable_arg_fallback:
+            disable_protection = cli_args_dict.get("disable_worker_overload_protection")
+        if disable_protection:
+            args_dict["worker_overload_protection"] = False
+
         # Map tls args to server cert/key path
         if f"{prefix}tls_cert_path" in cli_args_dict:
             args_dict["server_cert_path"] = cli_args_dict[f"{prefix}tls_cert_path"]
@@ -1752,6 +2046,23 @@ class RouterArgs:
         )
 
         return cls(**args_dict)
+
+    def selected_discovery_provider(self) -> str | None:
+        """The worker discovery provider selected by either spelling.
+
+        ``service_discovery=True`` is ``discovery_provider="kubernetes"``.
+        Setting both is an error rather than a precedence rule, as on the CLI.
+        """
+        if self.discovery_provider is not None:
+            if self.service_discovery:
+                raise ValueError("Set service_discovery=True or discovery_provider, not both")
+            if self.discovery_provider not in DISCOVERY_PROVIDER_CHOICES:
+                raise ValueError(
+                    f"Unknown discovery provider {self.discovery_provider!r};"
+                    f" expected one of {DISCOVERY_PROVIDER_CHOICES}"
+                )
+            return self.discovery_provider
+        return "kubernetes" if self.service_discovery else None
 
     def _validate_router_args(self):
         # Validate configuration based on mode

@@ -32,6 +32,13 @@ fi
 export DEBIAN_FRONTEND=noninteractive
 sudo dpkg --configure -a --force-confnew 2>/dev/null || true
 
+# CPython dev headers: Triton (and torch's cpp_extension) compile against them
+# at engine startup. Fail here, not 20 minutes later inside a JIT build. Placed
+# after the dpkg repair above: the guard apt-installs python3.X-dev, and this
+# lane's runners can arrive with an interrupted dpkg state that only
+# `dpkg --configure -a` clears.
+bash "${SCRIPT_DIR}/ci_ensure_python_headers.sh"
+
 # Add NVIDIA apt repository if needed
 if ! dpkg -l cuda-keyring 2>/dev/null | grep -q '^ii'; then
     echo "Setting up NVIDIA apt repository..."

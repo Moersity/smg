@@ -841,6 +841,60 @@ impl std::str::FromStr for TransportMode {
     }
 }
 
+/// Where media is fetched and preprocessed for vLLM gRPC workers.
+///
+/// - `Auto`: forward media references when every worker serving the model
+///   advertises worker-side processing; otherwise preprocess on the router.
+/// - `Router`: always preprocess on the router (kill switch).
+/// - `Worker`: always forward references; fail when no capable worker exists.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum MmProcessingMode {
+    #[default]
+    Auto,
+    Router,
+    Worker,
+}
+
+impl MmProcessingMode {
+    /// Parse from a case-insensitive string (`auto` | `router` | `worker`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "router" => Some(Self::Router),
+            "worker" => Some(Self::Worker),
+            _ => None,
+        }
+    }
+
+    /// Canonical lowercase name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Router => "router",
+            Self::Worker => "worker",
+        }
+    }
+}
+
+impl std::fmt::Display for MmProcessingMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for MmProcessingMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s).ok_or_else(|| {
+            format!("invalid multimodal processing mode '{s}'; expected auto|router|worker")
+        })
+    }
+}
+
 // ── API types ───────────────────────────────────────────────────────
 
 /// Worker information for API responses.
@@ -885,6 +939,12 @@ pub struct WorkerInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pd_pairing: Option<String>,
 
+    /// Why the gateway's liveness tracker currently keeps the worker out of
+    /// routing (`unreachable` or `wedged`) while its health status stands;
+    /// absent when it is routable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stalled: Option<String>,
+
     /// The worker's last polled engine load, as published by the load
     /// monitor. `None` when load monitoring has produced nothing for this
     /// worker yet. Unrelated to `load` above, which counts in-flight
@@ -908,6 +968,7 @@ impl WorkerInfo {
             load: 0,
             http2: false,
             pd_pairing: None,
+            stalled: None,
             engine_load: None,
             job_status,
         }
@@ -1401,6 +1462,14 @@ pub struct WorkerLoadResponse {
     pub loads: Vec<SchedulerLoadSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aggregate: Option<EngineAggregateMetricsSnapshot>,
+    /// When the engine's state behind this report was sampled, on the
+    /// gateway's clock: the poll's receipt, or a pushed record's receipt
+    /// less its age and the one-way latency. A policy that books in-flight
+    /// work locally releases only what it dispatched before this instant.
+    /// Not serialized: it is meaningful only in the process that set it.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub sampled_at: Option<std::time::Instant>,
 }
 
 impl WorkerLoadResponse {

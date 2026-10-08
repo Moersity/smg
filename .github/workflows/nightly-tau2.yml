@@ -7,9 +7,10 @@
 # identical OpenAI /v1 endpoint so the τ²-bench harness can point at either and
 # the ONLY variable is the frontend (tokenization + tool/reasoning parsing).
 #
-# Runs nightly across retail, airline, and telecom domains over a 6-model matrix
-# (qwen3.8 + gpt-oss on H100; deepseek-v4.1, minimax-m2.7, kimi-k2.6, glm-5.2 on
-# Blackwell). The 4 Blackwell legs are num_tasks-capped to bound GPU time and
+# Runs weekly (Thursdays 07:17 UTC) across retail, airline, and telecom domains over
+# a 5-model matrix (qwen3.8 + gpt-oss on H100; deepseek-v4.1, minimax-m3,
+# glm-5.3-flash on Blackwell, skipped on the schedule while the `blackwell` runner is
+# offline). The Blackwell legs are num_tasks-capped to bound GPU time and
 # gpt-5.2 spend (tau2 is far heavier per-leg than bfcl: multi-turn + per-turn API
 # spend). On PRs that touch this pipeline ALL legs run on a tiny retail / 1-trial /
 # few-task subset — a quick "does each leg launch + parse + score" smoke. The heavy
@@ -19,7 +20,7 @@ name: Nightly tau2
 
 on:
   schedule:
-    - cron: "17 7 * * 2,4,6" # Tue/Thu/Sat 07:17 UTC = 00:17 PDT — alternates nights with nightly-bfcl so the two ~7h runs don't queue back-to-back on the shared Blackwell runner
+    - cron: "17 7 * * 4" # Thursdays 07:17 UTC = 00:17 PDT; nightly-bfcl takes Mondays so the two never share the 4-gpu-h100 pool
   # PR sanity (disabled, like nightly-bfcl): when the tau2 pipeline itself changes
   # this would run ALL legs on a tiny retail / 1-trial / few-task subset — but the
   # 6-leg run (incl. the ~7h Blackwell legs) is too heavy for every pipeline PR.
@@ -31,7 +32,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: "Run only this matrix leg (qwen3.8|gpt-oss|deepseek-v4.1|minimax-m2.7|kimi-k2.6|glm-5.2); empty = all"
+        description: "Run only this matrix leg (qwen3.8|gpt-oss|deepseek-v4.1|minimax-m3|glm-5.3-flash); empty = all"
         required: false
         default: ""
       model:
@@ -132,6 +133,7 @@ jobs:
       - id: build
         env:
           ONLY: ${{ github.event.inputs.only }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
@@ -166,7 +168,7 @@ jobs:
               # Concurrent TP=4 per arm (0-3 + 4-7); num_tasks-capped.
               # DeepSeek-V4.1-Flash is ~765GB on disk (552B backbone + 196B int8 Engram,
               # all GPU-resident), so it outgrows a TP=4 half-node and runs SEQUENTIAL
-              # on the whole node like glm-5.2. SMG: deepseek_v41 tool/reasoning parsers
+              # on the whole node (the only such leg). SMG: deepseek_v41 tool/reasoning parsers
               # + native renderer (#2524/#2525/#2527). vLLM: V4.1 is on main only
               # (vllm-project/vllm#56208 + #56228, 2026-09-10), not in the 0.27.1 CI
               # pin, so this leg installs a per-commit main wheel (vllm_commit below).
@@ -185,34 +187,32 @@ jobs:
                "arm_mode": "sequential", "max_model_len": "auto", "num_tasks": 30,
                # 20m/domain = ~1h/arm, arms serial; the V4 leg hung here before.
                "run_timeout": "1200"},
-              {"name": "minimax-m2.7", "runner": "blackwell", "tp": 4,
+              # MiniMax-M3 official MXFP8 checkpoint (~444GB, TP=4 half-node) on the stock
+              # CI vLLM pin; flags per the vLLM recipe (see nightly-bfcl.yml).
+              {"name": "minimax-m3", "runner": "blackwell", "tp": 4,
                "gpu_a": "0,1,2,3", "gpu_b": "4,5,6,7",
-               "model": "MiniMaxAI/MiniMax-M2.7",
-               "vllm_tool": "minimax_m2", "vllm_reason": "minimax_m2",
-               "smg_tool": "minimax_m2", "smg_reason": "minimax",
-               "vllm_extra": "--trust-remote-code", "gpu_mem": "0.90", "startup_timeout": "2400",
+               "model": "MiniMaxAI/MiniMax-M3-MXFP8",
+               "vllm_tool": "minimax_m3", "vllm_reason": "minimax_m3",
+               "smg_tool": "minimax_m3", "smg_reason": "minimax_m3",
+               "vllm_extra": "--trust-remote-code --block-size 128 --attention_config.indexer_kv_dtype fp8",
+               "gpu_mem": "0.90", "startup_timeout": "3000",
                "model_cache": "/raid/models", "arm_mode": "concurrent",
                "max_model_len": "auto", "num_tasks": 30, "run_timeout": "5400"},
-              {"name": "kimi-k2.6", "runner": "blackwell", "tp": 4,
+              # GLM-5.3-Flash (~306GiB FP8) fits a TP=4 half-node, so it runs concurrent,
+              # unlike the whole-node GLM-5.2-FP8 leg it replaces. Flags per the vLLM
+              # recipe; per-commit main wheel shared with deepseek-v4.1 (see nightly-bfcl.yml).
+              {"name": "glm-5.3-flash", "runner": "blackwell", "tp": 4,
                "gpu_a": "0,1,2,3", "gpu_b": "4,5,6,7",
-               "model": "moonshotai/Kimi-K2.6",
-               "vllm_tool": "kimi_k2", "vllm_reason": "kimi_k2",
-               "smg_tool": "kimik2", "smg_reason": "kimi_thinking",  # K2.6 template prefills <think> (always-in-reasoning); kimi_k25 is always_in_reasoning=false -> mis-splits reasoning
-               "vllm_extra": "--trust-remote-code", "gpu_mem": "0.90", "startup_timeout": "2400",
-               "model_cache": "/raid/models", "arm_mode": "concurrent",
-               "max_model_len": "auto", "num_tasks": 30, "run_timeout": "5400"},
-              # GLM-5.2-FP8 (~744GB) needs the whole 8-GPU node, so it runs SEQUENTIAL
-              # (arm A then arm B; gpu_b unused) unlike the concurrent half-node legs.
-              {"name": "glm-5.2", "runner": "blackwell", "tp": 8,
-               "gpu_a": "0,1,2,3,4,5,6,7", "gpu_b": "",
-               "model": "zai-org/GLM-5.2-FP8",
+               "model": "zai-org/GLM-5.3-Flash",
                "vllm_tool": "glm47", "vllm_reason": "glm45",
                "smg_tool": "glm47_moe", "smg_reason": "glm45",
-               "vllm_extra": "--trust-remote-code --kv-cache-dtype fp8_e4m3",
-               "gpu_mem": "0.90", "startup_timeout": "3000", "model_cache": "/raid/models",
-               "arm_mode": "sequential", "max_model_len": "auto", "num_tasks": 30,
-               # Sequential: both arms share the 360m job, so half the per-domain budget.
-               "run_timeout": "2700"},
+               "vllm_extra": "--trust-remote-code --kv-cache-dtype fp8",
+               "vllm_commit": "a31ec3a68bbbedd4b5d59490c762bcf32abf1a17",
+               "vllm_version": "0.29.1rc1.dev185+ga31ec3a68",
+               "gpu_mem": "0.90", "startup_timeout": "3600", "model_cache": "/raid/models",
+               "arm_mode": "concurrent", "max_model_len": "auto", "num_tasks": 30,
+               # Concurrent arms: full per-domain budget like the other half-node legs.
+               "run_timeout": "5400"},
           ]
           only = os.environ.get("ONLY", "")
           valid = [l["name"] for l in legs]
@@ -220,6 +220,14 @@ jobs:
               legs = [l for l in legs if l["name"] == only]
               if not legs:
                   raise SystemExit(f"unknown leg {only!r}; valid: {valid}")
+          # Scheduled runs take the H100 legs only: the `blackwell` runner has served
+          # no job since 2026-09-18, and a leg queued against an offline label sits in
+          # GitHub's queue for its 24h maximum and is cancelled, which marks the whole
+          # run cancelled and trips the node-health "queued over 24h" alert. A
+          # dispatch (with or without `only`) still runs every leg, so the Blackwell
+          # legs stay one click away once the runner is back.
+          if os.environ.get("EVENT_NAME") == "schedule":
+              legs = [l for l in legs if l["runner"] != "blackwell"]
           # All legs (incl. Blackwell) run on PRs too — the PR env below forces a
           # tiny retail / 1-trial / few-task subset, so each leg is just a quick
           # "does it launch + parse + score" smoke (model load dominates its time).
@@ -235,7 +243,7 @@ jobs:
       matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     # Generous ceiling: multi-turn state simulation is slow, and the sequential
-    # glm-5.2 leg scores two whole-node arms serially. Ceiling only; fast legs
+    # deepseek-v4.1 leg scores two whole-node arms serially. Ceiling only; fast legs
     # finish early. --max-concurrency keeps the full run within budget.
     timeout-minutes: 360
     permissions:
@@ -294,8 +302,15 @@ jobs:
           # uv for fast venv management, then clone + sync tau2-bench (its own .venv).
           curl -LsSf https://astral.sh/uv/install.sh | sh
           export PATH="$HOME/.local/bin:$PATH"
+          # Pinned: an unpinned clone broke every run from 2026-09-11, when upstream's
+          # voice work made the `tau2` CLI import `websockets`, which upstream declares
+          # only in its `voice` extra. The smoke below fails the job at install time
+          # instead of after the arms are up. Bump the pin deliberately.
+          TAU2_BENCH_REF=5bfa7e37b36656b37dc6d022156be6563c1007f3
           git clone https://github.com/sierra-research/tau2-bench
-          (cd tau2-bench && uv sync)
+          (cd tau2-bench && git checkout --quiet "$TAU2_BENCH_REF" && uv sync \
+            && uv pip install --python .venv/bin/python websockets \
+            && .venv/bin/tau2 run --help >/dev/null)
       - name: Stage model weights
         # Skip if pre-staged locally at <cache>/<id> (e.g. blackwell NVMe); else
         # download just this leg's model (not the whole GPU tier).

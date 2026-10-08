@@ -13,22 +13,28 @@ pub mod types;
 pub mod vision;
 
 pub use audio::AudioPreProcessor;
-pub use encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs};
+pub use encoder_inputs::{
+    f32_to_bf16_bits, f32_to_f16_bits, EncoderDtype, EncoderInput, EncoderInputView,
+    ModelSpecificValue, PixelNorm, PreprocessedEncoderInputs,
+};
 pub use error::{MediaConnectorError, MultiModalError, MultiModalResult, TransformError};
 pub use media::{
-    ImageFetchConfig, MediaConnector, MediaConnectorConfig, MediaSource, VideoFetchConfig,
+    init_log_video_decode_timing, FrameSampling, ImageFetchConfig, MediaConnector,
+    MediaConnectorConfig, MediaSource, VideoFetchConfig,
 };
 pub use registry::{
-    MediaPartOrder, ModelMetadata, ModelProcessorSpec, ModelRegistry, Tokenizer,
+    MediaItemInfo, MediaPartOrder, ModelMetadata, ModelProcessorSpec, ModelRegistry, Tokenizer,
     DEEPSEEK_V41_IMAGE_PLACEHOLDER,
 };
 pub use tracker::{AsyncMultiModalTracker, TrackerOutput};
 pub use types::{
     AudioClip, AudioSource, EncoderFieldLayouts, FieldLayout, ImageDetail, ImageFrame, ImageSize,
     ImageSource, MediaContentPart, Modality, MultiModalData, MultiModalUUIDs, PlaceholderRange,
-    PromptReplacement, RgbFrameRef, TokenId, TrackedMedia, VideoClip, VideoSource,
+    PromptReplacement, RgbFrameRef, TokenId, TrackedMedia, VideoClip, VideoSamplingInfo,
+    VideoSource,
 };
 // Re-export vision processing components
+pub use vision::execution::{configure_parallelism, parallelism, Parallelism, POOL_THREADS_ENV};
 pub use vision::{
     DeepseekV41Processor, LlavaNextProcessor, LlavaProcessor, PreProcessorConfig,
     VisionPreProcessor, VisionProcessorRegistry,

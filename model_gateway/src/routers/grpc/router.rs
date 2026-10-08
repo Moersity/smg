@@ -9,6 +9,7 @@ use openai_protocol::{
     chat::ChatCompletionRequest,
     classify::ClassifyRequest,
     completion::CompletionRequest,
+    decisions::DecisionsRequest,
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
     messages::CreateMessageRequest,
@@ -27,17 +28,17 @@ use super::{
     context::SharedComponents,
     harmony::{serve_harmony_responses, serve_harmony_responses_stream, HarmonyDetector},
     mode::Mode,
-    multimodal::MultimodalComponents,
+    multimodal::{mm_settings, MultimodalComponents},
     pipeline::{Endpoint, PipelineDeps, RequestPipeline},
-    regular::responses,
+    regular::{responses, stages::decisions::supports_worker as supports_decisions_worker},
     utils::ParserResolver,
 };
 use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
     middleware::TenantRequestMeta,
-    routers::RouterTrait,
-    worker::{WorkerRegistry, WorkerType},
+    routers::{error, RouterTrait},
+    worker::{RoutingPool, WorkerRegistry, WorkerType},
 };
 
 /// `501 NOT_IMPLEMENTED`, returned by endpoints this router's mode doesn't
@@ -64,6 +65,7 @@ pub struct GrpcRouter {
     harmony_pipeline: Option<RequestPipeline>,
     embedding_pipeline: Option<RequestPipeline>,
     classify_pipeline: Option<RequestPipeline>,
+    decisions_pipeline: Option<RequestPipeline>,
     transcription_pipeline: Option<RequestPipeline>,
     messages_pipeline: RequestPipeline,
     completion_pipeline: RequestPipeline,
@@ -95,17 +97,18 @@ impl GrpcRouter {
         let worker_registry = ctx.worker_registry.clone();
         let policy_registry = ctx.policy_registry.clone();
 
-        // Create multimodal components (best-effort; non-fatal if initialization fails)
-        let multimodal = match MultimodalComponents::new(
-            ctx.multimodal_config_registry.clone(),
-            ctx.router_config.mm_per_request_image_limit,
-        ) {
-            Ok(mc) => Some(Arc::new(mc)),
-            Err(e) => {
-                tracing::warn!("Multimodal components initialization failed (non-fatal): {e}");
-                None
-            }
-        };
+        // What can fail here is the operator's own setting, so the router
+        // stops rather than coming up with media handling quietly switched
+        // off and every media request failing later for no stated reason.
+        let multimodal = Some(Arc::new(
+            MultimodalComponents::new(
+                ctx.multimodal_config_registry.clone(),
+                ctx.router_config.mm_per_request_image_limit,
+                ctx.router_config.multimodal_max_inflight_bytes,
+                mm_settings(),
+            )
+            .map_err(|e| format!("multimodal components: {e:#}"))?,
+        ));
 
         // Create shared components for pipeline
         let shared_components = Arc::new(SharedComponents {
@@ -125,6 +128,7 @@ impl GrpcRouter {
         let configured_deps = PipelineDeps::new(
             worker_registry.clone(),
             policy_registry.clone(),
+            ctx.prefill_admission.clone(),
             tool_parser_factory.clone(),
             reasoning_parser_factory.clone(),
             ctx.configured_tool_parser.clone(),
@@ -137,6 +141,7 @@ impl GrpcRouter {
         let pair_deps = PipelineDeps::pair(
             worker_registry.clone(),
             policy_registry.clone(),
+            ctx.prefill_admission.clone(),
             ctx.rate_limit_manager.clone(),
         );
 
@@ -152,6 +157,7 @@ impl GrpcRouter {
         let harmony_pipeline = RequestPipeline::build(Endpoint::Harmony, mode, &configured_deps);
         let embedding_pipeline = RequestPipeline::build(Endpoint::Embeddings, mode, &pair_deps);
         let classify_pipeline = RequestPipeline::build(Endpoint::Classify, mode, &pair_deps);
+        let decisions_pipeline = RequestPipeline::build(Endpoint::Decisions, mode, &pair_deps);
         let transcription_pipeline =
             RequestPipeline::build(Endpoint::Transcription, mode, &pair_deps);
 
@@ -200,6 +206,7 @@ impl GrpcRouter {
             harmony_pipeline,
             embedding_pipeline,
             classify_pipeline,
+            decisions_pipeline,
             transcription_pipeline,
             messages_pipeline,
             completion_pipeline,
@@ -308,6 +315,7 @@ impl GrpcRouter {
                 Some(tenant_meta.clone()),
                 Some(rate_limit_cell.clone()),
                 Some(&retry_config),
+                None,
             )
             .await;
 
@@ -520,6 +528,55 @@ impl GrpcRouter {
         response
     }
 
+    /// Score Decisions through the regular SGLang pipeline.
+    async fn route_decisions_impl(
+        &self,
+        headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
+        mut body: DecisionsRequest,
+        model_id: &str,
+    ) -> Response {
+        let Some(pipeline) = self.decisions_pipeline.as_ref() else {
+            return error::not_implemented(
+                "decisions_not_supported",
+                "Decisions requires a regular SGLang gRPC router",
+            );
+        };
+        let canonical = self.resolve_canonical_model_id(model_id);
+        if canonical == openai_protocol::UNKNOWN_MODEL_ID {
+            return error::model_not_found(model_id);
+        }
+        let Some(snapshot) = self.worker_registry.model_routing_snapshot(&canonical) else {
+            return error::model_not_found(model_id);
+        };
+        if !snapshot
+            .pool(RoutingPool::GrpcPipelineRegular)
+            .iter()
+            .any(|worker| supports_decisions_worker(worker.as_ref()))
+        {
+            return error::not_implemented(
+                "decisions_not_supported",
+                "Decisions scoring requires a regular SGLang gRPC worker",
+            );
+        }
+        body.model = canonical.clone();
+        let rate_limit_cell = Arc::new(RateLimitCell::new());
+        let retry_config = self.resolve_retry_config_for_canonical(&canonical);
+        let response = pipeline
+            .execute_decisions(
+                Arc::new(body),
+                headers.cloned(),
+                canonical,
+                self.shared_components.clone(),
+                Some(tenant_meta.clone()),
+                Some(rate_limit_cell.clone()),
+                Some(&retry_config),
+            )
+            .await;
+        Self::close_reservation_if_unsettled(&rate_limit_cell, response.status()).await;
+        response
+    }
+
     /// Main route_classify implementation
     async fn route_classify_impl(
         &self,
@@ -640,6 +697,17 @@ impl RouterTrait for GrpcRouter {
         model_id: &str,
     ) -> Response {
         self.route_classify_impl(headers, tenant_meta, body, model_id)
+            .await
+    }
+
+    async fn route_decisions(
+        &self,
+        headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
+        body: DecisionsRequest,
+        model_id: &str,
+    ) -> Response {
+        self.route_decisions_impl(headers, tenant_meta, body, model_id)
             .await
     }
 

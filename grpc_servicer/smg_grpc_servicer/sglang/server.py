@@ -29,10 +29,12 @@ from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
 from smg_grpc_servicer.sglang.request_manager import GrpcRequestManager
+from smg_grpc_servicer.sglang.rust import SERVICER_IMPL_ENV, resolve_servicer_impl, serve_rust
 from smg_grpc_servicer.sglang.scheduler_launcher import (
     launch_scheduler_process_only,
     terminate_scheduler_processes,
 )
+from smg_grpc_servicer.sglang.scheduler_watchdog import wait_for_scheduler_shutdown
 from smg_grpc_servicer.sglang.servicer import SGLangSchedulerServicer
 
 logger = logging.getLogger(__name__)
@@ -107,6 +109,17 @@ async def serve_grpc(
             callback signature is a public contract.
     """
 
+    # One flag selects the Rust request path; the entrypoint and every
+    # ServerArgs flag stay the same, and the Router cannot tell them apart.
+    if resolve_servicer_impl() == "rust":
+        if on_request_manager_ready is not None:
+            logger.warning(
+                "%s=rust: SGLang's HTTP sidecar (metrics, profiling endpoints) stays off; "
+                "the Rust servicer has no request manager to wire it to",
+                SERVICER_IMPL_ENV,
+            )
+        raise SystemExit(await serve_rust(server_args))
+
     # Install the process-wide runtime context before any sglang machinery
     # runs here. Since 0.5.18 the config is published per process and read
     # through `get_parallel()` rather than threaded from ServerArgs, so
@@ -123,7 +136,7 @@ async def serve_grpc(
     # This ensures the bootstrap server is ready when prefill schedulers try to register
     bootstrap_server = None
     if server_args.disaggregation_mode == "prefill":
-        bootstrap_server = start_disagg_service(server_args)
+        bootstrap_server = start_disagg_service()
         if bootstrap_server:
             logger.info(
                 "Bootstrap server started for disaggregation mode on %s:%s",
@@ -379,7 +392,7 @@ async def serve_grpc(
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, signal_handler)
 
-        await stop_event.wait()
+        await wait_for_scheduler_shutdown(scheduler_procs, stop_event)
     finally:
         logger.info("Shutting down gRPC server")
 

@@ -156,8 +156,12 @@ pub(crate) fn extract_thinking_from_kwargs(
                     .flatten()
             })
         }
-        // Tri-state string toggle: "adaptive" (or any other value) means the
-        // template adds no prefix, so it maps to no preference.
+        // The template's own on/off words for `reasoning_effort`.
+        Some(ThinkingKeyName::ReasoningEffort) => {
+            let effort = kwargs.get("reasoning_effort").and_then(Value::as_str)?;
+            native_effort_thinking(effort, tokenizer)
+        }
+        // Tri-state string toggle: adaptive adds no reasoning prefix.
         Some(ThinkingKeyName::ThinkingMode) => {
             match kwargs.get("thinking_mode").and_then(Value::as_str) {
                 Some("enabled") => Some(true),
@@ -169,13 +173,11 @@ pub(crate) fn extract_thinking_from_kwargs(
     }
 }
 
-/// The thinking preference implied by `reasoning_effort` for a renderer
-/// with native effort values, so the reasoning parser is armed consistently
-/// with the rendered prompt: `Some(true)` for a native value (the renderer
-/// enters thinking mode), `Some(false)` for the thinking switch
-/// (`"none"`/`"minimal"`, see [`thinking_from_reasoning_effort`]), which turns
-/// thinking off and short-circuits the generic `reasoning_effort` fallback in
-/// `resolve_thinking_pref`, and `None` otherwise.
+/// The thinking preference implied by `reasoning_effort` for a renderer that
+/// reads the kwarg natively, so the reasoning parser is armed consistently
+/// with the rendered prompt: `Some(true)` for one of its on words, `Some(false)`
+/// for one of its off words (which short-circuits the generic
+/// `reasoning_effort` fallback in `resolve_thinking_pref`), `None` otherwise.
 /// Mirrors the template-kwargs merge: an explicit kwargs entry wins over the
 /// top-level `reasoning_effort` field.
 fn extract_template_effort_thinking(
@@ -183,34 +185,59 @@ fn extract_template_effort_thinking(
     reasoning_effort: Option<&str>,
     tokenizer: &dyn Tokenizer,
 ) -> Option<bool> {
-    let native_values = tokenizer.native_reasoning_effort_values();
-    if native_values.is_empty() {
+    if tokenizer.native_reasoning_effort_values().is_empty()
+        && tokenizer.native_reasoning_effort_off_values().is_empty()
+    {
         return None;
     }
     let effort = kwargs
         .and_then(|k| k.get("reasoning_effort"))
         .and_then(Value::as_str)
         .or(reasoning_effort)?;
-    // `"none"`/`"minimal"` are the renderer's thinking switch, not effort
-    // levels: they render chat mode wherever they arrive (kwargs or
-    // top-level), so the parser must be disarmed the same way.
-    if thinking_from_reasoning_effort(Some(effort)) == Some(false) {
+    native_effort_thinking(effort, tokenizer)
+}
+
+/// What a `reasoning_effort` value means to this renderer, wherever it
+/// arrives (kwargs or top-level; the gateway forwards both to the template).
+/// A renderer that declares its own off words (Hy4's `no_think`) is read by
+/// those alone: an off word disarms the parser and every other value renders
+/// the template's default, so the protocol switch must not apply. One that
+/// declares none is switched off by the protocol's `"none"`/`"minimal"`,
+/// which the DeepSeek renderers render as chat mode, and armed by an on word.
+fn native_effort_thinking(effort: &str, tokenizer: &dyn Tokenizer) -> Option<bool> {
+    let off_values = tokenizer.native_reasoning_effort_off_values();
+    let on_values = tokenizer.native_reasoning_effort_values();
+    if off_values.is_empty() {
+        if thinking_from_reasoning_effort(Some(effort)) == Some(false) {
+            return Some(false);
+        }
+        return on_values.contains(&effort).then_some(true);
+    }
+    if off_values.contains(&effort) {
         return Some(false);
     }
-    native_values.contains(&effort).then_some(true)
+    Some(
+        on_values.contains(&effort)
+            || matches!(tokenizer.thinking_toggle(), ThinkingToggle::DefaultOn),
+    )
 }
 
 /// Precedence for the effective thinking preference: an explicit template
 /// toggle always wins, then a native template effort for renderers that
-/// support it, then the protocol-level OpenAI `reasoning_effort` mapping
-/// ([`thinking_from_reasoning_effort`]).
+/// support it, then the typed `thinking.type` toggle, then the protocol-level
+/// OpenAI `reasoning_effort` mapping ([`thinking_from_reasoning_effort`]).
+/// The typed rank matches where K3, V3.2 and V4.1 read `params.thinking`;
+/// V4 ranks it above its native effort, so a typed `disabled` plus a native
+/// effort disagrees there.
 fn resolve_thinking_pref(
     explicit: Option<bool>,
     template_effort: Option<bool>,
+    typed: Option<bool>,
     reasoning_effort: Option<&str>,
 ) -> Option<bool> {
     explicit
         .or(template_effort)
+        .or(typed)
         .or_else(|| thinking_from_reasoning_effort(reasoning_effort))
 }
 
@@ -225,6 +252,7 @@ fn resolve_thinking_pref(
 pub fn reasoning_starts_in_prefill(
     kwargs: Option<&std::collections::HashMap<String, Value>>,
     reasoning_effort: Option<&str>,
+    thinking: Option<bool>,
     continues_final_assistant: bool,
     tokenizer: &dyn Tokenizer,
 ) -> bool {
@@ -236,7 +264,7 @@ pub fn reasoning_starts_in_prefill(
         return false;
     }
     should_mark_reasoning_started(
-        resolve_user_thinking(kwargs, reasoning_effort, tokenizer),
+        resolve_user_thinking(kwargs, reasoning_effort, thinking, tokenizer),
         tokenizer,
     )
 }
@@ -255,7 +283,8 @@ pub fn chat_reasoning_starts_in_prefill(
 ) -> bool {
     reasoning_starts_in_prefill(
         request.chat_template_kwargs.as_ref(),
-        request.reasoning_effort.as_deref(),
+        request.effective_reasoning_effort(),
+        request.thinking_toggle(),
         continues_final_assistant(request),
         tokenizer,
     )
@@ -298,11 +327,13 @@ pub fn constraint_covers_reasoning(
 pub fn resolve_user_thinking(
     kwargs: Option<&std::collections::HashMap<String, Value>>,
     reasoning_effort: Option<&str>,
+    thinking: Option<bool>,
     tokenizer: &dyn Tokenizer,
 ) -> Option<bool> {
     resolve_thinking_pref(
         extract_thinking_from_kwargs(kwargs, tokenizer),
         extract_template_effort_thinking(kwargs, reasoning_effort, tokenizer),
+        thinking,
         reasoning_effort,
     )
 }
@@ -435,18 +466,29 @@ mod tests {
 
     #[test]
     fn resolve_thinking_pref_precedence() {
-        // Explicit toggle > native template effort > reasoning_effort mapping.
+        // Explicit toggle > native template effort > typed toggle > reasoning_effort mapping.
         assert_eq!(
-            resolve_thinking_pref(Some(false), Some(true), Some("high")),
+            resolve_thinking_pref(Some(false), Some(true), Some(true), Some("high")),
             Some(false)
         );
         assert_eq!(
-            resolve_thinking_pref(None, Some(true), Some("none")),
+            resolve_thinking_pref(None, Some(true), Some(false), Some("none")),
             Some(true)
         );
-        assert_eq!(resolve_thinking_pref(None, None, Some("none")), Some(false));
-        assert_eq!(resolve_thinking_pref(None, None, Some("high")), None);
-        assert_eq!(resolve_thinking_pref(None, None, None), None);
+        assert_eq!(
+            resolve_thinking_pref(None, None, Some(false), Some("high")),
+            Some(false)
+        );
+        assert_eq!(
+            resolve_thinking_pref(None, None, Some(true), Some("none")),
+            Some(true)
+        );
+        assert_eq!(
+            resolve_thinking_pref(None, None, None, Some("none")),
+            Some(false)
+        );
+        assert_eq!(resolve_thinking_pref(None, None, None, Some("high")), None);
+        assert_eq!(resolve_thinking_pref(None, None, None, None), None);
     }
 
     /// A kwargs `reasoning_effort` of `"none"` renders chat mode for native
@@ -464,10 +506,13 @@ mod tests {
             Some(false)
         );
         assert_eq!(
-            resolve_user_thinking(Some(&none_kw), Some("high"), &tok),
+            resolve_user_thinking(Some(&none_kw), Some("high"), None, &tok),
             Some(false)
         );
-        assert_eq!(resolve_user_thinking(None, Some("none"), &tok), Some(false));
+        assert_eq!(
+            resolve_user_thinking(None, Some("none"), None, &tok),
+            Some(false)
+        );
         // `minimal` is the switch's other spelling and disarms the same way.
         let minimal_kw = std::collections::HashMap::from([(
             "reasoning_effort".to_string(),
@@ -547,7 +592,7 @@ mod tests {
             Some(false)
         );
         assert_eq!(
-            resolve_user_thinking(Some(&alias_off), Some("high"), &tok),
+            resolve_user_thinking(Some(&alias_off), Some("high"), None, &tok),
             Some(false)
         );
         // `thinking` wins when both keys are present.
@@ -570,12 +615,18 @@ mod tests {
             Some(false)
         );
         assert_eq!(
-            resolve_user_thinking(Some(&none_kw), Some("high"), &tok),
+            resolve_user_thinking(Some(&none_kw), Some("high"), None, &tok),
             Some(false)
         );
         // Native names arm; a top-level "none" disarms; an explicit toggle beats "none".
-        assert_eq!(resolve_user_thinking(None, Some("xhigh"), &tok), Some(true));
-        assert_eq!(resolve_user_thinking(None, Some("none"), &tok), Some(false));
+        assert_eq!(
+            resolve_user_thinking(None, Some("xhigh"), None, &tok),
+            Some(true)
+        );
+        assert_eq!(
+            resolve_user_thinking(None, Some("none"), None, &tok),
+            Some(false)
+        );
         let explicit_on = std::collections::HashMap::from([
             ("thinking".to_string(), Value::Bool(true)),
             (
@@ -584,11 +635,11 @@ mod tests {
             ),
         ]);
         assert_eq!(
-            resolve_user_thinking(Some(&explicit_on), None, &tok),
+            resolve_user_thinking(Some(&explicit_on), None, None, &tok),
             Some(true)
         );
         assert!(should_mark_reasoning_started(
-            resolve_user_thinking(Some(&explicit_on), None, &tok),
+            resolve_user_thinking(Some(&explicit_on), None, None, &tok),
             &tok
         ));
 
@@ -619,8 +670,80 @@ mod tests {
             &tok
         ));
         assert!(!should_mark_reasoning_started(
-            resolve_user_thinking(Some(&none_kw), Some("high"), &tok),
+            resolve_user_thinking(Some(&none_kw), Some("high"), None, &tok),
             &tok
+        ));
+    }
+
+    /// Typed toggle: below an explicit kwargs toggle and a native effort, above the OpenAI mapping.
+    #[test]
+    fn typed_thinking_toggle_ranks_between_kwargs_and_effort() {
+        let k3 = llm_tokenizer::MockTokenizer::new()
+            .with_thinking_toggle(ThinkingToggle::DefaultOn)
+            .with_thinking_key_name(ThinkingKeyName::Thinking);
+
+        // KVV `thinking:{type:"disabled"}`: chat mode, parser not armed.
+        assert_eq!(
+            resolve_user_thinking(None, Some("max"), Some(false), &k3),
+            Some(false)
+        );
+        assert!(!should_mark_reasoning_started(
+            resolve_user_thinking(None, Some("max"), Some(false), &k3),
+            &k3
+        ));
+        // Absent `thinking`, K3 stays thinking-on by default.
+        assert!(should_mark_reasoning_started(
+            resolve_user_thinking(None, None, None, &k3),
+            &k3
+        ));
+        // An explicit kwargs toggle outranks the typed one.
+        let kw_on = std::collections::HashMap::from([("thinking".to_string(), Value::Bool(true))]);
+        assert_eq!(
+            resolve_user_thinking(Some(&kw_on), None, Some(false), &k3),
+            Some(true)
+        );
+        // The typed toggle outranks the OpenAI mapping; absent it, the mapping applies.
+        assert_eq!(
+            resolve_user_thinking(None, Some("none"), Some(true), &k3),
+            Some(true)
+        );
+        assert_eq!(
+            resolve_user_thinking(None, Some("none"), None, &k3),
+            Some(false)
+        );
+
+        // A native template effort outranks the typed toggle (DeepSeek-V4.1).
+        let v41 = v41_like();
+        assert_eq!(
+            resolve_user_thinking(None, Some("high"), Some(false), &v41),
+            Some(true)
+        );
+        assert_eq!(
+            resolve_user_thinking(None, Some("medium"), Some(false), &v41),
+            Some(false)
+        );
+
+        // End to end through the chat request: `thinking.effort` is the effective effort.
+        let request = |thinking: Value| -> ChatCompletionRequest {
+            serde_json::from_value(serde_json::json!({
+                "model": "kimi-k3",
+                "messages": [{"role": "user", "content": "q"}],
+                "thinking": thinking,
+                "reasoning_effort": "none",
+            }))
+            .expect("chat request")
+        };
+        assert!(chat_reasoning_starts_in_prefill(
+            &request(serde_json::json!({"type": "enabled"})),
+            &k3
+        ));
+        assert!(!chat_reasoning_starts_in_prefill(
+            &request(serde_json::json!({"type": "disabled"})),
+            &k3
+        ));
+        assert!(chat_reasoning_starts_in_prefill(
+            &request(serde_json::json!({"effort": "high"})),
+            &v41
         ));
     }
 
@@ -814,5 +937,49 @@ mod parser_resolver_tests {
             let resolver = ParserResolver::new(registry, None, None);
             assert_eq!(resolver.tool_parser("m").as_deref(), Some("alpha"));
         }
+    }
+}
+
+#[cfg(test)]
+mod hy_v4_tests {
+    use super::*;
+    #[test]
+    fn hy4_effort_arms_parser_like_template() {
+        let tok = llm_tokenizer::MockTokenizer::new()
+            .with_thinking_toggle(ThinkingToggle::DefaultOn)
+            .with_thinking_key_name(ThinkingKeyName::ReasoningEffort)
+            .with_native_reasoning_effort_values(&["high"])
+            .with_native_reasoning_effort_off_values(&["no_think"]);
+        assert!(should_mark_reasoning_started(None, &tok));
+        assert_eq!(
+            extract_template_effort_thinking(None, Some("no_think"), &tok),
+            Some(false)
+        );
+        let kwargs = std::collections::HashMap::from([(
+            "reasoning_effort".to_string(),
+            serde_json::json!("high"),
+        )]);
+        assert_eq!(
+            extract_thinking_from_kwargs(Some(&kwargs), &tok),
+            Some(true)
+        );
+        assert_eq!(
+            extract_template_effort_thinking(Some(&kwargs), Some("no_think"), &tok),
+            Some(true)
+        );
+        // The template renders its default for a value it does not know, so
+        // the protocol's `none` must not disarm the parser here.
+        assert_eq!(
+            resolve_user_thinking(None, Some("none"), None, &tok),
+            Some(true)
+        );
+        let unknown = std::collections::HashMap::from([(
+            "reasoning_effort".to_string(),
+            serde_json::json!("none"),
+        )]);
+        assert_eq!(
+            resolve_user_thinking(Some(&unknown), None, None, &tok),
+            Some(true)
+        );
     }
 }

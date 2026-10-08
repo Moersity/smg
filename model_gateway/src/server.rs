@@ -18,10 +18,11 @@ use openai_protocol::{
     chat::ChatCompletionRequest,
     classify::ClassifyRequest,
     completion::CompletionRequest,
+    decisions::DecisionsRequest,
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
     interactions::InteractionsRequest,
-    messages::CreateMessageRequest,
+    messages::{CountMessageTokensRequest, CreateMessageRequest},
     multipart::AudioTranscriptionMultipart,
     parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
     realtime_session::{
@@ -30,6 +31,7 @@ use openai_protocol::{
     },
     rerank::{RerankRequest, V1RerankReqInput},
     responses::ResponsesRequest,
+    systemone::SystemOneRequest,
     tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
     validated::ValidatedJson,
     worker::{
@@ -49,8 +51,10 @@ use crate::{
     config::RouterConfig,
     endpoints::{conversations, models, parse, responses as response_handlers, tokenize},
     mesh::MeshAdapters,
+    mesh_discovery::{start_mesh_discovery, MeshDiscoveryConfig},
     middleware::{self, AdmissionQueue, AuthConfig},
     observability::{
+        inflight_tracker::InFlightRequestTracker,
         logging::{self, LoggingConfig},
         metrics::{self, PrometheusConfig},
         metrics_server, otel_trace, runtime_metrics,
@@ -61,7 +65,7 @@ use crate::{
         http::router::{stream_eligible_request_bodies, StreamBodyState},
         RouterTrait,
     },
-    service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
+    service_discovery::{start_service_discovery, RuntimeDiscoveryConfig},
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
     worker::{
         manager::{WorkerManager, WorkerManagerConfig},
@@ -264,6 +268,40 @@ async fn v1_interactions(
         .await
 }
 
+async fn v1_decisions(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    cancel: middleware::scheduler::PreemptionGuard,
+    ValidatedJson(body): ValidatedJson<DecisionsRequest>,
+) -> Response {
+    let model = body.model.clone();
+    cancel
+        .guard(
+            state
+                .router
+                .route_decisions(Some(&headers), &tenant_meta, body, &model),
+        )
+        .await
+}
+
+async fn v1_systemone(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    cancel: middleware::scheduler::PreemptionGuard,
+    ValidatedJson(body): ValidatedJson<SystemOneRequest>,
+) -> Response {
+    let model = body.model.clone();
+    cancel
+        .guard(
+            state
+                .router
+                .route_systemone(Some(&headers), &tenant_meta, body, &model),
+        )
+        .await
+}
+
 async fn v1_embeddings(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -294,6 +332,23 @@ async fn v1_messages(
             state
                 .router
                 .route_messages(Some(&headers), &tenant_meta, body, &model),
+        )
+        .await
+}
+
+async fn v1_messages_count_tokens(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    cancel: middleware::scheduler::PreemptionGuard,
+    Json(body): Json<CountMessageTokensRequest>,
+) -> Response {
+    let model = body.model.clone();
+    cancel
+        .guard(
+            state
+                .router
+                .route_messages_count_tokens(Some(&headers), &tenant_meta, body, &model),
         )
         .await
 }
@@ -736,7 +791,10 @@ pub struct ServerConfig {
     pub log_dir: Option<String>,
     pub log_level: Option<String>,
     pub log_json: bool,
-    pub service_discovery_config: Option<ServiceDiscoveryConfig>,
+    pub service_discovery_config: Option<RuntimeDiscoveryConfig>,
+    /// Kubernetes discovery of SMG mesh router peers. Independent of the
+    /// worker discovery provider: either may run without the other.
+    pub mesh_discovery_config: Option<MeshDiscoveryConfig>,
     pub prometheus_config: Option<PrometheusConfig>,
     pub request_timeout_secs: u64,
     pub request_id_headers: Option<Vec<String>>,
@@ -854,8 +912,11 @@ pub fn build_app(
             .route("/v1/rerank", post(v1_rerank))
             .route("/v1/embeddings", post(v1_embeddings))
             .route("/v1/messages", post(v1_messages))
+            .route("/v1/messages/count_tokens", post(v1_messages_count_tokens))
             .route("/v1/interactions", post(v1_interactions))
             .route("/v1/classify", post(v1_classify))
+            .route("/v1/decisions", post(v1_decisions))
+            .route("/v1/systemone", post(v1_systemone))
             // Per-request buffer-vs-stream decision for typed-JSON bodies;
             // declined requests pass to the handlers untouched.
             .route_layer(axum::middleware::from_fn_with_state(
@@ -1024,19 +1085,81 @@ pub fn build_app(
         app = app.merge(rl_routes);
     }
 
-    Ok(app
+    Ok(attach_edge_layers(
+        app,
+        max_payload_size,
+        app_state.context.inflight_tracker.clone(),
+        request_id_headers,
+        cors_allowed_origins,
+    )
+    .with_state(app_state))
+}
+
+/// The middleware every request crosses, matched or not: body limits, access
+/// logging, HTTP metrics, request ids and CORS.
+///
+/// `Router::layer` wraps only what the router holds when it is called, so the
+/// not-found fallback goes in first. Registered after the layers, unknown
+/// routes ran outside all of them: no log line, no metric (the metrics layer
+/// already labels them `other`), no `x-request-id`, no CORS headers.
+fn attach_edge_layers<S>(
+    app: Router<S>,
+    max_payload_size: usize,
+    inflight_tracker: Arc<InFlightRequestTracker>,
+    request_id_headers: Vec<String>,
+    cors_allowed_origins: Vec<String>,
+) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    app.fallback(sink_handler)
         .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,
         ))
         .layer(middleware::create_logging_layer())
-        .layer(middleware::HttpMetricsLayer::new(
-            app_state.context.inflight_tracker.clone(),
-        ))
+        .layer(middleware::HttpMetricsLayer::new(inflight_tracker))
         .layer(middleware::RequestIdLayer::new(request_id_headers))
         .layer(create_cors_layer(cors_allowed_origins))
-        .fallback(sink_handler)
-        .with_state(app_state))
+}
+
+/// Discovery tasks owned by `startup`, aborted when this guard drops.
+///
+/// Discovery starts before `build_app`, address parsing, and TLS setup, so an
+/// error on any of those paths returns from `startup` early. Dropping a bare
+/// `AbortHandle` does not stop its task, so the guard makes cancellation
+/// unconditional rather than relying on reaching the cleanup block.
+#[derive(Default)]
+struct DiscoveryTasks(Vec<tokio::task::AbortHandle>);
+
+impl Drop for DiscoveryTasks {
+    fn drop(&mut self) {
+        for task in self.0.drain(..) {
+            task.abort();
+        }
+    }
+}
+
+/// Keep a discovery task's abort handle for shutdown while a supervisor logs if
+/// the task ever stops on its own. A watcher that panics or whose stream ends
+/// permanently disables that discovery, so it must not fail silently.
+fn supervise_discovery(
+    name: &'static str,
+    handle: tokio::task::JoinHandle<()>,
+) -> tokio::task::AbortHandle {
+    let abort = handle.abort_handle();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "supervisor outlives the task it watches; it ends when that task ends"
+    )]
+    spawn(async move {
+        match handle.await {
+            Ok(()) => error!("{name} task exited; it no longer receives updates"),
+            Err(e) if e.is_cancelled() => debug!("{name} task cancelled at shutdown"),
+            Err(e) => error!("{name} task panicked and is no longer running: {e}"),
+        }
+    });
+    abort
 }
 
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -1087,11 +1210,19 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     // Seed the process-wide multimodal tensor transport defaults from the
     // resolved router config; per-worker specs still override at request time.
-    use crate::routers::grpc::multimodal::init_mm_transport_defaults;
+    use crate::routers::grpc::multimodal::{
+        init_mm_settings, init_mm_transport_defaults, MultimodalSettings,
+    };
     init_mm_transport_defaults(
         config.router_config.multimodal_tensor_transport,
         config.router_config.multimodal_shm_min_bytes,
     );
+    // Flag > env > default, resolved once; an unreadable env value stops
+    // startup here rather than at router creation.
+    let mm_settings = MultimodalSettings::resolve(&config.router_config)
+        .map_err(|error| format!("multimodal settings: {error:#}"))?;
+    llm_multimodal::init_log_video_decode_timing(mm_settings.log_mm_timing.value);
+    init_mm_settings(mm_settings);
 
     // Start the metrics server. It binds the port eagerly so we fail fast on
     // port conflicts or bad addresses.
@@ -1385,35 +1516,52 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         mesh_adapters,
         probe_state,
     });
-    if let Some(service_discovery_config) = config.service_discovery_config {
-        if service_discovery_config.enabled {
-            let app_context_arc = Arc::clone(&app_state.context);
+    // Worker discovery and mesh-router discovery are independent lifetimes:
+    // either may run without the other. Each is supervised for unexpected exit
+    // and its abort handle held so shutdown cancels it.
+    let mut discovery_tasks = DiscoveryTasks::default();
 
-            match start_service_discovery(
-                service_discovery_config,
-                app_context_arc,
-                mesh_cluster_state,
-                mesh_port,
-            )
-            .await
-            {
-                Ok(handle) => {
-                    info!("Service discovery started");
-                    #[expect(
-                        clippy::disallowed_methods,
-                        reason = "service discovery runs for the lifetime of the server"
-                    )]
-                    spawn(async move {
-                        if let Err(e) = handle.await {
-                            error!("Service discovery task failed: {:?}", e);
-                        }
-                    });
-                }
-                Err(e) => {
-                    error!("Failed to start service discovery: {e}");
-                    warn!("Continuing without service discovery");
+    if let Some(service_discovery_config) = config.service_discovery_config {
+        let app_context_arc = Arc::clone(&app_state.context);
+        match start_service_discovery(service_discovery_config, app_context_arc).await {
+            Ok(handle) => {
+                info!("Service discovery started");
+                discovery_tasks
+                    .0
+                    .push(supervise_discovery("Worker discovery", handle));
+            }
+            Err(e) => {
+                error!("Failed to start service discovery: {e}");
+                warn!("Continuing without service discovery");
+            }
+        }
+    }
+
+    if let Some(mesh_discovery_config) = config.mesh_discovery_config {
+        match (
+            mesh_discovery_config.is_enabled(),
+            mesh_cluster_state,
+            mesh_port,
+        ) {
+            (true, Some(cluster_state), Some(port)) => {
+                match start_mesh_discovery(mesh_discovery_config, cluster_state, port).await {
+                    Ok(handle) => {
+                        info!("Mesh router discovery started");
+                        discovery_tasks
+                            .0
+                            .push(supervise_discovery("Mesh router discovery", handle));
+                    }
+                    Err(e) => {
+                        error!("Failed to start mesh router discovery: {e}");
+                        warn!("Continuing without mesh router discovery");
+                    }
                 }
             }
+            (true, _, _) => warn!(
+                "Router selector configured but mesh is not enabled (mesh cluster state or \
+                 mesh port not provided). Skipping router discovery."
+            ),
+            (false, _, _) => {}
         }
     }
 
@@ -1546,6 +1694,8 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     info!("HTTP server stopped. Starting component cleanup...");
 
+    drop(discovery_tasks);
+
     // This triggers background task cancellation, waits for tools, and denies approvals
     if let Some(orchestrator) = app_context.mcp_orchestrator.get() {
         orchestrator.shutdown().await;
@@ -1622,7 +1772,12 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
                 http::Method::DELETE,
                 http::Method::OPTIONS,
             ])
-            .allow_headers([http::header::CONTENT_TYPE, http::header::AUTHORIZATION])
+            .allow_headers([
+                http::header::CONTENT_TYPE,
+                http::header::AUTHORIZATION,
+                http::header::HeaderName::from_static("anthropic-version"),
+                http::header::HeaderName::from_static("anthropic-beta"),
+            ])
             .expose_headers([http::header::HeaderName::from_static("x-request-id")])
     };
 
@@ -1639,6 +1794,87 @@ mod tests {
 
     use super::*;
     use crate::config::TenantApiKeyEntry;
+
+    /// The not-found fallback sits inside the edge layers: an unknown route
+    /// gets a request id (and a log line and a metric) like a known one.
+    #[tokio::test]
+    async fn unknown_routes_cross_the_edge_middleware() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let app = attach_edge_layers(
+            Router::new().route("/known", get(|| async { StatusCode::OK })),
+            1024,
+            InFlightRequestTracker::new(),
+            vec![],
+            vec![],
+        );
+        for (path, status) in [("/known", StatusCode::OK), ("/nope", StatusCode::NOT_FOUND)] {
+            let response = app
+                .clone()
+                .oneshot(
+                    http::Request::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{path}");
+            assert!(
+                response.headers().contains_key("x-request-id"),
+                "{path} skipped the edge middleware"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_cors_allows_anthropic_headers() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let app = Router::new()
+            .route(
+                "/v1/messages/count_tokens",
+                post(|| async { StatusCode::OK }),
+            )
+            .layer(create_cors_layer(vec!["https://client.example".into()]));
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .method("OPTIONS")
+                    .uri("/v1/messages/count_tokens")
+                    .header("origin", "https://client.example")
+                    .header("access-control-request-method", "POST")
+                    .header(
+                        "access-control-request-headers",
+                        "content-type,authorization,anthropic-version,anthropic-beta",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        assert_eq!(
+            response.headers()["access-control-allow-origin"],
+            "https://client.example"
+        );
+        let allowed = response.headers()["access-control-allow-headers"]
+            .to_str()
+            .unwrap();
+        for header in [
+            "content-type",
+            "authorization",
+            "anthropic-version",
+            "anthropic-beta",
+        ] {
+            assert!(
+                allowed.split(',').any(|value| value.trim() == header),
+                "missing {header}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn plain_http_acceptor_enables_nodelay() {
@@ -1726,6 +1962,7 @@ mod tests {
             log_level: None,
             log_json: false,
             service_discovery_config: None,
+            mesh_discovery_config: None,
             prometheus_config: None,
             request_timeout_secs: 60,
             request_id_headers: None,

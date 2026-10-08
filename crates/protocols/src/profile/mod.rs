@@ -14,11 +14,14 @@
 //! parts, such as MiniMax's `max_long_side_pixel` and `fps`, are not covered
 //! by that pass and are forwarded as sent.
 
+mod deepseek;
 mod kimi;
 mod minimax;
+mod zai;
 
 use crate::{
     chat::{ChatCompletionRequest, ChatMessage},
+    common::Tool,
     ext::retain_if,
 };
 
@@ -31,9 +34,40 @@ pub enum ProviderProfile {
     Kimi,
     /// MiniMax contract (MiniMax-Provider-Verifier).
     Minimax,
+    /// z.ai / GLM contract (providers-verifier `golden/zai`).
+    Zai,
+    /// DeepSeek V4 / V4.1 Chat contract (deepseek-provider-verifier).
+    DeepSeek,
 }
 
 impl ProviderProfile {
+    /// Tools the profile lets messages declare on top of the request-level
+    /// `tools`: Kimi K3's dynamic tools on system and developer messages, in
+    /// message order. Empty for profiles without message-declared tools, so
+    /// a foreign `tools` field on a message never widens the tool set.
+    pub fn dynamic_tools<'a>(
+        self,
+        req: &'a ChatCompletionRequest,
+    ) -> Box<dyn Iterator<Item = &'a Tool> + 'a> {
+        match self {
+            ProviderProfile::Kimi => Box::new(kimi::dynamic_tools(req)),
+            ProviderProfile::DeepSeek
+            | ProviderProfile::Minimax
+            | ProviderProfile::Zai
+            | ProviderProfile::OpenAi => Box::new(std::iter::empty()),
+        }
+    }
+
+    /// Whether responses are scanned for tool calls even when the request
+    /// declares no tools. MiniMax's verifier expects a tool the conversation
+    /// established (a retry after a transient tool error, say) to come back
+    /// as a `tool_calls` finish without any tool inventory; the model's
+    /// tool-call markup is a dedicated token, so scanning every response is
+    /// unambiguous. Other profiles keep the parser gated on declared tools.
+    pub fn parses_tool_calls_without_tools(self) -> bool {
+        matches!(self, ProviderProfile::Minimax)
+    }
+
     /// Select the profile from a model id.
     ///
     /// Matches the way the tool and reasoning parser factories do: any
@@ -44,8 +78,14 @@ impl ProviderProfile {
     /// aliased vendor model falls back to the OpenAI baseline, any extension
     /// it carried is dropped with a warning, and a `root` message is rejected
     /// outright, so that role needs a canonical MiniMax model id.
+    /// DeepSeek is narrower: only the calibrated V4 / V4.1 model segments
+    /// and `deepseek-flash` alias select its profile; older versions and
+    /// unrecognized suffixes keep the baseline.
     pub fn for_model(model: &str) -> Self {
         for segment in model.split('/') {
+            if deepseek::matches_model(segment) {
+                return ProviderProfile::DeepSeek;
+            }
             if starts_with_ignore_ascii_case(segment, "kimi")
                 || starts_with_ignore_ascii_case(segment, "moonshot")
             {
@@ -55,6 +95,12 @@ impl ProviderProfile {
                 || starts_with_ignore_ascii_case(segment, "abab")
             {
                 return ProviderProfile::Minimax;
+            }
+            if starts_with_ignore_ascii_case(segment, "glm")
+                || starts_with_ignore_ascii_case(segment, "zai")
+                || starts_with_ignore_ascii_case(segment, "z-ai")
+            {
+                return ProviderProfile::Zai;
             }
         }
         ProviderProfile::OpenAi
@@ -74,7 +120,10 @@ impl ProviderProfile {
     pub fn normalize_chat(self, req: &mut ChatCompletionRequest) {
         match self {
             ProviderProfile::Minimax => minimax::normalize_chat(req),
-            ProviderProfile::Kimi | ProviderProfile::OpenAi => {}
+            ProviderProfile::DeepSeek
+            | ProviderProfile::Kimi
+            | ProviderProfile::Zai
+            | ProviderProfile::OpenAi => {}
         }
         let mut dropped: Vec<&'static str> = Vec::new();
         for message in &mut req.messages {
@@ -106,7 +155,9 @@ impl ProviderProfile {
             );
         }
         match self {
+            ProviderProfile::DeepSeek => deepseek::normalize_chat(req),
             ProviderProfile::Kimi => kimi::normalize_chat(req),
+            ProviderProfile::Zai => zai::normalize_chat(req),
             ProviderProfile::OpenAi | ProviderProfile::Minimax => {}
         }
     }
@@ -122,6 +173,14 @@ impl ProviderProfile {
                 kimi::validate_chat(req)
             }
             ProviderProfile::Minimax => minimax::validate_chat(req),
+            ProviderProfile::Zai => {
+                reject_root(req)?;
+                zai::validate_chat(req)
+            }
+            ProviderProfile::DeepSeek => {
+                reject_root(req)?;
+                deepseek::validate_chat(req)
+            }
             ProviderProfile::OpenAi => reject_root(req),
         }
     }
@@ -153,6 +212,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_the_kimi_profile_exposes_message_declared_tools() {
+        let request = |model: &str| -> ChatCompletionRequest {
+            serde_json::from_value(serde_json::json!({
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": "", "tools": [
+                        {"type": "function", "function": {"name": "get_weather"}}
+                    ]},
+                    {"role": "developer", "content": "", "tools": [
+                        {"type": "function", "function": {"name": "get_time"}}
+                    ]},
+                    {"role": "user", "content": "hi"}
+                ]
+            }))
+            .expect("request deserializes")
+        };
+
+        let kimi = request("kimi-k3");
+        let names: Vec<&str> = ProviderProfile::for_model(&kimi.model)
+            .dynamic_tools(&kimi)
+            .map(|tool| tool.function.name.as_str())
+            .collect();
+        assert_eq!(names, ["get_weather", "get_time"]);
+
+        for model in ["gpt-4o", "MiniMax-M2"] {
+            let other = request(model);
+            assert_eq!(
+                ProviderProfile::for_model(&other.model)
+                    .dynamic_tools(&other)
+                    .count(),
+                0,
+                "{model} must not pick up message-declared tools"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_minimax_profile_parses_tool_calls_without_tools() {
+        assert!(ProviderProfile::Minimax.parses_tool_calls_without_tools());
+        assert!(!ProviderProfile::Kimi.parses_tool_calls_without_tools());
+        assert!(!ProviderProfile::Zai.parses_tool_calls_without_tools());
+        assert!(!ProviderProfile::OpenAi.parses_tool_calls_without_tools());
+    }
+
+    #[test]
     fn model_id_selects_profile() {
         for model in [
             "kimi-k3",
@@ -181,11 +285,27 @@ mod tests {
             );
         }
         for model in [
+            "glm-5.3-flash",
+            "GLM-5.3-Flash",
+            "zai-org/GLM-5.3-Flash",
+            "/models/glm-4.7",
+            "z-ai/glm-5",
+        ] {
+            assert_eq!(
+                ProviderProfile::for_model(model),
+                ProviderProfile::Zai,
+                "{model}"
+            );
+        }
+        for model in [
             "gpt-4o-mini",
             "",
             "/models/llama-3",
             "my-kimi-alias",
             "openai/gpt-4o",
+            "my-glm-alias",
+            // ChatGLM predates the z.ai chat contract.
+            "THUDM/chatglm3-6b",
         ] {
             assert_eq!(
                 ProviderProfile::for_model(model),

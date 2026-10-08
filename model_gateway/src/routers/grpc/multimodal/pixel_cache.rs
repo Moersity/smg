@@ -1,5 +1,6 @@
 //! Host-DRAM LRU cache of preprocessed per-image encoder inputs for the gateway
-//! multimodal path. Disabled by default (`SMG_MM_PIXEL_CACHE_MB` unset / 0).
+//! multimodal path. Disabled by default (`--mm-pixel-cache-mb` /
+//! `SMG_MM_PIXEL_CACHE_MB` unset or 0).
 
 use std::{
     mem::size_of,
@@ -38,7 +39,7 @@ fn preprocessed_heap_bytes(preprocessed: &PreprocessedEncoderInputs) -> usize {
         .iter()
         .map(|(key, value)| key.len() + model_specific_value_heap_bytes(value))
         .sum();
-    preprocessed.encoder_input.len() * size_of::<f32>()
+    preprocessed.encoder_input.nbytes()
         + preprocessed.encoder_input.ndim() * size_of::<usize>()
         + preprocessed.feature_token_counts.len() * size_of::<usize>()
         + preprocessed.item_sizes.len() * size_of::<(u32, u32)>()
@@ -132,14 +133,12 @@ impl PixelCache {
     }
 }
 
-pub(crate) fn pixel_cache_from_env() -> Option<Arc<PixelCache>> {
+/// The process-wide pixel cache with a budget of `mb` MiB; 0 keeps it off.
+/// Built once: the first budget wins, later routers share it.
+pub(crate) fn pixel_cache_with_budget(mb: usize) -> Option<Arc<PixelCache>> {
     static CACHE: OnceLock<Option<Arc<PixelCache>>> = OnceLock::new();
     CACHE
         .get_or_init(|| {
-            let mb = std::env::var("SMG_MM_PIXEL_CACHE_MB")
-                .ok()
-                .and_then(|raw| raw.trim().parse::<usize>().ok())
-                .unwrap_or(0);
             if mb == 0 {
                 return None;
             }
@@ -176,7 +175,7 @@ mod tests {
     fn pixel_cache_item(token_count: usize, payload: usize) -> Arc<CachedPreprocessedItem> {
         Arc::new(CachedPreprocessedItem {
             preprocessed: PreprocessedEncoderInputs {
-                encoder_input: ArrayD::from_elem(IxDyn(&[1, payload]), token_count as f32),
+                encoder_input: ArrayD::from_elem(IxDyn(&[1, payload]), token_count as f32).into(),
                 feature_token_counts: vec![token_count],
                 item_sizes: vec![(payload as u32, 1)],
                 model_specific: HashMap::new(),

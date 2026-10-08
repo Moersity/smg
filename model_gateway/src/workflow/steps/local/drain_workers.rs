@@ -153,6 +153,7 @@ mod tests {
             rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
             rate_limit_manager: None,
             worker_registry: Arc::clone(&registry),
+            prefill_admission: None,
             policy_registry: Arc::new(crate::policies::PolicyRegistry::new(
                 router_config.policy.clone(),
             )),
@@ -195,7 +196,7 @@ mod tests {
         let data = WorkerRemovalWorkflowData {
             config: super::super::find_workers_to_remove::WorkerRemovalRequest {
                 url: worker_urls.first().cloned().unwrap_or_default(),
-                expected_revision: None,
+                expected_revisions: None,
             },
             workers_to_remove: Some(WorkerList::from_workers(&workers)),
             worker_urls,

@@ -142,6 +142,8 @@ impl VllmEngineClient {
             kv_transfer_params_json: None,
             data_parallel_rank: None,
             mm_inputs,
+            media_refs: None,
+            extra_mm_inputs: Vec::new(),
         };
 
         Ok(grpc_request)
@@ -171,6 +173,8 @@ impl VllmEngineClient {
             kv_transfer_params_json: None,
             data_parallel_rank: None,
             mm_inputs: None,
+            media_refs: None,
+            extra_mm_inputs: Vec::new(),
         };
 
         Ok(grpc_request)
@@ -204,6 +208,8 @@ impl VllmEngineClient {
             kv_transfer_params_json: None,
             data_parallel_rank: None,
             mm_inputs: None,
+            media_refs: None,
+            extra_mm_inputs: Vec::new(),
         };
 
         Ok(grpc_request)
@@ -416,6 +422,8 @@ impl VllmEngineClient {
             kv_transfer_params_json: None,
             data_parallel_rank: None,
             mm_inputs: multimodal_inputs,
+            media_refs: None,
+            extra_mm_inputs: Vec::new(),
         };
 
         Ok(grpc_request)
@@ -475,6 +483,8 @@ impl VllmEngineClient {
             kv_transfer_params_json: None,
             data_parallel_rank: None,
             mm_inputs: None,
+            media_refs: None,
+            extra_mm_inputs: Vec::new(),
         };
 
         Ok(grpc_request)
@@ -696,8 +706,7 @@ impl From<proto::SchedulerLoad> for openai_protocol::worker::SchedulerLoadSnapsh
             dp_rank: load.dp_rank,
             num_running_reqs: load.num_running_reqs,
             num_waiting_reqs: load.num_waiting_reqs,
-            // vLLM does not report queued token-work; degrade to 0.
-            num_waiting_uncached_tokens: 0,
+            num_waiting_uncached_tokens: load.num_waiting_uncached_tokens,
             num_total_reqs: load.num_total_reqs,
             num_used_tokens: load.num_used_tokens,
             max_total_num_tokens: load.max_total_num_tokens,
@@ -721,6 +730,7 @@ impl From<proto::GetLoadsResponse> for openai_protocol::worker::WorkerLoadRespon
             dp_rank_count: resp.dp_rank_count,
             loads: resp.loads.into_iter().map(Into::into).collect(),
             aggregate: None,
+            sampled_at: None,
         }
     }
 }
@@ -803,6 +813,8 @@ mod tests {
             kv_transfer_params_json: None,
             data_parallel_rank: None,
             mm_inputs: None,
+            media_refs: None,
+            extra_mm_inputs: Vec::new(),
         };
 
         assert_eq!(gen_req.request_id, "test-req-123");

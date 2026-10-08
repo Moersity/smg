@@ -43,6 +43,24 @@ pub(crate) fn build_usage(responses: &[ProtoGenerateComplete]) -> Usage {
         .with_speculative_tokens(total_spec_accepted, total_spec_drafted)
 }
 
+/// The version to report on a generate response: what the engine stamped on
+/// this very response (the proto accessors already treat an empty string and
+/// the engine's `"default"` placeholder as unset) beats the dispatch-time
+/// label (kept as registered, so an empty one counts as unset here), which
+/// beats the historical `"default"`.
+///
+/// Borrowed on purpose: the SSE call sites run once per chunk and serialize
+/// the value straight into the event, so no per-chunk allocation.
+pub(crate) fn effective_weight_version<'a>(
+    reported: Option<&'a str>,
+    dispatch: Option<&'a str>,
+) -> &'a str {
+    reported
+        .or(dispatch)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("default")
+}
+
 /// Tracks per-index completion token counts across streaming chunks.
 ///
 /// Handles the two chunk conventions (`ChunkSemantics`):
@@ -127,6 +145,22 @@ mod tests {
     }
 
     #[test]
+    fn build_usage_then_unbilled_charges_the_stub_once_for_n_greater_than_1() {
+        let usage =
+            build_usage(&[complete(10, 10, 4), complete(10, 10, 6)]).with_unbilled_prompt_tokens(3);
+        assert_eq!(usage.prompt_tokens, 7);
+        assert_eq!(
+            usage
+                .prompt_tokens_details
+                .as_ref()
+                .map(|d| d.cached_tokens),
+            Some(7)
+        );
+        assert_eq!(usage.completion_tokens, 10);
+        assert_eq!(usage.total_tokens, 17);
+    }
+
+    #[test]
     fn completion_token_tracker_follows_chunk_semantics() {
         // Delta stream (the vLLM shape, which the ZMQ lane also emits for
         // TokenSpeed workers): the chunks carry the counts.
@@ -135,10 +169,12 @@ mod tests {
             token_ids: vec![1, 2, 3],
             ..Default::default()
         }));
-        tracker.record_complete(&ProtoGenerateComplete::Vllm(vllm::GenerateComplete {
-            completion_tokens: 99,
-            ..Default::default()
-        }));
+        tracker.record_complete(&ProtoGenerateComplete::Vllm(Box::new(
+            vllm::GenerateComplete {
+                completion_tokens: 99,
+                ..Default::default()
+            },
+        )));
         assert_eq!(
             tracker.total(),
             3,
@@ -158,6 +194,18 @@ mod tests {
             tracker.total(),
             7,
             "cumulative stream reports it in Complete"
+        );
+    }
+
+    #[test]
+    fn engine_reported_version_beats_dispatch_which_beats_default() {
+        assert_eq!(effective_weight_version(Some("v7"), Some("v3")), "v7");
+        assert_eq!(effective_weight_version(None, Some("v3")), "v3");
+        assert_eq!(effective_weight_version(None, None), "default");
+        assert_eq!(
+            effective_weight_version(None, Some("")),
+            "default",
+            "an empty registration label is unset"
         );
     }
 }

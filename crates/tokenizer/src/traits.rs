@@ -72,6 +72,8 @@ pub struct ChatTemplateOutput {
     /// The flat prompt, for logs, routing, and `original_text`.
     pub text: String,
     pub encoding: PromptEncoding,
+    /// Prompt tokens the provider does not bill (K3's response-channel stub); 0 for flat renderers.
+    pub unbilled_prompt_tokens: u32,
 }
 
 /// Core encoding trait - separate from decoding for modularity
@@ -174,6 +176,7 @@ pub trait Tokenizer: Encoder + Decoder {
         Ok(ChatTemplateOutput {
             text,
             encoding: PromptEncoding::FromText,
+            unbilled_prompt_tokens: 0,
         })
     }
 
@@ -196,6 +199,14 @@ pub trait Tokenizer: Encoder + Decoder {
     /// tokenizer's renderer into thinking mode. Empty for renderers that
     /// don't interpret the kwarg natively.
     fn native_reasoning_effort_values(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// `chat_template_kwargs.reasoning_effort` values that switch this
+    /// tokenizer's renderer out of thinking mode. Empty when the renderer
+    /// has no such word of its own (the protocol-level `none`/`minimal`
+    /// still apply).
+    fn native_reasoning_effort_off_values(&self) -> &'static [&'static str] {
         &[]
     }
 

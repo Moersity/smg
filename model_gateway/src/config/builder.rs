@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 
-use openai_protocol::worker::TransportMode;
+use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use smg_mcp::McpConfig;
 
 use super::{
     CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, MetricsConfig, OracleConfig, PdPairingMode, PolicyConfig,
-    PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
-    TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
+    HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, KvIndexKind, MetricsConfig,
+    OracleConfig, PdPairingMode, PolicyConfig, PostgresConfig, RedisConfig, RetryConfig,
+    RouterConfig, RoutingKeyOverrideConfig, RoutingMode, TenantApiKeyEntry, TokenizerCacheConfig,
+    TraceConfig,
 };
 use crate::worker::{ConnectionMode, RuntimeType};
 
@@ -144,6 +145,8 @@ impl RouterConfigBuilder {
             cache_index: CacheIndexKind::Tree,
             cache_ttl_secs: 180,
             cache_boundaries: Vec::new(),
+            selection_policy: None,
+            selection_accounting_ttl_ms: 0,
         };
         self
     }
@@ -263,6 +266,32 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn worker_stall_secs(mut self, secs: u64) -> Self {
+        self.config.worker_stall_secs = secs;
+        self
+    }
+
+    pub fn worker_wedge_secs(mut self, secs: u64) -> Self {
+        self.config.worker_wedge_secs = secs;
+        self
+    }
+
+    pub fn worker_warmup(
+        mut self,
+        secs: u64,
+        share: f32,
+        blocks: usize,
+        thin_ratio: f32,
+        divert_every: u64,
+    ) -> Self {
+        self.config.worker_warmup_secs = secs;
+        self.config.worker_warmup_share = share;
+        self.config.worker_warmup_blocks = blocks;
+        self.config.worker_warmup_thin_ratio = thin_ratio;
+        self.config.worker_warmup_divert_every = divert_every;
+        self
+    }
+
     pub fn pd_admission_wait_secs(mut self, secs: u64) -> Self {
         self.config.pd_admission_wait_secs = secs;
         self
@@ -283,6 +312,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn worker_overload_shed(mut self, shed: bool) -> Self {
+        self.config.worker_overload_shed = shed;
+        self
+    }
+
     pub fn worker_overload_token_usage(mut self, threshold: Option<f64>) -> Self {
         self.config.worker_overload_token_usage = threshold;
         self
@@ -295,6 +329,11 @@ impl RouterConfigBuilder {
 
     pub fn kv_indexer_max_entries(mut self, max: Option<usize>) -> Self {
         self.config.kv_indexer_max_entries = max;
+        self
+    }
+
+    pub fn kv_index(mut self, kind: KvIndexKind) -> Self {
+        self.config.kv_index = kind;
         self
     }
 
@@ -315,9 +354,51 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// Most bytes of preprocessed media held in flight for engines at once.
+    pub fn multimodal_max_inflight_bytes(mut self, bytes: Option<usize>) -> Self {
+        self.config.multimodal_max_inflight_bytes = bytes;
+        self
+    }
+
     /// Per-request image-count limit replacing each model spec's built-in limit.
     pub fn mm_per_request_image_limit(mut self, limit: Option<usize>) -> Self {
         self.config.mm_per_request_image_limit = limit;
+        self
+    }
+
+    /// Where media for vLLM gRPC workers is fetched and preprocessed.
+    pub fn mm_processing(mut self, mode: Option<MmProcessingMode>) -> Self {
+        self.config.mm_processing = mode;
+        self
+    }
+
+    /// Host-DRAM budget (MiB) for router-side preprocessed media.
+    pub fn mm_pixel_cache_mb(mut self, mb: Option<usize>) -> Self {
+        self.config.mm_pixel_cache_mb = mb;
+        self
+    }
+
+    /// Serve cached pixels over RDMA (legacy switch for the RDMA lane).
+    pub fn mm_pixel_rdma(mut self, enabled: bool) -> Self {
+        self.config.mm_pixel_rdma = enabled;
+        self
+    }
+
+    /// Listener IP for the RDMA metadata exchange.
+    pub fn rdma_listen_ip(mut self, ip: Option<impl Into<String>>) -> Self {
+        self.config.rdma_listen_ip = ip.map(Into::into);
+        self
+    }
+
+    /// Full-TTL override (seconds) for leased RDMA pixel slots.
+    pub fn rdma_slot_ttl_s(mut self, secs: Option<u64>) -> Self {
+        self.config.rdma_slot_ttl_s = secs;
+        self
+    }
+
+    /// Emit per-request multimodal timing at INFO.
+    pub fn log_mm_timing(mut self, enabled: bool) -> Self {
+        self.config.log_mm_timing = enabled;
         self
     }
 
@@ -340,6 +421,21 @@ impl RouterConfigBuilder {
 
     pub fn queue_timeout_secs(mut self, timeout: u64) -> Self {
         self.config.queue_timeout_secs = timeout;
+        self
+    }
+
+    pub fn prefill_max_inflight_requests_per_worker(mut self, max: i32) -> Self {
+        self.config.prefill_max_inflight_requests_per_worker = max;
+        self
+    }
+
+    pub fn prefill_queue_size(mut self, size: Option<usize>) -> Self {
+        self.config.prefill_queue_size = size;
+        self
+    }
+
+    pub fn prefill_queue_timeout_secs(mut self, timeout: Option<u64>) -> Self {
+        self.config.prefill_queue_timeout_secs = timeout;
         self
     }
 
@@ -447,17 +543,14 @@ impl RouterConfigBuilder {
 
     // ==================== Discovery ====================
 
-    pub fn discovery_config(mut self, discovery: DiscoveryConfig) -> Self {
-        self.config.discovery = Some(discovery);
+    pub fn discovery_config(mut self, discovery: impl Into<DiscoveryConfig>) -> Self {
+        self.config.discovery = Some(discovery.into());
         self
     }
 
-    /// With default settings
+    /// Kubernetes discovery with default settings
     pub fn enable_discovery(mut self) -> Self {
-        self.config.discovery = Some(DiscoveryConfig {
-            enabled: true,
-            ..Default::default()
-        });
+        self.config.discovery = Some(KubernetesDiscoveryConfig::default().into());
         self
     }
 

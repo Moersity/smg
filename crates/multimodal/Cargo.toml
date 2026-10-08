@@ -1,6 +1,6 @@
 [package]
 name = "llm-multimodal"
-version = "1.11.0"
+version = "1.12.0"
 edition = "2021"
 description = "Multimodal processing for vision and other modalities"
 license = "Apache-2.0"
@@ -64,6 +64,10 @@ pkg-config = "0.3"
 
 [[bench]]
 name = "image_preprocess"
+harness = false
+
+[[bench]]
+name = "minimax_m3_preprocess"
 harness = false
 
 [lints]

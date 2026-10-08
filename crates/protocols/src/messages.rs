@@ -140,47 +140,52 @@ impl GenerationRequest for CreateMessageRequest {
     }
 
     fn extract_text_for_routing(&self) -> String {
-        let mut buffer = String::new();
-        let mut has_content = false;
+        routing_text(self.system.as_ref(), &self.messages)
+    }
+}
 
-        let push = |s: &str, has_content: &mut bool, buffer: &mut String| {
-            if s.is_empty() {
-                return;
-            }
-            if *has_content {
-                buffer.push(' ');
-            }
-            buffer.push_str(s);
-            *has_content = true;
-        };
+/// The system and message text a Messages request routes on.
+fn routing_text(system: Option<&SystemContent>, messages: &[InputMessage]) -> String {
+    let mut buffer = String::new();
+    let mut has_content = false;
 
-        if let Some(system) = &self.system {
-            match system {
-                SystemContent::String(s) => push(s, &mut has_content, &mut buffer),
-                SystemContent::Blocks(blocks) => {
-                    for block in blocks {
-                        let SystemContentBlock::Text(text_block) = block;
+    let push = |s: &str, has_content: &mut bool, buffer: &mut String| {
+        if s.is_empty() {
+            return;
+        }
+        if *has_content {
+            buffer.push(' ');
+        }
+        buffer.push_str(s);
+        *has_content = true;
+    };
+
+    if let Some(system) = system {
+        match system {
+            SystemContent::String(s) => push(s, &mut has_content, &mut buffer),
+            SystemContent::Blocks(blocks) => {
+                for block in blocks {
+                    let SystemContentBlock::Text(text_block) = block;
+                    push(&text_block.text, &mut has_content, &mut buffer);
+                }
+            }
+        }
+    }
+
+    for msg in messages {
+        match &msg.content {
+            InputContent::String(s) => push(s, &mut has_content, &mut buffer),
+            InputContent::Blocks(blocks) => {
+                for block in blocks {
+                    if let InputContentBlock::Text(text_block) = block {
                         push(&text_block.text, &mut has_content, &mut buffer);
                     }
                 }
             }
         }
-
-        for msg in &self.messages {
-            match &msg.content {
-                InputContent::String(s) => push(s, &mut has_content, &mut buffer),
-                InputContent::Blocks(blocks) => {
-                    for block in blocks {
-                        if let InputContentBlock::Text(text_block) = block {
-                            push(&text_block.text, &mut has_content, &mut buffer);
-                        }
-                    }
-                }
-            }
-        }
-
-        buffer
     }
+
+    buffer
 }
 
 impl Tool {
@@ -1140,6 +1145,24 @@ pub struct CountMessageTokensRequest {
 
     /// Tool definitions
     pub tools: Option<Vec<Tool>>,
+
+    /// Additional backend-specific token counting options.
+    #[serde(flatten)]
+    pub other: Map<String, Value>,
+}
+
+impl GenerationRequest for CountMessageTokensRequest {
+    fn is_stream(&self) -> bool {
+        false
+    }
+
+    fn get_model(&self) -> Option<&str> {
+        Some(&self.model)
+    }
+
+    fn extract_text_for_routing(&self) -> String {
+        routing_text(self.system.as_ref(), &self.messages)
+    }
 }
 
 /// Response from token counting

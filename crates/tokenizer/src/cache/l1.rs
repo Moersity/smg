@@ -30,6 +30,7 @@ use std::{
 use blake3;
 use dashmap::DashMap;
 
+use super::activity::L1;
 use crate::traits::{Encoder, Encoding, TokenIdType};
 
 /// Hash type for cache keys
@@ -45,8 +46,9 @@ pub(super) enum PrefixLookup {
     /// Longest cached prefix: the shared token allocation plus the byte length of the
     /// matched prefix. The tokens are returned as `Arc<[TokenIdType]>` so a hit does
     /// not copy the (large) cached prefix; the caller splices the suffix into an
-    /// exact-capacity buffer.
-    Hit(Arc<[TokenIdType]>, usize),
+    /// exact-capacity buffer. The third field is the input's deepest boundary and its
+    /// digest when that boundary lies beyond the match, so the caller can cache it.
+    Hit(Arc<[TokenIdType]>, usize, Option<(usize, Blake3Hash)>),
     /// No cached prefix. Carries the `(boundary, digest)` pairs the failed search
     /// computed (empty when the input has no special-token boundaries) so the miss
     /// path can seed entries without recomputing them.
@@ -182,7 +184,7 @@ impl L1Cache {
         add_special_tokens: bool,
     ) -> Option<(Arc<[TokenIdType]>, usize)> {
         match self.lookup_with_seeds(input, special_tokens, add_special_tokens) {
-            PrefixLookup::Hit(tokens, boundary_pos) => Some((tokens, boundary_pos)),
+            PrefixLookup::Hit(tokens, boundary_pos, _) => Some((tokens, boundary_pos)),
             PrefixLookup::Miss(_) => None,
         }
     }
@@ -201,6 +203,7 @@ impl L1Cache {
 
         if seeds.is_empty() {
             self.misses.fetch_add(1, Ordering::Relaxed);
+            L1.miss();
             return PrefixLookup::Miss(seeds);
         }
 
@@ -214,12 +217,18 @@ impl L1Cache {
                 entry.last_accessed.store(timestamp, Ordering::Relaxed);
 
                 self.hits.fetch_add(1, Ordering::Relaxed);
+                L1.hit(boundary_pos);
                 // Share the cached allocation instead of copying it on every hit.
-                return PrefixLookup::Hit(Arc::clone(&entry.tokens), boundary_pos);
+                let deeper = seeds
+                    .last()
+                    .copied()
+                    .filter(|&(deepest, _)| deepest > boundary_pos);
+                return PrefixLookup::Hit(Arc::clone(&entry.tokens), boundary_pos, deeper);
             }
         }
 
         self.misses.fetch_add(1, Ordering::Relaxed);
+        L1.miss();
         PrefixLookup::Miss(seeds)
     }
 
@@ -324,7 +333,26 @@ impl L1Cache {
             return Ok(running_tokens);
         }
 
-        let total_size_needed: usize = entries_to_insert.iter().map(|(_, _, size)| size).sum();
+        self.store_entries(entries_to_insert);
+
+        Ok(running_tokens)
+    }
+
+    /// Cache one cumulative prefix ending at `boundary_pos`.
+    pub(super) fn insert_prefix(
+        &self,
+        hash_bytes: Blake3Hash,
+        boundary_pos: usize,
+        tokens: &[TokenIdType],
+    ) {
+        let prefix_tokens: Arc<[TokenIdType]> = tokens.into();
+        let size_bytes = boundary_pos + prefix_tokens.len() * size_of::<TokenIdType>();
+        self.store_entries(vec![(hash_bytes, prefix_tokens, size_bytes)]);
+    }
+
+    /// Insert entries, evicting first if the memory limit requires it.
+    fn store_entries(&self, entries: Vec<(Blake3Hash, Arc<[TokenIdType]>, usize)>) {
+        let total_size_needed: usize = entries.iter().map(|(_, _, size)| size).sum();
 
         // Evict if necessary
         let current = self.current_memory.load(Ordering::Relaxed) as usize;
@@ -334,7 +362,7 @@ impl L1Cache {
 
         // Insert all entries, accounting for replaced entries in memory tracking
         let current_timestamp = self.access_counter.load(Ordering::Relaxed);
-        for (hash_bytes, prefix_tokens, size_bytes) in entries_to_insert {
+        for (hash_bytes, prefix_tokens, size_bytes) in entries {
             let shard_idx = hash_bytes[0] as usize % NUM_SHARDS;
 
             let cached = CachedPrefix {
@@ -363,8 +391,6 @@ impl L1Cache {
                     .fetch_add(size_bytes as u64, Ordering::Relaxed);
             }
         }
-
-        Ok(running_tokens)
     }
 
     /// Evict least recently used entries using approximate LRU via random sampling
@@ -414,6 +440,7 @@ impl L1Cache {
             {
                 // Remove it
                 if let Some((_, removed)) = self.shards[shard_idx].remove(&hash) {
+                    L1.evict();
                     freed += removed.size_bytes;
                     self.current_memory
                         .fetch_sub(removed.size_bytes as u64, Ordering::Relaxed);

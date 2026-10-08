@@ -33,8 +33,13 @@ from .constants import (  # Enums; Convenience sets; Fixture parameters; Default
     ConnectionMode,
     Runtime,
     WorkerType,
+    effective_startup_timeout,
     get_connection_mode_override,
+    get_mm_processing,
     get_runtime,
+    get_sglang_servicer_impl,
+    get_startup_timeout,
+    get_tokenspeed_servicer_impl,
     get_zmq_engine_count,
     is_mlx,
     is_sglang,
@@ -44,6 +49,7 @@ from .constants import (  # Enums; Convenience sets; Fixture parameters; Default
 from .gateway import Gateway, WorkerInfo, launch_cloud_gateway
 from .gpu_monitor import GPUMonitor
 from .gpu_monitor import should_monitor as should_monitor_gpu
+from .mm_processing import assert_mm_processing
 from .model_specs import (  # Default model paths; Model groups
     CHAT_MODELS,
     DEFAULT_EMBEDDING_MODEL_PATH,
@@ -112,8 +118,14 @@ __all__ = [
     "ENV_SHOW_ROUTER_LOGS",
     "ENV_SHOW_WORKER_LOGS",
     # Runtime helpers
+    "effective_startup_timeout",
     "get_runtime",
+    "get_startup_timeout",
     "get_connection_mode_override",
+    "get_mm_processing",
+    "assert_mm_processing",
+    "get_sglang_servicer_impl",
+    "get_tokenspeed_servicer_impl",
     "get_zmq_engine_count",
     "is_vllm",
     "is_sglang",

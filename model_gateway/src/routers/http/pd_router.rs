@@ -1,4 +1,10 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
 
 use async_trait::async_trait;
 use axum::{
@@ -15,16 +21,21 @@ use openai_protocol::{
     common::{GenerationRequest, InputIds, StringOrArray},
     completion::CompletionRequest,
     generate::GenerateRequest,
-    messages::CreateMessageRequest,
+    messages::{CountMessageTokensRequest, CreateMessageRequest},
     rerank::RerankRequest,
     responses::ResponsesRequest,
 };
-use serde::Serialize;
-use serde_json::{json, Value};
+use serde::{Deserialize, Serialize};
+use serde_json::{
+    json,
+    value::{to_raw_value, RawValue},
+    Value,
+};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, warn};
 
+use super::request_body::RawBody;
 use crate::{
     config::types::RetryConfig,
     middleware::TenantRequestMeta,
@@ -38,8 +49,12 @@ use crate::{
         common::{
             attach_sized_body, header_utils,
             kv_transfer::{
-                connector_mode_for_worker, mooncake_decode_params, mooncake_prefill_params,
-                KvConnectorMode, NIXL_PREFILL_KV_PARAMS,
+                carries_moriio_peer_markers, connector_mode_for_worker, is_moriio_worker,
+                mooncake_decode_params, mooncake_prefill_params, moriio_decode_params,
+                moriio_dp_mismatch_error, moriio_endpoint, moriio_prefill_params,
+                moriio_side_channel_error, moriio_write_target_error, validate_moriio_handoff,
+                KvConnectorMode, MoriIoEndpoint, MoriIoTransfer, DATA_PARALLEL_RANK_HEADER,
+                NIXL_PREFILL_KV_PARAMS,
             },
             overload,
             placement::{self, PairFailure, PlacementFailure, PlacementInputs},
@@ -52,11 +67,13 @@ use crate::{
         error,
         grpc::utils::{error_type_from_status, route_to_endpoint},
         http::router::send_with_stale_conn_retry,
-        RouterTrait,
+        prefill_queue_full, prefill_queue_timeout, RouterTrait, PD_PREFILL_QUEUE_FULL,
+        PD_PREFILL_QUEUE_TIMEOUT,
     },
     worker::{
-        PdPairIndex, PdWire, RoutingPool, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry,
-        UNKNOWN_MODEL_ID,
+        acquire_prefill, PdPairIndex, PdWire, PrefillAcquireError, PrefillAdmission,
+        PrefillAdmissionRejection, PrefillLoadGuard, PrefillSelectionContext, RoutingPool,
+        RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry, UNKNOWN_MODEL_ID,
     },
 };
 
@@ -66,6 +83,13 @@ use crate::{
 /// instead of being reworded as a circuit-breaker failure by
 /// [`PDRouter::handle_server_selection_error`].
 type PdPair = (Arc<dyn Worker>, Arc<dyn Worker>);
+
+/// The load one admitted PD request holds. The Prefill guard is released
+/// when the Prefill phase ends; the Decode guard rides on the response body.
+struct PdLoadGuards {
+    prefill: PrefillLoadGuard,
+    decode: WorkerLoadGuard,
+}
 
 #[derive(Debug)]
 enum PdSelectionFailure {
@@ -77,6 +101,25 @@ enum PdSelectionFailure {
     /// Both legs are up, but no prefill shares a KV transfer protocol with
     /// any decode (#2483).
     Incompatible(String),
+    /// The Prefill admission queue had no room for the request.
+    QueueFull,
+    /// The request waited out its Prefill admission timeout.
+    QueueTimeout,
+}
+
+impl From<PrefillAcquireError<Box<PairFailure>>> for PdSelectionFailure {
+    fn from(error: PrefillAcquireError<Box<PairFailure>>) -> Self {
+        match error {
+            PrefillAcquireError::Candidate(failure) => PDRouter::pair_failure(*failure),
+            PrefillAcquireError::Rejected(PrefillAdmissionRejection::QueueFull) => Self::QueueFull,
+            PrefillAcquireError::Rejected(PrefillAdmissionRejection::QueueTimeout) => {
+                Self::QueueTimeout
+            }
+            PrefillAcquireError::Rejected(PrefillAdmissionRejection::Unavailable) => {
+                Self::Unavailable("No available prefill and decode worker pair".to_string())
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -85,6 +128,18 @@ pub struct PDRouter {
     pub policy_registry: Arc<PolicyRegistry>,
     pub retry_config: RetryConfig,
     pub api_key: Option<String>,
+    prefill_admission: Option<Arc<PrefillAdmission>>,
+    /// Round-robin over the data-parallel ranks of MoRI-IO pairs.
+    moriio_dp_turn: AtomicUsize,
+}
+
+/// Who records the prefill leg's outcome for an attempt: the attempt, from
+/// the response status, or the drain task once the prefill body is known
+/// (the early-commit path, where the response is the decode's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrefillOutcome {
+    FromStatus,
+    Drained,
 }
 
 #[derive(Clone)]
@@ -95,6 +150,14 @@ struct PDRequestContext<'a> {
     return_logprob: bool,
     model_id: &'a str,
     headers: Option<HeaderMap>,
+}
+
+/// The bootstrap rendezvous an SGLang prefill worker hands out for one
+/// request, as the raw JSON values both legs carry.
+struct BootstrapFields {
+    host: Box<RawValue>,
+    port: Box<RawValue>,
+    room: Box<RawValue>,
 }
 
 impl PDRouter {
@@ -204,7 +267,19 @@ impl PDRouter {
             policy_registry: Arc::clone(&ctx.policy_registry),
             retry_config: ctx.router_config.effective_retry_config(),
             api_key: ctx.router_config.api_key.clone(),
+            prefill_admission: ctx.prefill_admission.clone(),
+            moriio_dp_turn: AtomicUsize::new(0),
         })
+    }
+
+    /// A Prefill admission rejection is this process's own backpressure;
+    /// retrying it would only queue the request behind the same limit again.
+    fn should_retry_pd_response(response: &Response) -> bool {
+        is_retryable_response(response)
+            && !matches!(
+                error::extract_error_code_from_response(response),
+                PD_PREFILL_QUEUE_FULL | PD_PREFILL_QUEUE_TIMEOUT
+            )
     }
 
     fn handle_server_selection_error(failure: PdSelectionFailure) -> Response {
@@ -217,6 +292,8 @@ impl PDRouter {
                 error!("Failed to select PD pair error={}", error);
                 error::service_unavailable("no_compatible_pd_pair", error)
             }
+            PdSelectionFailure::QueueFull => prefill_queue_full(),
+            PdSelectionFailure::QueueTimeout => prefill_queue_timeout(),
             PdSelectionFailure::Unavailable(error) => {
                 error!("Failed to select PD pair error={}", error);
                 // Same code the regular HTTP router and the gRPC routers use
@@ -269,68 +346,64 @@ impl PDRouter {
     const BOOTSTRAP_PORT_KEY: &'static str = "bootstrap_port";
     const BOOTSTRAP_ROOM_KEY: &'static str = "bootstrap_room";
 
-    fn inject_bootstrap_into_value(
-        mut original: Value,
+    /// The bootstrap rendezvous for one request, generated once so both legs
+    /// carry the same rooms: one value per prompt for a batch, scalars
+    /// otherwise.
+    fn bootstrap_fields(
         prefill_worker: &dyn Worker,
         batch_size: Option<usize>,
-    ) -> Result<Value, String> {
-        let obj = original
-            .as_object_mut()
-            .ok_or_else(|| "Request must be a JSON object".to_string())?;
-
-        if let Some(n) = batch_size {
-            let mut hosts = Vec::with_capacity(n);
-            let mut ports = Vec::with_capacity(n);
-            let mut rooms = Vec::with_capacity(n);
-            for _ in 0..n {
-                hosts.push(prefill_worker.bootstrap_host());
-                ports.push(prefill_worker.bootstrap_port());
-                rooms.push(super::pd_types::generate_room_id());
+    ) -> serde_json::Result<BootstrapFields> {
+        let host = prefill_worker.bootstrap_host();
+        let port = prefill_worker.bootstrap_port();
+        match batch_size {
+            Some(n) => {
+                let rooms: Vec<u64> = (0..n)
+                    .map(|_| super::pd_types::generate_room_id())
+                    .collect();
+                Ok(BootstrapFields {
+                    host: to_raw_value(&vec![host; n])?,
+                    port: to_raw_value(&vec![port; n])?,
+                    room: to_raw_value(&rooms)?,
+                })
             }
-            obj.insert(
-                Self::BOOTSTRAP_HOST_KEY.to_string(),
-                Value::Array(hosts.into_iter().map(Value::from).collect()),
-            );
-            obj.insert(
-                Self::BOOTSTRAP_PORT_KEY.to_string(),
-                Value::Array(
-                    ports
-                        .into_iter()
-                        .map(|p| match p {
-                            Some(v) => Value::from(v),
-                            None => Value::Null,
-                        })
-                        .collect(),
-                ),
-            );
-            obj.insert(
-                Self::BOOTSTRAP_ROOM_KEY.to_string(),
-                Value::Array(rooms.into_iter().map(Value::from).collect()),
-            );
-        } else {
-            obj.insert(
-                Self::BOOTSTRAP_HOST_KEY.to_string(),
-                Value::from(prefill_worker.bootstrap_host()),
-            );
-            obj.insert(
-                Self::BOOTSTRAP_PORT_KEY.to_string(),
-                match prefill_worker.bootstrap_port() {
-                    Some(v) => Value::from(v),
-                    None => Value::Null,
-                },
-            );
-            obj.insert(
-                Self::BOOTSTRAP_ROOM_KEY.to_string(),
-                Value::from(super::pd_types::generate_room_id()),
-            );
+            None => Ok(BootstrapFields {
+                host: to_raw_value(host)?,
+                port: to_raw_value(&port)?,
+                room: to_raw_value(&super::pd_types::generate_room_id())?,
+            }),
         }
-        Ok(original)
     }
 
-    fn inject_dp_rank_to_json(json_val: &mut Value, rank: isize, rank_key: &str) {
-        if let Some(obj) = json_val.as_object_mut() {
-            obj.insert(rank_key.to_string(), Value::Number(rank.into()));
+    fn inject_bootstrap(body: &mut RawBody<'_>, fields: BootstrapFields) {
+        body.insert(Self::BOOTSTRAP_HOST_KEY, fields.host);
+        body.insert(Self::BOOTSTRAP_PORT_KEY, fields.port);
+        body.insert(Self::BOOTSTRAP_ROOM_KEY, fields.room);
+    }
+
+    fn inject_dp_rank(
+        body: &mut RawBody<'_>,
+        rank: isize,
+        rank_key: &str,
+    ) -> serde_json::Result<()> {
+        body.insert(rank_key, to_raw_value(&rank)?);
+        Ok(())
+    }
+
+    /// The `kv_transfer_params` a prefill response carries, if any. A
+    /// missing field and `null` both mean the engine returned nothing to
+    /// relay. The slice is forwarded as the engine wrote it, so the rest of
+    /// the response is never materialized.
+    fn harvest_kv_transfer_params(prefill_bytes: &[u8]) -> Option<Box<RawValue>> {
+        #[derive(Deserialize)]
+        struct Handoff<'a> {
+            #[serde(borrow)]
+            kv_transfer_params: Option<&'a RawValue>,
         }
+        serde_json::from_slice::<Handoff>(prefill_bytes)
+            .ok()?
+            .kv_transfer_params
+            .filter(|params| params.get() != "null")
+            .map(ToOwned::to_owned)
     }
 
     async fn execute_dual_dispatch<T: Serialize>(
@@ -383,7 +456,7 @@ impl PDRouter {
                 .await;
             // Mirror the retry executor's exhaustion accounting for a
             // retryable response that gets no retry.
-            if is_retryable_response(&res) {
+            if Self::should_retry_pd_response(&res) {
                 Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_PREFILL, endpoint);
                 Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_DECODE, endpoint);
             }
@@ -403,7 +476,7 @@ impl PDRouter {
                         }
                     }
                 },
-                |res, _attempt| is_retryable_response(res),
+                |res, _attempt| Self::should_retry_pd_response(res),
                 |delay, attempt| {
                     // Layer 3 worker metrics (PD mode uses both prefill and decode workers)
                     Metrics::record_worker_retry(metrics_labels::WORKER_PREFILL, endpoint);
@@ -458,18 +531,33 @@ impl PDRouter {
         lease: &RequestLease<T>,
         context: PDRequestContext<'_>,
     ) -> Response {
-        let selected = lease.with_view(|view| {
-            self.select_pd_pair(
-                view.text,
-                view.tokens,
-                view.rid_key,
+        // Admission may queue the request, so the selection inputs are copied
+        // out of the lease's synchronous view first.
+        let (text, tokens, rid_key, cache_namespace) = lease.with_view(|view| {
+            (
+                view.text.map(str::to_string),
+                view.tokens.map(Vec::from),
+                view.rid_key.map(str::to_string),
                 view.cache_namespace,
-                context.model_id,
-                context.headers.as_ref(),
             )
         });
-        let (prefill, decode) = match selected {
-            Ok(pair) => pair,
+        let sticky_key = self.policy_registry.sticky_key(headers, rid_key.as_deref());
+        let selected = self
+            .select_pd_pair_with_admission(
+                context.model_id,
+                PlacementInputs {
+                    text: text.as_deref(),
+                    tokens: tokens.as_deref(),
+                    headers: context.headers.as_ref(),
+                    rid_key: rid_key.as_deref(),
+                    cache_namespace,
+                    candidate_filter: None,
+                },
+                sticky_key,
+            )
+            .await;
+        let ((prefill, decode), guards) = match selected {
+            Ok(admitted) => admitted,
             Err(e) => {
                 return Self::handle_server_selection_error(*e);
             }
@@ -484,75 +572,168 @@ impl PDRouter {
 
         // Dispatch-time re-check of both legs, the same one the regular HTTP
         // and gRPC paths take just before their load guards.
-        if let Some(shed) = overload::shed_if_worker_overloaded(prefill.as_ref(), context.model_id)
-            .or_else(|| overload::shed_if_worker_overloaded(decode.as_ref(), context.model_id))
+        let shedding = self.worker_registry.overload_shed_enabled();
+        if let Some(shed) =
+            overload::shed_if_worker_overloaded(prefill.as_ref(), context.model_id, shedding)
+                .or_else(|| {
+                    overload::shed_if_worker_overloaded(decode.as_ref(), context.model_id, shedding)
+                })
         {
             return shed;
         }
 
         let raw_body_len = header_utils::content_length(headers);
 
-        // Keyed-load accounting uses the same effective key as selection:
-        // rid-derived first, header fallback. Built before the lease releases.
-        let load_guards = lease.with_view(|view| {
-            let key = view
-                .rid_key
-                .or_else(|| self.policy_registry.sticky_header_key(headers));
-            vec![
-                WorkerLoadGuard::with_key(prefill.clone(), key),
-                WorkerLoadGuard::with_key(decode.clone(), key),
-            ]
-        });
-
-        if prefill.metadata().spec.runtime_type == RuntimeType::Vllm {
-            // vLLM PD is sequential: prefill first with connector params, then
-            // decode carrying the KV handoff — no bootstrap rendezvous exists.
-            let mode = connector_mode_for_worker(prefill.as_ref());
+        // A MoRI-IO decode engine never recomputes the prompt, so a MoRI-IO
+        // decode leg alone takes the checked MoRI-IO path, whatever the prefill.
+        if prefill.metadata().spec.runtime_type == RuntimeType::Vllm
+            || is_moriio_worker(decode.as_ref())
+        {
+            // vLLM PD has no bootstrap rendezvous: the prefill leg carries
+            // connector params and the decode leg the KV handoff, which only
+            // a MoRI-IO WRITE pair can mint up front (concurrent dispatch).
+            let mode = if is_moriio_worker(decode.as_ref()) {
+                KvConnectorMode::MoriIo
+            } else {
+                connector_mode_for_worker(prefill.as_ref())
+            };
+            let moriio_endpoints = match mode {
+                KvConnectorMode::MoriIo => {
+                    match Self::moriio_pair(prefill.as_ref(), decode.as_ref()) {
+                        Ok(endpoints) => Some(endpoints),
+                        Err(response) => return *response,
+                    }
+                }
+                _ => None,
+            };
+            let moriio_decode = moriio_endpoints.as_ref().map(|(_, decode)| decode);
+            let dp_rank = moriio_decode.and_then(|decode| self.moriio_dp_rank(decode));
+            // In WRITE mode the decode engine needs nothing from the prefill
+            // response, so a decode worker can opt into sending both legs at
+            // once.
+            let concurrent_write = moriio_decode.is_some_and(|decode| {
+                decode.transfer == MoriIoTransfer::Write && decode.concurrent_write
+            });
             let transfer_id = match &mode {
                 KvConnectorMode::Mooncake {
                     engine_id: Some(_), ..
                 } => Some(format!("xfer-{}", uuid::Uuid::now_v7())),
+                // vLLM's MoRIIOConstants.TRANSFER_PREFIX, so the id reads the
+                // same in gateway and engine logs.
+                KvConnectorMode::MoriIo => Some(format!("tx-{}", uuid::Uuid::now_v7().simple())),
                 _ => None,
             };
             let legs =
                 lease.serialize_legs_with(|view| -> Result<(Vec<u8>, Vec<u8>), Box<Response>> {
-                    let mut json_request = serde_json::to_value(view.request)
-                        .map_err(|e| Box::new(Self::handle_serialization_error(e)))?;
-                    super::set_request_model(&mut json_request, context.model_id);
+                    let serialization_error =
+                        |e: serde_json::Error| Box::new(Self::handle_serialization_error(e));
+                    let bytes = serialize_json_sized(view.request, raw_body_len)
+                        .map_err(serialization_error)?;
+                    let mut body = RawBody::parse(&bytes).map_err(serialization_error)?;
+                    body.set_model(to_raw_value(context.model_id).map_err(serialization_error)?);
 
                     // The KV handoff is single-consumer: with n>1 each fan-out
                     // child on decode would pull, and the first completion
                     // frees the prefill blocks under its siblings.
-                    let relay = Self::sampling_n(&json_request) <= 1;
-                    let mut prefill_json = json_request.clone();
-                    Self::sanitize_prefill_for_kv_handoff(&mut prefill_json, context.route);
+                    let relay = Self::sampling_n(&body) <= 1;
+                    if mode == KvConnectorMode::MoriIo {
+                        if let Some(refusal) = Self::moriio_refusal(&context, headers, &body) {
+                            return Err(refusal);
+                        }
+                    }
+                    let mut prefill_body = body.clone();
+                    Self::sanitize_prefill_for_kv_handoff(&mut prefill_body, context.route)
+                        .map_err(serialization_error)?;
+                    if mode == KvConnectorMode::MoriIo {
+                        // The connector hands KV over only when the prefill
+                        // stops at its one-token cap. That token is discarded,
+                        // so an EOS or stop match must not end the leg first.
+                        prefill_body.insert(
+                            "ignore_eos",
+                            to_raw_value(&true).map_err(serialization_error)?,
+                        );
+                        prefill_body.remove("stop");
+                        prefill_body.remove("stop_token_ids");
+                    }
                     if relay {
-                        let params = match (&mode, &transfer_id) {
-                            (KvConnectorMode::Nixl, _) => {
-                                serde_json::from_str::<Value>(NIXL_PREFILL_KV_PARAMS).ok()
+                        let params = match (&mode, &transfer_id, moriio_decode) {
+                            (KvConnectorMode::Nixl, _, _) => {
+                                RawValue::from_string(NIXL_PREFILL_KV_PARAMS.to_owned()).ok()
                             }
-                            (KvConnectorMode::Mooncake { .. }, Some(id)) => {
-                                serde_json::from_str::<Value>(&mooncake_prefill_params(id)).ok()
+                            (KvConnectorMode::Mooncake { .. }, Some(id), _) => {
+                                RawValue::from_string(mooncake_prefill_params(id)).ok()
+                            }
+                            (KvConnectorMode::MoriIo, Some(id), Some(decode)) => {
+                                RawValue::from_string(moriio_prefill_params(id, decode, dp_rank))
+                                    .ok()
                             }
                             _ => None,
                         };
-                        if let (Some(obj), Some(params)) = (prefill_json.as_object_mut(), params) {
-                            obj.insert("kv_transfer_params".to_string(), params);
+                        if let Some(params) = params {
+                            prefill_body.insert("kv_transfer_params", params);
                         }
                     }
+                    if let (true, Some(id), Some((prefill_endpoint, _))) =
+                        (concurrent_write, &transfer_id, &moriio_endpoints)
+                    {
+                        body.insert(
+                            "kv_transfer_params",
+                            RawValue::from_string(moriio_decode_params(
+                                id,
+                                prefill_endpoint,
+                                dp_rank,
+                            ))
+                            .map_err(serialization_error)?,
+                        );
+                    }
 
-                    Ok((
-                        serialize_json_sized(&prefill_json, raw_body_len)
-                            .map_err(|e| Box::new(Self::handle_serialization_error(e)))?,
-                        serialize_json_sized(&json_request, raw_body_len)
-                            .map_err(|e| Box::new(Self::handle_serialization_error(e)))?,
-                    ))
+                    let prefill_bytes = prefill_body
+                        .to_bytes(raw_body_len)
+                        .map_err(serialization_error)?;
+                    // The decode leg is the request as serialized unless the
+                    // model id changed.
+                    let decode_bytes = if body.mutated() {
+                        body.to_bytes(raw_body_len).map_err(serialization_error)?
+                    } else {
+                        bytes
+                    };
+                    Ok((prefill_bytes, decode_bytes))
                 });
             let (prefill_body, decode_body) = match legs {
                 Ok(pair) => pair,
                 Err(response) => return *response,
             };
+            if let (Some(endpoint), Some(id)) = (moriio_decode, &transfer_id) {
+                debug!(
+                    "vLLM PD (MoRI-IO {:?}, {} legs): transfer_id={id} prefill={} decode={} \
+                     dp_rank={dp_rank:?}",
+                    endpoint.transfer,
+                    if concurrent_write {
+                        "concurrent"
+                    } else {
+                        "sequential"
+                    },
+                    prefill.url(),
+                    decode.url()
+                );
+            }
             lease.release_dispatch();
+
+            if let (true, Some((prefill_endpoint, _))) = (concurrent_write, &moriio_endpoints) {
+                return self
+                    .execute_moriio_concurrent_write(
+                        headers,
+                        (prefill_body, decode_body),
+                        transfer_id,
+                        dp_rank,
+                        prefill_endpoint,
+                        context,
+                        Arc::clone(&prefill),
+                        Arc::clone(&decode),
+                        guards,
+                    )
+                    .await;
+            }
 
             // Outcome accounting happens per-leg inside the sequential path:
             // a prefill-only failure must not feed the decode worker's
@@ -563,33 +744,35 @@ impl PDRouter {
                     (prefill_body, decode_body),
                     mode,
                     transfer_id,
+                    dp_rank,
                     context,
                     Arc::clone(&prefill),
                     Arc::clone(&decode),
-                    load_guards,
+                    guards,
                 )
                 .await;
         }
 
         let legs = lease.serialize_legs_with(|view| -> Result<(Vec<u8>, Vec<u8>), Box<Response>> {
-            let mut json_request = serde_json::to_value(view.request)
-                .map_err(|e| Box::new(Self::handle_serialization_error(e)))?;
+            let serialization_error =
+                |e: serde_json::Error| Box::new(Self::handle_serialization_error(e));
+            let bytes =
+                serialize_json_sized(view.request, raw_body_len).map_err(serialization_error)?;
+            // Only a non-object body fails to parse, the shape the bootstrap
+            // injection has always refused.
+            let mut body = RawBody::parse(&bytes).map_err(|e| {
+                Metrics::record_pd_bootstrap_failure();
+                serialization_error(e)
+            })?;
             // The prefill and decode workers only know the canonical name, so
             // forward that, not the alias the client sent.
-            super::set_request_model(&mut json_request, context.model_id);
+            body.set_model(to_raw_value(context.model_id).map_err(serialization_error)?);
+            let bootstrap = Self::bootstrap_fields(prefill.as_ref(), context.batch_size)
+                .map_err(serialization_error)?;
+            Self::inject_bootstrap(&mut body, bootstrap);
 
-            json_request = Self::inject_bootstrap_into_value(
-                json_request,
-                prefill.as_ref(),
-                context.batch_size,
-            )
-            .map_err(|e| {
-                Metrics::record_pd_bootstrap_failure();
-                Self::handle_serialization_error(e)
-            })?;
-
-            let mut prefill_json_request = json_request.clone();
-            let mut decode_json_request = json_request;
+            let mut prefill_body = body.clone();
+            let mut decode_body = body;
 
             let mut prefill_rank = prefill.dp_rank().map(|rank| rank as isize);
             let mut decode_rank = decode.dp_rank().map(|rank| rank as isize);
@@ -622,15 +805,14 @@ impl PDRouter {
             }
 
             if let Some(p_rank) = prefill_rank {
-                Self::inject_dp_rank_to_json(&mut prefill_json_request, p_rank, "routed_dp_rank");
-                Self::inject_dp_rank_to_json(
-                    &mut decode_json_request,
-                    p_rank,
-                    "disagg_prefill_dp_rank",
-                );
+                Self::inject_dp_rank(&mut prefill_body, p_rank, "routed_dp_rank")
+                    .map_err(serialization_error)?;
+                Self::inject_dp_rank(&mut decode_body, p_rank, "disagg_prefill_dp_rank")
+                    .map_err(serialization_error)?;
             }
             if let Some(d_rank) = decode_rank {
-                Self::inject_dp_rank_to_json(&mut decode_json_request, d_rank, "routed_dp_rank");
+                Self::inject_dp_rank(&mut decode_body, d_rank, "routed_dp_rank")
+                    .map_err(serialization_error)?;
             }
             if prefill_rank.is_some() || decode_rank.is_some() {
                 debug!(
@@ -640,10 +822,12 @@ impl PDRouter {
             }
 
             Ok((
-                serialize_json_sized(&prefill_json_request, raw_body_len)
-                    .map_err(|e| Box::new(Self::handle_serialization_error(e)))?,
-                serialize_json_sized(&decode_json_request, raw_body_len)
-                    .map_err(|e| Box::new(Self::handle_serialization_error(e)))?,
+                prefill_body
+                    .to_bytes(raw_body_len)
+                    .map_err(serialization_error)?,
+                decode_body
+                    .to_bytes(raw_body_len)
+                    .map_err(serialization_error)?,
             ))
         });
         let (prefill_body, decode_body) = match legs {
@@ -655,6 +839,7 @@ impl PDRouter {
         // disabled.
         lease.release_dispatch();
 
+        let mut prefill_outcome = PrefillOutcome::FromStatus;
         let response = self
             .execute_dual_dispatch_internal(
                 headers,
@@ -662,30 +847,51 @@ impl PDRouter {
                 context,
                 Arc::clone(&prefill),
                 Arc::clone(&decode),
-                load_guards,
+                guards,
+                &mut prefill_outcome,
             )
             .await;
+        Self::record_attempt_outcomes(
+            prefill.as_ref(),
+            decode.as_ref(),
+            response.status(),
+            prefill_outcome,
+        );
+        response
+    }
 
-        let status = response.status();
-        prefill.record_outcome(status.as_u16());
+    /// Record an attempt's outcome on both legs. On the early-commit path the
+    /// drain records the prefill's once its body is known: the attempt's
+    /// status is the decode's there, and recording it on the prefill would
+    /// reset the failures the drain counts.
+    fn record_attempt_outcomes(
+        prefill: &dyn Worker,
+        decode: &dyn Worker,
+        status: StatusCode,
+        prefill_outcome: PrefillOutcome,
+    ) {
+        let attempt_records_prefill = prefill_outcome == PrefillOutcome::FromStatus;
+        if attempt_records_prefill {
+            prefill.record_outcome(status.as_u16());
+        }
         decode.record_outcome(status.as_u16());
 
         // Record worker errors for server errors (5xx)
         if status.is_server_error() {
             let error_type = error_type_from_status(status);
-            Metrics::record_worker_error(
-                metrics_labels::WORKER_PREFILL,
-                metrics_labels::CONNECTION_HTTP,
-                error_type,
-            );
+            if attempt_records_prefill {
+                Metrics::record_worker_error(
+                    metrics_labels::WORKER_PREFILL,
+                    metrics_labels::CONNECTION_HTTP,
+                    error_type,
+                );
+            }
             Metrics::record_worker_error(
                 metrics_labels::WORKER_DECODE,
                 metrics_labels::CONNECTION_HTTP,
                 error_type,
             );
         }
-
-        response
     }
 
     async fn handle_decode_error_response(
@@ -693,7 +899,7 @@ impl PDRouter {
         res: reqwest::Response,
         context: &PDRequestContext<'_>,
         decode: Arc<dyn Worker>,
-        load_guards: Vec<WorkerLoadGuard>,
+        decode_guard: WorkerLoadGuard,
     ) -> Response {
         let status = res.status();
 
@@ -727,7 +933,7 @@ impl PDRouter {
                 context.return_logprob,
                 Some(decode_url),
                 Some(response_headers),
-                load_guards,
+                decode_guard,
             )
         } else {
             // Handle non-streaming error response
@@ -802,6 +1008,10 @@ impl PDRouter {
     }
 
     // Internal method that performs the actual dual dispatch (without retry logic)
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one attempt carries both legs, their guards and who records the prefill"
+    )]
     async fn execute_dual_dispatch_internal(
         &self,
         headers: Option<&HeaderMap>,
@@ -809,9 +1019,14 @@ impl PDRouter {
         context: PDRequestContext<'_>,
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
-        load_guards: Vec<WorkerLoadGuard>,
+        guards: PdLoadGuards,
+        prefill_outcome: &mut PrefillOutcome,
     ) -> Response {
         let (prefill_body, decode_body) = leg_bodies;
+        let PdLoadGuards {
+            prefill: prefill_guard,
+            decode: decode_guard,
+        } = guards;
 
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
@@ -845,55 +1060,119 @@ impl PDRouter {
         // hits a transport error, the other is cancelled immediately — otherwise
         // the surviving request hangs waiting for a PD bootstrap that will never
         // come (see #831).
-        // Each leg captures its own head-arrival elapsed when its `send()`
-        // resolves, so the two are independent even though `try_join!` returns
-        // only once both heads arrive: decode TTFT isn't conflated with the
-        // prefill-head wait, and prefill duration isn't conflated with a slower
-        // decode head. Recorded on the success path only.
+        // Drain Prefill and release its slot inside its own future. A
+        // non-streaming Decode may not send its head until generation ends.
+        enum DispatchError {
+            Transport(reqwest::Error),
+            Prefill(Response),
+            Decode(reqwest::Response),
+        }
+        enum PrefillResult {
+            Buffered(Option<Bytes>),
+            Draining(tokio_util::task::AbortOnDropHandle<()>),
+        }
         let runtime = prefill.metadata().spec.runtime_type.as_str();
         let dispatch_start = Instant::now();
         let prefill_fut = async {
-            let resp = send_with_stale_conn_retry(prefill_request).await?;
-            Ok::<_, reqwest::Error>((dispatch_start.elapsed(), resp))
+            let resp = send_with_stale_conn_retry(prefill_request)
+                .await
+                .map_err(DispatchError::Transport)?;
+            if context.is_stream && !context.return_logprob && resp.status().is_success() {
+                let prefill = Arc::clone(&prefill);
+                let model_id = context.model_id.to_string();
+                // The drain owns both the permit and the outcome. It may finish
+                // before Decode sends headers; neither waits for the other.
+                *prefill_outcome = PrefillOutcome::Drained;
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "drains a prefill body concurrently with Decode; aborted before client commitment and detached after it"
+                )]
+                let drain = tokio::spawn(async move {
+                    let _prefill_guard = prefill_guard;
+                    let mut chunks = resp.bytes_stream();
+                    let mut drained = StatusCode::OK;
+                    while let Some(chunk) = chunks.next().await {
+                        if let Err(e) = chunk {
+                            warn!("Error consuming prefill response: {e}");
+                            drained = StatusCode::BAD_GATEWAY;
+                            break;
+                        }
+                    }
+                    prefill.record_outcome(drained.as_u16());
+                    if drained.is_server_error() {
+                        Metrics::record_worker_error(
+                            metrics_labels::WORKER_PREFILL,
+                            metrics_labels::CONNECTION_HTTP,
+                            error_type_from_status(drained),
+                        );
+                    }
+                    Metrics::record_pd_prefill_duration(
+                        metrics_labels::BACKEND_PD,
+                        &model_id,
+                        runtime,
+                        dispatch_start.elapsed(),
+                    );
+                });
+                // A Decode error or cancellation before both heads arrive
+                // cancels the drain too, releasing its admission permit.
+                return Ok(PrefillResult::Draining(
+                    tokio_util::task::AbortOnDropHandle::new(drain),
+                ));
+            }
+            let result = self
+                .process_prefill_response(resp, prefill.url(), context.return_logprob)
+                .await;
+            drop(prefill_guard);
+            let (_, body) = result.map_err(DispatchError::Prefill)?;
+            Metrics::record_pd_prefill_duration(
+                metrics_labels::BACKEND_PD,
+                context.model_id,
+                runtime,
+                dispatch_start.elapsed(),
+            );
+            Ok(PrefillResult::Buffered(body))
         };
         let decode_fut = async {
-            let resp = send_with_stale_conn_retry(decode_request).await?;
-            Ok::<_, reqwest::Error>((dispatch_start.elapsed(), resp))
+            let resp = send_with_stale_conn_retry(decode_request)
+                .await
+                .map_err(DispatchError::Transport)?;
+            if !resp.status().is_success() {
+                return Err(DispatchError::Decode(resp));
+            }
+            Ok((dispatch_start.elapsed(), resp))
         };
         let pd_result = tokio::try_join!(prefill_fut, decode_fut);
 
         events::RequestReceivedEvent {}.emit();
 
-        let ((prefill_head_elapsed, prefill_response), (decode_head_elapsed, decode_response)) =
-            match pd_result {
-                Ok(pair) => pair,
-                Err(e) => {
-                    error!("PD request transport error, both sides aborted: {e}");
-                    // Don't record_outcome here — the caller (execute_dual_dispatch)
-                    // records outcomes from the response status after we return.
-                    return error::bad_gateway(
-                        "PD disaggregation request failed",
-                        format!("Transport error: {e}"),
-                    );
-                }
-            };
+        let (prefill_body, (decode_head_elapsed, decode_response)) = match pd_result {
+            Ok(pair) => pair,
+            Err(DispatchError::Transport(e)) => {
+                error!("PD request transport error, both sides aborted: {e}");
+                // Don't record_outcome here — the caller (execute_dual_dispatch)
+                // records outcomes from the response status after we return.
+                return error::bad_gateway(
+                    "PD disaggregation request failed",
+                    format!("Transport error: {e}"),
+                );
+            }
+            Err(DispatchError::Prefill(response)) => return response,
+            Err(DispatchError::Decode(response)) => {
+                error!(
+                    "Decode server returned error status decode_url={} status={}",
+                    decode.url(),
+                    response.status()
+                );
+                return self
+                    .handle_decode_error_response(response, &context, decode, decode_guard)
+                    .await;
+            }
+        };
 
         // Process decode response
         let status = StatusCode::from_u16(decode_response.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         debug!("Decode response status: {}", status);
-
-        if !status.is_success() {
-            error!(
-                "Decode server returned error status decode_url={} status={}",
-                decode.url(),
-                status
-            );
-
-            return self
-                .handle_decode_error_response(decode_response, &context, decode, load_guards)
-                .await;
-        }
 
         // Honest PD TTFT: dispatch to the decode response head — the first
         // user-visible decode output, since the gateway forwards the decode body
@@ -906,70 +1185,164 @@ impl PDRouter {
             decode_head_elapsed,
         );
 
-        // Process prefill response
-        let prefill_drain_start = Instant::now();
-        let prefill_body = match self
-            .process_prefill_response(prefill_response, prefill.url(), context.return_logprob)
-            .await
-        {
-            Ok((_, body)) => body,
-            Err(error_response) => return error_response,
+        let prefill_body = match prefill_body {
+            PrefillResult::Buffered(body) => body,
+            PrefillResult::Draining(drain) => {
+                // Both response heads succeeded. Keep draining after a client
+                // disconnect, preserving the upstream KV-transfer behavior.
+                drop(drain.detach());
+                None
+            }
         };
-
-        // Prefill RPC duration: prefill-head elapsed + body drain, independent
-        // of decode so a slower decode head never inflates it.
-        Metrics::record_pd_prefill_duration(
-            metrics_labels::BACKEND_PD,
-            context.model_id,
-            runtime,
-            prefill_head_elapsed + prefill_drain_start.elapsed(),
-        );
-
         self.forward_decode_body(
             decode_response,
             status,
             &context,
             decode,
-            load_guards,
+            decode_guard,
             prefill_body,
         )
         .await
     }
 
     /// The request's fan-out factor, read from the serialized body.
-    fn sampling_n(json: &Value) -> u64 {
-        json.get("n").and_then(Value::as_u64).unwrap_or(1)
+    fn sampling_n(body: &RawBody<'_>) -> u64 {
+        body.get("n")
+            .and_then(|n| serde_json::from_str::<u64>(n.get()).ok())
+            .unwrap_or(1)
     }
 
     /// Sanitize the prefill leg for a KV handoff: the prefill engine computes
     /// KV for the prompt and must produce (at most) one token, unstreamed.
     /// The output-cap key is per-endpoint.
-    fn sanitize_prefill_for_kv_handoff(json: &mut Value, route: &str) {
-        let Some(obj) = json.as_object_mut() else {
-            return;
-        };
-        obj.insert("stream".to_string(), Value::Bool(false));
+    fn sanitize_prefill_for_kv_handoff(
+        body: &mut RawBody<'_>,
+        route: &str,
+    ) -> serde_json::Result<()> {
+        let one = || to_raw_value(&1);
+        body.insert("stream", to_raw_value(&false)?);
         // stream_options without stream=true is rejected by strict engines.
-        obj.remove("stream_options");
-        if obj.contains_key("n") {
-            obj.insert("n".to_string(), Value::from(1));
+        body.remove("stream_options");
+        if body.contains("n") {
+            body.insert("n", one()?);
         }
         // A min_tokens floor would force decode-phase work onto the prefill leg.
-        obj.remove("min_tokens");
+        body.remove("min_tokens");
         match route {
             // The engine rejects requests carrying both cap spellings, so
             // overwrite the one the client used.
-            "/v1/chat/completions" if obj.contains_key("max_completion_tokens") => {
-                obj.insert("max_completion_tokens".to_string(), Value::from(1));
-                obj.remove("max_tokens");
+            "/v1/chat/completions" if body.contains("max_completion_tokens") => {
+                body.insert("max_completion_tokens", one()?);
+                body.remove("max_tokens");
             }
-            "/v1/responses" => {
-                obj.insert("max_output_tokens".to_string(), Value::from(1));
-            }
-            _ => {
-                obj.insert("max_tokens".to_string(), Value::from(1));
+            "/v1/responses" => body.insert("max_output_tokens", one()?),
+            _ => body.insert("max_tokens", one()?),
+        }
+        Ok(())
+    }
+
+    /// MoRI-IO pair preconditions, checked before either leg is contacted:
+    /// both workers are MoRIIOConnector workers in one transfer mode, and a
+    /// WRITE producer can reach the decode side channel it is told to push to
+    /// (and, under concurrent dispatch, the decode engine the prefill's).
+    /// Returns the (prefill, decode) endpoints the legs are tagged with.
+    fn moriio_pair(
+        prefill: &dyn Worker,
+        decode: &dyn Worker,
+    ) -> Result<(MoriIoEndpoint, MoriIoEndpoint), Box<Response>> {
+        let misconfigured = |reason: String| {
+            Metrics::record_pd_kv_transfer_failure();
+            warn!("vLLM PD (MoRI-IO) over HTTP: {reason}");
+            Box::new(error::service_unavailable(
+                "moriio_pair_misconfigured",
+                "the selected prefill/decode pair is not configured for MoRI-IO",
+            ))
+        };
+        let prefill_endpoint = moriio_endpoint(prefill).map_err(misconfigured)?;
+        let decode_endpoint = moriio_endpoint(decode).map_err(misconfigured)?;
+        if prefill_endpoint.transfer != decode_endpoint.transfer {
+            return Err(misconfigured(format!(
+                "prefill {} runs {:?} but decode {} runs {:?}",
+                prefill.url(),
+                prefill_endpoint.transfer,
+                decode.url(),
+                decode_endpoint.transfer
+            )));
+        }
+        if decode_endpoint.transfer == MoriIoTransfer::Write {
+            if let Some(reason) = moriio_write_target_error(&prefill_endpoint, &decode_endpoint) {
+                return Err(misconfigured(reason));
             }
         }
+        if let Some(reason) = moriio_dp_mismatch_error(&prefill_endpoint, &decode_endpoint) {
+            return Err(misconfigured(reason));
+        }
+        Ok((prefill_endpoint, decode_endpoint))
+    }
+
+    /// The data-parallel rank both legs of the next request on a MoRI-IO
+    /// pair go to, if its engines run more than one.
+    fn moriio_dp_rank(&self, decode: &MoriIoEndpoint) -> Option<usize> {
+        (decode.dp_size > 1)
+            .then(|| self.moriio_dp_turn.fetch_add(1, Ordering::Relaxed) % decode.dp_size)
+    }
+
+    /// Requests one MoRI-IO handoff cannot serve, refused before either leg
+    /// is contacted.
+    fn moriio_refusal(
+        context: &PDRequestContext<'_>,
+        headers: Option<&HeaderMap>,
+        body: &RawBody<'_>,
+    ) -> Option<Box<Response>> {
+        if !matches!(context.route, "/v1/chat/completions" | "/v1/completions") {
+            return Some(Box::new(error::not_implemented(
+                "moriio_route_unsupported",
+                format!(
+                    "MoRI-IO PD serves /v1/chat/completions and /v1/completions, not {}",
+                    context.route
+                ),
+            )));
+        }
+        // Every n>1 child or batched prompt would claim the one prefill's KV,
+        // and beam search builds sampling params without the handoff.
+        let is_true = |key: &str| {
+            body.get(key)
+                .is_some_and(|v| serde_json::from_str::<bool>(v.get()).unwrap_or(false))
+        };
+        let embeds_batch = body
+            .get("prompt_embeds")
+            .and_then(|v| serde_json::from_str::<Vec<serde::de::IgnoredAny>>(v.get()).ok())
+            .is_some_and(|embeds| embeds.len() > 1);
+        if Self::sampling_n(body) > 1
+            || context.batch_size.is_some_and(|n| n > 1)
+            || embeds_batch
+            || is_true("use_beam_search")
+        {
+            return Some(Box::new(error::bad_request(
+                "moriio_fanout_unsupported",
+                "n>1, batched prompts and beam search cannot share one MoRI-IO KV handoff",
+            )));
+        }
+        // The connector prefers peer addresses parsed from the request id,
+        // which vLLM takes from X-Request-Id or else the body's request_id.
+        let header_ids = headers.into_iter().flat_map(|h| {
+            h.get_all("x-request-id")
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+        });
+        let body_id = body
+            .get("request_id")
+            .and_then(|v| serde_json::from_str::<String>(v.get()).ok());
+        if header_ids
+            .chain(body_id.as_deref())
+            .any(carries_moriio_peer_markers)
+        {
+            return Some(Box::new(error::bad_request(
+                "moriio_request_id_reserved",
+                "a request id must not contain MoRI-IO peer-address markers",
+            )));
+        }
+        None
     }
 
     /// vLLM PD over HTTP: send the tagged prefill leg, wait for it, harvest
@@ -985,26 +1358,31 @@ impl PDRouter {
         leg_bodies: (Bytes, Bytes),
         mode: KvConnectorMode,
         transfer_id: Option<String>,
+        dp_rank: Option<usize>,
         context: PDRequestContext<'_>,
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
-        load_guards: Vec<WorkerLoadGuard>,
+        guards: PdLoadGuards,
     ) -> Response {
         let (prefill_body, decode_body) = leg_bodies;
+        let PdLoadGuards {
+            prefill: prefill_guard,
+            decode: decode_guard,
+        } = guards;
 
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
         let runtime = prefill.metadata().spec.runtime_type.as_str();
 
-        let mut decode_json = match serde_json::from_slice::<Value>(&decode_body) {
-            Ok(json) => json,
+        let decode_leg = match RawBody::parse(&decode_body) {
+            Ok(body) => body,
             Err(e) => return Self::handle_serialization_error(e),
         };
         // The KV handoff is single-consumer, so an n>1 fan-out cannot use it —
         // and without the handoff a prefill leg is pure wasted GPU work plus
         // serial latency. Skip prefill entirely and let decode own the prompt.
-        let relay = Self::sampling_n(&decode_json) <= 1;
+        let relay = Self::sampling_n(&decode_leg) <= 1;
         Metrics::record_pd_kv_connector_mode(mode.metrics_label());
 
         let dispatch_start = Instant::now();
@@ -1015,12 +1393,15 @@ impl PDRouter {
             }
             .emit();
 
-            let prefill_request = self.build_post_with_headers(
-                prefill.as_ref(),
-                context.route,
-                prefill_body,
-                headers,
-                false,
+            let prefill_request = Self::pin_dp_rank(
+                self.build_post_with_headers(
+                    prefill.as_ref(),
+                    context.route,
+                    prefill_body,
+                    headers,
+                    false,
+                ),
+                dp_rank,
             );
             let prefill_response = match send_with_stale_conn_retry(prefill_request).await {
                 Ok(response) => response,
@@ -1081,10 +1462,7 @@ impl PDRouter {
 
             // Harvest the handoff params the prefill engine returned (NIXL and
             // opportunistic passthrough; Mooncake returns nothing and is minted).
-            serde_json::from_slice::<Value>(&prefill_bytes)
-                .ok()
-                .and_then(|json| json.get("kv_transfer_params").cloned())
-                .filter(|params| !params.is_null())
+            Self::harvest_kv_transfer_params(&prefill_bytes)
         } else {
             debug!(
                 "vLLM PD over HTTP: n>1 fan-out cannot consume a KV handoff; \
@@ -1092,6 +1470,24 @@ impl PDRouter {
             );
             None
         };
+        drop(prefill_guard);
+        if mode == KvConnectorMode::MoriIo {
+            let checked = match (&harvested, transfer_id.as_deref()) {
+                (Some(handoff), Some(id)) => validate_moriio_handoff(handoff, id, dp_rank),
+                _ => Err("prefill returned no kv_transfer_params".to_string()),
+            };
+            if let Err(reason) = checked {
+                Metrics::record_pd_kv_transfer_failure();
+                error!(
+                    "vLLM PD (MoRI-IO) over HTTP: {reason}; not dispatching a decode leg \
+                     that would run without its KV"
+                );
+                return error::bad_gateway(
+                    "moriio_handoff_invalid",
+                    "MoRI-IO prefill returned no usable KV handoff",
+                );
+            }
+        }
         let decode_params = match (&mode, harvested) {
             // Modern Mooncake: synthesized params under the minted transfer_id
             (
@@ -1103,8 +1499,7 @@ impl PDRouter {
                 _,
             ) if relay && transfer_id.is_some() => {
                 let id = transfer_id.as_deref().unwrap_or_default();
-                serde_json::from_str::<Value>(&mooncake_decode_params(id, engine_id, host, *port))
-                    .ok()
+                RawValue::from_string(mooncake_decode_params(id, engine_id, host, *port)).ok()
             }
             (KvConnectorMode::Mooncake { .. }, _) => {
                 // Legacy typed host/port injection is a sidecar-proto shape
@@ -1115,9 +1510,10 @@ impl PDRouter {
                 );
                 None
             }
-            (KvConnectorMode::Nixl | KvConnectorMode::Passthrough, Some(params)) if relay => {
-                Some(params)
-            }
+            (
+                KvConnectorMode::Nixl | KvConnectorMode::MoriIo | KvConnectorMode::Passthrough,
+                Some(params),
+            ) if relay => Some(params),
             (KvConnectorMode::Nixl, None) if relay => {
                 Metrics::record_pd_kv_transfer_failure();
                 warn!(
@@ -1128,22 +1524,30 @@ impl PDRouter {
             }
             _ => None,
         };
-        if let (Some(obj), Some(params)) = (decode_json.as_object_mut(), decode_params) {
-            obj.insert("kv_transfer_params".to_string(), params);
-        }
-        // The leg's own serialized length bounds the reserialization; the
+        // The decode leg goes out as serialized unless the handoff params are
+        // added; then the leg's own length bounds the reserialization and the
         // slack covers the injected kv_transfer_params.
-        let decode_body = match serialize_json_sized(&decode_json, Some(decode_body.len())) {
-            Ok(body) => Bytes::from(body),
-            Err(e) => return Self::handle_serialization_error(e),
+        let decode_body = match decode_params {
+            Some(params) => {
+                let mut decode_leg = decode_leg;
+                decode_leg.insert("kv_transfer_params", params);
+                match decode_leg.to_bytes(Some(decode_body.len())) {
+                    Ok(body) => Bytes::from(body),
+                    Err(e) => return Self::handle_serialization_error(e),
+                }
+            }
+            None => decode_body,
         };
 
-        let decode_request = self.build_post_with_headers(
-            decode.as_ref(),
-            context.route,
-            decode_body,
-            headers,
-            false,
+        let decode_request = Self::pin_dp_rank(
+            self.build_post_with_headers(
+                decode.as_ref(),
+                context.route,
+                decode_body,
+                headers,
+                false,
+            ),
+            dp_rank,
         );
         let decode_response = match send_with_stale_conn_retry(decode_request).await {
             Ok(response) => response,
@@ -1173,7 +1577,7 @@ impl PDRouter {
                 status
             );
             return self
-                .handle_decode_error_response(decode_response, &context, decode, load_guards)
+                .handle_decode_error_response(decode_response, &context, decode, decode_guard)
                 .await;
         }
 
@@ -1186,8 +1590,250 @@ impl PDRouter {
             dispatch_start.elapsed(),
         );
 
-        self.forward_decode_body(decode_response, status, &context, decode, load_guards, None)
-            .await
+        self.forward_decode_body(
+            decode_response,
+            status,
+            &context,
+            decode,
+            decode_guard,
+            None,
+        )
+        .await
+    }
+
+    /// vLLM MoRI-IO WRITE over HTTP: send both legs at once, so the decode
+    /// engine allocates its blocks while the prefill engine computes and pushes
+    /// the KV layer by layer. The first leg to fail, by transport error or
+    /// error status, ends the request, and dropping the other one makes its
+    /// engine abort it. The decode response is forwarded only after the prefill
+    /// has returned a valid handoff naming the side channel the decode leg was
+    /// sent to notify, since otherwise that decode would wait for a push that
+    /// never comes.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors execute_sequential_dispatch_internal"
+    )]
+    async fn execute_moriio_concurrent_write(
+        &self,
+        headers: Option<&HeaderMap>,
+        leg_bodies: (Bytes, Bytes),
+        transfer_id: Option<String>,
+        dp_rank: Option<usize>,
+        prefill_endpoint: &MoriIoEndpoint,
+        context: PDRequestContext<'_>,
+        prefill: Arc<dyn Worker>,
+        decode: Arc<dyn Worker>,
+        guards: PdLoadGuards,
+    ) -> Response {
+        let (prefill_body, decode_body) = leg_bodies;
+        let PdLoadGuards {
+            prefill: prefill_guard,
+            decode: decode_guard,
+        } = guards;
+        let mut headers_with_trace = headers.cloned().unwrap_or_default();
+        inject_trace_context_http(&mut headers_with_trace);
+        let headers = Some(&headers_with_trace);
+        let runtime = prefill.metadata().spec.runtime_type.as_str();
+        Metrics::record_pd_kv_connector_mode(KvConnectorMode::MoriIo.metrics_label());
+        events::RequestPDSentEvent {
+            prefill_url: prefill.url(),
+            decode_url: decode.url(),
+        }
+        .emit();
+
+        let dispatch_start = Instant::now();
+        let prefill_request = Self::pin_dp_rank(
+            self.build_post_with_headers(
+                prefill.as_ref(),
+                context.route,
+                prefill_body,
+                headers,
+                false,
+            ),
+            dp_rank,
+        );
+        let decode_request = Self::pin_dp_rank(
+            self.build_post_with_headers(
+                decode.as_ref(),
+                context.route,
+                decode_body,
+                headers,
+                false,
+            ),
+            dp_rank,
+        );
+        let prefill_leg = async {
+            let response = match send_with_stale_conn_retry(prefill_request).await {
+                Ok(response) => response,
+                Err(e) => {
+                    error!("PD prefill transport error: {e}");
+                    Self::record_sequential_leg(
+                        prefill.as_ref(),
+                        metrics_labels::WORKER_PREFILL,
+                        StatusCode::BAD_GATEWAY,
+                    );
+                    return Err(error::bad_gateway(
+                        "prefill_request_failed",
+                        format!("Prefill transport error: {e}"),
+                    ));
+                }
+            };
+            let status = StatusCode::from_u16(response.status().as_u16())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            if !status.is_success() {
+                error!(
+                    "Prefill server returned error status prefill_url={} status={}",
+                    prefill.url(),
+                    status
+                );
+                Self::record_sequential_leg(
+                    prefill.as_ref(),
+                    metrics_labels::WORKER_PREFILL,
+                    status,
+                );
+                return Err(Self::prefill_error_response(status, response).await);
+            }
+            match response.bytes().await {
+                Ok(bytes) => {
+                    Self::record_sequential_leg(
+                        prefill.as_ref(),
+                        metrics_labels::WORKER_PREFILL,
+                        status,
+                    );
+                    Ok(bytes)
+                }
+                Err(e) => {
+                    error!("Failed to read prefill response: {e}");
+                    Self::record_sequential_leg(
+                        prefill.as_ref(),
+                        metrics_labels::WORKER_PREFILL,
+                        StatusCode::BAD_GATEWAY,
+                    );
+                    Err(error::bad_gateway(
+                        "prefill_read_failed",
+                        format!("Failed to read prefill response: {e}"),
+                    ))
+                }
+            }
+        };
+        let decode_leg = send_with_stale_conn_retry(decode_request);
+        tokio::pin!(decode_leg);
+
+        let mut decode_head = None;
+        // Leaving this block drops the prefill leg, unless it has finished.
+        let first = {
+            tokio::pin!(prefill_leg);
+            loop {
+                tokio::select! {
+                    outcome = &mut prefill_leg => break Ok(outcome),
+                    sent = &mut decode_leg, if decode_head.is_none() => match sent {
+                        Ok(response) if response.status().is_success() => {
+                            decode_head = Some(response);
+                        }
+                        Ok(response) => break Err(response),
+                        Err(e) => {
+                            error!("PD decode transport error: {e}");
+                            Self::record_sequential_leg(
+                                decode.as_ref(),
+                                metrics_labels::WORKER_DECODE,
+                                StatusCode::BAD_GATEWAY,
+                            );
+                            return error::bad_gateway(
+                                "decode_request_failed",
+                                format!("Decode transport error: {e}"),
+                            );
+                        }
+                    },
+                }
+            }
+        };
+
+        let decode_response = match first {
+            // A decode engine that refused the request takes no push.
+            Err(refused) => refused,
+            Ok(prefill_outcome) => {
+                let prefill_bytes = match prefill_outcome {
+                    Ok(bytes) => bytes,
+                    Err(response) => return response,
+                };
+                drop(prefill_guard);
+                Metrics::record_pd_prefill_duration(
+                    metrics_labels::BACKEND_PD,
+                    context.model_id,
+                    runtime,
+                    dispatch_start.elapsed(),
+                );
+                let checked = match (
+                    Self::harvest_kv_transfer_params(&prefill_bytes),
+                    transfer_id.as_deref(),
+                ) {
+                    (Some(handoff), Some(id)) => validate_moriio_handoff(&handoff, id, dp_rank)
+                        .and_then(|()| {
+                            moriio_side_channel_error(&handoff, prefill_endpoint)
+                                .map_or(Ok(()), Err)
+                        }),
+                    _ => Err("prefill returned no kv_transfer_params".to_string()),
+                };
+                if let Err(reason) = checked {
+                    Metrics::record_pd_kv_transfer_failure();
+                    error!(
+                        "vLLM PD (MoRI-IO) over HTTP: {reason}; aborting the decode leg, \
+                         which would wait for a push that never comes"
+                    );
+                    return error::bad_gateway(
+                        "moriio_handoff_invalid",
+                        "MoRI-IO prefill returned no usable KV handoff",
+                    );
+                }
+                match decode_head {
+                    Some(response) => response,
+                    None => match decode_leg.await {
+                        Ok(response) => response,
+                        Err(e) => {
+                            error!("PD decode transport error: {e}");
+                            Self::record_sequential_leg(
+                                decode.as_ref(),
+                                metrics_labels::WORKER_DECODE,
+                                StatusCode::BAD_GATEWAY,
+                            );
+                            return error::bad_gateway(
+                                "decode_request_failed",
+                                format!("Decode transport error: {e}"),
+                            );
+                        }
+                    },
+                }
+            }
+        };
+        events::RequestReceivedEvent {}.emit();
+        let status = StatusCode::from_u16(decode_response.status().as_u16())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        Self::record_sequential_leg(decode.as_ref(), metrics_labels::WORKER_DECODE, status);
+        if !status.is_success() {
+            error!(
+                "Decode server returned error status decode_url={} status={}",
+                decode.url(),
+                status
+            );
+            return self
+                .handle_decode_error_response(decode_response, &context, decode, decode_guard)
+                .await;
+        }
+        Metrics::record_pd_ttft(
+            metrics_labels::BACKEND_PD,
+            context.model_id,
+            runtime,
+            dispatch_start.elapsed(),
+        );
+        self.forward_decode_body(
+            decode_response,
+            status,
+            &context,
+            decode,
+            decode_guard,
+            None,
+        )
+        .await
     }
 
     /// Map a failed prefill response to a client-facing error. The exact
@@ -1234,7 +1880,7 @@ impl PDRouter {
         status: StatusCode,
         context: &PDRequestContext<'_>,
         decode: Arc<dyn Worker>,
-        load_guards: Vec<WorkerLoadGuard>,
+        decode_guard: WorkerLoadGuard,
         prefill_body: Option<Bytes>,
     ) -> Response {
         if context.is_stream {
@@ -1259,7 +1905,7 @@ impl PDRouter {
                 context.return_logprob,
                 None,
                 Some(response_headers),
-                load_guards,
+                decode_guard,
             )
         } else {
             // Non-streaming response
@@ -1303,15 +1949,35 @@ impl PDRouter {
         prefill_policy.needs_request_text() || decode_policy.needs_request_text()
     }
 
+    /// Select a PD pair and take its load. With Prefill admission enabled
+    /// the selection runs at the head of the admission queue.
+    async fn select_pd_pair_with_admission(
+        &self,
+        model_id: &str,
+        inputs: PlacementInputs<'_>,
+        sticky_key: Option<&str>,
+    ) -> Result<(PdPair, PdLoadGuards), Box<PdSelectionFailure>> {
+        let ((prefill, decode), prefill_guard) = acquire_prefill(
+            self.prefill_admission.as_deref(),
+            sticky_key,
+            |(prefill, _): &PdPair| prefill,
+            |capacity| self.select_pd_pair(model_id, inputs, capacity),
+        )
+        .await
+        .map_err(|error| Box::new(PdSelectionFailure::from(error)))?;
+        let guards = PdLoadGuards {
+            prefill: prefill_guard,
+            decode: WorkerLoadGuard::with_key(Arc::clone(&decode), sticky_key),
+        };
+        Ok(((prefill, decode), guards))
+    }
+
     fn select_pd_pair(
         &self,
-        request_text: Option<&str>,
-        tokens: Option<&[u32]>,
-        rid_key: Option<&str>,
-        cache_namespace: Option<CacheNamespace>,
         model_id: &str,
-        headers: Option<&HeaderMap>,
-    ) -> Result<PdPair, Box<PdSelectionFailure>> {
+        inputs: PlacementInputs<'_>,
+        prefill_capacity: Option<&PrefillSelectionContext<'_>>,
+    ) -> Result<PdPair, Box<PairFailure>> {
         debug!("Selecting PD pair: model_id={:?}", model_id);
 
         // Shared HTTP-transport projections: this router proxies plain HTTP
@@ -1347,15 +2013,9 @@ impl PDRouter {
             &pairs,
             None,
             false,
-            PlacementInputs {
-                text: request_text,
-                tokens,
-                headers,
-                rid_key,
-                cache_namespace,
-            },
-        )
-        .map_err(|failure| Box::new(Self::pair_failure(*failure)))?;
+            prefill_capacity,
+            inputs,
+        )?;
 
         Ok((pair.prefill, pair.decode))
     }
@@ -1379,6 +2039,10 @@ impl PDRouter {
             PlacementFailure::PolicyDeclined(policy) => PdSelectionFailure::Unavailable(
                 format!("Policy {policy} failed to select a {leg} worker"),
             ),
+            // Admission turns this verdict into a wait before it gets here.
+            PlacementFailure::PrefillAtCapacity => PdSelectionFailure::Unavailable(format!(
+                "No {leg} workers below their Prefill admission limit"
+            )),
             PlacementFailure::NoCompatiblePair {
                 prefill,
                 decode,
@@ -1403,7 +2067,7 @@ impl PDRouter {
         return_logprob: bool,
         decode_url: Option<String>,
         headers: Option<HeaderMap>,
-        load_guards: Vec<WorkerLoadGuard>,
+        decode_guard: WorkerLoadGuard,
     ) -> Response {
         use crate::worker::AttachedBody;
 
@@ -1469,7 +2133,7 @@ impl PDRouter {
         response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
         *response.headers_mut() = response_headers;
 
-        AttachedBody::wrap_response(response, load_guards)
+        AttachedBody::wrap_response(response, decode_guard)
     }
 
     /// Build a non-streaming PD response with `Content-Type: application/json`.
@@ -1645,6 +2309,17 @@ impl PDRouter {
         request
     }
 
+    /// Route a MoRI-IO leg to the data-parallel rank both legs are pinned to.
+    fn pin_dp_rank(
+        request: reqwest::RequestBuilder,
+        dp_rank: Option<usize>,
+    ) -> reqwest::RequestBuilder {
+        match dp_rank {
+            Some(rank) => request.header(DATA_PARALLEL_RANK_HEADER, rank.to_string()),
+            None => request,
+        }
+    }
+
     // Helper to merge logprobs from prefill and decode responses
     // Optimized to avoid double cloning by taking ownership of decode array
     fn merge_logprobs_in_json(prefill_json: &Value, decode_json: &mut Value) -> bool {
@@ -1774,12 +2449,12 @@ impl RouterTrait for PDRouter {
 
         // Select a random worker pair using the policy
         let (prefill, decode) =
-            match self.select_pd_pair(None, None, None, None, UNKNOWN_MODEL_ID, None) {
+            match self.select_pd_pair(UNKNOWN_MODEL_ID, PlacementInputs::default(), None) {
                 Ok(pair) => pair,
                 // A deep probe that generates gets the same answer routing does:
                 // an all-vetoed fleet fails the probe, exactly as an all-circuit-
                 // broken one already did.
-                Err(failure) => match *failure {
+                Err(failure) => match Self::pair_failure(*failure) {
                     PdSelectionFailure::Shed(shed) => return shed,
                     PdSelectionFailure::Incompatible(e) => {
                         return error::service_unavailable("no_compatible_pd_pair", e);
@@ -1789,6 +2464,11 @@ impl RouterTrait for PDRouter {
                             "no_healthy_worker_pair",
                             format!("No healthy worker pair available: {e}"),
                         );
+                    }
+                    // The probe does not go through admission.
+                    rejection @ (PdSelectionFailure::QueueFull
+                    | PdSelectionFailure::QueueTimeout) => {
+                        return Self::handle_server_selection_error(rejection);
                     }
                 },
             };
@@ -1993,6 +2673,102 @@ impl RouterTrait for PDRouter {
             .await
     }
 
+    async fn route_messages_count_tokens(
+        &self,
+        headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
+        mut body: CountMessageTokensRequest,
+        model_id: &str,
+    ) -> Response {
+        // Counting generates nothing, so it takes one prefill worker (which
+        // holds the tokenizer and prompt template) and no KV handoff.
+        let canonical_model = self.worker_registry.resolve_model_alias(model_id);
+        let model_id = canonical_model.as_deref().unwrap_or(model_id);
+        let request_text = self
+            .policies_need_request_text()
+            .then(|| body.extract_text_for_routing());
+        let Some(worker) = placement::select_single(
+            &self.worker_registry,
+            &self.policy_registry,
+            model_id,
+            RoutingPool::HttpPrefill,
+            None,
+            PlacementInputs {
+                text: request_text.as_deref(),
+                tokens: None,
+                headers,
+                rid_key: None,
+                cache_namespace: None,
+                candidate_filter: None,
+            },
+        ) else {
+            return error::service_unavailable(
+                "no_prefill_servers",
+                "No available prefill servers to count tokens",
+            );
+        };
+
+        if let Some(canonical_model) = canonical_model.as_deref() {
+            canonical_model.clone_into(&mut body.model);
+        }
+        let body = match serialize_json_sized(&body, None) {
+            Ok(bytes) => Bytes::from(bytes),
+            Err(e) => return Self::handle_serialization_error(e),
+        };
+        if let Some(response) = overload::shed_if_worker_overloaded(
+            worker.as_ref(),
+            model_id,
+            self.worker_registry.overload_shed_enabled(),
+        ) {
+            return response;
+        }
+        let _load_guard = WorkerLoadGuard::with_key(
+            worker.clone(),
+            self.policy_registry.sticky_header_key(headers),
+        );
+        let request = header_utils::apply_forwarded_request_headers(
+            attach_sized_body(
+                worker
+                    .http_client()
+                    .post(worker.endpoint_url("/v1/messages/count_tokens"))
+                    .header(CONTENT_TYPE, "application/json"),
+                body,
+            ),
+            headers,
+            worker.api_key(),
+        );
+        let res = match send_with_stale_conn_retry(request).await {
+            Ok(res) => res,
+            Err(e) => {
+                worker.record_outcome(StatusCode::BAD_GATEWAY.as_u16());
+                return error::bad_gateway(
+                    "prefill_count_tokens_failed",
+                    format!("Prefill server error: {e}"),
+                );
+            }
+        };
+        let status = StatusCode::from_u16(res.status().as_u16())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let mut response_headers = header_utils::preserve_response_headers(res.headers());
+        header_utils::insert_routed_worker_id(&mut response_headers, worker.url());
+        match res.bytes().await {
+            Ok(bytes) => {
+                worker.record_outcome(status.as_u16());
+                let mut response = Response::new(Body::from(bytes));
+                *response.status_mut() = status;
+                *response.headers_mut() = response_headers;
+                response
+            }
+            Err(e) => {
+                worker.record_outcome(StatusCode::BAD_GATEWAY.as_u16());
+                error::bad_gateway(
+                    "prefill_count_tokens_failed",
+                    format!("Failed to read prefill response: {e}"),
+                )
+            }
+        }
+    }
+
     async fn route_responses(
         &self,
         headers: Option<&HeaderMap>,
@@ -2118,13 +2894,18 @@ impl RouterTrait for PDRouter {
 #[cfg(test)]
 mod tests {
     use openai_protocol::model_card::ModelCard;
+    use tokio::sync::oneshot;
 
     use super::*;
     use crate::{
-        config::PolicyConfig,
+        config::{types::PdPairingMode, PolicyConfig},
         tenant::TenantKey,
         worker::{BasicWorkerBuilder, WorkerType},
     };
+
+    /// Ceiling on a real HTTP round trip in these tests: a guard against a
+    /// hang, not a budget, since a loaded machine can take seconds.
+    const ROUND_TRIP_GUARD: std::time::Duration = std::time::Duration::from_secs(60);
 
     fn create_test_pd_router() -> PDRouter {
         let worker_registry = Arc::new(WorkerRegistry::new());
@@ -2135,6 +2916,8 @@ mod tests {
             policy_registry,
             retry_config: RetryConfig::default(),
             api_key: Some("test_api_key".to_string()),
+            prefill_admission: None,
+            moriio_dp_turn: AtomicUsize::new(0),
         }
     }
 
@@ -2186,12 +2969,11 @@ mod tests {
             .bootstrap_port(Some(8998))
             .build();
 
-        let body = PDRouter::inject_bootstrap_into_value(
-            serde_json::to_value(&request).unwrap(),
-            &prefill,
-            None,
-        )
-        .unwrap();
+        let bytes = serde_json::to_vec(&request).unwrap();
+        let mut leg = RawBody::parse(&bytes).unwrap();
+        let fields = PDRouter::bootstrap_fields(&prefill, None).unwrap();
+        PDRouter::inject_bootstrap(&mut leg, fields);
+        let body: Value = serde_json::from_slice(&leg.to_bytes(None).unwrap()).unwrap();
 
         assert_eq!(body["stream_options"]["step_usage_chunks"], json!("all"));
         assert_eq!(body["stream_options"]["include_usage"], json!(true));
@@ -2324,7 +3106,7 @@ mod tests {
             .worker_registry
             .register_or_replace(Arc::from(decode_worker));
 
-        let result = router.select_pd_pair(None, None, None, None, UNKNOWN_MODEL_ID, None);
+        let result = router.select_pd_pair(UNKNOWN_MODEL_ID, PlacementInputs::default(), None);
 
         assert!(result.is_ok());
         let (prefill, _decode) = result.unwrap();
@@ -2349,13 +3131,13 @@ mod tests {
         }
 
         let (prefill, decode) = router
-            .select_pd_pair(None, None, None, None, "GLM-5.2-Coding", None)
+            .select_pd_pair("GLM-5.2-Coding", PlacementInputs::default(), None)
             .expect("alias should select a PD pair");
         assert_eq!(prefill.url(), "http://prefill");
         assert_eq!(decode.url(), "http://decode");
 
         assert!(router
-            .select_pd_pair(None, None, None, None, "GLM-5.2-Unknown", None)
+            .select_pd_pair("GLM-5.2-Unknown", PlacementInputs::default(), None)
             .is_err());
     }
 
@@ -2363,18 +3145,21 @@ mod tests {
     async fn test_empty_worker_lists() {
         let router = create_test_pd_router();
 
-        let result = router.select_pd_pair(None, None, None, None, UNKNOWN_MODEL_ID, None);
+        let result = router.select_pd_pair(UNKNOWN_MODEL_ID, PlacementInputs::default(), None);
 
         assert!(result.is_err());
         // No workers at all is the pre-existing unavailable string, not a shed:
         // an empty pool has nothing to be overloaded.
-        match *result.unwrap_err() {
+        match PDRouter::pair_failure(*result.unwrap_err()) {
             PdSelectionFailure::Unavailable(error) => {
                 assert!(error.contains("No prefill workers available"));
             }
             PdSelectionFailure::Shed(_) => panic!("an empty fleet is not an overload shed"),
             PdSelectionFailure::Incompatible(_) => {
                 panic!("an empty fleet has no pairing to be incompatible about")
+            }
+            PdSelectionFailure::QueueFull | PdSelectionFailure::QueueTimeout => {
+                panic!("selection without admission cannot be queued")
             }
         }
     }
@@ -2474,6 +3259,515 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn both_legs_forward_client_numbers_exactly() {
+        let (prefill_url, prefill_seen) = spawn_recording_stub("{}").await;
+        let (decode_url, decode_seen) = spawn_recording_stub("{}").await;
+
+        let router = create_test_pd_router();
+        for (url, worker_type) in [
+            (prefill_url, WorkerType::Prefill),
+            (decode_url, WorkerType::Decode),
+        ] {
+            router
+                .worker_registry
+                .register_or_replace(Arc::from(create_test_worker(url, worker_type, true)));
+        }
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+        let chat: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 0.7,
+            "top_p": 0.95,
+        }))
+        .expect("valid chat request");
+        let response = router
+            .route_chat(None, &tenant, chat, UNKNOWN_MODEL_ID)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // The typed request stores these as f32; 0.95f32 widened to f64 is
+        // 0.949999988079071, which is not the number the client sent.
+        for seen in [&prefill_seen, &decode_seen] {
+            let seen = seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (_, body) = &seen[0];
+            assert_eq!(body["temperature"], json!(0.7));
+            assert_eq!(body["top_p"], json!(0.95));
+            assert!(body.get("bootstrap_room").is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn messages_count_tokens_tracks_load_auth_and_body_failure() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        for (client_auth, truncated) in [(None, false), (Some("Bearer client-key"), true)] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(format!("http://{}", listener.local_addr().unwrap()))
+                    .worker_type(WorkerType::Prefill)
+                    .api_key("worker-key".to_string())
+                    .circuit_breaker_config(crate::worker::CircuitBreakerConfig {
+                        failure_threshold: 1,
+                        ..Default::default()
+                    })
+                    .build(),
+            );
+            worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+            let router = create_test_pd_router();
+            router.worker_registry.register_or_replace(worker.clone());
+            let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+            let body = serde_json::from_value(json!({"model": "m", "messages": []})).unwrap();
+            let mut headers = HeaderMap::new();
+            if let Some(auth) = client_auth {
+                headers.insert("authorization", HeaderValue::from_static(auth));
+            }
+            let server = async {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                let mut request_headers = String::new();
+                loop {
+                    let mut line = String::new();
+                    socket.read_line(&mut line).await.unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    assert!(!line.is_empty());
+                    request_headers.push_str(&line);
+                }
+                let length: usize = request_headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length: "))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                socket.read_exact(&mut vec![0; length]).await.unwrap();
+                assert_eq!(worker.load(), 1);
+                let auth = client_auth.unwrap_or("Bearer worker-key");
+                assert!(request_headers.contains(&format!("authorization: {auth}\r\n")));
+                let length = if truncated { 100 } else { 2 };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n{{}}"
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            };
+            let (response, ()) = tokio::time::timeout(ROUND_TRIP_GUARD, async {
+                tokio::join!(
+                    router.route_messages_count_tokens(
+                        Some(&headers),
+                        &tenant,
+                        body,
+                        UNKNOWN_MODEL_ID
+                    ),
+                    server,
+                )
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                response.status(),
+                if truncated {
+                    StatusCode::BAD_GATEWAY
+                } else {
+                    StatusCode::OK
+                }
+            );
+            assert_eq!(worker.load(), 0);
+            assert_eq!(worker.circuit_breaker_can_execute(), !truncated);
+        }
+    }
+
+    #[tokio::test]
+    async fn messages_count_tokens_uses_one_prefill_worker_and_no_bootstrap() {
+        let (prefill_url, prefill_seen) = spawn_recording_stub(r#"{"input_tokens":42}"#).await;
+        let (decode_url, decode_seen) = spawn_recording_stub("{}").await;
+
+        let router = create_test_pd_router();
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let body = || -> CountMessageTokensRequest {
+            serde_json::from_value(json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "context_management": {"edits": []},
+                "mcp_servers": [{"type": "url", "name": "tools", "url": "https://example.com"}],
+            }))
+            .expect("valid count_tokens request")
+        };
+
+        // No prefill worker: nothing to count on.
+        let response = router
+            .route_messages_count_tokens(None, &tenant, body(), UNKNOWN_MODEL_ID)
+            .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        for (url, worker_type) in [
+            (prefill_url, WorkerType::Prefill),
+            (decode_url, WorkerType::Decode),
+        ] {
+            router
+                .worker_registry
+                .register_or_replace(Arc::from(create_test_worker(url, worker_type, true)));
+        }
+        let response = router
+            .route_messages_count_tokens(None, &tenant, body(), UNKNOWN_MODEL_ID)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        assert_eq!(&bytes[..], br#"{"input_tokens":42}"#);
+
+        let prefill_seen = prefill_seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(prefill_seen.len(), 1);
+        let (path, forwarded) = &prefill_seen[0];
+        assert_eq!(path, "/v1/messages/count_tokens");
+        let original = serde_json::to_value(body()).unwrap();
+        for field in ["context_management", "mcp_servers"] {
+            assert_eq!(forwarded[field], original[field]);
+            assert!(!forwarded[field].is_null());
+        }
+        assert!(forwarded.get("bootstrap_room").is_none());
+        assert!(decode_seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty());
+    }
+
+    /// Serves `app` on an ephemeral loopback port.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test stub server lives for the duration of the test process"
+    )]
+    async fn spawn_stub(app: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    fn register_pd_pair(router: &PDRouter, prefill_url: String, decode_url: String) {
+        for (url, worker_type) in [
+            (prefill_url, WorkerType::Prefill),
+            (decode_url, WorkerType::Decode),
+        ] {
+            router
+                .worker_registry
+                .register_or_replace(Arc::from(create_test_worker(url, worker_type, true)));
+        }
+    }
+
+    fn streaming_chat() -> ChatCompletionRequest {
+        serde_json::from_value(json!({
+            "model": "m",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .expect("valid chat request")
+    }
+
+    const DECODE_SSE: &str = "data: {\"choices\":[]}\n\ndata: [DONE]\n\n";
+
+    /// Reports on drop whether the prefill SSE body was read to its end. A
+    /// body dropped early means the gateway closed the prefill connection.
+    struct PrefillBodyProbe {
+        completed: bool,
+        report: Option<oneshot::Sender<bool>>,
+    }
+
+    impl PrefillBodyProbe {
+        fn mark_completed(&mut self) {
+            self.completed = true;
+        }
+    }
+
+    impl Drop for PrefillBodyProbe {
+        fn drop(&mut self) {
+            if let Some(report) = self.report.take() {
+                let _ = report.send(self.completed);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_commits_on_decode_head_and_drains_prefill_body() {
+        check_prefill_drain(false).await;
+        check_prefill_drain(true).await;
+    }
+
+    /// On the early-commit path the drain owns the prefill outcome: the
+    /// attempt's status (the decode's 2xx) must not reset the failures the
+    /// drain records, or a prefill whose body keeps failing never trips a
+    /// breaker with a threshold above one.
+    #[test]
+    fn a_drained_prefill_outcome_is_not_overwritten_by_the_attempt_status() {
+        let breaker = crate::worker::CircuitBreakerConfig {
+            failure_threshold: 2,
+            ..Default::default()
+        };
+        let worker = |name: &str, worker_type: WorkerType| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new(format!("http://{name}:8000"))
+                    .worker_type(worker_type)
+                    .circuit_breaker_config(breaker.clone())
+                    .build(),
+            )
+        };
+        let decode = worker("decode", WorkerType::Decode);
+        for (outcome, trips) in [
+            (PrefillOutcome::Drained, true),
+            (PrefillOutcome::FromStatus, false),
+        ] {
+            let prefill = worker("prefill", WorkerType::Prefill);
+            for _ in 0..2 {
+                // What the drain records when the prefill body fails.
+                prefill.record_outcome(StatusCode::BAD_GATEWAY.as_u16());
+                PDRouter::record_attempt_outcomes(
+                    prefill.as_ref(),
+                    decode.as_ref(),
+                    StatusCode::OK,
+                    outcome,
+                );
+            }
+            assert_eq!(!prefill.circuit_breaker_can_execute(), trips, "{outcome:?}");
+        }
+        assert!(decode.circuit_breaker_can_execute());
+    }
+
+    /// Streaming /v1/messages takes the same early commit as chat: the client
+    /// stream starts on the decode head while the prefill body is still open.
+    #[tokio::test]
+    async fn stream_messages_commits_on_the_decode_head() {
+        let guard = std::time::Duration::from_secs(60);
+        let release = Arc::new(tokio::sync::Notify::new());
+        let prefill_release = Arc::clone(&release);
+        let prefill = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move || {
+                let release = Arc::clone(&prefill_release);
+                async move {
+                    let body = futures_util::stream::unfold(
+                        (0u8, release),
+                        move |(step, release)| async move {
+                            match step {
+                                0 => Some((
+                                    Ok::<_, std::io::Error>(Bytes::from_static(b": keepalive\n\n")),
+                                    (1, release),
+                                )),
+                                1 => {
+                                    release.notified().await;
+                                    Some((Ok(Bytes::from_static(b"data: {}\n\n")), (2, release)))
+                                }
+                                _ => None,
+                            }
+                        },
+                    );
+                    (
+                        [(CONTENT_TYPE, "text/event-stream")],
+                        Body::from_stream(body),
+                    )
+                }
+            }),
+        );
+        let decode = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(|| async { ([(CONTENT_TYPE, "text/event-stream")], DECODE_SSE) }),
+        );
+        let router = create_test_pd_router();
+        let prefill: Arc<dyn Worker> = Arc::from(create_test_worker(
+            spawn_stub(prefill).await,
+            WorkerType::Prefill,
+            true,
+        ));
+        let decode: Arc<dyn Worker> = Arc::from(create_test_worker(
+            spawn_stub(decode).await,
+            WorkerType::Decode,
+            true,
+        ));
+        router.worker_registry.register_or_replace(prefill.clone());
+        router.worker_registry.register_or_replace(decode.clone());
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m",
+            "max_tokens": 16,
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .expect("valid messages request");
+
+        let response = tokio::time::timeout(
+            guard,
+            router.route_messages(None, &tenant, request, UNKNOWN_MODEL_ID),
+        )
+        .await
+        .expect("the client stream must not wait for the prefill body");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = tokio::time::timeout(
+            guard,
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("decode stream must complete while prefill is still open")
+        .expect("response body");
+        assert_eq!(&body[..], DECODE_SSE.as_bytes());
+        assert_eq!(
+            prefill.load(),
+            1,
+            "the prefill guard is held until its body drains"
+        );
+        release.notify_one();
+        tokio::time::timeout(guard, async {
+            while prefill.load() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("prefill load must be released after draining");
+        assert!(prefill.circuit_breaker_can_execute());
+    }
+
+    async fn check_prefill_drain(fail_body: bool) {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (report_tx, report_rx) = oneshot::channel();
+        let report_tx = Arc::new(std::sync::Mutex::new(Some(report_tx)));
+        let prefill_release = Arc::clone(&release);
+        // Prefill answers 200 at once but holds its body open until released,
+        // like an engine that streams only once prefill and KV transfer end.
+        let prefill = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || {
+                let release = Arc::clone(&prefill_release);
+                let probe = PrefillBodyProbe {
+                    completed: false,
+                    report: report_tx.lock().unwrap().take(),
+                };
+                async move {
+                    let body = futures_util::stream::unfold(
+                        (0u8, probe, release),
+                        move |(step, mut probe, release)| async move {
+                            match step {
+                                0 => Some((
+                                    Ok::<_, std::io::Error>(Bytes::from_static(b": keepalive\n\n")),
+                                    (1, probe, release),
+                                )),
+                                1 => {
+                                    release.notified().await;
+                                    if fail_body {
+                                        return Some((
+                                            Err(std::io::Error::other("prefill body failed")),
+                                            (2, probe, release),
+                                        ));
+                                    }
+                                    Some((
+                                        Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+                                        (2, probe, release),
+                                    ))
+                                }
+                                _ => {
+                                    probe.mark_completed();
+                                    None
+                                }
+                            }
+                        },
+                    );
+                    (
+                        [(CONTENT_TYPE, "text/event-stream")],
+                        Body::from_stream(body),
+                    )
+                }
+            }),
+        );
+        let decode = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async { ([(CONTENT_TYPE, "text/event-stream")], DECODE_SSE) }),
+        );
+        let router = create_test_pd_router();
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(spawn_stub(prefill).await)
+                .worker_type(WorkerType::Prefill)
+                .circuit_breaker_config(crate::worker::CircuitBreakerConfig {
+                    failure_threshold: 1,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        prefill.set_status(openai_protocol::worker::WorkerStatus::Ready);
+        let decode: Arc<dyn Worker> = Arc::from(create_test_worker(
+            spawn_stub(decode).await,
+            WorkerType::Decode,
+            true,
+        ));
+        router.worker_registry.register_or_replace(prefill.clone());
+        router.worker_registry.register_or_replace(decode.clone());
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+        let response = tokio::time::timeout(
+            ROUND_TRIP_GUARD,
+            router.route_chat(None, &tenant, streaming_chat(), UNKNOWN_MODEL_ID),
+        )
+        .await
+        .expect("the client stream must not wait for the prefill body");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = tokio::time::timeout(
+            ROUND_TRIP_GUARD,
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("decode stream must complete while prefill is still open")
+        .expect("response body");
+        assert_eq!(&body[..], DECODE_SSE.as_bytes());
+        assert_eq!(prefill.load(), 1);
+        assert_eq!(decode.load(), 0);
+
+        release.notify_one();
+        let completed = tokio::time::timeout(ROUND_TRIP_GUARD, report_rx)
+            .await
+            .expect("prefill body must be released")
+            .expect("probe report");
+        assert_eq!(completed, !fail_body);
+        tokio::time::timeout(ROUND_TRIP_GUARD, async {
+            while prefill.load() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("prefill load must be released after draining");
+        assert_eq!(prefill.circuit_breaker_can_execute(), !fail_body);
+    }
+
+    #[tokio::test]
+    async fn stream_prefill_error_head_is_not_committed() {
+        let prefill = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async {
+                (StatusCode::SERVICE_UNAVAILABLE, r#"{"error":"busy"}"#)
+            }),
+        );
+        let decode = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async { ([(CONTENT_TYPE, "text/event-stream")], DECODE_SSE) }),
+        );
+        let mut router = create_test_pd_router();
+        router.retry_config.max_retries = 1;
+        register_pd_pair(&router, spawn_stub(prefill).await, spawn_stub(decode).await);
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+        let response = router
+            .route_chat(None, &tenant, streaming_chat(), UNKNOWN_MODEL_ID)
+            .await;
+
+        // A prefill 5xx stays a status the retry layer and the client can act
+        // on, not a 200 carrying an in-band stream error.
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
     async fn vllm_pd_dispatches_sequentially_with_nixl_relay() {
         let (prefill_url, prefill_seen) = spawn_recording_stub(
             r#"{"kv_transfer_params":{"remote_engine_id":"eng0","remote_block_ids":[1,2]}}"#,
@@ -2503,6 +3797,7 @@ mod tests {
         let chat: ChatCompletionRequest = serde_json::from_value(json!({
             "model": "m",
             "max_tokens": 50,
+            "top_p": 0.95,
             "stream_options": {"include_usage": true},
             "messages": [{"role": "user", "content": "hi"}],
         }))
@@ -2521,6 +3816,7 @@ mod tests {
         let (path, body) = &prefill_seen[0];
         assert_eq!(path, "/v1/chat/completions");
         assert_eq!(body.get("max_tokens"), Some(&Value::from(1)));
+        assert_eq!(body.get("top_p"), Some(&json!(0.95)));
         assert_eq!(body.get("stream"), Some(&Value::Bool(false)));
         assert_eq!(body.get("stream_options"), None);
         assert_eq!(
@@ -2537,6 +3833,7 @@ mod tests {
         let (path, body) = &decode_seen[0];
         assert_eq!(path, "/v1/chat/completions");
         assert_eq!(body.get("max_tokens"), Some(&Value::from(50)));
+        assert_eq!(body.get("top_p"), Some(&json!(0.95)));
         assert_eq!(
             body.pointer("/kv_transfer_params/remote_engine_id"),
             Some(&Value::from("eng0"))
@@ -2596,11 +3893,1023 @@ mod tests {
         assert_eq!(body.get("kv_transfer_params"), None);
     }
 
+    type Seen = Arc<std::sync::Mutex<Vec<(String, Value)>>>;
+
+    /// What the MoRI-IO producer stub answers a prefill leg with.
+    #[derive(Debug, Clone, Copy)]
+    enum StubHandoff {
+        /// The handoff a vLLM 0.30 producer returns, under the minted id.
+        Minted,
+        /// The same handoff under another request's transfer id.
+        Foreign,
+        /// No kv_transfer_params at all.
+        Missing,
+        /// The minted handoff, naming a notify port the prefill is not labeled with.
+        OtherNotifyPort,
+        /// The minted handoff with its block ids as a string.
+        MalformedBlockIds,
+        /// The minted handoff naming another address of the prefill engine
+        /// than its label, with the labeled ports.
+        OtherHost,
+    }
+
+    fn stub_handoff(transfer_id: &Value) -> Value {
+        json!({
+            "do_remote_prefill": true, "do_remote_decode": false,
+            "remote_block_ids": [[7, 8]], "remote_engine_id": "10.0.0.1:6301",
+            "remote_host": "10.0.0.1", "remote_handshake_port": "6301",
+            "remote_notify_port": "61005", "tp_size": 2,
+            "transfer_id": transfer_id,
+        })
+    }
+
+    /// A MoRI-IO producer stub that records each request it answers.
+    async fn spawn_moriio_prefill_stub(handoff: StubHandoff) -> (String, Seen) {
+        let seen: Seen = Arc::default();
+        let log = Arc::clone(&seen);
+        let app = axum::Router::new().fallback(axum::routing::any(move |req: Request| {
+            let log = Arc::clone(&log);
+            async move {
+                let path = req.uri().path().to_string();
+                let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+                    .await
+                    .unwrap_or_default();
+                let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                let minted = body
+                    .pointer("/kv_transfer_params/transfer_id")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let reply = match handoff {
+                    StubHandoff::Minted => json!({"kv_transfer_params": stub_handoff(&minted)}),
+                    StubHandoff::Foreign => {
+                        json!({"kv_transfer_params": stub_handoff(&json!("tx-foreign"))})
+                    }
+                    StubHandoff::Missing => json!({}),
+                    StubHandoff::OtherNotifyPort => {
+                        let mut params = stub_handoff(&minted);
+                        params["remote_notify_port"] = json!("61006");
+                        json!({"kv_transfer_params": params})
+                    }
+                    StubHandoff::MalformedBlockIds => {
+                        let mut params = stub_handoff(&minted);
+                        params["remote_block_ids"] = json!("7,8");
+                        json!({"kv_transfer_params": params})
+                    }
+                    StubHandoff::OtherHost => {
+                        let mut params = stub_handoff(&minted);
+                        params["remote_host"] = json!("10.9.9.9");
+                        params["remote_engine_id"] = json!("10.9.9.9:6301");
+                        json!({"kv_transfer_params": params})
+                    }
+                };
+                log.lock().unwrap().push((path, body));
+                axum::Json(reply)
+            }
+        }));
+        (spawn_stub(app).await, seen)
+    }
+
+    /// Register a MoRI-IO pair; a `None` prefill mode registers a prefill
+    /// worker without any KV connector.
+    fn register_moriio_pair(
+        router: &PDRouter,
+        prefill: (String, Option<&str>),
+        decode: (String, &str),
+    ) {
+        register_moriio_pair_with(router, prefill, decode, &[]);
+    }
+
+    const CONCURRENT_WRITE: (&str, &str) = ("moriio_write_dispatch", "concurrent");
+
+    /// As [`register_moriio_pair`], with extra labels on the decode worker.
+    fn register_moriio_pair_with(
+        router: &PDRouter,
+        (prefill_url, prefill_mode): (String, Option<&str>),
+        (decode_url, decode_mode): (String, &str),
+        decode_labels: &[(&str, &str)],
+    ) {
+        let mut prefill = BasicWorkerBuilder::new(prefill_url)
+            .worker_type(WorkerType::Prefill)
+            .runtime_type(RuntimeType::Vllm);
+        if let Some(mode) = prefill_mode {
+            prefill = prefill
+                .kv_connector("MoRIIOConnector")
+                .label("moriio_mode", mode)
+                .label("moriio_host", "10.0.0.1");
+        }
+        let mut decode = BasicWorkerBuilder::new(decode_url)
+            .worker_type(WorkerType::Decode)
+            .runtime_type(RuntimeType::Vllm)
+            .kv_connector("MoRIIOConnector")
+            .label("moriio_mode", decode_mode)
+            .label("moriio_host", "10.0.0.2")
+            .label("moriio_notify_port", "62005")
+            .label("tp_size", "4");
+        for (key, value) in decode_labels {
+            decode = decode.label(*key, *value);
+        }
+        for worker in [prefill.build(), decode.build()] {
+            worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+            router.worker_registry.register_or_replace(Arc::new(worker));
+        }
+    }
+
+    /// Send a minimal request for `route`, with `extra` merged over its
+    /// fields, carrying `kv_transfer_params` of the client's own.
+    async fn moriio_call(
+        router: &PDRouter,
+        route: &str,
+        headers: Option<&HeaderMap>,
+        extra: &Value,
+    ) -> Response {
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let mut body = json!({
+            "model": "m",
+            "max_tokens": 50,
+            "kv_transfer_params": {"remote_host": "client-chosen"},
+        });
+        let fields = body.as_object_mut().unwrap();
+        match route {
+            "/v1/chat/completions" => {
+                fields.insert(
+                    "messages".into(),
+                    json!([{"role": "user", "content": "hi"}]),
+                );
+            }
+            "/v1/completions" => {
+                fields.insert("prompt".into(), json!("hi"));
+            }
+            _ => {
+                fields.clear();
+                fields.insert("text".into(), json!("hi"));
+            }
+        }
+        fields.extend(extra.as_object().cloned().unwrap_or_default());
+        match route {
+            "/v1/chat/completions" => {
+                let request = serde_json::from_value(body).expect("valid chat request");
+                router
+                    .route_chat(headers, &tenant, request, UNKNOWN_MODEL_ID)
+                    .await
+            }
+            "/v1/completions" => {
+                let request = serde_json::from_value(body).expect("valid completion request");
+                router
+                    .route_completion(headers, &tenant, request, UNKNOWN_MODEL_ID)
+                    .await
+            }
+            _ => {
+                let request = serde_json::from_value(body).expect("valid generate request");
+                router
+                    .route_generate(headers, &tenant, request, UNKNOWN_MODEL_ID)
+                    .await
+            }
+        }
+    }
+
+    fn error_code(response: &Response) -> Option<&str> {
+        response
+            .headers()
+            .get(error::HEADER_X_SMG_ERROR_CODE)
+            .and_then(|v| v.to_str().ok())
+    }
+
+    fn taken(seen: &Seen) -> Vec<(String, Value)> {
+        std::mem::take(
+            &mut *seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    #[tokio::test]
+    async fn vllm_pd_moriio_tags_prefill_and_relays_the_validated_handoff() {
+        let sequential = [("moriio_write_dispatch", "sequential")];
+        for (mode, decode_labels, route) in [
+            ("read", &[][..], "/v1/chat/completions"),
+            ("read", &[CONCURRENT_WRITE][..], "/v1/chat/completions"),
+            ("write", &[][..], "/v1/chat/completions"),
+            ("write", &sequential[..], "/v1/chat/completions"),
+            ("write", &[CONCURRENT_WRITE][..], "/v1/chat/completions"),
+            ("read", &[][..], "/v1/completions"),
+            ("write", &[][..], "/v1/completions"),
+            ("write", &[CONCURRENT_WRITE][..], "/v1/completions"),
+        ] {
+            let (prefill_url, prefill_seen) = spawn_moriio_prefill_stub(StubHandoff::Minted).await;
+            let (decode_url, decode_seen) = spawn_recording_stub(r#"{"choices":[]}"#).await;
+            let router = create_test_pd_router();
+            register_moriio_pair_with(
+                &router,
+                (prefill_url, Some(mode)),
+                (decode_url, mode),
+                decode_labels,
+            );
+            let case = format!("{mode} {decode_labels:?} {route}");
+
+            let stops = json!({"stop": ["\n"], "stop_token_ids": [7]});
+            let response = moriio_call(&router, route, None, &stops).await;
+            assert_eq!(response.status(), StatusCode::OK, "{case}");
+
+            let prefill = taken(&prefill_seen);
+            assert_eq!(prefill.len(), 1, "{case}: one prefill request");
+            assert_eq!(prefill[0].0, route);
+            let params = prefill[0].1.get("kv_transfer_params").unwrap();
+            let transfer_id = params.get("transfer_id").and_then(Value::as_str).unwrap();
+            assert!(transfer_id.starts_with("tx-"), "{case}: {transfer_id}");
+            let mut expected = json!({
+                "do_remote_decode": true, "do_remote_prefill": false,
+                "remote_engine_id": null, "remote_block_ids": null,
+                "transfer_id": transfer_id, "remote_dp_size": 1, "remote_tp_size": 4,
+            });
+            if mode == "write" {
+                // The producer pushes before the decode leg exists, so it is
+                // told where; the client's own remote_host never reaches it.
+                expected["remote_host"] = json!("10.0.0.2");
+                expected["remote_handshake_port"] = json!(6301);
+                expected["remote_notify_port"] = json!(62005);
+            }
+            assert_eq!(params, &expected, "{case}");
+            assert_eq!(prefill[0].1.get("max_tokens"), Some(&Value::from(1)));
+            // The prefill must stop at its cap to return a handoff.
+            assert_eq!(prefill[0].1.get("ignore_eos"), Some(&json!(true)));
+            assert_eq!(prefill[0].1.get("stop"), None);
+            assert_eq!(prefill[0].1.get("stop_token_ids"), None);
+
+            let decode = taken(&decode_seen);
+            assert_eq!(decode.len(), 1, "{case}: one decode request");
+            assert_eq!(decode[0].0, route);
+            // READ ignores the dispatch label: its decode engine pulls what the
+            // prefill reports.
+            let concurrent = mode == "write" && decode_labels.contains(&CONCURRENT_WRITE);
+            let expected_decode = if concurrent {
+                // Minted up front: the decode leg goes out with the prefill.
+                json!({
+                    "do_remote_decode": false, "do_remote_prefill": true,
+                    "remote_engine_id": null, "remote_block_ids": null,
+                    "transfer_id": transfer_id, "remote_dp_size": 1,
+                    "remote_host": "10.0.0.1", "remote_handshake_port": 6301,
+                    "remote_notify_port": 61005,
+                })
+            } else {
+                // Relayed verbatim, so `tp_size` stays the prefill's own TP.
+                stub_handoff(&json!(transfer_id))
+            };
+            assert_eq!(
+                decode[0].1.get("kv_transfer_params"),
+                Some(&expected_decode),
+                "{case}"
+            );
+            assert_eq!(decode[0].1.get("max_tokens"), Some(&Value::from(50)));
+            assert_eq!(decode[0].1.get("stop"), stops.get("stop"));
+            assert_eq!(
+                decode[0].1.get("stop_token_ids"),
+                stops.get("stop_token_ids")
+            );
+            assert_eq!(decode[0].1.get("ignore_eos"), None);
+        }
+    }
+
+    /// The data-parallel rank header and the body of each request a stub got.
+    type RankSeen = Arc<std::sync::Mutex<Vec<(Option<String>, Value)>>>;
+
+    fn rank_header(req: &Request) -> Option<String> {
+        req.headers()
+            .get(DATA_PARALLEL_RANK_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    }
+
+    /// A MoRI-IO producer stub with four data-parallel ranks. Like a vLLM 0.30
+    /// producer, its handoff names the rank the request ran on: the routed
+    /// one, or `answer_rank` when set.
+    async fn spawn_moriio_dp_prefill_stub(answer_rank: Option<u64>) -> (String, RankSeen) {
+        let seen: RankSeen = Arc::default();
+        let log = Arc::clone(&seen);
+        let app = axum::Router::new().fallback(axum::routing::any(move |req: Request| {
+            let log = Arc::clone(&log);
+            async move {
+                let rank = rank_header(&req);
+                let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+                    .await
+                    .unwrap_or_default();
+                let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                let mut handoff = stub_handoff(
+                    body.pointer("/kv_transfer_params/transfer_id")
+                        .unwrap_or(&Value::Null),
+                );
+                let ran_on = answer_rank
+                    .or_else(|| rank.as_deref().and_then(|r| r.parse().ok()))
+                    .unwrap_or(0);
+                handoff["remote_dp_rank"] = json!(ran_on);
+                handoff["remote_dp_rank_override"] = json!(true);
+                handoff["remote_dp_size"] = json!(4);
+                log.lock().unwrap().push((rank, body));
+                axum::Json(json!({"kv_transfer_params": handoff}))
+            }
+        }));
+        (spawn_stub(app).await, seen)
+    }
+
+    async fn spawn_moriio_dp_decode_stub() -> (String, RankSeen) {
+        let seen: RankSeen = Arc::default();
+        let log = Arc::clone(&seen);
+        let app = axum::Router::new().fallback(axum::routing::any(move |req: Request| {
+            let log = Arc::clone(&log);
+            async move {
+                let rank = rank_header(&req);
+                let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+                    .await
+                    .unwrap_or_default();
+                let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                log.lock().unwrap().push((rank, body));
+                ([(CONTENT_TYPE, "application/json")], r#"{"choices":[]}"#)
+            }
+        }));
+        (spawn_stub(app).await, seen)
+    }
+
+    /// Register a MoRI-IO pair whose engines run the given numbers of
+    /// data-parallel ranks, with extra labels on the decode worker.
+    fn register_moriio_dp_pair(
+        router: &PDRouter,
+        (prefill_url, prefill_dp): (String, &str),
+        (decode_url, decode_dp): (String, &str),
+        mode: &str,
+        decode_labels: &[(&str, &str)],
+    ) {
+        let prefill = BasicWorkerBuilder::new(prefill_url)
+            .worker_type(WorkerType::Prefill)
+            .runtime_type(RuntimeType::Vllm)
+            .kv_connector("MoRIIOConnector")
+            .label("moriio_mode", mode)
+            .label("moriio_host", "10.0.0.1")
+            .label("dp_size", prefill_dp);
+        let mut decode = BasicWorkerBuilder::new(decode_url)
+            .worker_type(WorkerType::Decode)
+            .runtime_type(RuntimeType::Vllm)
+            .kv_connector("MoRIIOConnector")
+            .label("moriio_mode", mode)
+            .label("moriio_host", "10.0.0.2")
+            .label("dp_size", decode_dp);
+        for (key, value) in decode_labels {
+            decode = decode.label(*key, *value);
+        }
+        for worker in [prefill.build(), decode.build()] {
+            worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+            router.worker_registry.register_or_replace(Arc::new(worker));
+        }
+    }
+
+    fn taken_ranked(seen: &RankSeen) -> Vec<(Option<String>, Value)> {
+        std::mem::take(
+            &mut *seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    #[tokio::test]
+    async fn vllm_pd_moriio_pins_both_legs_to_one_dp_rank() {
+        for (mode, decode_labels) in [
+            ("read", &[][..]),
+            ("write", &[][..]),
+            ("write", &[CONCURRENT_WRITE][..]),
+        ] {
+            let (prefill_url, prefill_seen) = spawn_moriio_dp_prefill_stub(None).await;
+            let (decode_url, decode_seen) = spawn_moriio_dp_decode_stub().await;
+            let router = create_test_pd_router();
+            register_moriio_dp_pair(
+                &router,
+                (prefill_url, "4"),
+                (decode_url, "4"),
+                mode,
+                decode_labels,
+            );
+            let case = format!("{mode} {decode_labels:?}");
+            for _ in 0..4 {
+                let response = moriio_call(&router, "/v1/completions", None, &json!({})).await;
+                assert_eq!(response.status(), StatusCode::OK, "{case}");
+            }
+
+            let decode = taken_ranked(&decode_seen);
+            let mut ranks = Vec::new();
+            for (prefill_rank, prefill_body) in taken_ranked(&prefill_seen) {
+                let params = prefill_body.get("kv_transfer_params").unwrap();
+                let rank: u64 = prefill_rank.as_deref().unwrap().parse().unwrap();
+                assert_eq!(params["remote_dp_size"], 4, "{case}");
+                assert_eq!(params["remote_dp_rank"], rank, "{case}");
+                let transfer_id = &params["transfer_id"];
+                let (decode_rank, decode_body) = decode
+                    .iter()
+                    .find(|(_, body)| &body["kv_transfer_params"]["transfer_id"] == transfer_id)
+                    .unwrap();
+                assert_eq!(decode_rank, &prefill_rank, "{case}: one rank for both legs");
+                let decode_params = &decode_body["kv_transfer_params"];
+                assert_eq!(decode_params["remote_dp_rank"], rank, "{case}");
+                if decode_labels.contains(&CONCURRENT_WRITE) {
+                    assert_eq!(decode_params["remote_dp_size"], 4, "{case}");
+                    assert_eq!(decode_params.get("remote_dp_rank_override"), None);
+                } else {
+                    // Relayed verbatim from the producer.
+                    assert_eq!(decode_params["remote_dp_rank_override"], true, "{case}");
+                }
+                ranks.push(rank);
+            }
+            ranks.sort_unstable();
+            assert_eq!(ranks, [0, 1, 2, 3], "{case}: every rank in turn");
+        }
+    }
+
+    #[tokio::test]
+    async fn vllm_pd_moriio_refuses_a_pair_with_different_dp_sizes() {
+        for (prefill_dp, decode_dp) in [("4", "1"), ("1", "4"), ("2", "4")] {
+            let (prefill_url, prefill_seen) = spawn_moriio_dp_prefill_stub(None).await;
+            let (decode_url, decode_seen) = spawn_moriio_dp_decode_stub().await;
+            let router = create_test_pd_router();
+            register_moriio_dp_pair(
+                &router,
+                (prefill_url, prefill_dp),
+                (decode_url, decode_dp),
+                "write",
+                &[],
+            );
+            let response = moriio_call(&router, "/v1/completions", None, &json!({})).await;
+            let case = format!("prefill dp {prefill_dp}, decode dp {decode_dp}");
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{case}");
+            assert_eq!(error_code(&response), Some("moriio_pair_misconfigured"));
+            assert!(taken_ranked(&prefill_seen).is_empty(), "{case}");
+            assert!(taken_ranked(&decode_seen).is_empty(), "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn vllm_pd_moriio_fails_a_handoff_from_another_dp_rank() {
+        for decode_labels in [&[][..], &[CONCURRENT_WRITE][..]] {
+            // The producer reports rank 0 whatever rank the request went to.
+            // A retry would go to the next rank, so allow only one attempt.
+            let (prefill_url, prefill_seen) = spawn_moriio_dp_prefill_stub(Some(0)).await;
+            let (decode_url, decode_seen) = spawn_moriio_dp_decode_stub().await;
+            let router = single_attempt_router();
+            register_moriio_dp_pair(
+                &router,
+                (prefill_url, "4"),
+                (decode_url, "4"),
+                "write",
+                decode_labels,
+            );
+            let pinned_to_0 = moriio_call(&router, "/v1/completions", None, &json!({})).await;
+            assert_eq!(pinned_to_0.status(), StatusCode::OK, "{decode_labels:?}");
+            let pinned_to_1 = moriio_call(&router, "/v1/completions", None, &json!({})).await;
+            assert_eq!(
+                pinned_to_1.status(),
+                StatusCode::BAD_GATEWAY,
+                "{decode_labels:?}"
+            );
+            assert_eq!(error_code(&pinned_to_1), Some("moriio_handoff_invalid"));
+            assert_eq!(taken_ranked(&prefill_seen).len(), 2);
+            // A sequential decode leg is never sent; a concurrent one went out
+            // with the prefill, and its answer is dropped.
+            let decode_legs = if decode_labels.is_empty() { 1 } else { 2 };
+            assert_eq!(taken_ranked(&decode_seen).len(), decode_legs);
+        }
+    }
+
+    #[tokio::test]
+    async fn vllm_pd_moriio_takes_a_handoff_host_other_than_the_label() {
+        for decode_labels in [&[][..], &[CONCURRENT_WRITE][..]] {
+            let (prefill_url, _) = spawn_moriio_prefill_stub(StubHandoff::OtherHost).await;
+            let (decode_url, decode_seen) = spawn_recording_stub(r#"{"choices":[]}"#).await;
+            let router = create_test_pd_router();
+            register_moriio_pair_with(
+                &router,
+                (prefill_url, Some("write")),
+                (decode_url, "write"),
+                decode_labels,
+            );
+
+            let response = moriio_call(&router, "/v1/chat/completions", None, &json!({})).await;
+            assert_eq!(response.status(), StatusCode::OK, "{decode_labels:?}");
+            let decode = taken(&decode_seen);
+            let host = decode[0].1.pointer("/kv_transfer_params/remote_host");
+            // Sequentially the decode dials the address the prefill engine
+            // reports; a concurrent decode leg was already told the label.
+            let expected = if decode_labels.is_empty() {
+                "10.9.9.9"
+            } else {
+                "10.0.0.1"
+            };
+            assert_eq!(host, Some(&json!(expected)), "{decode_labels:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn vllm_pd_moriio_without_a_usable_handoff_never_reaches_decode() {
+        for (mode, handoff) in [
+            ("read", StubHandoff::Missing),
+            ("read", StubHandoff::Foreign),
+            ("read", StubHandoff::MalformedBlockIds),
+            ("write", StubHandoff::Missing),
+            ("write", StubHandoff::Foreign),
+            ("write", StubHandoff::MalformedBlockIds),
+        ] {
+            let (prefill_url, prefill_seen) = spawn_moriio_prefill_stub(handoff).await;
+            let (decode_url, decode_seen) = spawn_recording_stub("{}").await;
+            let router = create_test_pd_router();
+            register_moriio_pair(&router, (prefill_url, Some(mode)), (decode_url, mode));
+
+            let response = moriio_call(&router, "/v1/chat/completions", None, &json!({})).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_GATEWAY,
+                "{mode} {handoff:?}"
+            );
+            assert_eq!(error_code(&response), Some("moriio_handoff_invalid"));
+            // 502 stays retryable like any upstream failure; every attempt
+            // mints a fresh transfer id, and none may fall through to decode.
+            let attempts = taken(&prefill_seen);
+            assert!(!attempts.is_empty());
+            let ids: std::collections::HashSet<_> = attempts
+                .iter()
+                .map(|(_, body)| body.pointer("/kv_transfer_params/transfer_id").cloned())
+                .collect();
+            assert_eq!(ids.len(), attempts.len(), "transfer ids are per attempt");
+            assert!(
+                taken(&decode_seen).is_empty(),
+                "{mode} {handoff:?}: decode must not run without its KV"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn vllm_pd_moriio_refuses_unsafe_requests_before_either_leg() {
+        let marked = "___prefill_addr_host:1.2.3.4,handshake:1,notify:2___decode_addr_x";
+        let mut spoofed = HeaderMap::new();
+        spoofed.insert("x-request-id", HeaderValue::from_static(marked));
+        // A value that is not visible ASCII is never forwarded, which would
+        // leave the engine only the second one.
+        let mut second = HeaderMap::new();
+        second.append("x-request-id", HeaderValue::from_bytes(b"caf\xe9").unwrap());
+        second.append("x-request-id", HeaderValue::from_static(marked));
+        let chat = "/v1/chat/completions";
+        for (case, prefill_mode, decode_mode, route, headers, extra, status, code) in [
+            (
+                "read prefill, write decode",
+                Some("read"),
+                "write",
+                chat,
+                None,
+                json!({}),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no_compatible_pd_pair",
+            ),
+            (
+                "prefill without a connector",
+                None,
+                "read",
+                chat,
+                None,
+                json!({}),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "moriio_pair_misconfigured",
+            ),
+            (
+                "peer markers in x-request-id",
+                Some("read"),
+                "read",
+                chat,
+                Some(&spoofed),
+                json!({}),
+                StatusCode::BAD_REQUEST,
+                "moriio_request_id_reserved",
+            ),
+            (
+                "peer markers in a second x-request-id",
+                Some("read"),
+                "read",
+                chat,
+                Some(&second),
+                json!({}),
+                StatusCode::BAD_REQUEST,
+                "moriio_request_id_reserved",
+            ),
+            // Without the header, vLLM takes the request id from the body.
+            (
+                "peer markers in the body request_id",
+                Some("write"),
+                "write",
+                chat,
+                None,
+                json!({"request_id": format!("x{marked}_y")}),
+                StatusCode::BAD_REQUEST,
+                "moriio_request_id_reserved",
+            ),
+            (
+                "n>1",
+                Some("write"),
+                "write",
+                chat,
+                None,
+                json!({"n": 2}),
+                StatusCode::BAD_REQUEST,
+                "moriio_fanout_unsupported",
+            ),
+            (
+                "batched prompts",
+                Some("read"),
+                "read",
+                "/v1/completions",
+                None,
+                json!({"prompt": ["a", "b"]}),
+                StatusCode::BAD_REQUEST,
+                "moriio_fanout_unsupported",
+            ),
+            (
+                "batched prompt embeddings",
+                Some("read"),
+                "read",
+                "/v1/completions",
+                None,
+                json!({"prompt_embeds": ["AAAA", "AAAA"]}),
+                StatusCode::BAD_REQUEST,
+                "moriio_fanout_unsupported",
+            ),
+            (
+                "beam search",
+                Some("write"),
+                "write",
+                chat,
+                None,
+                json!({"use_beam_search": true}),
+                StatusCode::BAD_REQUEST,
+                "moriio_fanout_unsupported",
+            ),
+            (
+                "route without a verified handoff",
+                Some("read"),
+                "read",
+                "/generate",
+                None,
+                json!({}),
+                StatusCode::NOT_IMPLEMENTED,
+                "moriio_route_unsupported",
+            ),
+        ] {
+            let (prefill_url, prefill_seen) = spawn_moriio_prefill_stub(StubHandoff::Minted).await;
+            let (decode_url, decode_seen) = spawn_recording_stub("{}").await;
+            let router = create_test_pd_router();
+            register_moriio_pair(
+                &router,
+                (prefill_url, prefill_mode),
+                (decode_url, decode_mode),
+            );
+
+            let response = moriio_call(&router, route, headers, &extra).await;
+            assert_eq!(response.status(), status, "{case}");
+            assert_eq!(error_code(&response), Some(code), "{case}");
+            assert!(taken(&prefill_seen).is_empty(), "{case}");
+            assert!(taken(&decode_seen).is_empty(), "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn vllm_pd_moriio_decode_behind_a_non_vllm_prefill_is_refused() {
+        // Pairing off lets an SGLang prefill reach a MoRI-IO decode; without
+        // the decode-side check this would take the bootstrap path.
+        let (prefill_url, prefill_seen) = spawn_moriio_prefill_stub(StubHandoff::Minted).await;
+        let (decode_url, decode_seen) = spawn_recording_stub("{}").await;
+        let router = PDRouter {
+            policy_registry: Arc::new(
+                PolicyRegistry::new(PolicyConfig::RoundRobin)
+                    .with_pd_pairing_mode(PdPairingMode::Off),
+            ),
+            ..create_test_pd_router()
+        };
+        let prefill = BasicWorkerBuilder::new(prefill_url)
+            .worker_type(WorkerType::Prefill)
+            .runtime_type(RuntimeType::Sglang)
+            .build();
+        let decode = BasicWorkerBuilder::new(decode_url)
+            .worker_type(WorkerType::Decode)
+            .runtime_type(RuntimeType::Vllm)
+            .kv_connector("MoRIIOConnector")
+            .label("moriio_mode", "read")
+            .build();
+        for worker in [prefill, decode] {
+            worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+            router.worker_registry.register_or_replace(Arc::new(worker));
+        }
+
+        let response = moriio_call(&router, "/v1/chat/completions", None, &json!({})).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error_code(&response), Some("moriio_pair_misconfigured"));
+        assert!(taken(&prefill_seen).is_empty());
+        assert!(taken(&decode_seen).is_empty());
+    }
+
+    #[test]
+    fn moriio_pair_needs_one_mode_and_a_write_target_the_prefill_reaches() {
+        let worker = |url: &str, worker_type, mode: &str| {
+            BasicWorkerBuilder::new(url)
+                .worker_type(worker_type)
+                .runtime_type(RuntimeType::Vllm)
+                .kv_connector("MoRIIOConnector")
+                .label("moriio_mode", mode)
+                .build()
+        };
+        let refusal = |result: Result<(MoriIoEndpoint, MoriIoEndpoint), Box<Response>>| {
+            result
+                .err()
+                .map(|response| error_code(&response).map(str::to_string))
+        };
+        let prefill = worker("http://10.0.0.1:8100", WorkerType::Prefill, "write");
+        let decode = worker("http://10.0.0.2:8200", WorkerType::Decode, "write");
+        assert!(PDRouter::moriio_pair(&prefill, &decode).is_ok());
+        let misconfigured = Some(Some("moriio_pair_misconfigured".to_string()));
+        // With pairing off, this check alone keeps READ and WRITE apart.
+        let read_prefill = worker("http://10.0.0.1:8100", WorkerType::Prefill, "read");
+        assert_eq!(
+            refusal(PDRouter::moriio_pair(&read_prefill, &decode)),
+            misconfigured
+        );
+        // A decode registered by loopback URL is not where a remote producer
+        // can push.
+        let loopback = worker("http://127.0.0.1:8200", WorkerType::Decode, "write");
+        assert_eq!(
+            refusal(PDRouter::moriio_pair(&prefill, &loopback)),
+            misconfigured
+        );
+        // A concurrent decode leg is sent to the prefill as named here, which
+        // a loopback prefill URL does not.
+        let concurrent = |dispatch: &str| {
+            BasicWorkerBuilder::new("http://10.0.0.2:8200")
+                .worker_type(WorkerType::Decode)
+                .runtime_type(RuntimeType::Vllm)
+                .kv_connector("MoRIIOConnector")
+                .label("moriio_mode", "write")
+                .label("moriio_write_dispatch", dispatch)
+                .build()
+        };
+        let loopback = worker("http://127.0.0.1:8100", WorkerType::Prefill, "write");
+        assert!(PDRouter::moriio_pair(&loopback, &decode).is_ok());
+        assert_eq!(
+            refusal(PDRouter::moriio_pair(&loopback, &concurrent("concurrent"))),
+            misconfigured
+        );
+        assert!(PDRouter::moriio_pair(&prefill, &concurrent("concurrent")).is_ok());
+        assert_eq!(
+            refusal(PDRouter::moriio_pair(&prefill, &concurrent("eager"))),
+            misconfigured
+        );
+    }
+
+    type Arrivals = Arc<std::sync::Mutex<Vec<Value>>>;
+
+    /// A stub that records each request body, then answers `reply` with
+    /// `status` after `delay`.
+    async fn spawn_delayed_stub(
+        status: StatusCode,
+        reply: Value,
+        delay: std::time::Duration,
+    ) -> (String, Arrivals) {
+        let seen: Arrivals = Arc::default();
+        let log = Arc::clone(&seen);
+        let app = axum::Router::new().fallback(axum::routing::any(move |req: Request| {
+            let (log, reply) = (Arc::clone(&log), reply.clone());
+            async move {
+                let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+                    .await
+                    .unwrap_or_default();
+                log.lock()
+                    .unwrap()
+                    .push(serde_json::from_slice(&bytes).unwrap_or(Value::Null));
+                tokio::time::sleep(delay).await;
+                (status, axum::Json(reply))
+            }
+        }));
+        (spawn_stub(app).await, seen)
+    }
+
+    fn single_attempt_router() -> PDRouter {
+        PDRouter {
+            retry_config: RetryConfig {
+                max_retries: 1,
+                ..Default::default()
+            },
+            ..create_test_pd_router()
+        }
+    }
+
+    #[tokio::test]
+    async fn vllm_pd_moriio_write_sends_both_legs_at_once() {
+        let prefill_answered: Arc<std::sync::Mutex<Option<Instant>>> = Arc::default();
+        let answered = Arc::clone(&prefill_answered);
+        let prefill_app = axum::Router::new().fallback(axum::routing::any(move |req: Request| {
+            let answered = Arc::clone(&answered);
+            async move {
+                let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+                    .await
+                    .unwrap_or_default();
+                let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                *answered.lock().unwrap() = Some(Instant::now());
+                let minted = body
+                    .pointer("/kv_transfer_params/transfer_id")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                axum::Json(json!({"kv_transfer_params": stub_handoff(&minted)}))
+            }
+        }));
+        let decode_arrived: Arc<std::sync::Mutex<Option<Instant>>> = Arc::default();
+        let arrived = Arc::clone(&decode_arrived);
+        let decode_app = axum::Router::new().fallback(axum::routing::any(move || {
+            let arrived = Arc::clone(&arrived);
+            async move {
+                *arrived.lock().unwrap() = Some(Instant::now());
+                axum::Json(json!({"choices": []}))
+            }
+        }));
+        let router = create_test_pd_router();
+        register_moriio_pair_with(
+            &router,
+            (spawn_stub(prefill_app).await, Some("write")),
+            (spawn_stub(decode_app).await, "write"),
+            &[CONCURRENT_WRITE],
+        );
+
+        let response = moriio_call(&router, "/v1/chat/completions", None, &json!({})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let arrived = decode_arrived.lock().unwrap().expect("decode contacted");
+        let answered = prefill_answered.lock().unwrap().expect("prefill answered");
+        assert!(
+            arrived < answered,
+            "the decode leg must not wait for the prefill"
+        );
+    }
+
+    #[tokio::test]
+    async fn vllm_pd_moriio_write_fails_fast_without_a_pushing_prefill() {
+        // A decode that waits for KV: it must be abandoned, not awaited.
+        let waiting = std::time::Duration::from_secs(30);
+        for (case, status, reply, expected, code) in [
+            (
+                "prefill error",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error": {"message": "boom"}}),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "prefill_upstream_error",
+            ),
+            (
+                "no handoff",
+                StatusCode::OK,
+                json!({}),
+                StatusCode::BAD_GATEWAY,
+                "moriio_handoff_invalid",
+            ),
+        ] {
+            // Answer after the decode leg has surely arrived.
+            let (prefill_url, _) =
+                spawn_delayed_stub(status, reply, std::time::Duration::from_millis(100)).await;
+            let (decode_url, decode_seen) =
+                spawn_delayed_stub(StatusCode::OK, json!({"choices": []}), waiting).await;
+            let router = single_attempt_router();
+            register_moriio_pair_with(
+                &router,
+                (prefill_url, Some("write")),
+                (decode_url, "write"),
+                &[CONCURRENT_WRITE],
+            );
+
+            let started = Instant::now();
+            let response = moriio_call(&router, "/v1/chat/completions", None, &json!({})).await;
+            assert!(started.elapsed() < waiting, "{case}: waited for the decode");
+            assert_eq!(response.status(), expected, "{case}");
+            assert_eq!(error_code(&response), Some(code), "{case}");
+            assert!(
+                !decode_seen.lock().unwrap().is_empty(),
+                "{case}: the decode leg goes out with the prefill"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn vllm_pd_moriio_write_fails_fast_when_the_decode_is_unreachable() {
+        let computing = std::time::Duration::from_secs(30);
+        let (prefill_url, _) = spawn_delayed_stub(StatusCode::OK, json!({}), computing).await;
+        let decode_url = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", listener.local_addr().unwrap())
+        };
+        let router = single_attempt_router();
+        register_moriio_pair_with(
+            &router,
+            (prefill_url, Some("write")),
+            (decode_url, "write"),
+            &[CONCURRENT_WRITE],
+        );
+
+        let started = Instant::now();
+        let response = moriio_call(&router, "/v1/chat/completions", None, &json!({})).await;
+        assert!(started.elapsed() < computing, "waited for the prefill");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(error_code(&response), Some("decode_request_failed"));
+    }
+
+    #[tokio::test]
+    async fn vllm_pd_moriio_write_fails_fast_when_the_decode_refuses() {
+        let computing = std::time::Duration::from_secs(30);
+        let (prefill_url, prefill_seen) =
+            spawn_delayed_stub(StatusCode::OK, json!({}), computing).await;
+        // Refuse once the prefill request has surely arrived.
+        let (decode_url, decode_seen) = spawn_delayed_stub(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error": "busy"}),
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        let router = single_attempt_router();
+        register_moriio_pair_with(
+            &router,
+            (prefill_url, Some("write")),
+            (decode_url, "write"),
+            &[CONCURRENT_WRITE],
+        );
+
+        let started = Instant::now();
+        let response = moriio_call(&router, "/v1/chat/completions", None, &json!({})).await;
+        assert!(started.elapsed() < computing, "waited for the prefill");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!prefill_seen.lock().unwrap().is_empty());
+        assert!(!decode_seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn vllm_pd_moriio_write_holds_an_early_decode_answer_until_the_handoff_checks_out() {
+        for handoff in [StubHandoff::Missing, StubHandoff::OtherNotifyPort] {
+            let (prefill_url, _) = spawn_moriio_prefill_stub(handoff).await;
+            let (decode_url, decode_seen) =
+                spawn_recording_stub(r#"{"choices":[{"text":"early"}]}"#).await;
+            let router = single_attempt_router();
+            register_moriio_pair_with(
+                &router,
+                (prefill_url, Some("write")),
+                (decode_url, "write"),
+                &[CONCURRENT_WRITE],
+            );
+
+            let response = moriio_call(&router, "/v1/chat/completions", None, &json!({})).await;
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{handoff:?}");
+            assert_eq!(error_code(&response), Some("moriio_handoff_invalid"));
+            assert_eq!(taken(&decode_seen).len(), 1, "{handoff:?}: decode leg sent");
+        }
+    }
+
+    /// The prefill sanitizer as it edits a `Value`: the wire contract the
+    /// raw editor reproduces byte for byte.
+    fn sanitize_prefill_value(json: &mut Value, route: &str) {
+        let Some(obj) = json.as_object_mut() else {
+            return;
+        };
+        obj.insert("stream".to_string(), Value::Bool(false));
+        obj.remove("stream_options");
+        if obj.contains_key("n") {
+            obj.insert("n".to_string(), Value::from(1));
+        }
+        obj.remove("min_tokens");
+        match route {
+            "/v1/chat/completions" if obj.contains_key("max_completion_tokens") => {
+                obj.insert("max_completion_tokens".to_string(), Value::from(1));
+                obj.remove("max_tokens");
+            }
+            "/v1/responses" => {
+                obj.insert("max_output_tokens".to_string(), Value::from(1));
+            }
+            _ => {
+                obj.insert("max_tokens".to_string(), Value::from(1));
+            }
+        }
+    }
+
+    /// Sanitize `body` for `route` through the raw editor, check the bytes
+    /// against the `Value` oracle, and return the result parsed.
+    fn sanitized_prefill(body: Value, route: &str) -> Value {
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let mut raw = RawBody::parse(&bytes).unwrap();
+        PDRouter::sanitize_prefill_for_kv_handoff(&mut raw, route).unwrap();
+        let raw_bytes = raw.to_bytes(Some(bytes.len())).unwrap();
+
+        let mut oracle = body;
+        sanitize_prefill_value(&mut oracle, route);
+        assert_eq!(raw_bytes, serde_json::to_vec(&oracle).unwrap(), "{route}");
+        serde_json::from_slice(&raw_bytes).unwrap()
+    }
+
     #[test]
     fn prefill_sanitization_is_route_aware() {
-        let mut chat = json!({"max_completion_tokens": 99, "max_tokens": 88, "n": 3,
-            "stream": true, "stream_options": {"include_usage": true}, "min_tokens": 5});
-        PDRouter::sanitize_prefill_for_kv_handoff(&mut chat, "/v1/chat/completions");
+        let chat = sanitized_prefill(
+            json!({"max_completion_tokens": 99, "max_tokens": 88, "n": 3,
+                "stream": true, "stream_options": {"include_usage": true}, "min_tokens": 5}),
+            "/v1/chat/completions",
+        );
         assert_eq!(chat.get("max_completion_tokens"), Some(&Value::from(1)));
         assert_eq!(chat.get("max_tokens"), None, "both caps would be rejected");
         assert_eq!(chat.get("n"), Some(&Value::from(1)));
@@ -2608,13 +4917,104 @@ mod tests {
         assert_eq!(chat.get("stream_options"), None);
         assert_eq!(chat.get("min_tokens"), None);
 
-        let mut responses = json!({"max_output_tokens": 99, "stream": true});
-        PDRouter::sanitize_prefill_for_kv_handoff(&mut responses, "/v1/responses");
+        // Without the long cap spelling a chat leg is capped like a completion.
+        let chat = sanitized_prefill(
+            json!({"messages": [], "max_tokens": 88, "stream": false}),
+            "/v1/chat/completions",
+        );
+        assert_eq!(chat.get("max_tokens"), Some(&Value::from(1)));
+
+        let responses = sanitized_prefill(
+            json!({"max_output_tokens": 99, "stream": true}),
+            "/v1/responses",
+        );
         assert_eq!(responses.get("max_output_tokens"), Some(&Value::from(1)));
 
-        let mut completion = json!({"prompt": "hi"});
-        PDRouter::sanitize_prefill_for_kv_handoff(&mut completion, "/v1/completions");
+        let completion = sanitized_prefill(json!({"prompt": "hi"}), "/v1/completions");
         assert_eq!(completion.get("max_tokens"), Some(&Value::from(1)));
+    }
+
+    #[test]
+    fn bootstrap_and_rank_edits_match_the_value_pipeline_bytes() {
+        let prefill =
+            create_test_worker("http://prefill:8000".to_string(), WorkerType::Prefill, true);
+        for batch_size in [None, Some(3)] {
+            let fields = PDRouter::bootstrap_fields(prefill.as_ref(), batch_size).unwrap();
+            let as_value = |raw: &RawValue| serde_json::from_str::<Value>(raw.get()).unwrap();
+            let (host, port, room) = (
+                as_value(&fields.host),
+                as_value(&fields.port),
+                as_value(&fields.room),
+            );
+            match batch_size {
+                Some(n) => {
+                    assert_eq!(host.as_array().unwrap().len(), n);
+                    assert_eq!(port.as_array().unwrap().len(), n);
+                    assert_eq!(room.as_array().unwrap().len(), n);
+                }
+                None => assert!(room.is_u64()),
+            }
+
+            let request = json!({
+                "model": "alias",
+                "input_ids": [[1, 2], [3, 4], [5, 6]],
+                "stream": false
+            });
+            let bytes = serde_json::to_vec(&request).unwrap();
+            let mut body = RawBody::parse(&bytes).unwrap();
+            body.set_model(to_raw_value("canonical").unwrap());
+            PDRouter::inject_bootstrap(&mut body, fields);
+            let mut prefill_leg = body.clone();
+            let mut decode_leg = body;
+            PDRouter::inject_dp_rank(&mut prefill_leg, 2, "routed_dp_rank").unwrap();
+            PDRouter::inject_dp_rank(&mut decode_leg, 2, "disagg_prefill_dp_rank").unwrap();
+            PDRouter::inject_dp_rank(&mut decode_leg, 5, "routed_dp_rank").unwrap();
+
+            // The same edits on a Value, the pipeline these bytes replace.
+            let mut oracle = request;
+            super::super::set_request_model(&mut oracle, "canonical");
+            let obj = oracle.as_object_mut().unwrap();
+            obj.insert("bootstrap_host".to_string(), host);
+            obj.insert("bootstrap_port".to_string(), port);
+            obj.insert("bootstrap_room".to_string(), room);
+            let mut oracle_prefill = oracle.clone();
+            let mut oracle_decode = oracle;
+            oracle_prefill
+                .as_object_mut()
+                .unwrap()
+                .insert("routed_dp_rank".to_string(), Value::from(2));
+            let decode_obj = oracle_decode.as_object_mut().unwrap();
+            decode_obj.insert("disagg_prefill_dp_rank".to_string(), Value::from(2));
+            decode_obj.insert("routed_dp_rank".to_string(), Value::from(5));
+
+            assert_eq!(
+                prefill_leg.to_bytes(Some(bytes.len())).unwrap(),
+                serde_json::to_vec(&oracle_prefill).unwrap()
+            );
+            assert_eq!(
+                decode_leg.to_bytes(Some(bytes.len())).unwrap(),
+                serde_json::to_vec(&oracle_decode).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn harvested_kv_transfer_params_are_the_prefill_response_slice() {
+        let harvested = |body: &str| {
+            PDRouter::harvest_kv_transfer_params(body.as_bytes())
+                .map(|params| params.get().to_owned())
+        };
+        assert_eq!(
+            harvested(
+                r#"{"id":"x","kv_transfer_params":{"remote_engine_id":"eng0","remote_block_ids":[1,2]}}"#
+            )
+            .as_deref(),
+            Some(r#"{"remote_engine_id":"eng0","remote_block_ids":[1,2]}"#)
+        );
+        assert_eq!(harvested(r#"{"kv_transfer_params":null}"#), None);
+        assert_eq!(harvested(r#"{"id":"x"}"#), None);
+        assert_eq!(harvested("[1,2]"), None);
+        assert_eq!(harvested("not json"), None);
     }
 
     #[tokio::test]
@@ -2678,7 +5078,7 @@ mod tests {
     async fn test_streaming_decode_error_emits_valid_json_sse() {
         let router = create_test_pd_router();
 
-        let prefill: Arc<dyn Worker> = Arc::from(create_test_worker(
+        let _prefill: Arc<dyn Worker> = Arc::from(create_test_worker(
             "http://prefill".to_string(),
             WorkerType::Prefill,
             true,
@@ -2704,13 +5104,10 @@ mod tests {
             headers: None,
         };
 
-        let load_guards = vec![
-            WorkerLoadGuard::new(prefill.clone(), None),
-            WorkerLoadGuard::new(decode.clone(), None),
-        ];
+        let decode_guard = WorkerLoadGuard::new(decode.clone(), None);
 
         let response = router
-            .handle_decode_error_response(decode_response, &context, decode, load_guards)
+            .handle_decode_error_response(decode_response, &context, decode, decode_guard)
             .await;
 
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -2793,6 +5190,272 @@ mod tests {
         );
     }
 
+    fn admission_test_router(prefill_url: String, decode_url: String) -> PDRouter {
+        let router = PDRouter {
+            prefill_admission: Some(Arc::new(PrefillAdmission::new(
+                1,
+                1,
+                std::time::Duration::from_secs(3),
+            ))),
+            ..create_test_pd_router()
+        };
+        for (url, role) in [
+            (prefill_url, WorkerType::Prefill),
+            (decode_url, WorkerType::Decode),
+        ] {
+            router
+                .worker_registry
+                .register_or_replace(Arc::from(create_test_worker(url, role, true)));
+        }
+        router
+    }
+
+    #[tokio::test]
+    async fn pd_prefill_release_admits_next_request_before_decode_head() {
+        use std::{sync::atomic::Ordering, time::Duration};
+
+        use crate::routers::common::request_lease::test_probe::spawn_release_gated_stub;
+
+        for is_stream in [false, true] {
+            for return_logprob in [false, true] {
+                let prefill_probe = Arc::new(());
+                let prefill_hold = Arc::clone(&prefill_probe);
+                let decode_probe = Arc::new(());
+                let decode_hold = Arc::clone(&decode_probe);
+                let (prefill_url, prefill_released) =
+                    spawn_release_gated_stub(Arc::downgrade(&prefill_probe)).await;
+                let (decode_url, decode_released) =
+                    spawn_release_gated_stub(Arc::downgrade(&decode_probe)).await;
+                let router = admission_test_router(prefill_url, decode_url);
+                let ((prefill, decode), guards) = router
+                    .select_pd_pair_with_admission(
+                        UNKNOWN_MODEL_ID,
+                        PlacementInputs::default(),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let context = PDRequestContext {
+                    route: "/generate",
+                    batch_size: None,
+                    is_stream,
+                    return_logprob,
+                    model_id: UNKNOWN_MODEL_ID,
+                    headers: None,
+                };
+                let mut outcome = PrefillOutcome::FromStatus;
+                let dispatch = router.execute_dual_dispatch_internal(
+                    None,
+                    (Bytes::from_static(b"{}"), Bytes::from_static(b"{}")),
+                    context,
+                    Arc::clone(&prefill),
+                    Arc::clone(&decode),
+                    guards,
+                    &mut outcome,
+                );
+                tokio::pin!(dispatch);
+
+                let next = router.select_pd_pair_with_admission(
+                    UNKNOWN_MODEL_ID,
+                    PlacementInputs::default(),
+                    None,
+                );
+                tokio::pin!(next);
+                tokio::select! {
+                    biased;
+                    _ = &mut dispatch => panic!("Decode must remain blocked"),
+                    _ = &mut next => panic!("Prefill must remain occupied until it responds"),
+                    () = tokio::task::yield_now() => {}
+                }
+                assert_eq!(
+                    router.prefill_admission.as_ref().unwrap().queued_requests(),
+                    1
+                );
+                assert_eq!(prefill.load(), 1);
+                assert_eq!(decode.load(), 1);
+                assert!(!prefill_released.load(Ordering::SeqCst));
+
+                drop(prefill_hold);
+                let (_, next_guards) = tokio::select! {
+                    _ = &mut dispatch => panic!("Decode must remain blocked"),
+                    result = tokio::time::timeout(Duration::from_secs(2), &mut next) => {
+                        result.expect("completed Prefill must admit the queued request").unwrap()
+                    }
+                };
+                assert!(prefill_released.load(Ordering::SeqCst));
+                assert!(!decode_released.load(Ordering::SeqCst));
+                assert_eq!(decode.load(), 2);
+                drop(next_guards);
+                assert_eq!(prefill.load(), 0);
+                assert_eq!(decode.load(), 1);
+
+                drop(decode_hold);
+                let response = tokio::time::timeout(Duration::from_secs(2), dispatch)
+                    .await
+                    .expect("released Decode must finish");
+                assert_eq!(response.status(), StatusCode::OK);
+                axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                assert_eq!(prefill.load(), 0);
+                assert_eq!(decode.load(), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pd_prefill_release_preserves_response_and_logprobs() {
+        for is_stream in [false, true] {
+            for return_logprob in [false, true] {
+                let (prefill_url, _) = spawn_recording_stub(
+                    r#"{"meta_info":{"input_token_logprobs":[[-0.1,1,"p"]]}}"#,
+                )
+                .await;
+                let (decode_url, _) = spawn_recording_stub(if is_stream {
+                    "data: {\"text\":\"answer\",\"meta_info\":{\"input_token_logprobs\":[[-0.2,2,\"d\"]]}}\n\n"
+                } else {
+                    r#"{"text":"answer","meta_info":{"input_token_logprobs":[[-0.2,2,"d"]]}}"#
+                })
+                .await;
+                let router = admission_test_router(prefill_url, decode_url);
+                let ((prefill, decode), guards) = router
+                    .select_pd_pair_with_admission(
+                        UNKNOWN_MODEL_ID,
+                        PlacementInputs::default(),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let mut outcome = PrefillOutcome::FromStatus;
+                let response = router
+                    .execute_dual_dispatch_internal(
+                        None,
+                        (Bytes::from_static(b"{}"), Bytes::from_static(b"{}")),
+                        PDRequestContext {
+                            route: "/generate",
+                            batch_size: None,
+                            is_stream,
+                            return_logprob,
+                            model_id: UNKNOWN_MODEL_ID,
+                            headers: None,
+                        },
+                        prefill,
+                        decode,
+                        guards,
+                        &mut outcome,
+                    )
+                    .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let body = std::str::from_utf8(&body).unwrap();
+                let value: Value = serde_json::from_str(if is_stream {
+                    body.strip_prefix("data: ").unwrap().trim()
+                } else {
+                    body
+                })
+                .unwrap();
+                assert_eq!(value["text"], "answer");
+                assert_eq!(
+                    value["meta_info"]["input_token_logprobs"],
+                    if return_logprob {
+                        json!([[-0.1, 1, "p"], [-0.2, 2, "d"]])
+                    } else {
+                        json!([[-0.2, 2, "d"]])
+                    }
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pd_prefill_release_on_error_or_cancellation() {
+        use std::time::Duration;
+
+        use crate::routers::common::request_lease::test_probe::{
+            spawn_immediate_stub, spawn_release_gated_stub,
+        };
+
+        // Each leg can fail while the other is still waiting for its head.
+        // A missing route exercises HTTP errors; a dropped listener exercises
+        // transport errors. Cancellation drops two pending legs.
+        for failed_prefill in [false, true] {
+            for failure in ["http", "transport", "cancel"] {
+                let probe = Arc::new(());
+                let hold = Arc::clone(&probe);
+                let (blocked_url, _) = spawn_release_gated_stub(Arc::downgrade(&probe)).await;
+                let failed_url = match failure {
+                    "http" => format!("{}/missing", spawn_immediate_stub().await),
+                    "transport" => {
+                        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                        format!("http://{}", listener.local_addr().unwrap())
+                    }
+                    _ => spawn_release_gated_stub(Arc::downgrade(&probe)).await.0,
+                };
+                let (prefill_url, decode_url) = if failed_prefill {
+                    (failed_url, blocked_url)
+                } else {
+                    (blocked_url, failed_url)
+                };
+                let router = admission_test_router(prefill_url, decode_url);
+                let ((prefill, decode), guards) = router
+                    .select_pd_pair_with_admission(
+                        UNKNOWN_MODEL_ID,
+                        PlacementInputs::default(),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let context = PDRequestContext {
+                    route: "/generate",
+                    batch_size: None,
+                    is_stream: false,
+                    return_logprob: false,
+                    model_id: UNKNOWN_MODEL_ID,
+                    headers: None,
+                };
+                {
+                    let mut outcome = PrefillOutcome::FromStatus;
+                    let dispatch = router.execute_dual_dispatch_internal(
+                        None,
+                        (Bytes::from_static(b"{}"), Bytes::from_static(b"{}")),
+                        context,
+                        Arc::clone(&prefill),
+                        Arc::clone(&decode),
+                        guards,
+                        &mut outcome,
+                    );
+                    tokio::pin!(dispatch);
+                    if failure == "cancel" {
+                        tokio::select! {
+                            biased;
+                            _ = &mut dispatch => panic!("both legs must remain blocked"),
+                            () = tokio::task::yield_now() => {}
+                        }
+                        assert_eq!(prefill.load(), 1);
+                        assert_eq!(decode.load(), 1);
+                    } else {
+                        let response = tokio::time::timeout(Duration::from_secs(2), dispatch)
+                            .await
+                            .expect("a failed leg must cancel the pending leg");
+                        assert_eq!(
+                            response.status(),
+                            if failure == "http" {
+                                StatusCode::NOT_FOUND
+                            } else {
+                                StatusCode::BAD_GATEWAY
+                            }
+                        );
+                    }
+                }
+                assert_eq!(prefill.load(), 0);
+                assert_eq!(decode.load(), 0);
+                drop(hold);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_streaming_load_tracking() {
         use futures_util::StreamExt;
@@ -2825,10 +5488,10 @@ mod tests {
         let stream = ReceiverStream::new(rx);
 
         {
-            let guards = vec![
-                WorkerLoadGuard::new(prefill_ref.clone(), None),
-                WorkerLoadGuard::new(decode_ref.clone(), None),
-            ];
+            let prefill_guard = PrefillLoadGuard::Unbounded {
+                _guard: WorkerLoadGuard::new(prefill_ref.clone(), None),
+            };
+            let decode_guard = WorkerLoadGuard::new(decode_ref.clone(), None);
 
             assert_eq!(prefill_ref.load(), 1);
             assert_eq!(decode_ref.load(), 1);
@@ -2840,19 +5503,20 @@ mod tests {
                 false,
                 None,
                 None,
-                guards,
+                decode_guard,
             );
 
-            // Guards are now attached to response body, so load should be 1
-            assert_eq!(prefill_ref.load(), 1);
+            // The Prefill guard is independent of the response body.
+            drop(prefill_guard);
+            assert_eq!(prefill_ref.load(), 0);
             assert_eq!(decode_ref.load(), 1);
 
             tx.send(Bytes::from("test data")).await.unwrap();
 
             sleep(Duration::from_millis(10)).await;
 
-            // Load still 1 while response body exists
-            assert_eq!(prefill_ref.load(), 1);
+            // Decode load is held while the response body exists.
+            assert_eq!(prefill_ref.load(), 0);
             assert_eq!(decode_ref.load(), 1);
 
             drop(tx);

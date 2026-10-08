@@ -262,11 +262,18 @@ impl HuggingFaceTokenizer {
             }
         }
 
-        // Load merged EOS token IDs from config.json + generation_config.json
-        let eos_token_ids = tokenizer_path
-            .parent()
-            .map(crate::eos::load_eos_token_ids)
-            .unwrap_or_default();
+        // Load merged EOS token IDs from config.json + generation_config.json,
+        // plus the tokenizer's own eos_token (structured-output grammars end on it).
+        let eos_token_ids = crate::eos::with_tokenizer_eos(
+            tokenizer_path
+                .parent()
+                .map(crate::eos::load_eos_token_ids)
+                .unwrap_or_default(),
+            special_tokens
+                .eos_token
+                .as_deref()
+                .and_then(|token| vocab.get(token).copied()),
+        );
 
         // Detect a custom Python-encoder model from config.json::architectures.
         let renderer = tokenizer_path
@@ -619,7 +626,17 @@ impl TokenizerTrait for HuggingFaceTokenizer {
         match self.renderer {
             Renderer::DeepseekV4(encoding) => encoding.valid_native_values(),
             Renderer::DeepseekV41 => deepseek_v41::NATIVE_EFFORT_VALUES,
-            Renderer::DeepseekV32 | Renderer::Jinja => &[],
+            Renderer::DeepseekV32 => &[],
+            Renderer::Jinja => self.chat_template.native_reasoning_effort_values(),
+        }
+    }
+
+    fn native_reasoning_effort_off_values(&self) -> &'static [&'static str] {
+        match self.renderer {
+            // The native DeepSeek renderers switch off on the protocol's
+            // `none`/`minimal`, so they declare no words of their own.
+            Renderer::DeepseekV32 | Renderer::DeepseekV4(_) | Renderer::DeepseekV41 => &[],
+            Renderer::Jinja => self.chat_template.native_reasoning_effort_off_values(),
         }
     }
 
@@ -934,8 +951,9 @@ fn restore_integer_reasoning_effort(value: &serde_json::Value) -> Option<serde_j
 ///    thinking switch, `thinking_from_reasoning_effort`) switch thinking off,
 ///    a native effort name (`low`/`high`/`xhigh`/`max`) switches it on, and
 ///    an integer budget has no opinion;
-/// 3. else `params.thinking` (the gateway's projection of the top-level
-///    `reasoning_effort`: `Some(false)` for `none`/`minimal`);
+/// 3. else `params.thinking` (the gateway's projection of the typed
+///    `thinking.type` toggle, else `Some(false)` for a `none`/`minimal`
+///    effective `reasoning_effort`);
 /// 4. else on ([`ThinkingToggle::DefaultOn`]).
 ///
 /// Deliberate divergence from vLLM's Python: there `reasoning_effort: "none"`

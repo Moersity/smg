@@ -5,7 +5,9 @@ use std::{collections::HashMap, sync::Arc};
 use anyhow::Result;
 
 use crate::{
-    chat_template::{ChatTemplateParams, ThinkingKeyName, ThinkingToggle},
+    chat_template::{
+        ChatTemplateContentFormat, ChatTemplateParams, ThinkingKeyName, ThinkingToggle,
+    },
     traits::{
         ChatTemplateOutput, Decoder, EncodeJob, Encoder, Encoding, PromptEncoding,
         RendererCapabilities, SpecialTokens, Tokenizer as TokenizerTrait,
@@ -22,13 +24,17 @@ pub struct MockTokenizer {
     deferred_chat_ids: Option<Vec<u32>>,
     /// Runs inside the deferred job, on whatever thread the caller runs it.
     deferred_chat_probe: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Reported as the rendering's `unbilled_prompt_tokens`.
+    unbilled_prompt_tokens: u32,
     /// The renderer-shaped trait hooks, so a test can stand in for a native
     /// renderer (thinking toggle, effort names, capabilities) without a
     /// checkpoint.
     thinking_toggle: ThinkingToggle,
     thinking_key_name: Option<ThinkingKeyName>,
     native_reasoning_effort_values: &'static [&'static str],
+    native_reasoning_effort_off_values: &'static [&'static str],
     renderer_capabilities: RendererCapabilities,
+    content_format: ChatTemplateContentFormat,
     /// When set, `apply_chat_template` renders the message list and the
     /// generation-prompt flag as JSON, so a test can assert exactly what
     /// reached the template.
@@ -86,10 +92,13 @@ impl MockTokenizer {
             special_tokens,
             deferred_chat_ids: None,
             deferred_chat_probe: None,
+            unbilled_prompt_tokens: 0,
             thinking_toggle: ThinkingToggle::None,
             thinking_key_name: None,
             native_reasoning_effort_values: &[],
+            native_reasoning_effort_off_values: &[],
             renderer_capabilities: RendererCapabilities::default(),
+            content_format: ChatTemplateContentFormat::default(),
             json_chat_template: false,
         }
     }
@@ -106,6 +115,12 @@ impl MockTokenizer {
     /// caller ran it.
     pub fn with_deferred_chat_probe(mut self, probe: impl Fn() + Send + Sync + 'static) -> Self {
         self.deferred_chat_probe = Some(Arc::new(probe));
+        self
+    }
+
+    /// Report `n` unbilled prompt tokens on every rendering.
+    pub fn with_unbilled_prompt_tokens(mut self, n: u32) -> Self {
+        self.unbilled_prompt_tokens = n;
         self
     }
 
@@ -127,9 +142,24 @@ impl MockTokenizer {
         self
     }
 
+    /// Report `values` from `native_reasoning_effort_off_values()`.
+    pub fn with_native_reasoning_effort_off_values(
+        mut self,
+        values: &'static [&'static str],
+    ) -> Self {
+        self.native_reasoning_effort_off_values = values;
+        self
+    }
+
     /// Declare `capabilities` from `renderer_capabilities()`.
     pub fn with_renderer_capabilities(mut self, capabilities: RendererCapabilities) -> Self {
         self.renderer_capabilities = capabilities;
+        self
+    }
+
+    /// Report `format` from `chat_template_content_format()`.
+    pub fn with_content_format(mut self, format: ChatTemplateContentFormat) -> Self {
+        self.content_format = format;
         self
     }
 
@@ -215,8 +245,16 @@ impl TokenizerTrait for MockTokenizer {
         self.native_reasoning_effort_values
     }
 
+    fn native_reasoning_effort_off_values(&self) -> &'static [&'static str] {
+        self.native_reasoning_effort_off_values
+    }
+
     fn renderer_capabilities(&self) -> RendererCapabilities {
         self.renderer_capabilities
+    }
+
+    fn chat_template_content_format(&self) -> ChatTemplateContentFormat {
+        self.content_format
     }
 
     /// One `role: content` line per message, plus an `assistant:` tail when a
@@ -274,7 +312,11 @@ impl TokenizerTrait for MockTokenizer {
             }
             None => PromptEncoding::FromText,
         };
-        Ok(ChatTemplateOutput { text, encoding })
+        Ok(ChatTemplateOutput {
+            text,
+            encoding,
+            unbilled_prompt_tokens: self.unbilled_prompt_tokens,
+        })
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
