@@ -222,10 +222,23 @@ Worker-side media processing uses the same `--mm-processor` /
   the same way. It serves the model families that pipeline supports
   (`crates/multimodal`), takes `http`, `https` and `data` references, reads
   the model's `config.json` and preprocessor configs from the tokenizer
-  directory the launcher resolved, and refuses a request above the engine's
-  own `--limit-mm-per-prompt` as the engine's server does (`--mm-max-items`
-  and `SMG_*_MAX_COUNT` tighten those limits, never loosen them). An engine
-  that normalizes pixels on device
+  directory the launcher resolved, refuses a request above the engine's own
+  `--limit-mm-per-prompt` as the engine's server does (`--mm-max-items` and
+  `SMG_*_MAX_COUNT` tighten those limits, never loosen them), and samples a
+  video to the engine's own frame budget (`--media-io-kwargs`
+  `video.num_frames`, else its loader's default) where the family's processor
+  takes the loader's frames, so a clip costs the same tokens as on the engine's
+  own server; the budget is read under the same `SMG_VLLM_MM_MAX_VIDEO_FRAMES`
+  cap the in-process and Redis processors apply, so an unbounded count stays
+  bounded in `smg` mode too (a cap below the engine's count then samples fewer
+  frames than the engine's own server would, as intended), and a loader rule
+  the pipeline cannot follow (`video_backend` in the engine's media kwargs,
+  else `VLLM_VIDEO_LOADER_BACKEND`, other than `opencv`, or a `video.fps` above
+  zero, which thins frames by duration) is refused at launch for a family that
+  samples the way the loader does (Gemma 4) and serves video at all; the
+  families with a rate-based sampler of their own never followed the loader and
+  start as before. An engine that normalizes pixels on
+  device
   (vLLM's `mm_device_do_normalize`, on by default for the Qwen-VL family)
   takes raw `uint8` pixels, and the pipeline writes those for it; a model
   whose processor cannot emit raw pixels is refused at startup under that
