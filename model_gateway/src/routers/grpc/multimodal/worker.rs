@@ -887,7 +887,7 @@ mod unsupported_model_tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("config.json"),
-            r#"{"model_type": "gemma4", "architectures": ["Gemma4ForConditionalGeneration"]}"#,
+            r#"{"model_type": "quux", "architectures": ["QuuxForConditionalGeneration"]}"#,
         )
         .unwrap();
         let path = dir.path().to_str().unwrap().to_string();
@@ -909,9 +909,9 @@ mod unsupported_model_tests {
             .err()
             .expect("no spec for this family");
         let message = format!("{error:#}");
-        assert!(message.contains(r#"model_type "gemma4""#), "{message}");
+        assert!(message.contains(r#"model_type "quux""#), "{message}");
         assert!(
-            message.contains("Gemma4ForConditionalGeneration"),
+            message.contains("QuuxForConditionalGeneration"),
             "{message}"
         );
         assert!(message.contains(r#"served as "m6""#), "{message}");
