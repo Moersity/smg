@@ -4,7 +4,10 @@
 use std::{
     net::{IpAddr, SocketAddr},
     pin::Pin,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -160,6 +163,23 @@ impl TokenSpeedScheduler for MockScheduler {
 
         // Realistic mode: submit to the engine simulator and stream its output.
         if let Some(engine) = &self.engine {
+            // The fault hook's answer for this request, when one is armed: a
+            // stall, a status before admission, or a cut after some output.
+            let injected = engine.inject();
+            if let Some(fault) = injected {
+                if !fault.stall.is_zero() {
+                    tokio::time::sleep(fault.stall).await;
+                }
+                if fault.status != 0 && fault.after_tokens.is_none() {
+                    engine.record_failure();
+                    return Err(injected_status(fault.status));
+                }
+            }
+            let cut = injected.and_then(|fault| {
+                fault
+                    .after_tokens
+                    .map(|after| (after, injected_status(fault.status), engine.cut_counter()))
+            });
             let request_id = req.request_id;
             let prompt_token_ids = req.tokenized.map(|t| t.input_ids).unwrap_or_default();
             // Omitted limit falls back to the worker default, matching the HTTP
@@ -185,6 +205,7 @@ impl TokenSpeedScheduler for MockScheduler {
                 rx,
                 stream_chunks,
                 request_id,
+                cut,
             )));
         }
 
@@ -376,72 +397,124 @@ impl TokenSpeedScheduler for MockScheduler {
     }
 }
 
+/// The gRPC status code closest to the HTTP status a request fault answers,
+/// chosen so the gateway's mapping of codes to HTTP statuses gives that status
+/// back where it can: 408 reads back as 504 and 502 as 503 (both still
+/// retryable), any other 4xx as 400 (not retryable, as on the HTTP worker),
+/// any other 5xx as 500.
+fn injected_status(status: u16) -> Status {
+    const MESSAGE: &str = "injected";
+    match status {
+        400 => Status::invalid_argument(MESSAGE),
+        401 => Status::unauthenticated(MESSAGE),
+        403 => Status::permission_denied(MESSAGE),
+        404 => Status::not_found(MESSAGE),
+        408 | 504 => Status::deadline_exceeded(MESSAGE),
+        409 => Status::aborted(MESSAGE),
+        429 => Status::resource_exhausted(MESSAGE),
+        501 => Status::unimplemented(MESSAGE),
+        502 | 503 => Status::unavailable(MESSAGE),
+        other if (400..=499).contains(&other) => Status::invalid_argument(MESSAGE),
+        _ => Status::internal(MESSAGE),
+    }
+}
+
+/// The generate stream's state between items.
+struct Generating {
+    rx: mpsc::UnboundedReceiver<engine::GenEvent>,
+    output_ids: Vec<u32>,
+    stream_chunks: bool,
+    request_id: String,
+    /// The fault hook's cut: the stream ends with the status once the engine
+    /// has produced more than this many tokens; the counter records the cut.
+    cut: Option<(u32, Status, Arc<AtomicU64>)>,
+    ended: bool,
+}
+
 /// Map the engine's [`engine::GenEvent`] channel to the gRPC generate stream.
 /// In streaming mode each token becomes a `Chunk`; otherwise tokens are
 /// accumulated and only the final `Complete` is sent. After `Complete` the
 /// engine has dropped the sender, so the next `recv()` yields `None` and the
-/// stream ends.
+/// stream ends. With `cut`, the stream ends with that status instead once the
+/// engine has produced more than the given number of tokens (the fault hook's
+/// `after_tokens`); an output no longer than that completes as usual.
 fn generate_stream(
     rx: mpsc::UnboundedReceiver<engine::GenEvent>,
     stream_chunks: bool,
     request_id: String,
+    cut: Option<(u32, Status, Arc<AtomicU64>)>,
 ) -> GenStream {
-    let init = (rx, Vec::<u32>::new(), stream_chunks, request_id);
-    Box::pin(stream::unfold(
-        init,
-        |(mut rx, mut output_ids, stream_chunks, request_id)| async move {
-            loop {
-                match rx.recv().await {
-                    Some(engine::GenEvent::Token {
-                        token_id,
-                        prompt_tokens,
-                        cached_tokens,
-                    }) => {
-                        output_ids.push(token_id);
-                        if stream_chunks {
-                            let resp = ts::GenerateResponse {
-                                request_id: request_id.clone(),
-                                response: Some(GenResp::Chunk(ts::GenerateStreamChunk {
-                                    token_ids: vec![token_id],
-                                    prompt_tokens,
-                                    completion_tokens: output_ids.len() as u32,
-                                    cached_tokens,
-                                    output_logprobs: None,
-                                    index: 0,
-                                    weight_version: None,
-                                })),
-                            };
-                            return Some((Ok(resp), (rx, output_ids, stream_chunks, request_id)));
+    let init = Generating {
+        rx,
+        output_ids: Vec::new(),
+        stream_chunks,
+        request_id,
+        cut,
+        ended: false,
+    };
+    Box::pin(stream::unfold(init, |mut st| async move {
+        if st.ended {
+            return None;
+        }
+        loop {
+            match st.rx.recv().await {
+                Some(engine::GenEvent::Token {
+                    token_id,
+                    prompt_tokens,
+                    cached_tokens,
+                }) => {
+                    st.output_ids.push(token_id);
+                    if let Some((after, status, cut_total)) = &st.cut {
+                        if st.output_ids.len() > *after as usize {
+                            let status = status.clone();
+                            cut_total.fetch_add(1, Ordering::Relaxed);
+                            st.ended = true;
+                            return Some((Err(status), st));
                         }
-                        // Non-streaming: keep accumulating until Done.
                     }
-                    Some(engine::GenEvent::Done {
-                        finish_reason,
-                        prompt_tokens,
-                        completion_tokens,
-                        cached_tokens,
-                    }) => {
+                    if st.stream_chunks {
                         let resp = ts::GenerateResponse {
-                            request_id: request_id.clone(),
-                            response: Some(GenResp::Complete(ts::GenerateComplete {
-                                output_ids: std::mem::take(&mut output_ids),
-                                finish_reason: finish_reason.to_string(),
+                            request_id: st.request_id.clone(),
+                            response: Some(GenResp::Chunk(ts::GenerateStreamChunk {
+                                token_ids: vec![token_id],
                                 prompt_tokens,
-                                completion_tokens,
+                                completion_tokens: st.output_ids.len() as u32,
                                 cached_tokens,
                                 output_logprobs: None,
-                                matched_stop: None,
                                 index: 0,
-                                ..Default::default()
+                                weight_version: None,
                             })),
                         };
-                        return Some((Ok(resp), (rx, output_ids, stream_chunks, request_id)));
+                        return Some((Ok(resp), st));
                     }
-                    None => return None,
+                    // Non-streaming: keep accumulating until Done.
                 }
+                Some(engine::GenEvent::Done {
+                    finish_reason,
+                    prompt_tokens,
+                    completion_tokens,
+                    cached_tokens,
+                }) => {
+                    let resp = ts::GenerateResponse {
+                        request_id: st.request_id.clone(),
+                        response: Some(GenResp::Complete(ts::GenerateComplete {
+                            output_ids: std::mem::take(&mut st.output_ids),
+                            finish_reason: finish_reason.to_string(),
+                            prompt_tokens,
+                            completion_tokens,
+                            cached_tokens,
+                            output_logprobs: None,
+                            matched_stop: None,
+                            index: 0,
+                            ..Default::default()
+                        })),
+                    };
+                    return Some((Ok(resp), st));
+                }
+                None => return None,
             }
-        },
-    ))
+        }
+    }))
 }
 
 /// Map an engine load snapshot to the TokenSpeed `SchedulerLoad` wire type.
@@ -654,5 +727,83 @@ mod tests {
             "the accepted socket runs with Nagle on"
         );
         drop(client);
+    }
+
+    fn token(id: u32) -> engine::GenEvent {
+        engine::GenEvent::Token {
+            token_id: id,
+            prompt_tokens: 4,
+            cached_tokens: 0,
+        }
+    }
+
+    fn done(tokens: u32) -> engine::GenEvent {
+        engine::GenEvent::Done {
+            finish_reason: "stop",
+            prompt_tokens: 4,
+            completion_tokens: tokens,
+            cached_tokens: 0,
+        }
+    }
+
+    fn chunk_ids(item: Option<Result<ts::GenerateResponse, Status>>) -> Vec<u32> {
+        match item.expect("an item").expect("ok").response {
+            Some(GenResp::Chunk(chunk)) => chunk.token_ids,
+            other => panic!("not a chunk: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cut_stream_ends_with_the_status_after_the_given_tokens() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        for id in 1..=4 {
+            tx.send(token(id)).unwrap();
+        }
+        tx.send(done(4)).unwrap();
+        drop(tx);
+        let cuts = Arc::new(AtomicU64::new(0));
+        let cut = Some((2, Status::unavailable("injected"), Arc::clone(&cuts)));
+        let mut stream = generate_stream(rx, true, "r".to_string(), cut);
+        assert_eq!(chunk_ids(stream.next().await), vec![1]);
+        assert_eq!(chunk_ids(stream.next().await), vec![2]);
+        let cut = stream.next().await.expect("the cut");
+        assert!(matches!(cut, Err(ref status) if status.code() == tonic::Code::Unavailable));
+        assert!(stream.next().await.is_none(), "nothing after the cut");
+        assert_eq!(cuts.load(Ordering::Relaxed), 1, "the cut is counted once");
+    }
+
+    #[tokio::test]
+    async fn an_output_no_longer_than_the_cut_completes_as_usual() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(token(1)).unwrap();
+        tx.send(done(1)).unwrap();
+        drop(tx);
+        let cuts = Arc::new(AtomicU64::new(0));
+        let cut = Some((1, Status::internal("injected"), Arc::clone(&cuts)));
+        let mut stream = generate_stream(rx, true, "r".to_string(), cut);
+        assert_eq!(chunk_ids(stream.next().await), vec![1]);
+        let complete = stream.next().await.expect("complete").expect("ok");
+        assert!(matches!(complete.response, Some(GenResp::Complete(_))));
+        assert!(stream.next().await.is_none());
+        assert_eq!(
+            cuts.load(Ordering::Relaxed),
+            0,
+            "an output no longer than the cut is not counted as cut"
+        );
+    }
+
+    #[test]
+    fn injected_statuses_map_to_the_closest_grpc_code() {
+        assert_eq!(injected_status(503).code(), tonic::Code::Unavailable);
+        assert_eq!(injected_status(502).code(), tonic::Code::Unavailable);
+        assert_eq!(injected_status(500).code(), tonic::Code::Internal);
+        assert_eq!(injected_status(429).code(), tonic::Code::ResourceExhausted);
+        assert_eq!(injected_status(504).code(), tonic::Code::DeadlineExceeded);
+        assert_eq!(injected_status(400).code(), tonic::Code::InvalidArgument);
+        // The two non-inverse cases (read back as 504 and 503) and a 4xx
+        // without its own code (read back as 400).
+        assert_eq!(injected_status(408).code(), tonic::Code::DeadlineExceeded);
+        assert_eq!(injected_status(502).code(), tonic::Code::Unavailable);
+        assert_eq!(injected_status(422).code(), tonic::Code::InvalidArgument);
     }
 }

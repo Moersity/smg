@@ -537,7 +537,8 @@ struct EngineShared {
 }
 
 /// Fault hooks the admin API switches on: batches lost on the wire, delayed
-/// publishing, delayed admission, a frozen engine, a publisher restart.
+/// publishing, delayed admission, a frozen engine, a publisher restart, and
+/// requests answered with an error status, held back or cut mid-stream.
 #[derive(Default)]
 struct Faults {
     /// Event batches still to lose on the wire.
@@ -560,6 +561,50 @@ struct Faults {
     /// Publisher generation; a restart bumps it.
     generation: AtomicU64,
     restarts: AtomicU64,
+    /// The request fault, while one is armed.
+    fail: Mutex<Option<RequestFault>>,
+    /// Requests answered with the fault's status before admission.
+    failed_total: AtomicU64,
+    /// Streams cut with the fault's status after their first tokens, counted
+    /// by the worker paths where they end the stream (`Engine::cut_counter`).
+    cut_total: Arc<AtomicU64>,
+    /// Requests held back by the fault's stall.
+    stalled_total: AtomicU64,
+}
+
+/// A request fault the admin API arms: what the worker answers instead of
+/// serving, for how long, and whether before admission or after some output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RequestFault {
+    /// The HTTP status to answer (the gRPC worker maps it to a status code);
+    /// 0 serves the request after the stall.
+    pub status: u16,
+    /// How long the request is held before the answer.
+    pub stall: Duration,
+    /// Serve this many tokens, then cut the stream with `status`; `None`
+    /// answers before admission, so the request never counts as served.
+    pub after_tokens: Option<u32>,
+    /// How long the fault stays armed.
+    pub scope: FaultScope,
+}
+
+/// How long a request fault stays armed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FaultScope {
+    /// Until cleared.
+    Open,
+    /// The next N requests.
+    Requests(u32),
+    /// Every request until this instant.
+    Until(Instant),
+}
+
+/// What the armed request fault does to one request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Injected {
+    pub status: u16,
+    pub stall: Duration,
+    pub after_tokens: Option<u32>,
 }
 
 /// The hooks' current state.
@@ -573,6 +618,11 @@ pub(crate) struct FaultStatus {
     pub paused: bool,
     pub generation: u64,
     pub restarts: u64,
+    /// The armed request fault, if any.
+    pub fail: Option<RequestFault>,
+    pub failed_total: u64,
+    pub cut_total: u64,
+    pub stalled_total: u64,
 }
 
 /// What the engine itself would serve from cache for a prompt right now.
@@ -822,8 +872,81 @@ impl Engine {
         self.shared.resume.notify_one();
     }
 
+    /// Arm a request fault (`None` clears it).
+    pub(crate) fn fault_fail(&self, fault: Option<RequestFault>) {
+        *self
+            .shared
+            .faults
+            .fail
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = fault;
+    }
+
+    /// What the armed request fault does to the request arriving now; `None`
+    /// when no fault applies. A `Requests(n)` scope is spent by one, an
+    /// elapsed `Until` disarms the fault. A stall is counted here; a status
+    /// answered before admission is counted by the worker path that answers
+    /// it ([`Engine::record_failure`], after the stall), a cut where the stream
+    /// is actually cut (an output no longer than `after_tokens` is never cut).
+    pub(crate) fn inject(&self) -> Option<Injected> {
+        let faults = &self.shared.faults;
+        let mut armed = faults.fail.lock().unwrap_or_else(|p| p.into_inner());
+        let fault = (*armed)?;
+        let next_scope = match fault.scope {
+            FaultScope::Until(at) if Instant::now() >= at => {
+                *armed = None;
+                return None;
+            }
+            FaultScope::Requests(n) => n
+                .checked_sub(1)
+                .filter(|left| *left > 0)
+                .map(FaultScope::Requests),
+            scope => Some(scope),
+        };
+        *armed = next_scope.map(|scope| RequestFault { scope, ..fault });
+        drop(armed);
+        if !fault.stall.is_zero() {
+            faults.stalled_total.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(Injected {
+            status: fault.status,
+            stall: fault.stall,
+            after_tokens: fault.after_tokens,
+        })
+    }
+
+    /// The count of streams the request fault actually cut; the worker paths
+    /// bump it at the point where they end a stream with the fault's status.
+    pub(crate) fn cut_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.shared.faults.cut_total)
+    }
+
+    /// One request answered with the fault's status before admission; the
+    /// worker paths call it at the point where they return that status.
+    pub(crate) fn record_failure(&self) {
+        self.shared
+            .faults
+            .failed_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn fault_status(&self) -> FaultStatus {
         let f = &self.shared.faults;
+        // A timed fault whose deadline passed without another request reads as
+        // disarmed, as the next request would find it.
+        let fail = {
+            let mut armed = f.fail.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(RequestFault {
+                scope: FaultScope::Until(at),
+                ..
+            }) = *armed
+            {
+                if Instant::now() >= at {
+                    *armed = None;
+                }
+            }
+            *armed
+        };
         FaultStatus {
             drop_pending: f.drop_batches.load(Ordering::Relaxed),
             dropped_total: f.dropped_total.load(Ordering::Relaxed),
@@ -833,6 +956,10 @@ impl Engine {
             paused: f.paused.load(Ordering::Relaxed),
             generation: f.generation.load(Ordering::Relaxed),
             restarts: f.restarts.load(Ordering::Relaxed),
+            fail,
+            failed_total: f.failed_total.load(Ordering::Relaxed),
+            cut_total: f.cut_total.load(Ordering::Relaxed),
+            stalled_total: f.stalled_total.load(Ordering::Relaxed),
         }
     }
 
@@ -3064,6 +3191,90 @@ mod tests {
         );
         let status = engine.fault_status();
         assert_eq!((status.drop_pending, status.dropped_total), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn fail_hook_answers_the_next_n_requests_then_clears() {
+        let engine = live();
+        assert_eq!(engine.inject(), None, "nothing armed");
+        engine.fault_fail(Some(RequestFault {
+            status: 503,
+            stall: Duration::ZERO,
+            after_tokens: None,
+            scope: FaultScope::Requests(2),
+        }));
+        let injected = Injected {
+            status: 503,
+            stall: Duration::ZERO,
+            after_tokens: None,
+        };
+        assert_eq!(engine.inject(), Some(injected));
+        assert_eq!(
+            engine.fault_status().fail.map(|f| f.scope),
+            Some(FaultScope::Requests(1)),
+            "one request left"
+        );
+        assert_eq!(engine.inject(), Some(injected));
+        assert_eq!(engine.inject(), None, "spent");
+        let status = engine.fault_status();
+        assert_eq!(status.fail, None, "cleared once spent");
+        assert_eq!(
+            (status.failed_total, status.cut_total, status.stalled_total),
+            (0, 0, 0),
+            "a refusal is counted by the path that answers it"
+        );
+        engine.record_failure();
+        engine.record_failure();
+        assert_eq!(engine.fault_status().failed_total, 2);
+    }
+
+    #[tokio::test]
+    async fn fail_hook_timed_scope_elapses_and_cuts_count_apart() {
+        let engine = live();
+        engine.fault_fail(Some(RequestFault {
+            status: 500,
+            stall: Duration::from_millis(5),
+            after_tokens: Some(3),
+            scope: FaultScope::Until(Instant::now() + Duration::from_millis(100)),
+        }));
+        let injected = engine.inject().expect("armed");
+        assert_eq!(
+            (injected.status, injected.stall, injected.after_tokens),
+            (500, Duration::from_millis(5), Some(3))
+        );
+        assert!(engine.fault_status().fail.is_some(), "still armed");
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(
+            engine.fault_status().fail,
+            None,
+            "an elapsed fault reads as disarmed before the next request"
+        );
+        assert_eq!(engine.inject(), None, "elapsed");
+        let status = engine.fault_status();
+        assert_eq!(status.fail, None, "disarmed once elapsed");
+        assert_eq!(
+            (status.failed_total, status.cut_total, status.stalled_total),
+            (0, 0, 1),
+            "a cut is counted where the stream is cut, not when it is armed"
+        );
+        engine.cut_counter().fetch_add(1, Ordering::Relaxed);
+        assert_eq!(engine.fault_status().cut_total, 1);
+        // Open scope: every request until cleared.
+        engine.fault_fail(Some(RequestFault {
+            status: 429,
+            stall: Duration::ZERO,
+            after_tokens: None,
+            scope: FaultScope::Open,
+        }));
+        assert!(engine.inject().is_some());
+        assert!(engine.inject().is_some());
+        engine.fault_fail(None);
+        assert_eq!(engine.inject(), None, "cleared");
+        assert_eq!(
+            engine.fault_status().failed_total,
+            0,
+            "inject() counts no refusal of its own"
+        );
     }
 
     #[tokio::test]
