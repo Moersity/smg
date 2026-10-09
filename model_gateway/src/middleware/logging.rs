@@ -60,6 +60,7 @@ impl<B> MakeSpan<B> for RequestSpan {
             status_code = Empty,
             latency = Empty,
             error = Empty,
+            otel.status_code = Empty,
             module = "smg"
         );
 
@@ -153,6 +154,13 @@ impl<B> OnResponse<B> for ResponseLogger {
         span.record("status_code", status_code);
         // Use microseconds as integer to avoid format! string allocation
         span.record("latency", latency.as_micros() as u64);
+        // The span's status, so the trace backend can filter by outcome: a
+        // 5xx is the server's failure (as is a body that fails later, see
+        // `StreamFailureLogger`); anything else is left unset, as the HTTP
+        // server conventions have it.
+        if status.is_server_error() {
+            span.record("otel.status_code", "ERROR");
+        }
 
         // Log the response completion
         let _enter = span.enter();
@@ -199,6 +207,7 @@ impl OnFailure<ServerErrorsFailureClass> for StreamFailureLogger {
             // Already logged by ResponseLogger with status + latency.
             ServerErrorsFailureClass::StatusCode(_) => {}
             ServerErrorsFailureClass::Error(error) => {
+                span.record("otel.status_code", "ERROR");
                 let _enter = span.enter();
                 error!(
                     target: "smg::response",
