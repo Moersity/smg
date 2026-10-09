@@ -330,6 +330,9 @@ class RouterArgs:
     # Per-tenant token/request rate limiting
     tenant_rate_limit_enabled: bool = False
     tenant_rate_limit_config: str | None = None
+    # Heap profiles of the router process (a jemalloc-profiling build); appended
+    # last: positional callers bind the fields by position
+    jemalloc_prof_dir: str | None = None
 
     @staticmethod
     def add_cli_args(
@@ -366,6 +369,9 @@ class RouterArgs:
         logging_group = parser.add_argument_group("Logging", "Log output configuration")
         prometheus_group = parser.add_argument_group(
             "Prometheus Metrics", "Metrics export configuration"
+        )
+        profiling_group = parser.add_argument_group(
+            "Profiling", "Heap profiles of the router process"
         )
         request_group = parser.add_argument_group(
             "Request Handling", "Request timeout and ID configuration"
@@ -1406,6 +1412,17 @@ class RouterArgs:
             nargs="+",
             action="extend",
             help="Buckets for Prometheus duration metrics",
+        )
+        profiling_group.add_argument(
+            f"--{prefix}jemalloc-prof-dir",
+            type=str,
+            default=None,
+            help=(
+                "Directory where POST /heap_profile (an admin route) writes a jemalloc heap"
+                " profile of the router. Needs a build with the jemalloc-profiling feature,"
+                " started with _RJEM_MALLOC_CONF=prof:true,prof_active:true; unset, the route"
+                " answers 404"
+            ),
         )
 
         # Request handling configuration

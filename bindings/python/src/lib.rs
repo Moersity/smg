@@ -441,6 +441,7 @@ struct Router {
     prometheus_port: Option<u16>,
     prometheus_host: Option<String>,
     prometheus_duration_buckets: Option<Vec<f64>>,
+    jemalloc_prof_dir: Option<String>,
     request_timeout_secs: u64,
     shutdown_grace_period_secs: u64,
     request_id_headers: Option<Vec<String>>,
@@ -1028,6 +1029,7 @@ impl Router {
             .maybe_metrics(metrics)
             .maybe_trace(trace_config)
             .maybe_log_dir(self.log_dir.as_ref())
+            .maybe_jemalloc_prof_dir(self.jemalloc_prof_dir.as_ref())
             .maybe_log_level(self.log_level.as_ref())
             .maybe_request_id_headers(self.request_id_headers.clone())
             .trust_tenant_header(self.trust_tenant_header)
@@ -1282,6 +1284,7 @@ impl Router {
         priority_scheduler_tenant_metric_top_n = 32,
         tenant_rate_limit_enabled = false,
         tenant_rate_limit_config = None,
+        jemalloc_prof_dir = None,
         // Keyword-only, so it never takes a positional slot.
         *,
         discovery = None,
@@ -1470,6 +1473,7 @@ impl Router {
         priority_scheduler_tenant_metric_top_n: u32,
         tenant_rate_limit_enabled: bool,
         tenant_rate_limit_config: Option<String>,
+        jemalloc_prof_dir: Option<String>,
         discovery: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         // Two spellings of one choice: refuse both rather than pick one.
@@ -1550,6 +1554,7 @@ impl Router {
             prometheus_port,
             prometheus_host,
             prometheus_duration_buckets,
+            jemalloc_prof_dir,
             request_timeout_secs,
             shutdown_grace_period_secs,
             request_id_headers,
