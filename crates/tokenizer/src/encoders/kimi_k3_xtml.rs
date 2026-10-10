@@ -15,9 +15,8 @@
 //! `<|sep|>`, `<|end_of_msg|>` and media anchors with special tokens allowed,
 //! everything else — tag names, attribute pieces, message text of every role,
 //! reasoning, tool arguments, internal system messages — as ordinary BPE. A
-//! marker string inside message text therefore never becomes a control id
-//! (the one exception is the gateway's `<|media_pad|>` anchor, see below), and
-//! attribute pieces (`" role"`, `="`, value, `"`) are separate BPE units.
+//! marker string inside message text therefore never becomes a control id,
+//! and attribute pieces (`" role"`, `="`, value, `"`) are separate BPE units.
 //! `render_kimi_k3_xtml_prompt` reproduces that segmentation piece by piece
 //! for the tiktoken backend, which encodes it and hands the caller a deferred
 //! encode; [`apply_kimi_k3_xtml_with_effort_default`] is that prompt joined
@@ -33,7 +32,8 @@
 //! gateway passes content parts through (OpenAI format), each image part
 //! becomes one `<|media_pad|>` control anchor at its authored position, and
 //! prompt expansion replaces it — see `llm_multimodal::registry::kimi_k3`. A
-//! literal anchor inside string content is kept as a control segment too.
+//! literal anchor spelled inside message text stays text, as the checkpoint's
+//! own encoder keeps it.
 
 use std::collections::HashMap;
 
@@ -408,17 +408,12 @@ fn push_text(out: &mut Vec<PromptSegment>, text: &str) {
     }
 }
 
-/// Message text (`_append_text` in the reference): ordinary BPE, except that
-/// the gateway's `<|media_pad|>` anchors must survive as control tokens for
-/// prompt expansion, so the text is split around them.
+/// Message text (`_append_text` in the reference): ordinary BPE, special
+/// spellings included. A `<|media_pad|>` typed in a message stays text, as
+/// the checkpoint's own encoder keeps it; the anchors the media pipeline
+/// expands come from image parts only (`push_content`).
 fn push_message_text(out: &mut Vec<PromptSegment>, text: &str) {
-    let mut rest = text;
-    while let Some(pos) = rest.find(MEDIA_ANCHOR) {
-        push_text(out, &rest[..pos]);
-        push_control(out, MEDIA_ANCHOR);
-        rest = &rest[pos + MEDIA_ANCHOR.len()..];
-    }
-    push_text(out, rest);
+    push_text(out, text);
 }
 
 fn escape_attr_value(value: &str) -> String {
@@ -1203,20 +1198,24 @@ mod tests {
         assert_eq!(&segments[..expected.len()], &expected[..]);
     }
 
+    /// A `<|media_pad|>` spelling typed in message text stays text, as the
+    /// checkpoint's own encoder keeps it (it scans message text for no
+    /// marker and encodes it with special tokens disallowed); the anchor
+    /// segment the media pipeline expands comes from an image part only.
     #[test]
-    fn media_anchors_in_message_text_are_control_segments() {
+    fn media_anchor_spellings_in_message_text_stay_text() {
         let messages = vec![json!({"role": "user", "content": "see <|media_pad|> here"})];
         let segments = render_xtml(&messages, &params(Some(true), None), None)
             .unwrap()
             .segments;
         assert_eq!(
-            segments[7..10].to_vec(),
+            segments[7..9].to_vec(),
             vec![
-                PromptSegment::text("see "),
-                PromptSegment::control(MEDIA_ANCHOR),
-                PromptSegment::text(" here"),
+                PromptSegment::text("see <|media_pad|> here"),
+                PromptSegment::control(CLOSE_TOKEN),
             ]
         );
+        assert!(!control_texts(&segments).contains(&MEDIA_ANCHOR));
     }
 
     #[test]
