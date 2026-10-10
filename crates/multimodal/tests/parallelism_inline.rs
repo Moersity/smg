@@ -9,14 +9,13 @@ use llm_multimodal::{
 };
 
 #[cfg(target_os = "linux")]
-fn thread_names() -> Vec<String> {
-    std::fs::read_dir("/proc/self/task")
-        .expect("read Linux thread directory")
+fn thread_names() -> std::io::Result<Vec<String>> {
+    std::fs::read_dir("/proc/self/task")?
         .map(|task| {
-            let task = task.expect("read thread entry");
-            std::fs::read_to_string(task.path().join("comm")).expect("read thread name")
+            let task = task?;
+            let name = std::fs::read_to_string(task.path().join("comm"))?;
+            Ok(name.trim().to_string())
         })
-        .map(|name| name.trim().to_string())
         .collect()
 }
 
@@ -32,7 +31,7 @@ fn inline_mode_preprocesses_without_creating_threads() {
         "this test must own the process's mode"
     );
     #[cfg(target_os = "linux")]
-    let before = thread_names();
+    let before = thread_names().expect("read Linux thread names");
     let processor = Qwen2VLProcessor::new();
     let config = PreProcessorConfig::default();
     let out = processor
@@ -45,7 +44,7 @@ fn inline_mode_preprocesses_without_creating_threads() {
     {
         use llm_multimodal::vision::execution::POOL_THREAD_NAME_PREFIX;
 
-        let after = thread_names();
+        let after = thread_names().expect("read Linux thread names");
         assert!(
             !after
                 .iter()
