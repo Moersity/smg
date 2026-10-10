@@ -231,6 +231,7 @@ mod tests {
                 description: None,
                 parameters,
                 strict: None,
+                extra: Default::default(),
             },
         }
     }
