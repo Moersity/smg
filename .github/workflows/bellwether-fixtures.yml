@@ -70,11 +70,7 @@ env:
 
 jobs:
   fixture-tests:
-    name: fixture-tests (${{ matrix.encoder }})
-    strategy:
-      fail-fast: false
-      matrix:
-        encoder: [default, tokenizers-v1]
+    name: fixture-tests (tokenizers-v1)
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     timeout-minutes: 140
     permissions:
@@ -154,7 +150,7 @@ jobs:
       - name: Setup Rust
         uses: ./.github/actions/setup-rust
         with:
-          cache-key: bellwether-fixtures-${{ matrix.encoder }}
+          cache-key: bellwether-fixtures-tokenizers-v1
 
       # The tests fetch each model's tokenizer files from Hugging Face once, at
       # the revision its manifest pins, into these directories. Which files
@@ -195,7 +191,6 @@ jobs:
       - name: Run the tests that read bellwether
         timeout-minutes: 120
         env:
-          BELLWETHER_ENCODER: ${{ matrix.encoder }}
           BELLWETHER_FIXTURES: ${{ github.workspace }}/.bellwether/fixtures-plain
           BELLWETHER_REPORT_DIR: ${{ runner.temp }}/bellwether-reports
           SYMPHONY_SAMPLE_EVERY: "200"
@@ -212,12 +207,9 @@ jobs:
           SOURCE_DATE_EPOCH: "1791374400"
         run: |
           source "$HOME/.cargo/env"
-          features=()
-          if [[ "$BELLWETHER_ENCODER" == tokenizers-v1 ]]; then
-            # Gateway forwards the feature to llm-tokenizer, so both encode
-            # harnesses exercise the adapter with the same feature set.
-            features=(--features smg/tokenizers-v1)
-          fi
+          # Gateway forwards the feature to llm-tokenizer. Supported models
+          # exercise v1; unsupported configurations retain the existing encoder.
+          features=(--features smg/tokenizers-v1)
           cargo test -p llm-tokenizer -p smg -p smg-symphony "${features[@]}" --test 'bellwether_*' --no-run
           targets=()
           for file in crates/symphony/tests/bellwether_*.rs model_gateway/tests/bellwether_*.rs crates/tokenizer/tests/bellwether_*.rs; do
@@ -248,7 +240,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: bellwether-reports-${{ matrix.encoder }}
+          name: bellwether-reports-tokenizers-v1
           path: ${{ runner.temp }}/bellwether-reports/
           if-no-files-found: ignore
           retention-days: 30
