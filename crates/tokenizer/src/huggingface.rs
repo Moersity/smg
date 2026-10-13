@@ -1020,6 +1020,10 @@ impl Decoder for HuggingFaceTokenizer {
     }
 
     fn decode(&self, token_ids: &[TokenIdType], skip_special_tokens: bool) -> Result<String> {
+        #[cfg(feature = "tokenizers-v1")]
+        if let Some(table) = &self.byte_level {
+            return Ok(table.decode(token_ids, skip_special_tokens));
+        }
         self.tokenizer
             .decode(token_ids, skip_special_tokens)
             .map_err(|e| Error::msg(format!("Decoding failed: {e}")))
