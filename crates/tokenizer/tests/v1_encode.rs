@@ -267,6 +267,45 @@ fn both_cache_levels_preserve_ids_on_hits_and_changing_suffixes() {
     }
 }
 
+/// Long cache batches preserve IDs and ordering under the gateway's outer pool.
+#[test]
+fn cached_long_batch_matches_reference_inside_rayon_pool() {
+    let reference = fixture();
+    let ours = Arc::new(HuggingFaceTokenizer::from_tokenizer(reference.clone()));
+    assert_eq!(ours.uses_v1_encoder(), cfg!(feature = "tokenizers-v1"));
+    let cached = CachedTokenizer::new(
+        ours,
+        CacheConfig {
+            enable_l0: false,
+            enable_l1: false,
+            ..Default::default()
+        },
+    );
+    let texts = ["hello 中文🙂 ".repeat(2048), "world café ".repeat(2048)];
+    let inputs: Vec<_> = texts.iter().map(String::as_str).collect();
+    assert!(inputs.iter().all(|text| text.len() >= 16 * 1024));
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .expect("outer pool");
+    for specials in [false, true] {
+        let actual = pool.install(|| {
+            cached
+                .encode_batch(&inputs, specials)
+                .expect("cached batch")
+        });
+        for (text, actual) in inputs.iter().zip(actual) {
+            assert_eq!(
+                actual.token_ids(),
+                reference
+                    .encode(*text, specials)
+                    .expect("reference")
+                    .get_ids()
+            );
+        }
+    }
+}
+
 /// Run explicitly with the four pinned model directories from the benchmark.
 #[test]
 #[ignore = "requires SMG_V1_TOKENIZER_DIRS (comma-separated tokenizer directories)"]

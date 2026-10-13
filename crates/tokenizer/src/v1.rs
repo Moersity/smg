@@ -147,7 +147,10 @@ impl Encoder for V1Encoder {
         // The borrowed serial API avoids copying input and assembling a batch
         // handle. Small inputs cannot benefit from internal splitting; longer
         // inputs use the general API when internal parallelism is requested.
+        // CachedTokenizer already fans out on Rayon workers; keep those calls
+        // serial instead of nesting the v1 pool inside the outer batch.
         if input.len() < 16 * 1024
+            || rayon::current_thread_index().is_some()
             || !tokenizers_v1::parallelism::get_parallelism()
             || tokenizers_v1::parallelism::num_threads() == 1
         {

@@ -120,6 +120,13 @@ struct AddedTokenConfig {
 impl HuggingFaceTokenizer {
     /// Whether this tokenizer uses the opt-in tokenizers v1 encode pipeline.
     /// Unsupported configurations retain the existing encode path.
+    #[cfg_attr(
+        not(feature = "tokenizers-v1"),
+        expect(
+            clippy::unused_self,
+            reason = "keep the instance API identical across features"
+        )
+    )]
     pub fn uses_v1_encoder(&self) -> bool {
         #[cfg(feature = "tokenizers-v1")]
         {
