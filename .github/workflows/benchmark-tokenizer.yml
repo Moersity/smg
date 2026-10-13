@@ -4,6 +4,9 @@ on:
   push:
     branches: [ main ]
     paths:
+      - '.github/workflows/benchmark-tokenizer.yml'
+      - 'model_gateway/Cargo.toml'
+      - 'Cargo.toml'
       - 'model_gateway/benches/tokenizer_benchmark.rs'
       - 'crates/tokenizer/**'
       - '!crates/tokenizer/**/tests/**'
@@ -12,6 +15,9 @@ on:
   pull_request:
     branches: [ main ]
     paths:
+      - '.github/workflows/benchmark-tokenizer.yml'
+      - 'model_gateway/Cargo.toml'
+      - 'Cargo.toml'
       - 'model_gateway/benches/tokenizer_benchmark.rs'
       - 'crates/tokenizer/**'
       - '!crates/tokenizer/**/tests/**'
@@ -47,13 +53,13 @@ jobs:
         with:
           # Bench-profile artifacts; kept apart from the debug-profile cache
           # every other job saves under the default key.
-          cache-key: rust-cache-bench-tokenizer
+          cache-key: rust-cache-bench-tokenizer-v1
 
       - name: Run benchmark
         timeout-minutes: 60
         run: |
           source "$HOME/.cargo/env"
-          cargo bench --bench tokenizer_benchmark 2>&1 | tee benchmark_output.txt
+          cargo bench -p smg --features tokenizers-v1 --bench tokenizer_benchmark 2>&1 | tee benchmark_output.txt
 
       - name: Upload benchmark results
         if: always()
@@ -72,7 +78,7 @@ jobs:
       - name: Summary
         if: always()
         run: |
-          echo "## Tokenizer Benchmark" >> $GITHUB_STEP_SUMMARY
+          echo "## Tokenizer Benchmark (tokenizers-v1 enabled)" >> $GITHUB_STEP_SUMMARY
           if [ -f benchmark_output.txt ]; then
             echo '```' >> $GITHUB_STEP_SUMMARY
             tail -100 benchmark_output.txt >> $GITHUB_STEP_SUMMARY
