@@ -197,6 +197,13 @@ opt-level = 3
 [profile.release.package.tokenizers]
 opt-level = 3
 
+# v1 moves the encode hot path out of the tokenizers umbrella crate.
+[profile.release.package.tk-encode]
+opt-level = 3
+
+[profile.release.package.bitcannon]
+opt-level = 3
+
 [profile.release.package.aho-corasick]
 opt-level = 3
 

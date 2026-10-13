@@ -16,6 +16,10 @@ categories = ["text-processing", "parsing"]
 [lib]
 name = "llm_tokenizer"
 
+[features]
+# Opt-in encode acceleration; the established decoder and metadata APIs stay on 0.23.
+tokenizers-v1 = ["dep:tokenizers-v1"]
+
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true
@@ -43,6 +47,7 @@ rayon = "1.12"
 thread_local = "1.1"
 tiktoken-rs = "0.12"
 tokenizers = "0.23.1"
+tokenizers-v1 = { package = "tokenizers", version = "=1.0.0-rc.2", optional = true, default-features = false, features = ["regex"] }
 unicode-normalization = "0.1"
 
 [dev-dependencies]
@@ -75,4 +80,8 @@ harness = false
 
 [[bench]]
 name = "byte_fallback_invalid_run"
+harness = false
+
+[[bench]]
+name = "v1_compare"
 harness = false

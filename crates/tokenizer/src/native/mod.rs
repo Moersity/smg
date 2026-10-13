@@ -896,7 +896,7 @@ mod tests {
                 texts.insert(texts.len() / 2, declined.to_string());
             }
             let inputs: Vec<&str> = texts.iter().map(String::as_str).collect();
-            let batch = tokenizer.encode_batch(&inputs, false).expect("batch");
+            let batch = tokenizer.encode_batch(&inputs, false).expect(shape.name);
             assert_eq!(batch.len(), inputs.len(), "{}", shape.name);
             for (input, encoding) in inputs.iter().zip(&batch) {
                 let single = tokenizer.encode(input, false).expect("encode");
@@ -906,7 +906,7 @@ mod tests {
                     "{}: {input:?}",
                     shape.name
                 );
-                if shape.nfc && *input == declined {
+                if shape.nfc && *input == declined && !tokenizer.uses_v1_encoder() {
                     assert!(
                         matches!(encoding, Encoding::Hf(_)),
                         "{}: the declined input takes the tokenizers path",

@@ -17,6 +17,8 @@ pub mod sequence;
 pub mod stop;
 pub mod stream;
 pub mod traits;
+#[cfg(feature = "tokenizers-v1")]
+mod v1;
 
 pub mod chat_template;
 pub mod huggingface;

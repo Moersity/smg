@@ -56,6 +56,8 @@ pub struct HuggingFaceTokenizer {
     /// The direct encode path for byte-level BPE tokenizers of the common
     /// shape (see `native`); `None` keeps every encode in `tokenizers`.
     native: Option<NativeEncoder>,
+    #[cfg(feature = "tokenizers-v1")]
+    v1: Option<crate::v1::V1Encoder>,
     has_byte_fallback: bool,
     /// The byte each `<0xHH>` token stands for, indexed by id (see
     /// [`byte_fallback_values`]); empty unless the decoder has ByteFallback.
@@ -116,6 +118,19 @@ struct AddedTokenConfig {
 }
 
 impl HuggingFaceTokenizer {
+    /// Whether this tokenizer uses the opt-in tokenizers v1 encode pipeline.
+    /// Unsupported configurations retain the existing encode path.
+    pub fn uses_v1_encoder(&self) -> bool {
+        #[cfg(feature = "tokenizers-v1")]
+        {
+            self.v1.is_some()
+        }
+        #[cfg(not(feature = "tokenizers-v1"))]
+        {
+            false
+        }
+    }
+
     /// Create a tokenizer from a HuggingFace tokenizer JSON file
     pub fn from_file(file_path: &str) -> Result<Self> {
         // Try to auto-discover chat template if not explicitly provided
@@ -333,6 +348,16 @@ impl HuggingFaceTokenizer {
             .map(detect_renderer_from_config)
             .unwrap_or(Renderer::Jinja);
 
+        #[cfg(feature = "tokenizers-v1")]
+        let v1 =
+            crate::v1::V1Encoder::from_tokenizer(&tokenizer, Self::BPE_WORDS_CACHED_PER_THREAD);
+        #[cfg(feature = "tokenizers-v1")]
+        let native = if v1.is_none() {
+            NativeEncoder::from_tokenizer(&tokenizer)
+        } else {
+            None
+        };
+        #[cfg(not(feature = "tokenizers-v1"))]
         let native = NativeEncoder::from_tokenizer(&tokenizer);
         Self::bound_bpe_cache(&mut tokenizer, Self::bpe_words_cached(native.as_ref()));
         let has_byte_fallback = tokenizer.get_decoder().is_some_and(has_byte_fallback);
@@ -340,6 +365,8 @@ impl HuggingFaceTokenizer {
         Ok(HuggingFaceTokenizer {
             byte_level: ByteLevelTable::build(&tokenizer),
             native,
+            #[cfg(feature = "tokenizers-v1")]
+            v1,
             tokenizer,
             special_tokens,
             vocab,
@@ -484,6 +511,16 @@ impl HuggingFaceTokenizer {
 
     /// Create from an existing HuggingFace tokenizer
     pub fn from_tokenizer(mut tokenizer: HfTokenizer) -> Self {
+        #[cfg(feature = "tokenizers-v1")]
+        let v1 =
+            crate::v1::V1Encoder::from_tokenizer(&tokenizer, Self::BPE_WORDS_CACHED_PER_THREAD);
+        #[cfg(feature = "tokenizers-v1")]
+        let native = if v1.is_none() {
+            NativeEncoder::from_tokenizer(&tokenizer)
+        } else {
+            None
+        };
+        #[cfg(not(feature = "tokenizers-v1"))]
         let native = NativeEncoder::from_tokenizer(&tokenizer);
         Self::bound_bpe_cache(&mut tokenizer, Self::bpe_words_cached(native.as_ref()));
         let special_tokens = Self::extract_special_tokens(&tokenizer, &ConfigTokens::default());
@@ -498,6 +535,8 @@ impl HuggingFaceTokenizer {
         HuggingFaceTokenizer {
             byte_level: ByteLevelTable::build(&tokenizer),
             native,
+            #[cfg(feature = "tokenizers-v1")]
+            v1,
             tokenizer,
             special_tokens,
             vocab,
@@ -634,6 +673,10 @@ struct TokenizerConfigResult {
 
 impl Encoder for HuggingFaceTokenizer {
     fn encode(&self, input: &str, add_special_tokens: bool) -> Result<Encoding> {
+        #[cfg(feature = "tokenizers-v1")]
+        if let Some(v1) = &self.v1 {
+            return v1.encode(input, add_special_tokens);
+        }
         // The direct path accepts no post-processor that adds tokens, so a
         // request for special tokens gets the same ids and is served too.
         if let Some(ids) = self
@@ -650,6 +693,10 @@ impl Encoder for HuggingFaceTokenizer {
     }
 
     fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>> {
+        #[cfg(feature = "tokenizers-v1")]
+        if let Some(v1) = &self.v1 {
+            return v1.encode_batch(inputs, add_special_tokens);
+        }
         // A batch takes the path a single input takes: the direct encoder when
         // the vocabulary has one (an input it declines goes through the
         // `tokenizers` path on its own), so a batch never runs on the model
