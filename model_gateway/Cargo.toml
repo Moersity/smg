@@ -50,10 +50,6 @@ crate-type = ["rlib"]
 name = "smg"
 path = "src/main.rs"
 
-[[bin]]
-name = "amg"
-path = "src/main.rs"
-
 [dependencies]
 # Workspace dependencies (simple)
 anyhow.workspace = true

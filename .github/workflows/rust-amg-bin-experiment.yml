@@ -1,0 +1,128 @@
+name: Rust AMG Bin Experiment
+
+on:
+  push:
+    branches: [cl/lixiang/ci-rust-experiment]
+    paths: ['.github/workflows/rust-amg-bin-experiment.yml', 'model_gateway/Cargo.toml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: rust-amg-bin-experiment-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    if: github.repository == 'Moersity/smg'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: 'true'
+      SCCACHE_IDLE_TIMEOUT: '0'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: fork-amg-bin-experiment
+      - name: Record resources and prepare manifests
+        run: |
+          lscpu
+          free -h
+          df -h .
+          mkdir -p results
+          cp model_gateway/Cargo.toml results/Cargo.after.toml
+          python3 - <<'PY'
+          from pathlib import Path
+          after = Path('results/Cargo.after.toml').read_text()
+          assert 'name = "amg"' not in after
+          before = after.replace('[dependencies]\n', '[[bin]]\nname = "amg"\npath = "src/main.rs"\n\n[dependencies]\n', 1)
+          Path('results/Cargo.before.toml').write_text(before)
+          PY
+          printf 'variant,scenario,iteration,seconds,exit_code\n' > results/timings.csv
+          cat > results/measure.sh <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          variant=$1 scenario=$2 iteration=$3
+          shift 3
+          cp "results/Cargo.$variant.toml" model_gateway/Cargo.toml
+          trap 'cp results/Cargo.after.toml model_gateway/Cargo.toml' EXIT
+          if [[ $scenario == rebuild ]]; then
+            # Remove only the bin test fingerprints. The shared libraries,
+            # source files, profile and toolchain remain warm and identical.
+            python3 - <<'PY'
+          from pathlib import Path
+          import shutil
+          dirs = {p.parent for p in Path('target/debug/.fingerprint').glob('smg-*/test-bin-*')}
+          for directory in dirs:
+              shutil.rmtree(directory)
+          print('Invalidated bin test fingerprints:', len(dirs))
+          PY
+          fi
+          set +e
+          /usr/bin/time -v -o "results/$variant-$scenario-$iteration-resources.txt" \
+            -f "experiment,$variant,$scenario,$iteration,%e,%x" \
+            cargo test --locked -p smg "$@" 2>&1 | tee "results/$variant-$scenario-$iteration.log"
+          code=${PIPESTATUS[0]}
+          set -e
+          sed -n 's/^experiment,//p' "results/$variant-$scenario-$iteration-resources.txt" >> results/timings.csv
+          if [[ -f target/cargo-timings/cargo-timing.html ]]; then
+            cp target/cargo-timings/cargo-timing.html "results/$variant-$scenario-$iteration.html"
+          fi
+          exit "$code"
+          SH
+      - name: Warm shared libraries and both bin test targets
+        run: bash results/measure.sh before warm 0 --lib --bins --no-run --timings
+      - name: Verify gateway and CLI tests before removal
+        timeout-minutes: 30
+        run: bash results/measure.sh before tests 0 --lib --bins
+      - name: Paired bin rebuild measurements 1
+        run: |
+          bash results/measure.sh before rebuild 1 --bins --no-run --timings
+          bash results/measure.sh after rebuild 1 --bins --no-run --timings
+      - name: Paired bin rebuild measurements 2 in reverse order
+        run: |
+          bash results/measure.sh after rebuild 2 --bins --no-run --timings
+          bash results/measure.sh before rebuild 2 --bins --no-run --timings
+      - name: Paired bin rebuild measurements 3
+        run: |
+          bash results/measure.sh before rebuild 3 --bins --no-run --timings
+          bash results/measure.sh after rebuild 3 --bins --no-run --timings
+      - name: Verify gateway and CLI tests after removal
+        timeout-minutes: 30
+        run: bash results/measure.sh after tests 0 --lib --bins
+      - name: Summarize paired results
+        if: always()
+        run: |
+          sccache --show-stats
+          free -h
+          df -h .
+          du -sh target || true
+          python3 - <<'PY'
+          import csv, os, statistics
+          from pathlib import Path
+          path = Path('results/timings.csv')
+          rows = list(csv.DictReader(path.open())) if path.exists() else []
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
+              out.write('Same runner, shared warmed dependencies; bin test fingerprints invalidated before every measurement. This measures bin test compilation, not whole-CI wall time.\n\n')
+              out.write('| Variant | Scenario | Median seconds |\n|---|---|---:|\n')
+              for variant in ('before', 'after'):
+                  for scenario in ('warm', 'tests', 'rebuild'):
+                      times = [float(r['seconds']) for r in rows if r['variant'] == variant and r['scenario'] == scenario and r['exit_code'] == '0']
+                      if times:
+                          out.write(f'| {variant} | {scenario} | {statistics.median(times):.2f} |\n')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rust-amg-bin-experiment
+          path: results/
+          retention-days: 7
