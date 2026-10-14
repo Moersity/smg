@@ -56,11 +56,24 @@ jobs:
           set -euo pipefail
           variant=$1 scenario=$2 iteration=$3
           shift 3
+          args=("$@")
           # build.rs watches Cargo.toml and emits a new BUILD_TIME whenever
           # its mtime changes. Preserve that mtime to isolate bin target
           # duplication from recompiling the whole gateway library.
-          cp -p "results/Cargo.$variant.toml" model_gateway/Cargo.toml
-          trap 'cp -p results/Cargo.after.toml model_gateway/Cargo.toml' EXIT
+          if [[ $scenario == rebuild ]]; then
+            # Keep the same manifest throughout paired measurements. With
+            # no integration targets selected, --bin smg is exactly the
+            # bin-test target set produced by removing the amg definition.
+            # The final regression step verifies the real removed manifest.
+            cp -p results/Cargo.before.toml model_gateway/Cargo.toml
+            if [[ $variant == after ]]; then
+              args=(--bin smg --no-run --timings)
+            fi
+          else
+            cp -p "results/Cargo.$variant.toml" model_gateway/Cargo.toml
+          fi
+          # Leave the warmed baseline manifest in place between measurements;
+          # restoring the candidate every time would invalidate build.rs.
           if [[ $scenario == rebuild ]]; then
             # Remove only the bin test fingerprints. The shared libraries,
             # source files, profile and toolchain remain warm and identical.
@@ -76,7 +89,7 @@ jobs:
           set +e
           /usr/bin/time -v -o "results/$variant-$scenario-$iteration-resources.txt" \
             -f "experiment,$variant,$scenario,$iteration,%e,%x" \
-            cargo test --locked -p smg "$@" 2>&1 | tee "results/$variant-$scenario-$iteration.log"
+            cargo test --locked -p smg "${args[@]}" 2>&1 | tee "results/$variant-$scenario-$iteration.log"
           code=${PIPESTATUS[0]}
           set -e
           sed -n 's/^experiment,//p' "results/$variant-$scenario-$iteration-resources.txt" >> results/timings.csv
@@ -134,7 +147,7 @@ jobs:
           path = Path('results/timings.csv')
           rows = list(csv.DictReader(path.open())) if path.exists() else []
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
-              out.write('Same runner, shared warmed dependencies; bin test fingerprints invalidated before every measurement. This measures bin test compilation, not whole-CI wall time.\n\n')
+              out.write('Same runner, shared warmed dependencies; bin test fingerprints invalidated before every measurement. Baseline --bins versus --bin smg isolates the target-set effect without changing build.rs inputs; the removed manifest is tested separately. This measures bin test compilation, not whole-CI wall time.\n\n')
               out.write('| Variant | Scenario | Median seconds |\n|---|---|---:|\n')
               for variant in ('before', 'after'):
                   for scenario in ('warm', 'tests', 'rebuild'):
