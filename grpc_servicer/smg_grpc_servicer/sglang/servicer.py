@@ -391,26 +391,30 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
 
         task = asyncio.create_task(run_health_check())
 
-        # Wait for response with timeout
-        tic = time.time()
-        while time.time() < tic + HEALTH_CHECK_TIMEOUT:
-            await asyncio.sleep(1)
-            # Check if we got a response from scheduler
-            if self.request_manager.last_receive_tstamp > tic:
-                task.cancel()
-                # Clean up health check state
-                self.request_manager._cleanup_request_state(rid)
-                return sglang_scheduler_pb2.HealthCheckResponse(
-                    healthy=True, message="Health check passed"
-                )
+        try:
+            # Wait for response with timeout
+            tic = time.time()
+            while time.time() < tic + HEALTH_CHECK_TIMEOUT:
+                await asyncio.sleep(1)
+                # Check if we got a response from scheduler
+                if self.request_manager.last_receive_tstamp > tic:
+                    return sglang_scheduler_pb2.HealthCheckResponse(
+                        healthy=True, message="Health check passed"
+                    )
 
-        # Timeout - server not responding
-        task.cancel()
-        self.request_manager._cleanup_request_state(rid)
-        logger.warning(f"Health check timeout after {HEALTH_CHECK_TIMEOUT}s")
-        return sglang_scheduler_pb2.HealthCheckResponse(
-            healthy=False, message=f"Health check timeout after {HEALTH_CHECK_TIMEOUT}s"
-        )
+            # Timeout - server not responding
+            logger.warning(f"Health check timeout after {HEALTH_CHECK_TIMEOUT}s")
+            return sglang_scheduler_pb2.HealthCheckResponse(
+                healthy=False, message=f"Health check timeout after {HEALTH_CHECK_TIMEOUT}s"
+            )
+        finally:
+            # The RPC may be cancelled before a scheduler response or the timeout.
+            # Reap its probe before removing state that the probe can still access.
+            task.cancel()
+            try:
+                await asyncio.gather(task, return_exceptions=True)
+            finally:
+                self.request_manager._cleanup_request_state(rid)
 
     async def Abort(
         self,
