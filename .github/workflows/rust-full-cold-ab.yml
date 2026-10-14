@@ -1,0 +1,79 @@
+name: Rust Full Cold and Warm AB
+
+on:
+  push:
+    branches: [cl/lixiang/ci-rust-experiment]
+    paths: ['.github/workflows/rust-full-cold-ab.yml', 'scripts/ci_rust_full_ab.py']
+  workflow_dispatch:
+    inputs:
+      warm:
+        description: 'Also measure three warmed source-change pairs'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: rust-full-ab-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  paired:
+    if: github.repository == 'Moersity/smg'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install community compiler and test prerequisites
+        run: |
+          bash scripts/ci_install_rust.sh
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          lscpu
+          free -h
+          df -h .
+      - name: Prepare identical source revisions
+        run: python3 scripts/ci_rust_full_ab.py prepare
+      - name: Cold baseline full target build and tests
+        run: python3 scripts/ci_rust_full_ab.py run --variant before --scenario cold
+      - name: Cold removed-amg full target build and tests
+        run: python3 scripts/ci_rust_full_ab.py run --variant after --scenario cold
+      - name: Warm unchanged target comparison
+        if: inputs.warm
+        run: |
+          python3 scripts/ci_rust_full_ab.py run --variant before --scenario unchanged
+          python3 scripts/ci_rust_full_ab.py run --variant after --scenario unchanged
+      - name: Source change pair 1
+        if: inputs.warm
+        run: |
+          python3 scripts/ci_rust_full_ab.py run --variant before --scenario changed --iteration 1
+          python3 scripts/ci_rust_full_ab.py run --variant after --scenario changed --iteration 1
+      - name: Source change pair 2 in reverse order
+        if: inputs.warm
+        run: |
+          python3 scripts/ci_rust_full_ab.py run --variant after --scenario changed --iteration 2
+          python3 scripts/ci_rust_full_ab.py run --variant before --scenario changed --iteration 2
+      - name: Source change pair 3
+        if: inputs.warm
+        run: |
+          python3 scripts/ci_rust_full_ab.py run --variant before --scenario changed --iteration 3
+          python3 scripts/ci_rust_full_ab.py run --variant after --scenario changed --iteration 3
+      - name: Publish samples and resources
+        if: always()
+        run: |
+          python3 scripts/ci_rust_full_ab.py summarize
+          free -h
+          df -h .
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rust-full-ab
+          path: ${{ runner.temp }}/smg-full-rust-ab/results/
+          retention-days: 7
