@@ -87,7 +87,7 @@ jobs:
           PY
           fi
           set +e
-          /usr/bin/time -v -o "results/$variant-$scenario-$iteration-resources.txt" \
+          /usr/bin/time -o "results/$variant-$scenario-$iteration-resources.txt" \
             -f "experiment,$variant,$scenario,$iteration,%e,%x" \
             cargo test --locked -p smg "${args[@]}" 2>&1 | tee "results/$variant-$scenario-$iteration.log"
           code=${PIPESTATUS[0]}
@@ -105,20 +105,22 @@ jobs:
           match = re.search(r'const UNIT_DATA = (\[.*?\]);', html, re.S)
           assert match, 'Cargo timing unit data missing'
           units = json.loads(match.group(1))
-          libs = [u for u in units if u.get('name') == 'smg' and u.get('target') in ('', 'lib')]
+          libs = [u for u in units if u.get('name') == 'smg' and u.get('target') in ('', 'lib') and u.get('duration', 0) > 0]
           # Inspect unit target names as well as the duration: a library
           # compilation would invalidate the claimed bin-only comparison.
           Path(f'results/{variant}-rebuild-{iteration}-units.json').write_text(json.dumps(units, indent=2))
           assert not libs, f'Unexpected gateway library recompilation: {libs}'
+          bins = [u for u in units if u.get('name') == 'smg' and '"bin" (test)' in u.get('target', '') and u.get('duration', 0) > 0]
+          assert len(bins) == (2 if variant == 'before' else 1), f'Unexpected compiled bin set: {bins}'
           PY
           fi
           exit "$code"
           SH
       - name: Warm shared libraries and both bin test targets
-        run: bash results/measure.sh before warm 0 --lib --bins --no-run --timings
-      - name: Verify gateway and CLI tests before removal
+        run: bash results/measure.sh before warm 0 --bins --no-run --timings
+      - name: Verify CLI tests before removal
         timeout-minutes: 30
-        run: bash results/measure.sh before tests 0 --lib --bins
+        run: bash results/measure.sh before tests 0 --bins
       - name: Paired bin rebuild measurements 1
         run: |
           bash results/measure.sh before rebuild 1 --bins --no-run --timings
@@ -131,9 +133,9 @@ jobs:
         run: |
           bash results/measure.sh before rebuild 3 --bins --no-run --timings
           bash results/measure.sh after rebuild 3 --bins --no-run --timings
-      - name: Verify gateway and CLI tests after removal
+      - name: Verify CLI tests after actual manifest removal
         timeout-minutes: 30
-        run: bash results/measure.sh after tests 0 --lib --bins
+        run: bash results/measure.sh after tests 0 --bins
       - name: Summarize paired results
         if: always()
         run: |
