@@ -1,0 +1,96 @@
+name: Rust Fuzz Profile Experiment
+
+on:
+  push:
+    branches: [cl/lixiang/ci-rust-experiment]
+    paths: ['.github/workflows/rust-fuzz-profile-experiment.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-fuzz-profile-experiment-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  compare:
+    if: github.repository == 'Moersity/smg'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Record environment and prepare comparison
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal
+          rustc -Vv
+          lscpu
+          free -h
+          df -h .
+          mkdir -p results
+          printf 'profile,scenario,iteration,seconds,exit_code\n' > results/timings.csv
+          cat > results/measure.sh <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          profile=$1 scenario=$2 iteration=$3
+          shift 3
+          configs=()
+          if [[ $profile == optimized ]]; then
+            configs=(--config 'profile.test.package.smg-radix-tree.opt-level=1' --config 'profile.test.package.kv-index.opt-level=1')
+          fi
+          export CARGO_TARGET_DIR="$PWD/target/$profile"
+          set +e
+          /usr/bin/time -f "$profile,$scenario,$iteration,%e,%x" -o results/one.csv \
+            cargo "${configs[@]}" test --locked "$@" 2>&1 | tee "results/$profile-$scenario-$iteration.log"
+          code=${PIPESTATUS[0]}
+          set -e
+          tail -1 results/one.csv >> results/timings.csv
+          exit "$code"
+          SH
+      - name: Build baseline targets
+        run: bash results/measure.sh baseline build 0 -p smg-radix-tree -p kv-index --no-run
+      - name: Build optimized targets with debug assertions
+        run: bash results/measure.sh optimized build 0 -p smg-radix-tree -p kv-index --no-run
+      - name: Run all affected targets in both configurations
+        run: |
+          bash results/measure.sh baseline regression 0 -p smg-radix-tree -p kv-index
+          bash results/measure.sh optimized regression 0 -p smg-radix-tree -p kv-index
+      - name: Paired fuzz measurements 1
+        run: |
+          bash results/measure.sh baseline fuzz 1 -p smg-radix-tree --test fuzz_differential
+          bash results/measure.sh optimized fuzz 1 -p smg-radix-tree --test fuzz_differential
+      - name: Paired fuzz measurements 2 in reverse order
+        run: |
+          bash results/measure.sh optimized fuzz 2 -p smg-radix-tree --test fuzz_differential
+          bash results/measure.sh baseline fuzz 2 -p smg-radix-tree --test fuzz_differential
+      - name: Paired fuzz measurements 3
+        run: |
+          bash results/measure.sh baseline fuzz 3 -p smg-radix-tree --test fuzz_differential
+          bash results/measure.sh optimized fuzz 3 -p smg-radix-tree --test fuzz_differential
+      - name: Summarize measurements
+        if: always()
+        run: |
+          du -sh target/* || true
+          df -h .
+          python3 - <<'PY'
+          import csv, os, statistics
+          rows = list(csv.DictReader(open('results/timings.csv')))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
+              out.write('Same runner and test seeds. opt-level=1 only for smg-radix-tree and kv-index; debug assertions and overflow checks stay enabled.\n\n')
+              out.write('| Profile | Scenario | Median seconds |\n|---|---|---:|\n')
+              for profile in ('baseline', 'optimized'):
+                  for scenario in ('build', 'regression', 'fuzz'):
+                      times = [float(r['seconds']) for r in rows if r['profile'] == profile and r['scenario'] == scenario and r['exit_code'] == '0']
+                      if times:
+                          out.write(f'| {profile} | {scenario} | {statistics.median(times):.2f} |\n')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rust-fuzz-profile-experiment
+          path: results/
+          retention-days: 7
