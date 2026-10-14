@@ -39,13 +39,16 @@ jobs:
           free -h
           df -h .
           mkdir -p results
-          cp model_gateway/Cargo.toml results/Cargo.after.toml
+          cp -p model_gateway/Cargo.toml results/Cargo.after.toml
           python3 - <<'PY'
           from pathlib import Path
+          import os
           after = Path('results/Cargo.after.toml').read_text()
           assert 'name = "amg"' not in after
           before = after.replace('[dependencies]\n', '[[bin]]\nname = "amg"\npath = "src/main.rs"\n\n[dependencies]\n', 1)
           Path('results/Cargo.before.toml').write_text(before)
+          stamp = Path('results/Cargo.after.toml').stat()
+          os.utime('results/Cargo.before.toml', ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
           PY
           printf 'variant,scenario,iteration,seconds,exit_code\n' > results/timings.csv
           cat > results/measure.sh <<'SH'
@@ -53,8 +56,11 @@ jobs:
           set -euo pipefail
           variant=$1 scenario=$2 iteration=$3
           shift 3
-          cp "results/Cargo.$variant.toml" model_gateway/Cargo.toml
-          trap 'cp results/Cargo.after.toml model_gateway/Cargo.toml' EXIT
+          # build.rs watches Cargo.toml and emits a new BUILD_TIME whenever
+          # its mtime changes. Preserve that mtime to isolate bin target
+          # duplication from recompiling the whole gateway library.
+          cp -p "results/Cargo.$variant.toml" model_gateway/Cargo.toml
+          trap 'cp -p results/Cargo.after.toml model_gateway/Cargo.toml' EXIT
           if [[ $scenario == rebuild ]]; then
             # Remove only the bin test fingerprints. The shared libraries,
             # source files, profile and toolchain remain warm and identical.
@@ -76,6 +82,22 @@ jobs:
           sed -n 's/^experiment,//p' "results/$variant-$scenario-$iteration-resources.txt" >> results/timings.csv
           if [[ -f target/cargo-timings/cargo-timing.html ]]; then
             cp target/cargo-timings/cargo-timing.html "results/$variant-$scenario-$iteration.html"
+          fi
+          if [[ $scenario == rebuild && $code == 0 ]]; then
+            python3 - "$variant" "$iteration" <<'PY'
+          import json, re, sys
+          from pathlib import Path
+          variant, iteration = sys.argv[1:]
+          html = Path(f'results/{variant}-rebuild-{iteration}.html').read_text()
+          match = re.search(r'const UNIT_DATA = (\[.*?\]);', html, re.S)
+          assert match, 'Cargo timing unit data missing'
+          units = json.loads(match.group(1))
+          libs = [u for u in units if u.get('name') == 'smg' and u.get('target') in ('', 'lib')]
+          # Inspect unit target names as well as the duration: a library
+          # compilation would invalidate the claimed bin-only comparison.
+          Path(f'results/{variant}-rebuild-{iteration}-units.json').write_text(json.dumps(units, indent=2))
+          assert not libs, f'Unexpected gateway library recompilation: {libs}'
+          PY
           fi
           exit "$code"
           SH
