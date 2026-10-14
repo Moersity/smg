@@ -1,0 +1,135 @@
+name: Rust Clippy Serial and Parallel AB
+
+on:
+  push:
+    branches: [cl/lixiang/ci-rust-experiment]
+    paths: ['.github/workflows/rust-clippy-parallel-ab.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: rust-clippy-ab-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  serial:
+    if: github.repository == 'Moersity/smg'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      RUSTC_WRAPPER: ''
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install community Rust and Clippy prerequisites
+        run: |
+          bash scripts/ci_install_rust.sh
+          AUTO_INSTALL=1 bash scripts/install_opencv.sh
+          rustup component add clippy
+          cargo metadata --locked --no-deps --format-version 1 > /dev/null
+      - name: Run all three Clippy configurations serially
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          printf 'configuration,seconds,exit_code\n' > results/timings.csv
+          measure() {
+            local name=$1
+            shift
+            set +e
+            /usr/bin/time -f "%e,%x" -o results/one.csv \
+              cargo clippy "$@" > "results/$name.log" 2>&1
+            local status=$?
+            set -e
+            IFS=, read -r seconds timed_status < results/one.csv
+            printf '%s,%s,%s\n' "$name" "$seconds" "$status" >> results/timings.csv
+            if [[ $timed_status != "$status" || $status != 0 ]]; then
+              tail -100 "results/$name.log"
+              return 1
+            fi
+          }
+          measure all-features --all-targets --all-features -- -D warnings
+          measure selfhosted -p smg -p smg-external-router --no-default-features \
+            --features smg/grpc-client,smg/jemalloc-stats --all-targets -- -D warnings
+          measure anthropic -p smg -p smg-external-router --no-default-features \
+            --features smg/grpc-client,smg/jemalloc-stats,smg/provider-anthropic \
+            --all-targets -- -D warnings
+          cat results/timings.csv
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rust-clippy-serial
+          path: results/
+          retention-days: 7
+
+  parallel:
+    if: github.repository == 'Moersity/smg'
+    needs: serial
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - configuration: all-features
+          - configuration: selfhosted
+          - configuration: anthropic
+    env:
+      RUSTC_WRAPPER: ''
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install community Rust and Clippy prerequisites
+        run: |
+          bash scripts/ci_install_rust.sh
+          AUTO_INSTALL=1 bash scripts/install_opencv.sh
+          rustup component add clippy
+          cargo metadata --locked --no-deps --format-version 1 > /dev/null
+      - name: Run ${{ matrix.configuration }} Clippy configuration
+        env:
+          CLIPPY_CONFIGURATION: ${{ matrix.configuration }}
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          case "$CLIPPY_CONFIGURATION" in
+            all-features)
+              args=(--all-targets --all-features -- -D warnings)
+              ;;
+            selfhosted)
+              args=(-p smg -p smg-external-router --no-default-features
+                --features smg/grpc-client,smg/jemalloc-stats --all-targets -- -D warnings)
+              ;;
+            anthropic)
+              args=(-p smg -p smg-external-router --no-default-features
+                --features smg/grpc-client,smg/jemalloc-stats,smg/provider-anthropic
+                --all-targets -- -D warnings)
+              ;;
+          esac
+          set +e
+          /usr/bin/time -f "%e,%x" -o results/timing.csv \
+            cargo clippy "${args[@]}" > "results/$CLIPPY_CONFIGURATION.log" 2>&1
+          status=$?
+          set -e
+          IFS=, read -r seconds timed_status < results/timing.csv
+          printf 'configuration,seconds,exit_code\n%s,%s,%s\n' \
+            "$CLIPPY_CONFIGURATION" "$seconds" "$status" > results/timings.csv
+          if [[ $timed_status != "$status" || $status != 0 ]]; then
+            tail -100 "results/$CLIPPY_CONFIGURATION.log"
+            exit 1
+          fi
+          cat results/timings.csv
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rust-clippy-${{ matrix.configuration }}
+          path: results/
+          retention-days: 7
