@@ -1,0 +1,110 @@
+name: Rust CI Experiment
+
+on:
+  push:
+    branches: [cl/lixiang/ci-rust-experiment]
+    paths: ['.github/workflows/rust-ci-experiment.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-ci-experiment-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  resource-and-profile-probe:
+    if: github.repository == 'Moersity/smg'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Record runner resources
+        run: |
+          uname -a
+          lscpu
+          free -h
+          df -h .
+      - name: Install pinned Rust
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal
+          rustc -Vv
+          cargo metadata --locked --no-deps --format-version 1 > /dev/null
+      - uses: mozilla-actions/sccache-action@v0.0.9
+        with:
+          version: v0.12.0
+          disable_annotations: true
+      - name: Compare profiles on the same runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          cp crates/reasoning_parser/src/lib.rs results/reasoning-lib.rs
+          trap 'cp results/reasoning-lib.rs crates/reasoning_parser/src/lib.rs' EXIT
+          printf 'profile,scenario,iteration,seconds,exit_code\n' > results/timings.csv
+          packages=(-p reasoning-parser -p tool-parser -p smg-radix-tree --lib)
+          measure() {
+            local profile=$1 scenario=$2 iteration=$3
+            shift 3
+            export CARGO_TARGET_DIR="$PWD/target/ci-$profile"
+            if [[ $profile == compact ]]; then
+              export CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
+            else
+              unset CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG
+            fi
+            set +e
+            /usr/bin/time -f "$profile,$scenario,$iteration,%e,%x" -o results/one.csv \
+              "$@" 2>&1 | tee "results/$profile-$scenario-$iteration.log"
+            local code=${PIPESTATUS[0]}
+            set -e
+            tail -1 results/one.csv >> results/timings.csv
+            return "$code"
+          }
+          # Cold runs include downloads; only the warmed, alternating changed
+          # runs support the profile comparison. Test coverage is identical.
+          for profile in baseline compact; do
+            measure "$profile" cold 0 cargo test --locked "${packages[@]}" --no-run
+            measure "$profile" tests 0 cargo test --locked "${packages[@]}"
+          done
+          for iteration in 1 2 3; do
+            cp results/reasoning-lib.rs crates/reasoning_parser/src/lib.rs
+            printf '\n#[allow(dead_code)]\nconst CI_REBUILD_PROBE: u32 = %s;\n' "$iteration" >> crates/reasoning_parser/src/lib.rs
+            profiles=(baseline compact)
+            if [[ $iteration == 2 ]]; then profiles=(compact baseline); fi
+            for profile in "${profiles[@]}"; do
+              measure "$profile" changed "$iteration" cargo test --locked "${packages[@]}" --no-run
+              measure "$profile" unchanged "$iteration" cargo test --locked "${packages[@]}" --no-run
+            done
+          done
+          du -sh target/ci-*
+          sccache --show-stats | tee results/sccache.txt
+          python3 - <<'PY'
+          import csv, os, statistics
+          rows = list(csv.DictReader(open('results/timings.csv')))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
+              out.write('Same runner, three crates, library tests only; not the full community gate.\n\n')
+              out.write('| Profile | Scenario | Median seconds |\n|---|---|---:|\n')
+              for profile in ('baseline', 'compact'):
+                  for scenario in ('cold', 'tests', 'changed', 'unchanged'):
+                      times = [float(r['seconds']) for r in rows if r['profile'] == profile and r['scenario'] == scenario]
+                      out.write(f'| {profile} | {scenario} | {statistics.median(times):.2f} |\n')
+          PY
+      - name: Report resources and cache stats
+        if: always()
+        run: |
+          free -h
+          df -h .
+          sccache --show-stats || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rust-ci-probe
+          path: results/
+          retention-days: 7
