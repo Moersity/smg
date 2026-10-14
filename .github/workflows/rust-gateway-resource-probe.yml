@@ -9,6 +9,14 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: rust-gateway-resource-probe-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   gateway:
     if: github.repository == 'Moersity/smg'
