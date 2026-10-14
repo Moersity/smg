@@ -1,0 +1,55 @@
+name: Rust Gateway Resource Probe
+
+on:
+  push:
+    branches: [cl/lixiang/ci-rust-experiment]
+    paths: ['.github/workflows/rust-gateway-resource-probe.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gateway:
+    if: github.repository == 'Moersity/smg'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: 'true'
+      SCCACHE_IDLE_TIMEOUT: '0'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Record runner resources
+        run: |
+          lscpu
+          free -h
+          df -h .
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: fork-gateway-resource-probe
+      - name: Build gateway library tests with community defaults
+        run: |
+          mkdir -p results
+          /usr/bin/time -v -o results/build-resources.txt \
+            cargo test --locked -p smg --lib --no-run 2>&1 | tee results/build.log
+          sccache --show-stats | tee results/build-sccache.txt
+      - name: Run all gateway library tests
+        timeout-minutes: 30
+        run: |
+          /usr/bin/time -v -o results/test-resources.txt \
+            cargo test --locked -p smg --lib 2>&1 | tee results/tests.log
+      - name: Record final resources
+        if: always()
+        run: |
+          free -h
+          df -h .
+          du -sh target || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gateway-resource-probe
+          path: results/
+          retention-days: 7
