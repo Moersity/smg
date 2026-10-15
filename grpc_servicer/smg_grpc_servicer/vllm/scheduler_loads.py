@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 from smg_grpc_proto import vllm_engine_pb2 as pb
 
-from smg_grpc_servicer.vllm.loads import LoadEstimate, scheduler_load_fields
+from smg_grpc_servicer.vllm.loads import scheduler_load_fields
 
 _MAX_INT32 = 2**31 - 1
 
@@ -110,7 +110,7 @@ def build_loads_response(engine, request, version="", *, trackers=None):
             continue
 
         tracker = trackers.for_rank(rank) if trackers is not None else None
-        estimate = tracker.estimate(waiting) if tracker is not None else LoadEstimate()
+        estimate = tracker.estimate(waiting) if tracker is not None else None
         fields = scheduler_load_fields(
             running,
             waiting,

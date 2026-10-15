@@ -205,3 +205,28 @@ def test_cluster_size_does_not_invent_managed_global_ranks():
     assert not loads.build_loads_response(e, pb.GetLoadsRequest()).loads
     e.vllm_config.parallel_config.data_parallel_size = 1
     assert loads.managed_ranks(e) == [0]
+
+
+@pytest.mark.parametrize("with_trackers", [False, True])
+def test_missing_tracker_omits_estimate_fields(dp4, monkeypatch, with_trackers):
+    """Missing estimates stay absent before proto3 scalar defaults erase presence."""
+    from smg_grpc_servicer.vllm.loads import RankLoadTrackers
+
+    constructed_fields = []
+
+    def scheduler_load(**fields):
+        """Capture field presence at the protobuf construction boundary."""
+        constructed_fields.append(fields)
+        return pb.SchedulerLoad(**fields)
+
+    monkeypatch.setattr(
+        loads, "pb", NS(SchedulerLoad=scheduler_load, GetLoadsResponse=pb.GetLoadsResponse)
+    )
+    trackers = RankLoadTrackers([]) if with_trackers else None
+    result = loads.build_loads_response(dp4, pb.GetLoadsRequest(), trackers=trackers)
+
+    assert result.dp_rank_count == len(constructed_fields) == 4
+    for fields in constructed_fields:
+        assert "num_waiting_uncached_tokens" not in fields
+        assert "gen_throughput" not in fields
+        assert "cache_hit_rate" not in fields
