@@ -36,4 +36,5 @@ jobs:
           EOF
           source "$HOME/.cargo/env"
           cargo -vv check --manifest-path "$probe_dir/Cargo.toml"
+          cargo -vv check -p llm-multimodal
           sccache --show-stats
