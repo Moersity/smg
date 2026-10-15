@@ -16,6 +16,10 @@ categories = ["text-processing", "parsing"]
 [lib]
 name = "llm_tokenizer"
 
+[features]
+# Opt-in encoding and full ByteLevel decode acceleration; streaming stays unchanged.
+tokenizers-v1 = ["dep:tokenizers-v1"]
+
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true
@@ -38,14 +42,19 @@ hf-hub = { version = "0.5.0", default-features = false, features = ["tokio", "ru
 # unit-tests lane. Bump deliberately, revalidating template output.
 minijinja = { version = "=2.24.0", features = ["unstable_machinery", "json", "builtins", "loader", "loop_controls", "preserve_order"] }
 minijinja-contrib = { version = "=2.24.0", features = ["pycompat"] }
+chrono.workspace = true
 rayon = "1.12"
+thread_local = "1.1"
 tiktoken-rs = "0.12"
 tokenizers = "0.23.1"
+tokenizers-v1 = { package = "tokenizers", version = "=1.0.0-rc.2", optional = true, default-features = false, features = ["regex"] }
+unicode-normalization = "0.1"
 
 [dev-dependencies]
 criterion = "0.8"
 openai-protocol.workspace = true
-reqwest = { workspace = true, features = ["blocking"] }
+reqwest = { workspace = true, features = ["blocking", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tempfile = "3.27"
 # The bellwether fixtures test reads the fixture manifests (TOML).
 toml = "1.1"
@@ -58,5 +67,29 @@ harness = false
 name = "stop_decoder"
 harness = false
 
+[[bench]]
+name = "incremental_decode"
+harness = false
+
 [lints]
 workspace = true
+
+[[bench]]
+name = "encode_cost"
+harness = false
+
+[[bench]]
+name = "byte_fallback_invalid_run"
+harness = false
+
+[[bench]]
+name = "v1_compare"
+harness = false
+
+[[bench]]
+name = "decode_compare"
+harness = false
+
+[[bench]]
+name = "prefix_cache"
+harness = false

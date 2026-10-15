@@ -8,10 +8,7 @@ use std::{
 };
 
 use llm_tokenizer::{create_tokenizer_from_file, traits::Tokenizer};
-use openai_protocol::{
-    chat::ChatCompletionRequest,
-    common::{ToolChoice, ToolChoiceValue},
-};
+use openai_protocol::chat::ChatCompletionRequest;
 use smg::routers::grpc::utils::process_chat_messages;
 use smg_grpc_client::sglang_scheduler::{SglangGenerateRequestOptions, SglangSchedulerClient};
 use uuid::Uuid;
@@ -22,6 +19,7 @@ use super::{
     runtime::RUNTIME,
     stream::SglangStreamHandle,
     tokenizer::TokenizerHandle,
+    tool_constraint::{effective_tools_json, tool_constraint_for, tools_keep_special_tokens},
     utils::chat_requires_reasoning,
 };
 
@@ -178,38 +176,20 @@ pub unsafe extern "C" fn sgl_client_chat_completion_stream(
     let prompt_tokens = token_ids.len() as u32; // Save prompt token count
 
     // Generate tool constraints if needed
-    let registry = super::runtime::PARSER_FACTORY.registry();
-    let tool_constraint = if let (Some(tools), Some(tool_choice)) = (
-        chat_request.tools.as_ref(),
-        chat_request.tool_choice.as_ref(),
-    ) {
-        // No parser is configured here, so the registry falls back to a JSON
-        // schema, which carries no reasoning prefix.
-        match registry.generate_tool_constraint(None, tools, tool_choice, false) {
-            Ok(Some(c)) => Some(c.to_tuple()),
-            Ok(None) => None,
-            Err(e) => {
-                set_error_message(
-                    error_out,
-                    &format!("Failed to generate tool constraints: {e}"),
-                );
-                return SglErrorCode::ParsingError;
-            }
+    let tool_constraint = match tool_constraint_for(&chat_request) {
+        Ok(constraint) => constraint.map(|c| c.to_tuple()),
+        Err(e) => {
+            set_error_message(
+                error_out,
+                &format!("Failed to generate tool constraints: {e}"),
+            );
+            return SglErrorCode::ParsingError;
         }
-    } else {
-        None
     };
 
-    // Derive skip_special_tokens from constraint type (option B)
-    if tool_constraint
-        .as_ref()
-        .is_none_or(|c| c.0 != "json_schema")
-        && chat_request.tools.is_some()
-        && !matches!(
-            chat_request.tool_choice,
-            Some(ToolChoice::Value(ToolChoiceValue::None))
-        )
-    {
+    // The engine keeps its special tokens when a parser will read them:
+    // tools at either level, a choice that allows calls, no JSON schema.
+    if tools_keep_special_tokens(&chat_request, tool_constraint.as_ref()) {
         chat_request.skip_special_tokens = false;
     }
 
@@ -245,10 +225,9 @@ pub unsafe extern "C" fn sgl_client_chat_completion_stream(
 
     // Create response converter
     // Use and_then with CString::new to safely handle potential null bytes in JSON strings
-    let tools_json = chat_request
-        .tools
-        .as_ref()
-        .and_then(|t| serde_json::to_string(t).ok())
+    // The tools the response parser resolves calls against: request-level and
+    // message-declared, the set the constraint was built from.
+    let tools_json = effective_tools_json(&chat_request)
         .and_then(|s| CString::new(s).ok())
         .map(|s| s.into_raw());
     let tool_choice_json = chat_request

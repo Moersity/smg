@@ -5,10 +5,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use openai_protocol::worker::WorkerStatus;
 use tracing::{debug, info};
-use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
+use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
-    worker::{overload::OverloadThresholds, BasicWorker, BasicWorkerBuilder, Worker},
+    worker::{
+        overload::OverloadThresholds, service::MAX_WORKER_LABELS, BasicWorker, BasicWorkerBuilder,
+        Worker,
+    },
     workflow::data::WorkerUpdateWorkflowData,
 };
 
@@ -45,15 +48,41 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
 
         let mut updated_workers: Vec<Arc<dyn Worker>> = Vec::with_capacity(workers_to_update.len());
 
-        for worker in &workers_to_update {
-            // Build updated labels - merge new labels into existing ones
-            let mut updated_labels = worker.metadata().spec.labels.clone();
-            if let Some(ref new_labels) = request.labels {
-                for (key, value) in new_labels {
-                    updated_labels.insert(key.clone(), value.clone());
+        // The labels each worker ends up with: the request's merged into its
+        // own. The admin check held the cap against the labels the worker had
+        // when the request arrived; updates queued together each passed it,
+        // so it is held again here, over the labels actually merged, and only
+        // when the merge adds keys: a worker over the cap through the labels
+        // discovered at registration still takes a rewrite of its keys and an
+        // update of its other properties. Every rank is checked before any is
+        // replaced, so a refusal leaves no partial update behind.
+        let merged_labels: Vec<std::collections::HashMap<String, String>> = workers_to_update
+            .iter()
+            .map(|worker| {
+                let existing = &worker.metadata().spec.labels;
+                let mut updated_labels = existing.clone();
+                if let Some(ref new_labels) = request.labels {
+                    for (key, value) in new_labels {
+                        updated_labels.insert(key.clone(), value.clone());
+                    }
                 }
-            }
+                if updated_labels.len() > existing.len() && updated_labels.len() > MAX_WORKER_LABELS {
+                    return Err(WorkflowError::StepFailed {
+                        step_id: StepId::new("update_worker_properties"),
+                        message: format!(
+                            "{} labels on worker {} after this update ({} now, {} new); at most {MAX_WORKER_LABELS} are accepted",
+                            updated_labels.len(),
+                            worker.url(),
+                            existing.len(),
+                            updated_labels.len() - existing.len()
+                        ),
+                    });
+                }
+                Ok(updated_labels)
+            })
+            .collect::<Result<_, _>>()?;
 
+        for (worker, updated_labels) in workers_to_update.iter().zip(merged_labels) {
             // Resolve priority and cost: use update value if specified, otherwise keep existing
             let updated_priority = request.priority.unwrap_or_else(|| worker.priority());
             let updated_cost = request.cost.unwrap_or_else(|| worker.cost());
@@ -231,7 +260,7 @@ mod tests {
 
         Arc::new(AppContext {
             gateway_auth: AuthConfig::new(None),
-            client: reqwest::Client::new(),
+            client: crate::http_client::client(),
             router_config: router_config.clone(),
             rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
             rate_limit_manager: None,
@@ -257,6 +286,7 @@ mod tests {
             mcp_format_registry: openai_bridge::FormatRegistry::new(),
             tokenizer_registry: Arc::new(llm_tokenizer::registry::TokenizerRegistry::new()),
             multimodal_config_registry: Arc::new(MultimodalConfigRegistry::new()),
+            tokenizer_load_failures: Arc::default(),
             wasm_manager: None,
             worker_client_cache: Arc::new(crate::worker::WorkerHttpClientCache::new(
                 &router_config,
@@ -290,6 +320,42 @@ mod tests {
             updated_workers: None,
         };
         WorkflowContext::new(WorkflowInstanceId::new(), data)
+    }
+
+    /// The cap is held where the labels are merged, not only at the admin
+    /// check: a worker already at the cap refuses an update with a new key
+    /// (updates queued together each passed the early check), while one that
+    /// rewrites keys the worker has goes through.
+    #[tokio::test]
+    async fn the_label_cap_holds_over_the_labels_the_step_merges() {
+        let mut builder = BasicWorkerBuilder::new("http://full:8000").status(WorkerStatus::Ready);
+        for i in 0..MAX_WORKER_LABELS {
+            builder = builder.label(format!("k{i}"), "v");
+        }
+        let worker: Arc<dyn Worker> = Arc::new(builder.build());
+        let app_ctx = make_app_context(std::slice::from_ref(&worker));
+        let mut over = make_context(
+            Arc::clone(&app_ctx),
+            Arc::clone(&worker),
+            HashMap::from([("k_new".to_string(), "v".to_string())]),
+        );
+        let err = UpdateWorkerPropertiesStep
+            .execute(&mut over)
+            .await
+            .expect_err("a 129th label at merge time");
+        assert!(err.to_string().contains("129 labels on worker"), "{err}");
+        let mut rewrite = make_context(
+            Arc::clone(&app_ctx),
+            Arc::clone(&worker),
+            HashMap::from([("k0".to_string(), "w".to_string())]),
+        );
+        assert_eq!(
+            UpdateWorkerPropertiesStep
+                .execute(&mut rewrite)
+                .await
+                .unwrap(),
+            StepResult::Success
+        );
     }
 
     #[tokio::test]
@@ -571,7 +637,7 @@ mod tests {
     /// entry the old worker was keeping alive.
     #[tokio::test]
     async fn http_update_adopts_the_materialized_shared_client() {
-        let client = Arc::new(reqwest::Client::new());
+        let client = Arc::new(crate::http_client::client());
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("http://w:8080")
                 .http_client(Arc::clone(&client))
@@ -597,7 +663,7 @@ mod tests {
     async fn http_update_preserves_http2() {
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("http://w:8080")
-                .http_client(Arc::new(reqwest::Client::new()))
+                .http_client(Arc::new(crate::http_client::client()))
                 .http2(true)
                 .status(WorkerStatus::Ready)
                 .build(),
@@ -609,5 +675,98 @@ mod tests {
 
         let updated = &ctx.data.updated_workers.as_ref().expect("updated workers")[0];
         assert!(updated.http2());
+    }
+
+    /// A worker over the cap through the labels discovered at registration
+    /// still takes an update that adds no key: a priority alone, or a rewrite
+    /// of keys it has; one that would add a key is refused.
+    #[tokio::test]
+    async fn a_worker_over_the_cap_takes_updates_that_add_no_key() {
+        let mut builder = BasicWorkerBuilder::new("http://over:8000").status(WorkerStatus::Ready);
+        for i in 0..MAX_WORKER_LABELS + 20 {
+            builder = builder.label(format!("k{i}"), "v");
+        }
+        let worker: Arc<dyn Worker> = Arc::new(builder.build());
+        let app_ctx = make_app_context(std::slice::from_ref(&worker));
+        let mut priority = make_context(Arc::clone(&app_ctx), Arc::clone(&worker), HashMap::new());
+        priority.data.config.labels = None;
+        priority.data.config.priority = Some(7);
+        assert_eq!(
+            UpdateWorkerPropertiesStep
+                .execute(&mut priority)
+                .await
+                .unwrap(),
+            StepResult::Success
+        );
+        let mut rewrite = make_context(
+            Arc::clone(&app_ctx),
+            Arc::clone(&worker),
+            HashMap::from([("k3".to_string(), "w".to_string())]),
+        );
+        assert_eq!(
+            UpdateWorkerPropertiesStep
+                .execute(&mut rewrite)
+                .await
+                .unwrap(),
+            StepResult::Success
+        );
+        let mut adds = make_context(
+            Arc::clone(&app_ctx),
+            Arc::clone(&worker),
+            HashMap::from([("k_new".to_string(), "v".to_string())]),
+        );
+        let err = UpdateWorkerPropertiesStep
+            .execute(&mut adds)
+            .await
+            .expect_err("a new key on a worker over the cap");
+        assert!(
+            err.to_string().contains("149 labels on worker") && err.to_string().contains("1 new"),
+            "{err}"
+        );
+    }
+
+    /// Every rank is checked before any is replaced: when the second of two
+    /// ranks refuses the merge, the first keeps its labels too.
+    #[tokio::test]
+    async fn a_refused_rank_leaves_no_partial_update_behind() {
+        let first: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://rank:8000@0")
+                .status(WorkerStatus::Ready)
+                .label("k0", "v")
+                .build(),
+        );
+        let mut builder = BasicWorkerBuilder::new("http://rank:8000@1").status(WorkerStatus::Ready);
+        for i in 0..MAX_WORKER_LABELS {
+            builder = builder.label(format!("k{i}"), "v");
+        }
+        let second: Arc<dyn Worker> = Arc::new(builder.build());
+        let app_ctx = make_app_context(&[Arc::clone(&first), Arc::clone(&second)]);
+        let data = WorkerUpdateWorkflowData {
+            config: WorkerUpdateRequest {
+                priority: None,
+                cost: None,
+                labels: Some(HashMap::from([("k_new".to_string(), "v".to_string())])),
+                api_key: None,
+                health: None,
+            },
+            worker_url: "http://rank:8000".to_string(),
+            app_context: Some(Arc::clone(&app_ctx)),
+            workers_to_update: Some(vec![Arc::clone(&first), Arc::clone(&second)]),
+            updated_workers: None,
+        };
+        let mut context = WorkflowContext::new(WorkflowInstanceId::new(), data);
+        let err = UpdateWorkerPropertiesStep
+            .execute(&mut context)
+            .await
+            .expect_err("the second rank refuses the merge");
+        assert!(err.to_string().contains("http://rank:8000@1"), "{err}");
+        let kept = app_ctx
+            .worker_registry
+            .get_by_url("http://rank:8000@0")
+            .expect("the first rank is still registered");
+        assert!(
+            !kept.metadata().spec.labels.contains_key("k_new"),
+            "the first rank was not updated before the second was checked"
+        );
     }
 }

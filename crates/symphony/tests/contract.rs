@@ -30,9 +30,15 @@ use common::{bytes_of, chunkings, delta, prompt};
 use openai_protocol::common::{Function, Tool};
 use serde_json::json as value;
 use symphony::{
-    formats, json::PartialJson, tagged::Spelling, CallSyntax, Declared, DropReason, Engine,
-    EngineFinish, Event, Events, FinishReason, Input, MalformedReason, ParseError, Parser,
-    TokenSpan,
+    formats,
+    json::PartialJson,
+    shape::{
+        self, Arguments, Atom, CallShape, Class, Dialect, End, NameSource, Path, Pattern, Slot,
+        ValueParser,
+    },
+    tagged::{Placement, Spelling},
+    CallSyntax, Declared, DropReason, Emits, Engine, EngineFinish, Event, Events, FinishReason,
+    Format, Input, MalformedReason, ParseError, Parser, TokenSpan,
 };
 
 /// A subject under test: how to make its parser, and the outputs it is checked over.
@@ -51,7 +57,7 @@ fn qwen3() -> Box<dyn Parser> {
 
 fn qwen3_tagged() -> Box<dyn Parser> {
     Box::new(Engine::new(
-        formats::qwen3(CallSyntax::Tagged(Spelling::Json)),
+        formats::qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine)),
         Declared::of(&[Tool {
             tool_type: "function".to_string(),
             function: Function {
@@ -63,6 +69,7 @@ fn qwen3_tagged() -> Box<dyn Parser> {
                     "note": {"type": ["string", "null"]},
                 }}),
                 strict: None,
+                extra: Default::default(),
             },
         }]),
     ))
@@ -86,6 +93,7 @@ fn seed_oss() -> Box<dyn Parser> {
                     "note": {"type": ["string", "null"]},
                 }}),
                 strict: None,
+                extra: Default::default(),
             },
         }]),
     ))
@@ -107,6 +115,7 @@ fn keyed_tools() -> Declared {
                 "note": {"type": ["string", "null"]},
             }}),
             strict: None,
+            extra: Default::default(),
         },
     }])
 }
@@ -121,6 +130,131 @@ fn ling() -> Box<dyn Parser> {
 
 fn glm() -> Box<dyn Parser> {
     Box::new(Engine::new(formats::glm(), keyed_tools()))
+}
+
+/// The GLM table where the stream's stop closes the last call, as when a family's last call ends
+/// with a stop token the stop decoder hides.
+fn glm_closed_at_stop() -> Box<dyn Parser> {
+    Box::new(Engine::new(
+        formats::glm().closes_at_stop("call"),
+        keyed_tools(),
+    ))
+}
+
+/// Muse Glimmer's messages, spelled from the response template of `meta-models/Muse-Glimmer-30B`
+/// (its `tokenizer_config.json`): a thought addressed to the model itself, an answer addressed to
+/// the user, and nothing kept outside them. The calls are left out.
+fn muse_messages() -> Box<dyn Parser> {
+    Box::new(Engine::new(
+        Format::new("muse messages")
+            .terminal("thought", "to=self<|message|>")
+            .terminal("answer", "to=user<|message|>")
+            .terminal("eot", "<|eot|>")
+            .terminal("eom", "<|eom|>")
+            .state("outside", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .state("content", Emits::Content)
+            .transition("outside", "thought", "reasoning")
+            .transition("outside", "answer", "content")
+            .transition("reasoning", "eom", "outside")
+            .transition("content", "eot", "outside")
+            .transition("content", "eom", "outside")
+            .framing("outside")
+            .trims("reasoning")
+            .trims("content"),
+        Declared::default(),
+    ))
+}
+
+/// ERNIE's turn, spelled from transformers v5.18.0's `tests/utils/test_chat_parsing.py`
+/// (`ernie_template`): the thought opens with `(?:^|<think>\s*)`, so a turn that starts with text
+/// starts in it; the answer opens with `<response>\n`, a call with `<tool_call>`, and nothing is
+/// kept outside them.
+fn ernie() -> Box<dyn Parser> {
+    Box::new(Engine::new(
+        Format::new("ernie")
+            .terminal("think_open", "<think>")
+            .terminal("think_close", "</think>")
+            .terminal("answer_open", "<response>\n")
+            .terminal("answer_close", "</response>")
+            .terminal("call_open", "<tool_call>")
+            .terminal("call_close", "</tool_call>")
+            .state("outside", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .state("content", Emits::Content)
+            .state("call", Emits::Arguments)
+            .transition("outside", "think_open", "reasoning")
+            .transition("reasoning", "think_close", "outside")
+            .transition("outside", "answer_open", "content")
+            .transition("content", "answer_close", "outside")
+            .transition("outside", "call_open", "call")
+            .transition("call", "call_close", "outside")
+            .calls(CallSyntax::Json)
+            .framing("outside")
+            .turn_anchor("Assistant:")
+            .starts_in("reasoning")
+            .trims("reasoning")
+            .trims("content"),
+        Declared::default(),
+    ))
+}
+
+/// Gemma 4's turn, spelled from the response template of `google/gemma-4-31B-it` (its
+/// `tokenizer_config.json`): two anchors, a thought, the calls in Gemma's spelling, the content
+/// outside them trimmed stay by stay, and its non-stop close, `<|tool_response>`, a row back into
+/// the content that drops the marker.
+fn gemma4_template() -> Box<dyn Parser> {
+    Box::new(Engine::new(
+        Format::new("gemma 4 template")
+            .terminal("think_open", "<|channel>thought\n")
+            .terminal("think_close", "<channel|>")
+            .terminal("call_open", "<|tool_call>")
+            .terminal("call_close", "<tool_call|>")
+            .terminal("response_open", "<|tool_response>")
+            .state("content", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .state("call", Emits::Arguments)
+            .transition("content", "think_open", "reasoning")
+            .transition("reasoning", "think_close", "content")
+            .transition("content", "call_open", "call")
+            .transition("call", "call_close", "content")
+            .transition("content", "response_open", "content")
+            .calls(CallSyntax::Gemma(symphony::gemma::Spelling::GEMMA4))
+            .turn_anchor("<|turn>model\n")
+            .turn_anchor("<tool_response|>")
+            .trims("content")
+            .trims("reasoning"),
+        Declared::default(),
+    ))
+}
+
+/// Inkling's messages, spelled from transformers v5.18.0's `tests/utils/test_chat_parsing.py`
+/// (`inkling_template`): each message is a thought, an answer or a call after its own marker, all
+/// of them closed by `<|end_message|>`, and nothing is kept outside them; the thoughts and the
+/// answers repeat, joined with `""`, as the engine's stays follow one another, and not stripped
+/// (no trim row).
+fn inkling_template() -> Box<dyn Parser> {
+    Box::new(Engine::new(
+        Format::new("inkling template")
+            .terminal("thought", "<|content_thinking|>")
+            .terminal("answer", "<|content_text|>")
+            .terminal("call", "<|content_invoke_tool_json|>")
+            .terminal("end", "<|end_message|>")
+            .state("outside", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .state("content", Emits::Content)
+            .state("calls", Emits::Arguments)
+            .transition("outside", "thought", "reasoning")
+            .transition("outside", "answer", "content")
+            .transition("outside", "call", "calls")
+            .transition("reasoning", "end", "outside")
+            .transition("content", "end", "outside")
+            .transition("calls", "end", "outside")
+            .calls(CallSyntax::Json)
+            .framing("outside")
+            .turn_anchor("<|message_model|>"),
+        Declared::default(),
+    ))
 }
 
 fn iquest() -> Box<dyn Parser> {
@@ -154,6 +288,7 @@ fn minimax_m3() -> Box<dyn Parser> {
                     "opts": {"type": "object", "properties": {"unit": {"type": "string"}}},
                 }}),
                 strict: None,
+                extra: Default::default(),
             },
         }]),
     ))
@@ -163,8 +298,359 @@ fn kimi_k3() -> Box<dyn Parser> {
     Box::new(Engine::new(formats::kimi_k3(), Declared::default()))
 }
 
+fn mistral_v13() -> Box<dyn Parser> {
+    Box::new(Engine::new(formats::mistral_v13(), Declared::default()))
+}
+
+fn llama_nemotron() -> Box<dyn Parser> {
+    Box::new(Engine::new(formats::llama_nemotron(), Declared::default()))
+}
+
+fn function_gemma() -> Box<dyn Parser> {
+    Box::new(Engine::new(formats::function_gemma(), Declared::default()))
+}
+
+fn forced() -> Box<dyn Parser> {
+    Box::new(Engine::new(
+        formats::forced(),
+        Declared::default().forcing("get_weather"),
+    ))
+}
+
 fn plain() -> Box<dyn Parser> {
     Box::new(Engine::new(formats::plain(), Declared::default()))
+}
+
+/// `\w` as these outputs need it: the ASCII letters, digits and `_` their names are written in.
+fn word() -> Class {
+    Class::new([('0', '9'), ('A', 'Z'), ('_', '_'), ('a', 'z')], false)
+}
+
+fn run(class: Class, min: u16, greedy: bool, capture: Option<Slot>) -> Atom {
+    Atom::Run {
+        class,
+        min,
+        max: None,
+        greedy,
+        capture,
+    }
+}
+
+/// The Qwen3 table with its calls given as data: one JSON object that names the call, right
+/// after the region's marker, as the hand-written JSON syntax reads it.
+fn qwen3_shaped() -> Box<dyn Parser> {
+    let shape = shape::intern(CallShape {
+        header: Pattern::default(),
+        name: NameSource::Body,
+        arguments: Arguments::Envelope {
+            dialect: Dialect::default(),
+            name: Path::new(["name"]),
+            arguments: Path::new(["arguments"]),
+        },
+        trailer: Pattern::default(),
+        word: word(),
+        hold_cap: 8192,
+    });
+    Box::new(Engine::new(
+        formats::qwen3(CallSyntax::Shaped(shape)),
+        Declared::default(),
+    ))
+}
+
+/// transformers v5.18.0's `tests/utils/test_chat_parsing.py` (`gpt_oss_template`): Harmony's
+/// analysis and final channels, nothing kept outside them, and the calls the commentary channel
+/// opens: `<|channel|>commentary to=functions.` is the terminal, `(?P<name>\w+).*?<\|message\|>`
+/// the header, the arguments one JSON value, and the stop token `<|call|>` the close.
+fn gpt_oss_template() -> Box<dyn Parser> {
+    let shape = shape::intern(CallShape {
+        header: Pattern(
+            [
+                run(word(), 1, true, Some(Slot::Name)),
+                run(Class::any(), 0, false, None),
+                Atom::Lit("<|message|>".into()),
+            ]
+            .into(),
+        ),
+        name: NameSource::Header,
+        arguments: Arguments::Json(Dialect::default()),
+        trailer: Pattern::default(),
+        word: word(),
+        hold_cap: 8192,
+    });
+    Box::new(Engine::new(
+        Format::new("gpt-oss test template")
+            .terminal("analysis", "<|channel|>analysis<|message|>")
+            .terminal("final", "<|channel|>final<|message|>")
+            .terminal("end", "<|end|>")
+            .terminal("call_open", "<|channel|>commentary to=functions.")
+            .terminal("call_close", "<|call|>")
+            .state("outside", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .state("content", Emits::Content)
+            .state("call", Emits::Arguments)
+            .transition("outside", "analysis", "reasoning")
+            .transition("outside", "final", "content")
+            .transition("reasoning", "end", "outside")
+            .transition("content", "end", "outside")
+            .transition("outside", "call_open", "call")
+            .transition("call", "call_close", "outside")
+            .calls(CallSyntax::Shaped(shape))
+            .framing("outside")
+            .closes_at_stop("call")
+            .turn_anchor("<|start|>assistant")
+            .trims("reasoning")
+            .trims("content")
+            .stop_tokens(["<|return|>", "<|endoftext|>", "<|call|>"]),
+        Declared::default(),
+    ))
+}
+
+fn space() -> Class {
+    Class::new([('\t', '\r'), (' ', ' ')], false)
+}
+
+fn none_of(chars: &str) -> Class {
+    Class::new(chars.chars().map(|c| (c, c)), true)
+}
+
+fn ends_at(consume: impl IntoIterator<Item = Atom>, ahead: impl IntoIterator<Item = Atom>) -> End {
+    End {
+        consume: Pattern(consume.into_iter().collect()),
+        ahead: Pattern(ahead.into_iter().collect()),
+    }
+}
+
+/// transformers v5.18.0's `transformers serve` template for Qwen 3.5 (`qwen3_5` in
+/// `src/transformers/cli/serving/utils.py`): a thought, the content outside it stripped, and calls
+/// opened by `<tool_call>` and the header `\s*<function=(?P<name>[^>\n]+)>`, closed by the
+/// trailer `</function>\s*` and `</tool_call>`, their parameters tags with a key and a value up
+/// to `\s*</parameter>`, typed by the request's tools.
+fn qwen3_5_serve_shaped() -> Box<dyn Parser> {
+    Box::new(Engine::new(qwen3_5_serve_table(), keyed_tools()))
+}
+
+/// The Qwen 3.5 serve template where the stream's stop closes a call, as the template's reader
+/// closes a region at the end of its text, whatever the trailer.
+fn qwen3_5_serve_closed_at_stop() -> Box<dyn Parser> {
+    Box::new(Engine::new(
+        qwen3_5_serve_table().closes_at_stop("call"),
+        keyed_tools(),
+    ))
+}
+
+fn qwen3_5_serve_table() -> Format {
+    let name = none_of(">\n");
+    let shape = shape::intern(CallShape {
+        header: Pattern(
+            [
+                run(space(), 0, true, None),
+                Atom::Lit("<function=".into()),
+                run(name.clone(), 1, true, Some(Slot::Name)),
+                Atom::Lit(">".into()),
+            ]
+            .into(),
+        ),
+        name: NameSource::Header,
+        arguments: Arguments::Params {
+            tag: Pattern(
+                [
+                    Atom::Lit("<parameter=".into()),
+                    run(name, 1, true, Some(Slot::Key)),
+                    Atom::Lit(">".into()),
+                    run(space(), 0, true, None),
+                    run(Class::any(), 0, false, Some(Slot::Value)),
+                ]
+                .into(),
+            ),
+            ends: [ends_at(
+                [
+                    run(space(), 0, true, None),
+                    Atom::Lit("</parameter>".into()),
+                ],
+                [],
+            )]
+            .into(),
+            values: ValueParser::Raw,
+        },
+        trailer: Pattern([Atom::Lit("</function>".into()), run(space(), 0, true, None)].into()),
+        word: word(),
+        hold_cap: 8192,
+    });
+    Format::new("qwen 3.5 serve template")
+        .terminal("think_open", "<think>")
+        .terminal("think_close", "</think>")
+        .terminal("call_open", "<tool_call>")
+        .terminal("call_close", "</tool_call>")
+        .state("content", Emits::Content)
+        .state("reasoning", Emits::Reasoning)
+        .state("call", Emits::Arguments)
+        .transition("content", "think_open", "reasoning")
+        .transition("reasoning", "think_close", "content")
+        .transition("content", "call_open", "call")
+        .transition("call", "call_close", "content")
+        .calls(CallSyntax::Shaped(shape))
+        .turn_anchor("<|im_start|>assistant\n")
+        .trims("content")
+        .trims("reasoning")
+}
+
+/// The response template of `meta-models/Muse-Glimmer-30B` (its `tokenizer_config.json`) with its
+/// calls: the terminal `<atem:invoke`, a header that skips other attributes and names the tool, and
+/// parameter tags that do the same for their keys, each value up to `</atem:parameter>`.
+fn muse_shaped() -> Box<dyn Parser> {
+    let skip = || run(none_of(">"), 0, false, None);
+    let shape = shape::intern(CallShape {
+        header: Pattern(
+            [
+                Atom::Boundary,
+                skip(),
+                Atom::Boundary,
+                Atom::Lit("name=\"".into()),
+                run(none_of("\""), 1, true, Some(Slot::Name)),
+                Atom::Lit("\">".into()),
+            ]
+            .into(),
+        ),
+        name: NameSource::Header,
+        arguments: Arguments::Params {
+            tag: Pattern(
+                [
+                    Atom::Lit("<atem:parameter".into()),
+                    Atom::Boundary,
+                    skip(),
+                    Atom::Boundary,
+                    Atom::Lit("name=\"".into()),
+                    run(none_of("\""), 1, true, Some(Slot::Key)),
+                    Atom::Lit("\"".into()),
+                    skip(),
+                    Atom::Lit(">".into()),
+                    run(Class::any(), 0, false, Some(Slot::Value)),
+                ]
+                .into(),
+            ),
+            ends: [ends_at([Atom::Lit("</atem:parameter>".into())], [])].into(),
+            values: ValueParser::Json {
+                dialect: Dialect::default(),
+                allow_non_json: true,
+                strip: true,
+            },
+        },
+        trailer: Pattern::default(),
+        word: word(),
+        hold_cap: 8192,
+    });
+    Box::new(Engine::new(
+        Format::new("muse glimmer template")
+            .terminal("thought", "to=self<|message|>")
+            .terminal("answer", "to=user<|message|>")
+            .terminal("eot", "<|eot|>")
+            .terminal("eom", "<|eom|>")
+            .terminal("call_open", "<atem:invoke")
+            .terminal("call_close", "</atem:invoke>")
+            .state("outside", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .state("content", Emits::Content)
+            .state("call", Emits::Arguments)
+            .transition("outside", "thought", "reasoning")
+            .transition("outside", "answer", "content")
+            .transition("reasoning", "eom", "outside")
+            .transition("content", "eot", "outside")
+            .transition("content", "eom", "outside")
+            .transition("outside", "call_open", "call")
+            .transition("call", "call_close", "outside")
+            .calls(CallSyntax::Shaped(shape))
+            .framing("outside")
+            .turn_anchor("<|start|>assistant")
+            .trims("reasoning")
+            .trims("content"),
+        Declared::default(),
+    ))
+}
+
+/// Parameters on abstract tags: a call named by the template, its parameters `<k=KEY>` and a
+/// value that ends at `</k>` or where the next parameter's tag begins.
+fn params_tags() -> Box<dyn Parser> {
+    let shape = shape::intern(CallShape {
+        header: Pattern::default(),
+        name: NameSource::Literal("f".into()),
+        arguments: Arguments::Params {
+            tag: Pattern(
+                [
+                    Atom::Lit("<k=".into()),
+                    run(word(), 1, true, Some(Slot::Key)),
+                    Atom::Lit(">".into()),
+                    run(Class::any(), 0, false, Some(Slot::Value)),
+                ]
+                .into(),
+            ),
+            ends: [
+                ends_at([Atom::Lit("</k>".into())], []),
+                ends_at([], [Atom::Lit("<k=".into())]),
+            ]
+            .into(),
+            values: ValueParser::Raw,
+        },
+        trailer: Pattern::default(),
+        word: word(),
+        hold_cap: 8192,
+    });
+    Box::new(Engine::new(
+        Format::new("parameters on abstract tags")
+            .terminal("call_open", "<c>")
+            .terminal("call_close", "</c>")
+            .state("content", Emits::Content)
+            .state("call", Emits::Arguments)
+            .transition("content", "call_open", "call")
+            .transition("call", "call_close", "content")
+            .calls(CallSyntax::Shaped(shape))
+            .closes_at_stop("call"),
+        Declared::default(),
+    ))
+}
+
+/// Calls given as data on abstract tags: a region between `<c>` and `</c>` beside a thought
+/// between `<t>` and `</t>`, each call named by a `<n=NAME>` header, its arguments one JSON value,
+/// and `</f>` with the whitespace after it as the trailer, which the stream's stop may end too.
+fn shaped_tags() -> Box<dyn Parser> {
+    let shape = shape::intern(CallShape {
+        header: Pattern(
+            [
+                Atom::Lit("<n=".into()),
+                run(word(), 1, true, Some(Slot::Name)),
+                Atom::Lit(">".into()),
+            ]
+            .into(),
+        ),
+        name: NameSource::Header,
+        arguments: Arguments::Json(Dialect::default()),
+        trailer: Pattern(
+            [
+                Atom::Lit("</f>".into()),
+                run(Class::new([('\t', '\r'), (' ', ' ')], false), 0, true, None),
+            ]
+            .into(),
+        ),
+        word: word(),
+        hold_cap: 8192,
+    });
+    Box::new(Engine::new(
+        Format::new("shaped tags")
+            .terminal("think_open", "<t>")
+            .terminal("think_close", "</t>")
+            .terminal("call_open", "<c>")
+            .terminal("call_close", "</c>")
+            .state("content", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .state("call", Emits::Arguments)
+            .transition("content", "think_open", "reasoning")
+            .transition("reasoning", "think_close", "content")
+            .transition("content", "call_open", "call")
+            .transition("reasoning", "call_open", "call")
+            .transition("call", "call_close", "content")
+            .calls(CallSyntax::Shaped(shape))
+            .closes_at_stop("call"),
+        Declared::default(),
+    ))
 }
 
 const FORMATS: &[Subject] = &[
@@ -209,6 +695,31 @@ const FORMATS: &[Subject] = &[
         outputs: GLM_OUTPUTS,
     },
     Subject {
+        name: "glm, closed at stop",
+        new: glm_closed_at_stop,
+        outputs: GLM_STOPPED_OUTPUTS,
+    },
+    Subject {
+        name: "muse messages, framed",
+        new: muse_messages,
+        outputs: MUSE_OUTPUTS,
+    },
+    Subject {
+        name: "ernie, started in the thought",
+        new: ernie,
+        outputs: ERNIE_OUTPUTS,
+    },
+    Subject {
+        name: "gemma 4 template, trimmed",
+        new: gemma4_template,
+        outputs: GEMMA4_TEMPLATE_OUTPUTS,
+    },
+    Subject {
+        name: "inkling template, framed",
+        new: inkling_template,
+        outputs: INKLING_TEMPLATE_OUTPUTS,
+    },
+    Subject {
         name: "iquest",
         new: iquest,
         outputs: IQUEST_OUTPUTS,
@@ -243,6 +754,147 @@ const FORMATS: &[Subject] = &[
         new: plain,
         outputs: PLAIN_OUTPUTS,
     },
+    Subject {
+        name: "mistral v13",
+        new: mistral_v13,
+        outputs: MISTRAL_OUTPUTS,
+    },
+    Subject {
+        name: "llama nemotron",
+        new: llama_nemotron,
+        outputs: LLAMA_NEMOTRON_OUTPUTS,
+    },
+    Subject {
+        name: "function gemma",
+        new: function_gemma,
+        outputs: FUNCTION_GEMMA_OUTPUTS,
+    },
+    Subject {
+        name: "qwen3, its calls as a shape",
+        new: qwen3_shaped,
+        outputs: QWEN3_OUTPUTS,
+    },
+    Subject {
+        name: "gpt-oss test template, its calls as a shape",
+        new: gpt_oss_template,
+        outputs: GPT_OSS_OUTPUTS,
+    },
+    Subject {
+        name: "shaped calls on abstract tags",
+        new: shaped_tags,
+        outputs: SHAPED_TAGS_OUTPUTS,
+    },
+    Subject {
+        name: "qwen 3.5 serve template, its calls as a shape",
+        new: qwen3_5_serve_shaped,
+        outputs: QWEN3_5_SERVE_OUTPUTS,
+    },
+    Subject {
+        name: "qwen 3.5 serve template, its calls as a shape, closed at stop",
+        new: qwen3_5_serve_closed_at_stop,
+        outputs: QWEN3_5_SERVE_OUTPUTS,
+    },
+    Subject {
+        name: "muse glimmer template, its calls as a shape",
+        new: muse_shaped,
+        outputs: MUSE_CALLS_OUTPUTS,
+    },
+    Subject {
+        name: "parameters on abstract tags",
+        new: params_tags,
+        outputs: PARAMS_TAGS_OUTPUTS,
+    },
+    Subject {
+        name: "forced",
+        new: forced,
+        outputs: FORCED_OUTPUTS,
+    },
+];
+
+/// The Qwen 3.5 serve template: a thought, an answer and a call; two calls; a close without the
+/// trailer; a marker with no function; text between parameters; a value that never ends; values
+/// across lines and empty; calls cut in a value, in a tag and in the header; and nothing.
+const QWEN3_5_SERVE_OUTPUTS: &[&str] = &[
+    "<think>\nThe user wants the weather.\n</think>\n\nLet me check.\n<tool_call>\n\
+     <function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n3\n\
+     </parameter>\n</function>\n</tool_call>",
+    "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n\
+     </tool_call>\n<tool_call>\n<function=get_weather>\n<parameter=city>\nRome\n</parameter>\n\
+     </function>\n</tool_call>",
+    "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</tool_call>\n\
+     More text</function></tool_call>",
+    "<tool_call>\nnot a function</tool_call>Hi",
+    "<tool_call>\n<function=get_weather>\nnoise <parameter=city>  Paris  </parameter> junk \
+     <parameter=days>4</parameter></function>\n</tool_call>",
+    "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</function>\n</tool_call>",
+    "<tool_call>\n<function=get_weather>\n<parameter=days>\n</parameter>\n<parameter=city>\n\
+     New\nYork\n</parameter>\n</function>\n</tool_call>",
+    "<tool_call>\n<function=get_weather>\n<parameter=city>\nPar",
+    "<tool_call>\n<function=get_weather>\n<parame",
+    "<tool_call>\n<fun",
+    "",
+];
+
+/// Muse Glimmer's calls: after a thought, with attributes and text between parameters, an invoke
+/// without a name, two calls, a tag whose name runs on, a call cut short, and nothing.
+const MUSE_CALLS_OUTPUTS: &[&str] = &[
+    "to=self<|message|>Plan.<|eom|><|start|>assistant<atem:invoke name=\"get_weather\">\
+     <atem:parameter name=\"city\">Paris</atem:parameter><atem:parameter name=\"days\">3\
+     </atem:parameter></atem:invoke>",
+    "<atem:invoke id=\"1\" name=\"lookup\"><atem:parameter type=\"string\" name=\"q\">x y\
+     </atem:parameter> <atem:parameter name=\"ids\">[1, 2]</atem:parameter></atem:invoke>",
+    "<atem:invoke id=\"1\">text</atem:invoke> to=user<|message|>Hi<|eot|>",
+    "<atem:invoke name=\"f\"></atem:invoke><atem:invoke name=\"g\"><atem:parameter \
+     name=\"o\">{\"a\": true}</atem:parameter></atem:invoke>",
+    "<atem:invoke name=\"f\"><atem:parameters name=\"x\">1</atem:parameter></atem:invoke>",
+    "<atem:invoke name=\"f\"><atem:parameter name=\"q\">cut",
+    "",
+];
+
+/// Parameters on abstract tags: values ended by their close and by the next tag, text between
+/// them, a tag that does not match, a key written twice, calls cut in a value and in a tag, a
+/// call the stop closes, and nothing.
+const PARAMS_TAGS_OUTPUTS: &[&str] = &[
+    "<c><k=a>1<k=b>2</k></c>",
+    "Hi <c>junk<k=a>1</k> mid <k=b>x y</k>tail</c> bye",
+    "<c><k=a b>1</k><k=c>[1, 2]</k></c>",
+    "<c><k=a>1</k><k=a>2</k></c>",
+    "<c><k=a>1<k=b>2",
+    "<c><k=",
+    "<c><k=a>{\"x\": [1, {\"y\": null}]}</k>",
+    "",
+];
+
+/// The gpt-oss test template: a thought and a call the stop closes, a call cut short, a header
+/// that cannot match (no name after the marker) and one the end leaves unfinished, an answer with
+/// text outside it, arguments that are not JSON, text after the arguments, and nothing.
+const GPT_OSS_OUTPUTS: &[&str] = &[
+    "<|channel|>analysis<|message|>User asks for the weather.<|end|><|start|>assistant\
+     <|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>\
+     {\"city\": \"Paris\", \"days\": 3}",
+    "<|channel|>commentary to=functions.get_weather<|message|>{\"city\": \"Par",
+    "<|channel|>commentary to=functions.<|channel|>final<|message|>Hi",
+    "<|channel|>commentary to=functions.get_weather json",
+    "Hello <|channel|>final<|message|> It is sunny. <|end|> after",
+    "<|channel|>commentary to=functions.f<|message|>not json",
+    "<|channel|>commentary to=functions.f<|message|>{} trailing",
+    "",
+];
+
+/// Calls on abstract tags: a call its trailer closes, terminals whose header does not match (in
+/// the content, in a thought, twice in a row), a close the trailer does not end at, a call cut
+/// short, a call the stop closes after its trailer, a header the end leaves unfinished, and
+/// nothing.
+const SHAPED_TAGS_OUTPUTS: &[&str] = &[
+    "Sure.<c><n=f>{\"a\": 1}</f>\n</c>Done.",
+    "Hi <c><x>bye",
+    "<t>plan <c>oops</t>ok",
+    "<c><c><n=f>{}</f></c>",
+    "<c><n=f>{}</c>x</f></c>",
+    "<c><n=f>{\"a\": [1, 2",
+    "<c><n=f>{}</f>",
+    "<c><n=",
+    "",
 ];
 
 /// MiniMax M3's syntax: the recorded shape with its separators, the tree's shapes, cut streams,
@@ -406,6 +1058,73 @@ const LFM_OUTPUTS: &[&str] = &[
     "<|tool_call_start|>[]<|tool_call_end|>Nothing to call.",
 ];
 
+/// Mistral's calls: the tool's name, `[ARGS]`, the arguments object alone, one call per opener,
+/// the thought between `[THINK]` and `[/THINK]`.
+const MISTRAL_OUTPUTS: &[&str] = &[
+    "[TOOL_CALLS]get_weather[ARGS]{\"city\": \"Paris\", \"days\": [1, 2.5, true, null]}",
+    "[TOOL_CALLS]get_weather[ARGS]{\"city\": \"Paris\"}[TOOL_CALLS]get_stock_price[ARGS]{}",
+    "Let me check.[TOOL_CALLS]get_weather[ARGS]{\"city\": \"Paris\"}",
+    "[THINK]The user asks about Paris.[/THINK][TOOL_CALLS]get_weather[ARGS]{\"city\": \"Paris\"}",
+    "[TOOL_CALLS]get_weather[ARGS]{\"city\": \"Par",
+    "[TOOL_CALLS]get_wea",
+    "[TOOL_CALLS][TOOL_CALLS]get_weather[ARGS]{}",
+    "[TOOL_CALLS]get_weather[ARGS]{\"city\": @}",
+    "[TOOL_CALLS]get_weather[ARGS]{} trailing",
+    "[THINK]Only a thought.[/THINK]",
+    "Hello!",
+];
+
+/// Llama Nemotron's calls: one JSON list between `<TOOLCALL>` and `</TOOLCALL>`, content before
+/// it, the thought between `<think>` and `</think>`; the list cut, empty, or not a list.
+const LLAMA_NEMOTRON_OUTPUTS: &[&str] = &[
+    "<TOOLCALL>[{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\", \"days\": \
+     [1, 2.5, true, null]}}]</TOOLCALL>",
+    "<TOOLCALL>[{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}, \
+     {\"name\": \"get_stock_price\", \"arguments\": {}}]</TOOLCALL>",
+    "Let me check.<TOOLCALL>[{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}]\
+     </TOOLCALL>",
+    "<think>The user asks about Paris.</think><TOOLCALL>[{\"name\": \"get_weather\", \
+     \"arguments\": {\"city\": \"Paris\"}}]</TOOLCALL>",
+    "<TOOLCALL>[{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Par",
+    "<TOOLCALL>[{\"name\": \"get_wea",
+    "<TOOLCALL>[]</TOOLCALL>",
+    "<TOOLCALL>not a list</TOOLCALL>",
+    "<TOOLCALL>[{\"name\": \"get_weather\", \"arguments\": {}} junk]</TOOLCALL> after",
+    "<think>Only a thought.</think>",
+    "Hello!",
+];
+
+/// FunctionGemma's calls: Gemma's spelling between `<start_function_call>` and
+/// `<end_function_call>`, `<escape>` around a string, `None` for a null; cut streams, a block that
+/// is no call, and text after the arguments.
+const FUNCTION_GEMMA_OUTPUTS: &[&str] = &[
+    "<start_function_call>call:get_weather{city:<escape>Paris<escape>,days:[1,2.5,true,None]}\
+     <end_function_call>",
+    "<start_function_call>call:get_weather{city:<escape>Paris<escape>}<end_function_call>\
+     <start_function_call>call:get_stock_price{}<end_function_call>",
+    "Let me check.<start_function_call>call:get_weather{city:<escape>Paris<escape>}\
+     <end_function_call>",
+    "<start_function_call>call:get_weather{city:<escape>Par",
+    "<start_function_call>call:get_wea",
+    "<start_function_call>not a call<end_function_call>",
+    "<start_function_call>call:get_weather{} trailing<end_function_call>",
+    "<start_function_call>call:f{a:<esc",
+    "Hello!",
+];
+
+/// The forced call's arguments alone, as the engine writes them under the gateway's schema for a
+/// named function: whole, wrapped in whitespace, cut short, broken, followed by text, blank.
+const FORCED_OUTPUTS: &[&str] = &[
+    "{\"city\": \"Paris\", \"days\": [1, 2.5, true, null]}",
+    "  {\"city\": \"Paris\"}\n",
+    "{\"city\": \"Par",
+    "{\"city\": @}",
+    "{\"city\": \"Paris\"} trailing",
+    "{}",
+    "   ",
+    "[1, 2]",
+];
+
 /// Seed-OSS: the tagged syntax under its own markers, a value as Python's repr, and Qwen's
 /// markers as text.
 const SEED_OUTPUTS: &[&str] = &[
@@ -476,6 +1195,82 @@ const GLM_OUTPUTS: &[&str] = &[
     "<think></think>Hello!",
     "The syntax is:\n\n```\n<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris\
      </arg_value></tool_call>\n```\n\nThat is all.",
+    "",
+];
+
+/// GLM's outputs, and last calls whose closing marker a stop token would be: in a string, in an
+/// integer, between two parameters and inside a key.
+const GLM_STOPPED_OUTPUTS: &[&str] = &[
+    "<think>plan</think>Sure.<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris\
+     </arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call><tool_call>get_weather\
+     </tool_call>",
+    "<think></think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Par",
+    "<think></think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value>\
+     <arg_key>days</arg_key><arg_value>3",
+    "<think></think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value>",
+    "<think></think><tool_call>get_weather<arg_key>ci",
+    "<think></think>Hello!",
+    "",
+];
+
+/// Muse Glimmer's messages: a thought and an answer with the turn's opener written between them,
+/// text outside every message, a message cut short, a marker cut short, and nothing.
+const MUSE_OUTPUTS: &[&str] = &[
+    "to=self<|message|>Plan the answer.<|eom|><|start|>assistant to=user<|message|>It is sunny.",
+    " junk to=user<|message|>\nHi\n<|eot|> more junk",
+    "to=self<|message|>Only a thought.",
+    "to=self<|message|>Plan.<|eom|><|start|>assistant to=us",
+    "Text outside every message, <|eom|> and to=user without its marker.",
+    "",
+];
+
+/// ERNIE's turns: the transformers tests' outputs without their stop text (a thought then a call,
+/// a thought then an answer, `<think>` at the first byte), an answer or a call at the first byte,
+/// a thought's close at the first byte, a thought cut short, a marker cut short, and nothing.
+const ERNIE_OUTPUTS: &[&str] = &[
+    "The user is asking about the weather in Paris today.\n</think>\n\n<tool_call>\n\
+     {\"name\": \"get_current_temperature\", \"arguments\": {\"location\": \"Paris\"}}\n\
+     </tool_call>\n",
+    "The user just greeted me.\n\nFirst, I'll say hello back.\n</think>\n\n<response>\n\
+     Hello! I'm doing well, thank you for asking.\n</response>\n",
+    "<think>some deliberation here</think>\n\n<tool_call>\n{\"name\": \"get_current_temperature\", \
+     \"arguments\": {\"location\": \"Paris\"}}\n</tool_call>\n",
+    "<response>\nHello!\n</response>",
+    "<tool_call>\n{\"name\": \"f\", \"arguments\": {}}\n</tool_call>",
+    "</think>\n<response>\nHi\n</response>",
+    "A thought cut short",
+    "<respo",
+    "",
+];
+
+/// Gemma 4's turns: transformers' streaming fixture for the template, a thought, calls and an
+/// answer with whitespace at every edge, whitespace inside the text, the content's own close
+/// between two stays, Python's whitespace beyond ASCII, a call written inside a thought, a stay
+/// of whitespace only, a cut call, and nothing.
+const GEMMA4_TEMPLATE_OUTPUTS: &[&str] = &[
+    "<|channel>thought\nhi<channel|><|tool_call>call:foo{a:1,b:<|\"|>bar<|\"|>}<tool_call|>",
+    "<|channel>thought\n The user wants the weather.\n<channel|>\n<|tool_call>call:get_weather{\
+     city:<|\"|>Paris<|\"|>}<tool_call|>\n\nIt is\n\nsunny. \n",
+    "Hi <|tool_response> there\n",
+    "\u{a0}\u{1c}Hi\u{2003}there\u{2003}\u{1f}",
+    "<|channel>thought\nPlan <|tool_call>call:f{}<tool_call|> more<channel|>Done",
+    " \n\t ",
+    "Sure.\n<|tool_call>call:get_weather{city:<|\"|>Par",
+    "",
+];
+
+/// Inkling's messages: transformers' streaming fixture and multi-message test for the template,
+/// two answers with spaces at their edges, text outside the messages around an author's name, a
+/// call cut short, and nothing.
+const INKLING_TEMPLATE_OUTPUTS: &[&str] = &[
+    "<|content_thinking|>Consider the weather.<|end_message|><|message_model|><|content_thinking|> \
+     Tokyo, probably.<|end_message|><|message_model|><|content_text|>Checking now.<|end_message|>\
+     <|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":\
+     {\"city\":\"Tokyo\"}}<|end_message|><|content_model_end_sampling|>",
+    "<|content_text|> A <|end_message|><|message_model|><|content_text|> B <|end_message|>",
+    "stray <|message_model|>author<|content_text|>Hi<|end_message|> tail",
+    "<|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":\
+     {\"city\":\"To",
     "",
 ];
 

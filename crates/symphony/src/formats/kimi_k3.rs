@@ -6,35 +6,11 @@
 //! `<|open|>call tool="…" index="N"<|sep|>` and `<|close|>call<|sep|>`, and the whole turn closed
 //! by `<|close|>message<|sep|>`. As recorded for `moonshotai/Kimi-K3`.
 //!
-//! What this table says beyond the DeepSeek one:
-//!
-//! - **The turn itself is a state.** Between the regions there is nothing: the template writes
-//!   the regions back to back, and the end-of-turn tag after the last. `message` is that
-//!   wrapping, so a byte there is `Dropped { Wrapper }` when it is whitespace and `Malformed`
-//!   otherwise, and it is the state the turn opener leaves the engine in. Content is only what the
-//!   `response` region holds, every byte of it; the recorded answers match it exactly.
-//! - **Two states for the calls**, as for DSML: `tools` is the wrapping between calls, and `call`
-//!   is one call's arguments, read by the XTML assembler ([`tagged::xtml`](crate::tagged::xtml)).
-//!   The call tag's opening is the terminal that enters `call`, so the assembler starts inside the
-//!   function's name; the call's closing tag leaves it, and the call's end carries its bytes. A
-//!   second call before the first closed ends the first (`call + call_open = call`), and the
-//!   block's close ends a call still open (`call + tools_close = message`).
-//! - **The end-of-turn tag ends whatever is open.** `<|close|>message<|sep|>` is a token the model
-//!   cannot write by accident, so from any state it ends the region and returns to `message`: a
-//!   thought or an answer cut by it is closed, a call is closed into its object, and the tag
-//!   itself is dropped as wrapping. The same holds for a region's opening inside the thought
-//!   (`reasoning + response_open = content`, `reasoning + tools_open = tools`) and for a tools
-//!   block opened inside the answer (`content + tools_open = tools`): the region ended, however
-//!   the model left it, since the tags are tokens the model cannot write as text.
-//! - **The prompt opens the thought.** The template ends the generation prompt with
-//!   `<|open|>message role="assistant"<|sep|><|open|>think<|sep|>`, so an empty thought writes
-//!   `<|close|>think<|sep|>` at once, and the engine's prompt replay puts the output inside the
-//!   thought first. The turn opener is the message tag with the assistant's role, so an earlier
-//!   turn's regions move nothing.
+//! Notes on this table, and on what it leaves open: `docs/tables.md`.
 
 use crate::{
     format::{CallSyntax, Emits, Format},
-    tagged::xtml,
+    tagged::attributed::Tags,
 };
 
 /// The Kimi K3 table.
@@ -47,8 +23,10 @@ pub fn kimi_k3() -> Format {
         .terminal("tools_open", "<|open|>tools<|sep|>")
         .terminal("tools_close", "<|close|>tools<|sep|>")
         .terminal("call_open", "<|open|>call tool=\"")
-        .terminal("call_close", xtml::CALL_CLOSE)
+        .terminal("call_close", Tags::XTML.invoke_close)
         .terminal("message_close", "<|close|>message<|sep|>")
+        .structural_token("<|open|>")
+        .structural_token("<|close|>")
         .state("message", Emits::Wrapper)
         .state("reasoning", Emits::Reasoning)
         .state("content", Emits::Content)
@@ -72,7 +50,7 @@ pub fn kimi_k3() -> Format {
         .transition("tools", "tools_close", "message")
         .transition("tools", "message_close", "message")
         .transition("message", "message_close", "message")
-        .calls(CallSyntax::Xtml)
+        .calls(CallSyntax::Attributed(Tags::XTML))
         .opens_turn("<|open|>message role=\"assistant\"<|sep|>")
 }
 
@@ -217,7 +195,7 @@ mod tests {
             arguments_of(&events, 0),
             r#"{"drink_id": "latte", "new_preferences": {"size": "large", "temperature": "hot"}}"#
         );
-        assert_eq!(ends(&events), [xtml::CALL_CLOSE]);
+        assert_eq!(ends(&events), [Tags::XTML.invoke_close]);
         assert_eq!(content(&events), "");
         assert!(events.contains(&dropped("<|close|>tools<|sep|>")));
         assert!(events.contains(&dropped("<|close|>message<|sep|>")));
@@ -324,7 +302,7 @@ mod tests {
         assert_eq!(arguments_of(&events, 1), "{}");
         // The block's close cut `h` inside a string: the string and the object are closed.
         assert_eq!(arguments_of(&events, 2), r#"{"b": "x"}"#);
-        assert_eq!(ends(&events), [xtml::CALL_CLOSE, "", ""]);
+        assert_eq!(ends(&events), [Tags::XTML.invoke_close, "", ""]);
         assert!(matches!(
             events.last(),
             Some(Event::Finish { tool_calls: 3, .. })
@@ -533,5 +511,139 @@ mod tests {
                 "{ending}: {events:?}"
             );
         }
+    }
+
+    /// The generation prompt's tail with thinking off: the assistant's message opened, and its
+    /// answer's region.
+    const PROMPT_THINKING_OFF: &str =
+        "<|open|>message role=\"assistant\"<|sep|><|open|>response<|sep|>";
+
+    /// A short answer and the turn's closing structure, one token each: how a cut by
+    /// `max_tokens` lands between them.
+    const PONG: [&str; 10] = [
+        "P",
+        "ong",
+        ".",
+        "<|close|>",
+        "response",
+        "<|sep|>",
+        "<|close|>",
+        "message",
+        "<|sep|>",
+        "",
+    ];
+
+    fn reasoning(events: &[Event]) -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Reasoning(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_tag_the_end_of_the_output_cut_short_is_dropped_not_released_as_content() {
+        // The output cut after 8 of the turn's 10 tokens ends in `<|close|>message`, a tag the
+        // cut left unfinished (smg-lab #116): it begins with a whole `<|close|>` token, which the
+        // model cannot write as text, so it is wrapping, never content. Cut after 7 the same
+        // holds for the bare `<|close|>`; cut after 6, or whole, the answer stands alone.
+        for cut in [6, 7, 8, 9] {
+            let events = run(PROMPT_THINKING_OFF, &PONG[..cut]);
+            assert_eq!(
+                content(&events),
+                "Pong.",
+                "cut after {cut} tokens: {events:?}"
+            );
+            assert_eq!(
+                bytes(&events),
+                PONG[..cut].concat(),
+                "cut after {cut} tokens: every byte accounted for"
+            );
+        }
+        let events = run(PROMPT_THINKING_OFF, &PONG[..8]);
+        assert!(
+            events.contains(&dropped("<|close|>message")),
+            "the tag cut short is dropped as wrapping: {events:?}"
+        );
+        let events = run(PROMPT_THINKING_OFF, &PONG[..7]);
+        assert!(
+            events.contains(&dropped("<|close|>")),
+            "the structural token alone is a tag cut short too: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_thought_cut_inside_its_closing_tag_keeps_the_thought_alone() {
+        // Thinking on: the prompt opened the thought, the cut falls inside `<|close|>think<|sep|>`.
+        // The thought is the thought; the unfinished tag reaches neither field.
+        let events = run(PROMPT, &["Thought", "<|close|>", "think"]);
+        assert_eq!(reasoning(&events), "Thought", "{events:?}");
+        assert_eq!(content(&events), "", "{events:?}");
+        assert!(events.contains(&dropped("<|close|>think")), "{events:?}");
+        assert_eq!(bytes(&events), "Thought<|close|>think");
+    }
+
+    #[test]
+    fn a_tail_shorter_than_a_structural_token_stays_text_at_the_end() {
+        // Inside a structural token the bytes so far may be text (`<|clo` could be the model's
+        // own, and no stream splits the token anyway), so they stay, as every parser keeps a
+        // partial marker at the end of the output.
+        let events = run(PROMPT_THINKING_OFF, &["Pong.", "<|clo"]);
+        assert_eq!(content(&events), "Pong.<|clo", "{events:?}");
+    }
+
+    #[test]
+    fn a_call_cut_after_an_arguments_close_keeps_every_byte_in_order() {
+        // The output cut right after the `<|close|>` of a number argument, inside a call: the
+        // assembler still holds the argument's bytes, which came before the cut tag, so the call
+        // ends first (its bytes, malformed, and its end) and the cut tag is dropped after them;
+        // every byte in exactly one event, in the output's order, and none of it content.
+        let tokens = [
+            "<|open|>tools<|sep|><|open|>call tool=\"f\" index=\"1\"<|sep|>",
+            "<|open|>argument key=\"n\" type=\"number\"<|sep|>",
+            "1.5",
+            "<|close|>",
+        ];
+        let events = run(PROMPT_THINKING_OFF, &tokens);
+        assert_eq!(bytes(&events), tokens.concat(), "{events:?}");
+        assert_eq!(content(&events), "", "{events:?}");
+        let end = events
+            .iter()
+            .position(|event| matches!(event, Event::ToolCallEnd { .. }))
+            .unwrap_or_else(|| panic!("the call ends: {events:?}"));
+        let cut = events
+            .iter()
+            .position(|event| *event == dropped("<|close|>"))
+            .unwrap_or_else(|| panic!("the cut tag is dropped: {events:?}"));
+        assert!(
+            end < cut,
+            "the call's bytes leave before the cut tag: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::Malformed { text, why: MalformedReason::UnterminatedRegion }
+                    if text.text == "<|open|>argument key=\"n\" type=\"number\"<|sep|>1.5"
+            )),
+            "the unfinished argument is the call's malformed bytes: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_cut_tag_the_state_keeps_as_text_when_whole_stays_text() {
+        // Content has no row for the thought's close, so a whole `<|close|>think<|sep|>` there is
+        // text, where the model put it; the same tag cut short is text too, not a drop: the cut
+        // is judged as the whole tag would be. (In the thought, where the table has the row, the
+        // cut tag is dropped: `a_thought_cut_inside_its_closing_tag_keeps_the_thought_alone`.)
+        let whole = run(
+            PROMPT_THINKING_OFF,
+            &["Pong.", "<|close|>", "think", "<|sep|>"],
+        );
+        assert_eq!(content(&whole), "Pong.<|close|>think<|sep|>", "{whole:?}");
+        let cut = run(PROMPT_THINKING_OFF, &["Pong.", "<|close|>", "think"]);
+        assert_eq!(content(&cut), "Pong.<|close|>think", "{cut:?}");
+        assert_eq!(bytes(&cut), "Pong.<|close|>think");
     }
 }

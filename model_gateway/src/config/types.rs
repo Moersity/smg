@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -8,7 +9,7 @@ pub use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use serde::{de, Deserialize, Deserializer, Serialize};
 // Re-export storage config types from data_connector
 pub use smg_data_connector::{
-    HistoryBackend, OracleConfig, PostgresConfig, RedisConfig, SchemaConfig,
+    HistoryBackend, MemoryConfig, OracleConfig, PostgresConfig, RedisConfig, SchemaConfig,
 };
 
 use super::{validation::ConfigValidator, ConfigResult};
@@ -20,6 +21,46 @@ use crate::{
         ConnectionMode, RuntimeType,
     },
 };
+
+/// The parser name that reads a model with the table its tokenizer's `response_template`
+/// compiles into, under `--parser symphony` (see `routers::grpc::regular::symphony`): the same
+/// name for `--tool-call-parser` and `--reasoning-parser`, as vLLM names it.
+pub const TEMPLATE_PARSER: &str = "hf";
+
+/// The parser that reads a chat completion's output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ParserChoice {
+    /// The tool-call and reasoning parser crates, one parser per model family.
+    #[default]
+    Legacy,
+    /// Symphony's tables: the one a model's parser names select (its worker labels, else the
+    /// `--tool-call-parser` and `--reasoning-parser` flags) when a table answers to the name, its
+    /// own or a legacy parser's that reads its format (`qwen` for `qwen3`, `qwen_xml` for
+    /// `qwen3_tagged`); the registry's for the models it knows when they name nothing, or only a
+    /// reasoning parser no table answers to, `passthrough` excepted; any other legacy tool-call
+    /// parser's name, `passthrough`, and every other model, keep the legacy parsers.
+    Symphony,
+}
+
+impl ParserChoice {
+    /// The choice `name` spells, `legacy` or `symphony` in any case; `None` for any other text.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "legacy" => Some(Self::Legacy),
+            "symphony" => Some(Self::Symphony),
+            _ => None,
+        }
+    }
+
+    /// The name the flag and the header spell this choice as.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Symphony => "symphony",
+        }
+    }
+}
 
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,7 +103,8 @@ pub struct RouterConfig {
     pub health_check_port: Option<u16>,
     /// Explicit async runtime worker-thread count. `None` uses tokio's default
     /// (`available_parallelism()`), which already honors the cgroup CPU quota on
-    /// Rust 1.95+ and is therefore container-aware. `Some` pins a count.
+    /// Rust 1.95+ and is therefore container-aware. `Some` pins a count of at
+    /// least 1: the runtime builder panics on 0, so `ConfigValidator` refuses it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_worker_threads: Option<usize>,
     pub max_payload_size: usize,
@@ -79,9 +121,34 @@ pub struct RouterConfig {
     /// `0` disables the watchdog.
     #[serde(default = "default_stream_body_stall_timeout_secs")]
     pub stream_body_stall_timeout_secs: u64,
+    /// Close a connection that has not delivered a complete request head
+    /// within this many seconds of being accepted, and a keep-alive
+    /// connection whose next request head stalls for this long after its
+    /// first byte. `0` disables the bound.
+    #[serde(default = "default_header_read_timeout_secs")]
+    pub header_read_timeout_secs: u64,
+    /// Close a keep-alive connection that has had no request in flight for
+    /// this many seconds; an open streaming response counts as in flight.
+    /// The bound starts with the connection's first request: a connection
+    /// that never sends one is bounded by `header_read_timeout_secs` alone.
+    /// Keep it above the idle timeout of any proxy or load balancer in front
+    /// of the gateway, so that side closes an idle connection first; otherwise
+    /// a request can be sent on a connection the gateway is closing and fail
+    /// with a reset. A connection the proxy opened ahead of time and never
+    /// used is bounded by `header_read_timeout_secs` instead: keep the proxy's
+    /// idle timeout under that too, or do not pre-open. `0` keeps idle
+    /// connections until the client closes them.
+    #[serde(default = "default_idle_connection_timeout_secs")]
+    pub idle_connection_timeout_secs: u64,
     pub request_timeout_secs: u64,
+    /// Seconds of upstream silence after which an open SSE stream carries a
+    /// keep-alive frame (an SSE comment; the `ping` event on the Messages
+    /// API), so an idle-timeout proxy does not cut a stream that is waiting
+    /// on a long prefill. Nothing is sent while frames flow. `0` sends none.
+    #[serde(default = "default_sse_keepalive_secs")]
+    pub sse_keepalive_secs: u64,
     /// Idle timeout for pooled upstream connections. Must stay below the
-    /// backend HTTP server's keep-alive timeout (vLLM and SGLang default to
+    /// backend HTTP server's keep-alive timeout (the engines default to
     /// 5s), or the pool hands out connections the server has already closed
     /// and non-idempotent sends fail. `0` keeps idle connections forever.
     #[serde(default = "default_upstream_pool_idle_timeout_secs")]
@@ -109,14 +176,26 @@ pub struct RouterConfig {
     pub worker_stall_secs: u64,
     /// Seconds without a token or a completion from a worker that still
     /// answers polls, with requests in flight and a growing queue, after which
-    /// new requests stop being routed to it until it makes progress.
+    /// new requests stop being routed to it until it makes progress. The same
+    /// bound caps how long a disaggregated prefill leg may produce nothing,
+    /// with its worker answering no other leg, before its request fails over
+    /// to another prefill worker; on the parallel dispatch shape it must
+    /// cover the decode-side wait a leg's first response may see.
     #[serde(default = "default_worker_wedge_secs")]
     pub worker_wedge_secs: u64,
+    /// Seconds without any contact from a worker whose KV-event stream pushes
+    /// load records, after which it is excluded from routing as unreachable
+    /// until it is heard from again; workers that never pushed a record are
+    /// not judged by it. 0 disables the rule.
+    #[serde(default = "default_worker_stale_secs")]
+    pub worker_stale_secs: u64,
     /// Warm-up slice for cache-aware routing: for this many seconds after a
     /// worker becomes routable, until its index has grown by
     /// `worker_warmup_blocks` blocks, one cache miss in `1 / share` goes to it.
     #[serde(default = "default_worker_warmup_secs")]
     pub worker_warmup_secs: u64,
+    /// The share of cache misses offered to warming workers: a finite value
+    /// from 0.0 to 1.0.
     #[serde(default = "default_worker_warmup_share")]
     pub worker_warmup_share: f32,
     #[serde(default = "default_worker_warmup_blocks")]
@@ -126,7 +205,7 @@ pub struct RouterConfig {
     /// the warm-up slice until it has grown by `worker_warmup_blocks`,
     /// whatever emptied it (a resync after a publisher restart, an
     /// out-of-range or data-loss resubscription, an engine that came back
-    /// empty). 0 keeps the age rule alone.
+    /// empty). A finite value from 0.0 to 1.0; 0 keeps the age rule alone.
     #[serde(default = "default_worker_warmup_thin_ratio")]
     pub worker_warmup_thin_ratio: f32,
     /// One cache hit in this many is diverted to a thin worker although
@@ -140,7 +219,7 @@ pub struct RouterConfig {
     pub worker_warmup_divert_every: u64,
     /// How long a disaggregated (PD) dispatch waits for a slot in the decode
     /// engine's running window before shedding. Must stay well under the
-    /// engine's bootstrap deadline (120s on TokenSpeed): a request that waits
+    /// engine's bootstrap deadline (120s on one engine): a request that waits
     /// out this budget and then dispatches still has the whole deadline ahead
     /// of it. `0` sheds immediately instead of waiting. Ignored for engines
     /// that report no running window.
@@ -220,14 +299,15 @@ pub struct RouterConfig {
     /// larger than the whole budget gets 413 straight away. A request waiting
     /// for room still holds its media, and the queue is capped at one budget
     /// as well, so size memory for about twice this value. Unset leaves it
-    /// unbounded; zero is refused rather than read as unset.
+    /// unbounded; counted in whole KiB, so a value under 1024 (one 1 KiB unit,
+    /// zero included) is refused rather than read as unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multimodal_max_inflight_bytes: Option<usize>,
     /// Per-request image-count limit applied to every model, replacing each
     /// spec's built-in limit; beats `SMG_IMAGE_MAX_COUNT`. Unset keeps spec limits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mm_per_request_image_limit: Option<usize>,
-    /// Where media for vLLM gRPC workers is fetched and preprocessed (`auto` |
+    /// Where media for one engine's gRPC workers is fetched and preprocessed (`auto` |
     /// `router` | `worker`); when unset, falls back to `SMG_MM_PROCESSING`,
     /// then `auto`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -240,6 +320,17 @@ pub struct RouterConfig {
     /// = rdma` is the first-class one); when unset, falls back to `SMG_MM_PIXEL_RDMA`.
     #[serde(default)]
     pub mm_pixel_rdma: bool,
+    /// Hosts the router's own media pipeline may fetch client-supplied media
+    /// URLs from, by name, every redirect hop included; unset (or empty)
+    /// allows any host the address policy passes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mm_allowed_media_domains: Option<Vec<String>>,
+    /// Allow client-supplied media URLs that name or resolve to a loopback,
+    /// link-local or private address (a deployment whose media origin is
+    /// internal); off, such URLs are refused before anything is connected.
+    /// When unset, falls back to `SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS`.
+    #[serde(default)]
+    pub mm_allow_private_media_hosts: bool,
     /// Listener IP for the RDMA metadata exchange; when unset, falls back to
     /// `SMG_RDMA_LISTEN_IP`, and without either the lane stays on the inline path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -257,24 +348,41 @@ pub struct RouterConfig {
     pub dp_minimum_tokens_scheduler: bool,
     pub api_key: Option<String>,
     /// Per-tenant API keys for serving-path auth, layered on top of
-    /// `api_key` rather than replacing it.
+    /// `api_key` rather than replacing it. Stored responses and conversations
+    /// are scoped to the tenant that created them (see
+    /// [`TenantResolutionConfig`]).
     #[serde(default)]
     pub tenant_api_keys: Vec<TenantApiKeyEntry>,
     #[serde(default, deserialize_with = "deserialize_discovery")]
     pub discovery: Option<DiscoveryConfig>,
     pub metrics: Option<MetricsConfig>,
     pub trace_config: Option<TraceConfig>,
+    /// Directory for the gateway's log files, created at logging start-up
+    /// when missing; an existing path must be a directory the gateway can
+    /// write, a missing one must sit under such a directory (checked at
+    /// configuration validation, which creates nothing). `None` logs to the
+    /// console only.
     pub log_dir: Option<String>,
     pub log_level: Option<String>,
+    /// Directory for the heap profiles `POST /heap_profile` writes, on a
+    /// build with the `jemalloc-profiling` feature; unset, the route
+    /// answers 404.
+    #[serde(default)]
+    pub jemalloc_prof_dir: Option<String>,
     pub request_id_headers: Option<Vec<String>>,
     #[serde(default)]
     pub storage_context_headers: HashMap<String, String>,
     #[serde(default)]
     pub tenant_resolution: TenantResolutionConfig,
-    /// Standing-concurrency cap; -1 disables. Each admission permit is
-    /// held for the full response, including streaming bodies.
+    /// Standing-concurrency cap. -1 (default) derives it from the host (1024
+    /// per available core, at least 4096); 0 disables it. Each admission
+    /// permit is held for the full response, including streaming bodies.
     pub max_concurrent_requests: i32,
     pub queue_size: usize,
+    /// Longest a request may wait inside the gateway: in the admission queue,
+    /// and, in the gRPC router, from its admission (its acceptance without an
+    /// admission layer) to worker selection: a request still ahead of
+    /// selection after this long is refused with a 503, once per request.
     pub queue_timeout_secs: u64,
     /// Maximum in-flight Prefill requests per worker in PD or EPD mode.
     /// A non-positive value disables the limit.
@@ -288,9 +396,15 @@ pub struct RouterConfig {
     /// `None` applies the built-in default when admission is enabled.
     #[serde(default)]
     pub prefill_queue_timeout_secs: Option<u64>,
-    /// Unset or 0 = no refill: `max_concurrent_requests` bounds standing
-    /// concurrency alone.
+    /// Sustained admission rate (requests per second), bursting up to
+    /// `max_concurrent_requests`, which keeps bounding standing concurrency.
+    /// Unset or 0 = no rate limit.
     pub rate_limit_tokens_per_second: Option<i32>,
+    /// Most Responses API requests with `background: true` in flight at
+    /// once; one beyond answers 429. 0 switches background mode off: such
+    /// requests then run in the foreground, as every other request does.
+    #[serde(default = "default_max_background_responses")]
+    pub max_background_responses: usize,
     /// Enable the priority-aware admission scheduler. When false (default),
     /// the legacy concurrency-limit middleware stays wired — zero behavior
     /// change for existing deployments.
@@ -301,7 +415,10 @@ pub struct RouterConfig {
     #[serde(default = "default_priority_scheduler_max_class")]
     pub priority_scheduler_default_max_class: String,
     /// Optional path to the priority-scheduler YAML (per-class + per-tenant
-    /// overrides). Absent → built-in defaults, empty tenant policy map.
+    /// overrides). Absent → built-in defaults, empty tenant policy map. With
+    /// the scheduler enabled, a file that cannot be read, parsed or validated
+    /// is a configuration error (`ConfigValidator`), not a fallback to the
+    /// legacy admission.
     #[serde(default)]
     pub priority_scheduler_config: Option<String>,
     /// Cap on per-tenant scheduler metric label cardinality (top-N tenants
@@ -333,10 +450,19 @@ pub struct RouterConfig {
     /// RL control plane (`/v1/rl/*`); inert unless `rl.enabled`.
     #[serde(default)]
     pub rl: smg_rl::RlConfig,
-    /// Can be a HuggingFace model ID or local path
+    /// Can be a HuggingFace model ID or local path. A local path (absolute,
+    /// explicitly relative, or present on disk) that exists must hold a
+    /// tokenizer layout at configuration validation; one that does not exist
+    /// is left to the worker fallback where a gRPC worker can still register
+    /// (gRPC worker URLs, IGW mode, worker discovery) and refused otherwise;
+    /// a model ID is fetched lazily. Not read as a tokenizer
+    /// source when `tokenizer_path` is set; not checked with
+    /// `disable_tokenizer_autoload`.
     pub model_path: Option<String>,
-    /// Overrides model_path tokenizer if provided
+    /// Overrides model_path tokenizer if provided; the same rule applies.
     pub tokenizer_path: Option<String>,
+    /// Path of the chat template file: must exist, be readable and not be
+    /// empty at configuration validation.
     pub chat_template: Option<String>,
     /// Alias → canonical model ID map. At worker creation, every alias whose
     /// canonical ID equals the worker's model ID is added to that model's
@@ -349,6 +475,11 @@ pub struct RouterConfig {
     /// Disable automatic tokenizer loading at startup and worker registration
     #[serde(default)]
     pub disable_tokenizer_autoload: bool,
+    /// Which parser reads a chat completion's reasoning and tool calls: the per-model
+    /// parsers (`legacy`, the default) or Symphony (`symphony`) for the models its
+    /// registry knows. A request's `X-SMG-Parser` header overrides it for that request.
+    #[serde(default)]
+    pub parser: ParserChoice,
     #[serde(default = "default_history_backend")]
     pub history_backend: HistoryBackend,
     /// Required when history_backend = "oracle"
@@ -360,6 +491,12 @@ pub struct RouterConfig {
     /// Required when history_backend = "redis"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redis: Option<RedisConfig>,
+    /// Bounds of the memory history backend (`history_backend = "memory"`):
+    /// the most stored responses and conversation items it keeps and how long
+    /// it keeps a record; unset = the defaults (10,000 responses, 100,000
+    /// items, one day).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemoryConfig>,
     /// For reasoning models (e.g., deepseek-r1, qwen3)
     pub reasoning_parser: Option<String>,
     /// For tool-call interactions
@@ -372,6 +509,14 @@ pub struct RouterConfig {
     /// Server TLS private key (PEM)
     #[serde(skip)]
     pub server_key: Option<Vec<u8>>,
+    /// Path the server TLS private key was read from: the start-up check of
+    /// who else can read that file names it (the key itself is `server_key`)
+    #[serde(skip)]
+    pub server_key_path: Option<String>,
+    /// Path the mTLS client private key was read from, for the same check
+    /// (the key itself is in `client_identity`)
+    #[serde(skip)]
+    pub client_key_path: Option<String>,
     /// Combined certificate + key in PEM format, loaded from client_cert_path and client_key_path during config creation
     #[serde(skip)]
     pub client_identity: Option<Vec<u8>>,
@@ -398,6 +543,13 @@ pub struct RouterConfig {
     pub storage_hook_wasm_path: Option<String>,
 }
 
+/// How a request's tenant is resolved on the serving path. The tenant scopes
+/// the stored state: a response or conversation created under a tenant (a
+/// trusted tenant header, a tenant API key) is read, continued, written into
+/// and deleted by that tenant only; another tenant's id answers 404. A record
+/// stored without a tenant identity (no tenant resolution configured, a caller
+/// known by its address only, records from before tenants were stored) stays
+/// readable by every caller.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct TenantResolutionConfig {
@@ -439,6 +591,9 @@ pub struct TokenizerCacheConfig {
     pub enable_l0: bool,
     #[serde(default = "default_l0_max_entries")]
     pub l0_max_entries: usize,
+    /// Byte budget of the L0 cache (texts, ids and per-entry overhead)
+    #[serde(default = "default_l0_max_memory")]
+    pub l0_max_memory: usize,
     /// Prefix matching at fixed boundaries
     #[serde(default = "default_enable_l1")]
     pub enable_l1: bool,
@@ -479,6 +634,10 @@ fn default_worker_wedge_secs() -> u64 {
     3
 }
 
+fn default_worker_stale_secs() -> u64 {
+    15
+}
+
 fn default_worker_warmup_secs() -> u64 {
     60
 }
@@ -507,6 +666,10 @@ const fn default_disabled_limit() -> i32 {
     -1
 }
 
+const fn default_max_background_responses() -> usize {
+    1024
+}
+
 pub const DEFAULT_PREFILL_QUEUE_SIZE: usize = 100;
 pub const DEFAULT_PREFILL_QUEUE_TIMEOUT_SECS: u64 = 60;
 
@@ -524,6 +687,10 @@ fn default_enable_l0() -> bool {
 
 fn default_l0_max_entries() -> usize {
     10_000
+}
+
+fn default_l0_max_memory() -> usize {
+    256 * 1024 * 1024 // 256MB
 }
 
 fn default_enable_l1() -> bool {
@@ -551,6 +718,7 @@ impl Default for TokenizerCacheConfig {
         Self {
             enable_l0: default_enable_l0(),
             l0_max_entries: default_l0_max_entries(),
+            l0_max_memory: default_l0_max_memory(),
             enable_l1: default_enable_l1(),
             l1_max_memory: default_l1_max_memory(),
         }
@@ -855,6 +1023,31 @@ pub enum CacheIndexKind {
     Hash,
 }
 
+/// What `power_of_two` compares its candidates by.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PowerOfTwoLoadMetric {
+    /// Least-load expected wait of two random workers.
+    #[default]
+    ExpectedWait,
+    /// Router in-flight requests of two random workers, then expected wait.
+    Requests,
+    /// Router in-flight requests of every healthy worker, then expected wait.
+    LeastRequests,
+}
+
+impl PowerOfTwoLoadMetric {
+    /// Parse the CLI spelling (`expected_wait` / `requests` / `least_requests`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "expected_wait" => Some(Self::ExpectedWait),
+            "requests" => Some(Self::Requests),
+            "least_requests" => Some(Self::LeastRequests),
+            _ => None,
+        }
+    }
+}
+
 /// Policy configuration for routing
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -878,11 +1071,16 @@ pub enum PolicyConfig {
         cache_threshold: f32,
         /// Spill gate, absolute part: the selected worker spills to
         /// least-loaded when its load exceeds the healthy-fleet mean by this
-        /// many requests AND by `balance_rel_threshold`.
+        /// many requests AND by `balance_rel_threshold`; capped at the
+        /// in-flight count's natural swing at the pool's current mean (two
+        /// standard deviations, never under four requests unless this value
+        /// is lower), so a small pool
+        /// can spill at all.
         #[serde(alias = "spill_abs_threshold")]
         balance_abs_threshold: usize,
-        /// Spill gate, relative part (multiple of the healthy-fleet mean);
-        /// fires only together with `balance_abs_threshold`.
+        /// Spill gate, relative part (multiple of the healthy-fleet mean;
+        /// finite, at least 1.0); fires only together with
+        /// `balance_abs_threshold`.
         #[serde(alias = "spill_rel_threshold")]
         balance_rel_threshold: f32,
         eviction_interval_secs: u64,
@@ -939,7 +1137,11 @@ pub enum PolicyConfig {
     /// but WorkerMonitor does not yet use per-policy intervals. This field is reserved for
     /// future support of different polling cadences per policy.
     #[serde(rename = "power_of_two")]
-    PowerOfTwo { load_check_interval_secs: u64 },
+    PowerOfTwo {
+        load_check_interval_secs: u64,
+        #[serde(default)]
+        load_metric: PowerOfTwoLoadMetric,
+    },
 
     /// Least-(token-)work policy: routes to the worker minimizing the expected
     /// wait `(queued_tokens + inflight_tokens) / throughput + kv_pressure_weight * k/(1-k)`
@@ -1029,7 +1231,8 @@ pub enum PolicyConfig {
         #[serde(default = "default_prefix_token_count")]
         prefix_token_count: usize,
         /// Relative load threshold - a worker is overloaded when its load
-        /// exceeds both avg * factor and the absolute margin (default: 1.25)
+        /// exceeds both avg * factor and the absolute margin (finite, at
+        /// least 1.0; default: 1.25)
         #[serde(default = "default_load_factor")]
         load_factor: f64,
         /// Absolute load difference over average a worker must also exceed
@@ -1078,6 +1281,18 @@ fn default_upstream_pool_idle_timeout_secs() -> u64 {
 
 fn default_stream_body_stall_timeout_secs() -> u64 {
     300
+}
+
+fn default_header_read_timeout_secs() -> u64 {
+    30
+}
+
+fn default_idle_connection_timeout_secs() -> u64 {
+    90
+}
+
+fn default_sse_keepalive_secs() -> u64 {
+    15
 }
 
 fn default_max_buffered_request_bytes() -> u64 {
@@ -1146,13 +1361,24 @@ impl PolicyConfig {
 /// predates the tag; see [`deserialize_discovery`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "provider", rename_all = "snake_case")]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one per router, built at startup; boxing the Kubernetes variant would complicate every construction and match to save a few hundred bytes"
+)]
 pub enum DiscoveryConfig {
     Kubernetes(KubernetesDiscoveryConfig),
+    File(FileDiscoveryConfig),
 }
 
 impl From<KubernetesDiscoveryConfig> for DiscoveryConfig {
     fn from(config: KubernetesDiscoveryConfig) -> Self {
         Self::Kubernetes(config)
+    }
+}
+
+impl From<FileDiscoveryConfig> for DiscoveryConfig {
+    fn from(config: FileDiscoveryConfig) -> Self {
+        Self::File(config)
     }
 }
 
@@ -1271,14 +1497,41 @@ impl Default for KubernetesDiscoveryConfig {
     }
 }
 
+/// How often the file-discovery manifest is reread, changed or not, when no
+/// interval is given.
+pub const DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS: u64 = 30;
+
+fn default_file_discovery_check_interval_secs() -> u64 {
+    DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS
+}
+
+/// File worker discovery: the workers listed in a JSON manifest on disk.
+///
+/// The manifest is reread in full whenever it changes, and every
+/// `check_interval_secs` in case a change went unreported. It may be absent at
+/// startup: discovery reads it once a writer creates it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileDiscoveryConfig {
+    pub path: PathBuf,
+    #[serde(default = "default_file_discovery_check_interval_secs")]
+    pub check_interval_secs: u64,
+}
+
 pub use smg_external_router::RetryConfig;
 
-/// Health check configuration for worker monitoring
+/// Health check configuration for worker monitoring. The four counts and
+/// periods are at least 1 (checked at configuration validation): none of
+/// them has a meaning at 0, and a zero interval would make the checker a
+/// busy loop. `disable_health_check` turns probing off.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthCheckConfig {
+    /// Consecutive failed probes before a worker leaves rotation; at least 1.
     pub failure_threshold: u32,
+    /// Consecutive passed probes before a worker returns; at least 1.
     pub success_threshold: u32,
+    /// Seconds a single probe may take; at least 1.
     pub timeout_secs: u64,
+    /// Seconds between the probes of a worker; at least 1.
     pub check_interval_secs: u64,
     pub endpoint: String,
     pub disable_health_check: bool,
@@ -1377,6 +1630,26 @@ impl Default for MetricsConfig {
     }
 }
 
+impl MetricsConfig {
+    /// The metrics host when none is configured: the unspecified address of
+    /// the serving listener's family. A gateway bound to an IPv6 address
+    /// (`[::]`, `::`, `[fd00::1]`) then exposes its metrics over IPv6 too,
+    /// instead of on an IPv4-only `0.0.0.0` that nothing on an IPv6-only
+    /// network can reach; `::` is dual-stack on Linux, so IPv4 scrapers keep
+    /// working. IPv4 hosts (and anything that is not an IP literal) keep the
+    /// IPv4 wildcard they always had.
+    pub fn default_host_for(server_host: &str) -> String {
+        let bare = server_host
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+            .unwrap_or(server_host);
+        match bare.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V6(_)) => "::".to_string(),
+            _ => "0.0.0.0".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceConfig {
     pub enable_trace: bool,
@@ -1409,7 +1682,10 @@ impl Default for RouterConfig {
             max_payload_size: 536_870_912, // 512MB
             max_buffered_request_bytes: default_max_buffered_request_bytes(),
             stream_body_stall_timeout_secs: default_stream_body_stall_timeout_secs(),
+            header_read_timeout_secs: default_header_read_timeout_secs(),
+            idle_connection_timeout_secs: default_idle_connection_timeout_secs(),
             request_timeout_secs: 1800, // 30 minutes
+            sse_keepalive_secs: default_sse_keepalive_secs(),
             upstream_pool_idle_timeout_secs: default_upstream_pool_idle_timeout_secs(),
             worker_startup_timeout_secs: 1800, // 30 minutes for large model loading
             worker_startup_delay_secs: 0,
@@ -1419,6 +1695,7 @@ impl Default for RouterConfig {
             load_monitor_interval_secs: 10,
             worker_stall_secs: default_worker_stall_secs(),
             worker_wedge_secs: default_worker_wedge_secs(),
+            worker_stale_secs: default_worker_stale_secs(),
             worker_warmup_secs: default_worker_warmup_secs(),
             worker_warmup_share: default_worker_warmup_share(),
             worker_warmup_blocks: default_worker_warmup_blocks(),
@@ -1441,6 +1718,8 @@ impl Default for RouterConfig {
             mm_processing: None,
             mm_pixel_cache_mb: None,
             mm_pixel_rdma: false,
+            mm_allowed_media_domains: None,
+            mm_allow_private_media_hosts: false,
             rdma_listen_ip: None,
             rdma_slot_ttl_s: None,
             log_mm_timing: false,
@@ -1453,6 +1732,7 @@ impl Default for RouterConfig {
             trace_config: None,
             log_dir: None,
             log_level: None,
+            jemalloc_prof_dir: None,
             request_id_headers: None,
             storage_context_headers: HashMap::new(),
             tenant_resolution: TenantResolutionConfig::default(),
@@ -1463,6 +1743,7 @@ impl Default for RouterConfig {
             prefill_queue_size: None,
             prefill_queue_timeout_secs: None,
             rate_limit_tokens_per_second: None,
+            max_background_responses: default_max_background_responses(),
             priority_scheduler_enabled: false,
             priority_scheduler_default_max_class: default_priority_scheduler_max_class(),
             priority_scheduler_config: None,
@@ -1485,11 +1766,13 @@ impl Default for RouterConfig {
             tokenizer_path: None,
             chat_template: None,
             disable_tokenizer_autoload: false,
+            parser: ParserChoice::default(),
             model_aliases: HashMap::new(),
             history_backend: default_history_backend(),
             oracle: None,
             postgres: None,
             redis: None,
+            memory: None,
             reasoning_parser: None,
             tool_call_parser: None,
             tokenizer_cache: TokenizerCacheConfig::default(),
@@ -1501,6 +1784,8 @@ impl Default for RouterConfig {
             storage_hook_wasm_path: None,
             server_cert: None,
             server_key: None,
+            server_key_path: None,
+            client_key_path: None,
         }
     }
 }
@@ -1738,6 +2023,7 @@ mod tests {
         for key in [
             "mm_processing",
             "mm_pixel_cache_mb",
+            "mm_allowed_media_domains",
             "rdma_listen_ip",
             "rdma_slot_ttl_s",
         ] {
@@ -1748,11 +2034,14 @@ mod tests {
         let mut without: serde_json::Value = serde_json::from_str(&json).unwrap();
         let object = without.as_object_mut().unwrap();
         object.remove("mm_pixel_rdma").unwrap();
+        object.remove("mm_allow_private_media_hosts").unwrap();
         object.remove("log_mm_timing").unwrap();
         let without: RouterConfig = serde_json::from_value(without).unwrap();
         assert_eq!(without.mm_processing, None);
         assert_eq!(without.mm_pixel_cache_mb, None);
         assert!(!without.mm_pixel_rdma);
+        assert_eq!(without.mm_allowed_media_domains, None);
+        assert!(!without.mm_allow_private_media_hosts);
         assert_eq!(without.rdma_listen_ip, None);
         assert_eq!(without.rdma_slot_ttl_s, None);
         assert!(!without.log_mm_timing);
@@ -1763,6 +2052,8 @@ mod tests {
             .mm_processing(Some(MmProcessingMode::Worker))
             .mm_pixel_cache_mb(Some(512))
             .mm_pixel_rdma(true)
+            .mm_allowed_media_domains(Some(vec!["media.example".to_string()]))
+            .mm_allow_private_media_hosts(true)
             .rdma_listen_ip(Some("10.0.0.7"))
             .rdma_slot_ttl_s(Some(600))
             .log_mm_timing(true)
@@ -1773,6 +2064,11 @@ mod tests {
         assert_eq!(with.mm_processing, Some(MmProcessingMode::Worker));
         assert_eq!(with.mm_pixel_cache_mb, Some(512));
         assert!(with.mm_pixel_rdma);
+        assert_eq!(
+            with.mm_allowed_media_domains.as_deref(),
+            Some(&["media.example".to_string()][..])
+        );
+        assert!(with.mm_allow_private_media_hosts);
         assert_eq!(with.rdma_listen_ip.as_deref(), Some("10.0.0.7"));
         assert_eq!(with.rdma_slot_ttl_s, Some(600));
         assert!(with.log_mm_timing);
@@ -1834,6 +2130,50 @@ mod tests {
                 .build_unchecked();
             assert!(config.validate().is_err());
         }
+    }
+
+    #[test]
+    fn test_connection_timeouts_serde_default_and_roundtrip() {
+        // Config files predating the fields deserialize to the defaults.
+        let mut json: serde_json::Value = serde_json::to_value(RouterConfig::default()).unwrap();
+        let object = json.as_object_mut().unwrap();
+        object.remove("header_read_timeout_secs").unwrap();
+        object.remove("idle_connection_timeout_secs").unwrap();
+        let without: RouterConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(without.header_read_timeout_secs, 30);
+        assert_eq!(without.idle_connection_timeout_secs, 90);
+
+        // The disabling zero round-trips instead of reverting to the default.
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .header_read_timeout_secs(0)
+            .idle_connection_timeout_secs(0)
+            .build_unchecked();
+        let json = serde_json::to_string(&config).unwrap();
+        let with: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(with.header_read_timeout_secs, 0);
+        assert_eq!(with.idle_connection_timeout_secs, 0);
+    }
+
+    #[test]
+    fn test_sse_keepalive_serde_default_and_roundtrip() {
+        // Config files predating the field deserialize to the 15 s default.
+        let mut json: serde_json::Value = serde_json::to_value(RouterConfig::default()).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("sse_keepalive_secs")
+            .unwrap();
+        let without: RouterConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(without.sse_keepalive_secs, 15);
+
+        // The disabling zero round-trips instead of reverting to the default.
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .sse_keepalive_secs(0)
+            .build_unchecked();
+        let json = serde_json::to_string(&config).unwrap();
+        let with: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(with.sse_keepalive_secs, 0);
     }
 
     #[test]
@@ -2099,6 +2439,7 @@ mod tests {
 
         let power_of_two = PolicyConfig::PowerOfTwo {
             load_check_interval_secs: 60,
+            load_metric: Default::default(),
         };
         assert_eq!(power_of_two.name(), "power_of_two");
     }
@@ -2133,6 +2474,7 @@ mod tests {
 
         let power_of_two = PolicyConfig::PowerOfTwo {
             load_check_interval_secs: 60,
+            load_metric: Default::default(),
         };
         let json = serde_json::to_string(&power_of_two).unwrap();
         assert!(json.contains("\"type\":\"power_of_two\""));
@@ -2287,11 +2629,13 @@ mod tests {
     fn test_power_of_two_parameters() {
         let power_of_two = PolicyConfig::PowerOfTwo {
             load_check_interval_secs: 120,
+            load_metric: Default::default(),
         };
 
         match power_of_two {
             PolicyConfig::PowerOfTwo {
                 load_check_interval_secs,
+                ..
             } => {
                 assert_eq!(load_check_interval_secs, 120);
             }
@@ -2493,6 +2837,24 @@ discovery:
         ));
     }
 
+    /// The file provider is the tag plus its path; the interval defaults.
+    #[test]
+    fn tagged_file_discovery_reads_with_the_default_interval() {
+        let discovery = read_discovery(serde_json::json!({
+            "provider": "file",
+            "path": "/run/smg/workers.json",
+        }));
+        assert_eq!(
+            discovery,
+            Some(DiscoveryConfig::File(FileDiscoveryConfig {
+                path: "/run/smg/workers.json".into(),
+                check_interval_secs: DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS,
+            }))
+        );
+        let written = serde_json::to_value(discovery.unwrap()).unwrap();
+        assert_eq!(written["provider"], "file");
+    }
+
     #[test]
     fn unknown_discovery_provider_is_rejected() {
         let mut config = serde_json::to_value(RouterConfig::default()).unwrap();
@@ -2515,6 +2877,28 @@ discovery:
 
         assert_eq!(config.port, 29000);
         assert_eq!(config.host, "0.0.0.0");
+    }
+
+    #[test]
+    fn metrics_host_defaults_to_the_serving_listeners_family() {
+        for (server_host, expected) in [
+            ("[::]", "::"),
+            ("::", "::"),
+            ("[::1]", "::"),
+            ("fd00::1", "::"),
+            ("[fd00::1]", "::"),
+            ("0.0.0.0", "0.0.0.0"),
+            ("127.0.0.1", "0.0.0.0"),
+            ("10.0.0.7", "0.0.0.0"),
+            ("localhost", "0.0.0.0"),
+            ("", "0.0.0.0"),
+        ] {
+            assert_eq!(
+                MetricsConfig::default_host_for(server_host),
+                expected,
+                "server host {server_host:?}"
+            );
+        }
     }
 
     #[test]
@@ -2669,10 +3053,13 @@ discovery:
             .request_timeout_secs(120)
             .worker_startup_timeout_secs(60)
             .worker_startup_check_interval_secs(5)
-            .discovery_config(KubernetesDiscoveryConfig {
-                namespace: Some("sglang".to_string()),
-                ..Default::default()
-            })
+            .maybe_discovery(Some(
+                KubernetesDiscoveryConfig {
+                    namespace: Some("sglang".to_string()),
+                    ..Default::default()
+                }
+                .into(),
+            ))
             .enable_metrics("0.0.0.0", 9090)
             .enable_trace("localhost:4317")
             .log_dir("/var/log/sglang")
@@ -2706,13 +3093,16 @@ discovery:
             .request_timeout_secs(300)
             .worker_startup_timeout_secs(180)
             .worker_startup_check_interval_secs(15)
-            .discovery_config(KubernetesDiscoveryConfig {
-                namespace: None,
-                port: 8080,
-                check_interval_secs: 45,
-                selector,
-                ..Default::default()
-            })
+            .maybe_discovery(Some(
+                KubernetesDiscoveryConfig {
+                    namespace: None,
+                    port: 8080,
+                    check_interval_secs: 45,
+                    selector,
+                    ..Default::default()
+                }
+                .into(),
+            ))
             .metrics_config(MetricsConfig::default())
             .enable_trace("localhost:4317")
             .log_level("debug")
@@ -2742,22 +3132,25 @@ discovery:
             .request_timeout_secs(900)
             .worker_startup_timeout_secs(600)
             .worker_startup_check_interval_secs(20)
-            .discovery_config(KubernetesDiscoveryConfig {
-                namespace: Some("production".to_string()),
-                port: 8443,
-                check_interval_secs: 120,
-                selector: selectors.clone(),
-                encode_selector: selectors.clone(),
-                prefill_selector: selectors.clone(),
-                decode_selector: selectors,
-                bootstrap_port_annotation: "mycompany.io/bootstrap".to_string(),
-                worker_ports_annotation: "smg.ai/worker-ports".to_string(),
-                kv_connector_annotation: "smg.ai/kv-connector".to_string(),
-                kv_engine_id_annotation: "smg.ai/kv-engine-id".to_string(),
-                router_selector: HashMap::new(),
-                router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
-                model_id_source: None,
-            })
+            .maybe_discovery(Some(
+                KubernetesDiscoveryConfig {
+                    namespace: Some("production".to_string()),
+                    port: 8443,
+                    check_interval_secs: 120,
+                    selector: selectors.clone(),
+                    encode_selector: selectors.clone(),
+                    prefill_selector: selectors.clone(),
+                    decode_selector: selectors,
+                    bootstrap_port_annotation: "mycompany.io/bootstrap".to_string(),
+                    worker_ports_annotation: "smg.ai/worker-ports".to_string(),
+                    kv_connector_annotation: "smg.ai/kv-connector".to_string(),
+                    kv_engine_id_annotation: "smg.ai/kv-engine-id".to_string(),
+                    router_selector: HashMap::new(),
+                    router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
+                    model_id_source: None,
+                }
+                .into(),
+            ))
             .enable_metrics("::", 9999) // IPv6 any
             .enable_trace("localhost:4317")
             .log_dir("/opt/logs/sglang")
@@ -2805,6 +3198,7 @@ discovery:
             }),
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
+                load_metric: Default::default(),
             }),
         };
 
@@ -2867,6 +3261,7 @@ discovery:
             prefill_policy: None,
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
+                load_metric: Default::default(),
             }),
         };
 

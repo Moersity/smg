@@ -1,3 +1,17 @@
+"""The Python launcher's side of the gateway's command line.
+
+``RouterArgs`` carries the router settings the launcher exposes (the Rust
+core's ``Router`` takes one more, the drain settle time, which the launcher
+leaves at its default), in a frozen positional order (new fields are appended
+at the end, never inserted: callers build it positionally). ``add_cli_args`` is the argparse
+mapping of those settings, one option per Rust CLI flag with the same name,
+default and second spelling, grouped as the CLI's help headings;
+``from_cli_args`` reads a parsed namespace back into ``RouterArgs`` (with the
+``--router-`` prefixed spellings taking precedence over the backend's when
+the launcher is embedded in a serving command); the ``_parse_*`` helpers
+mirror the Rust parsers of the flags whose values have a shape.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -25,7 +39,7 @@ COMMON_POLICY_CHOICES = [
 PREFILL_POLICY_CHOICES = [*COMMON_POLICY_CHOICES, "bucket"]
 ENCODE_POLICY_CHOICES = ["random", "round_robin", "consistent_hashing"]
 # Worker discovery providers --discovery-provider accepts.
-DISCOVERY_PROVIDER_CHOICES = ["kubernetes"]
+DISCOVERY_PROVIDER_CHOICES = ["kubernetes", "file"]
 
 
 def _parse_int_csv(value: str) -> list[int]:
@@ -93,7 +107,7 @@ class RouterArgs:
     multimodal_shm_min_bytes: int | None = None
     routing_key_override: bool = False
     dp_minimum_tokens_scheduler: bool = False
-    enable_igw: bool = False  # Enable IGW (Inter-Gateway) mode for multi-model support
+    enable_igw: bool = False  # Enable IGW (Inference Gateway) mode for multi-model support
     api_key: str | None = None
     log_dir: str | None = None
     log_level: str | None = None
@@ -117,7 +131,10 @@ class RouterArgs:
     prometheus_duration_buckets: list[float] | None = None
     # Request ID headers configuration
     request_id_headers: list[str] | None = None
-    # HTTP header to storage hook context mapping
+    # Storage-hook request context read from HTTP headers, oriented
+    # {header name: context key}, as `--storage-context-headers
+    # header=context_key` lists them and as the Rust CLI parses the same
+    # entries (the header name is the key, never the value)
     storage_context_headers: dict[str, str] = dataclasses.field(default_factory=dict)
     # Request timeout in seconds
     request_timeout_secs: int = 1800
@@ -129,7 +146,8 @@ class RouterArgs:
     queue_size: int = 100
     # Maximum time (in seconds) a request can wait in queue before timing out
     queue_timeout_secs: int = 60
-    # Token bucket refill rate (tokens per second). Unset or 0 = no refill
+    # Sustained admission rate (requests per second), bursting up to
+    # max_concurrent_requests. Unset or 0 = no rate limit
     rate_limit_tokens_per_second: int | None = None
     # CORS allowed origins
     cors_allowed_origins: list[str] = dataclasses.field(default_factory=list)
@@ -303,6 +321,9 @@ class RouterArgs:
     # worker is vetoed; seconds without progress before a loaded one is wedged
     worker_stall_secs: int = 2
     worker_wedge_secs: int = 3
+    # Liveness: seconds without any contact from a worker whose KV-event
+    # stream pushes load records before it is vetoed as unreachable (0 = off)
+    worker_stale_secs: int = 15
     # Warm-up slice for cache-aware routing (see the --worker-warmup-* flags)
     worker_warmup_secs: int = 60
     worker_warmup_share: float = 0.25
@@ -312,6 +333,66 @@ class RouterArgs:
     # The cache-aware selection policy and the optimistic accounting TTL
     selection_policy: str = "cache-aware-default"
     selection_accounting_ttl_ms: int = 0
+    # Tenant resolution: trust an upstream tenant header, and its name
+    trust_tenant_header: bool = False
+    tenant_header_name: str = "x-smg-tenant-id"
+    # Per-tenant data-plane keys as (tenant_id, key) pairs (--tenant-api-key)
+    tenant_api_keys: list[tuple] = dataclasses.field(default_factory=list)
+    # Priority-aware admission scheduler
+    priority_scheduler_enabled: bool = False
+    priority_scheduler_default_max_class: str = "default"
+    priority_scheduler_config: str | None = None
+    priority_scheduler_tenant_metric_top_n: int = 32
+    # Per-tenant token/request rate limiting
+    tenant_rate_limit_enabled: bool = False
+    tenant_rate_limit_config: str | None = None
+    # Heap profiles of the router process (a jemalloc-profiling build); appended
+    # last: positional callers bind the fields by position
+    jemalloc_prof_dir: str | None = None
+    # Mesh mTLS: the CA, this node's certificate and key (PEM paths); all three or none.
+    mesh_tls_ca_cert: str | None = None
+    mesh_tls_cert: str | None = None
+    mesh_tls_key: str | None = None
+    # Byte budget of the L0 tokenizer cache (--tokenizer-cache-l0-max-memory);
+    # appended last for the same reason
+    tokenizer_cache_l0_max_memory: int = 256 * 1024 * 1024  # 256MB
+    # File discovery (discovery_provider="file"): the JSON manifest, and how
+    # often to reread it besides on every change (None = 30s).
+    discovery_file: str | None = None
+    discovery_check_interval_secs: int | None = None
+    # Most Responses API requests with background: true in flight at once;
+    # one beyond answers 429. 0 = background mode off (such requests run in
+    # the foreground); appended last for the same reason
+    max_background_responses: int = 1024
+    power_of_two_load_metric: str = "expected_wait"
+    # HTTP edge: seconds to receive a complete request head, and seconds a
+    # keep-alive connection may sit with no request in flight (0 disables)
+    header_read_timeout_secs: int = 30
+    idle_connection_timeout_secs: int = 90
+    # Hosts the router fetches client-supplied media URLs from when it processes
+    # media itself (every redirect hop included); None allows any host the
+    # address policy passes
+    mm_allowed_media_domains: list[str] | None = None
+    # Allow media URLs on loopback, link-local or private addresses (an internal
+    # media origin); False falls back to SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS
+    mm_allow_private_media_hosts: bool = False
+    # Seconds of upstream silence after which an open SSE stream carries a
+    # keep-alive frame; 0 sends none; appended last for the same reason
+    sse_keepalive_secs: int = 15
+    # The bound on one history-store call (pool wait, connect and the
+    # operation included); appended last for positional callers
+    postgres_op_timeout_secs: int = 5
+    redis_op_timeout_secs: int = 5
+    # Bounds of the memory history backend: the most stored responses and
+    # conversation items kept (the oldest go first) and how long a record is
+    # kept (0 = until a count bound drops it); appended last for the same reason
+    history_memory_max_responses: int = 10000
+    history_memory_max_items: int = 100000
+    history_memory_retention_secs: int = 86400
+    # Which parser reads a chat completion's reasoning and tool calls: the per-model parsers
+    # ("legacy") or Symphony ("symphony") for the models its registry knows; a request's
+    # X-SMG-Parser header overrides it; appended last for the same reason
+    parser: str = "legacy"
 
     @staticmethod
     def add_cli_args(
@@ -345,9 +426,15 @@ class RouterArgs:
         k8s_group = parser.add_argument_group(
             "Service Discovery (Kubernetes)", "Kubernetes-based worker discovery"
         )
+        file_discovery_group = parser.add_argument_group(
+            "Service Discovery (File)", "Workers listed in a JSON manifest"
+        )
         logging_group = parser.add_argument_group("Logging", "Log output configuration")
         prometheus_group = parser.add_argument_group(
             "Prometheus Metrics", "Metrics export configuration"
+        )
+        profiling_group = parser.add_argument_group(
+            "Profiling", "Heap profiles of the router process"
         )
         request_group = parser.add_argument_group(
             "Request Handling", "Request timeout and ID configuration"
@@ -393,6 +480,15 @@ class RouterArgs:
         )
         rl_group = parser.add_argument_group(
             "RL Control Plane", "Worker discovery and engine-route passthrough for RL training"
+        )
+        dp_auth_group = parser.add_argument_group(
+            "Data Plane Authentication", "Per-tenant API keys for the serving path"
+        )
+        scheduler_group = parser.add_argument_group(
+            "Priority Scheduler", "Priority-aware admission scheduler"
+        )
+        tenant_rate_limit_group = parser.add_argument_group(
+            "Tenant Rate Limit", "Per-tenant token and request rate limiting"
         )
 
         if use_router_prefix:
@@ -534,7 +630,10 @@ class RouterArgs:
             f"--{prefix}prefix-hash-load-factor",
             type=float,
             default=RouterArgs.prefix_hash_load_factor,
-            help="Load factor above which prefix_hash walks the ring (multiple of average load)",
+            help=(
+                "Load factor above which prefix_hash walks the ring (multiple of"
+                " average load; finite, at least 1.0)"
+            ),
         )
         routing_group.add_argument(
             f"--{prefix}prefix-hash-balance-abs-threshold",
@@ -580,13 +679,25 @@ class RouterArgs:
             ),
         )
         routing_group.add_argument(
+            f"--{prefix}power-of-two-load-metric",
+            type=str,
+            choices=["expected_wait", "requests", "least_requests"],
+            default=RouterArgs.power_of_two_load_metric,
+            help="What power_of_two compares: expected_wait, requests or least_requests",
+        )
+        routing_group.add_argument(
             f"--{prefix}balance-abs-threshold",
             f"--{prefix}spill-abs-threshold",
             type=int,
             default=RouterArgs.balance_abs_threshold,
             help=(
-                "Spill gate, absolute part. Balancing is triggered if"
-                " `(max_load - min_load) > abs_threshold` and the relative threshold is also met."
+                "Spill gate, absolute part: a matched worker is skipped for the least-loaded one"
+                " when its load exceeds the healthy-fleet mean by this many requests AND by the"
+                " relative threshold. The margin is capped at the in-flight count's natural swing"
+                " at the pool's current mean (two standard deviations, never under four unless"
+                " this value is lower), so a small pool can spill at all. With the bucket policy"
+                " the pair keeps its own rule: balancing when (max_load - min_load) exceeds this"
+                " value and max_load exceeds min_load times the relative threshold."
             ),
         )
         routing_group.add_argument(
@@ -595,8 +706,9 @@ class RouterArgs:
             type=float,
             default=RouterArgs.balance_rel_threshold,
             help=(
-                "Spill gate, relative part. Balancing is triggered if"
-                " `max_load > min_load * rel_threshold` and the absolute threshold is also met."
+                "Spill gate, relative part: a matched worker is skipped when its load exceeds"
+                " this multiple of the healthy-fleet mean AND the absolute threshold is also met."
+                " Finite, at least 1.0."
             ),
         )
         routing_group.add_argument(
@@ -608,7 +720,8 @@ class RouterArgs:
                 " coldest backend KV utilization above which cache affinity is"
                 " abandoned for shortest-queue. Catches long-context KV imbalance that"
                 " in-flight request counts miss, and is invariant to gateway replica"
-                " count. Backend must report token_usage. Defaults to 1.0 (disabled)."
+                " count. Backend must report token_usage. Finite and > 0.0; >= 1.0"
+                " disables it. Defaults to 1.0 (disabled)."
             ),
         )
         routing_group.add_argument(
@@ -619,7 +732,8 @@ class RouterArgs:
                 "Cache-aware KV-utilization CEILING (0.0-1.0): when the hottest backend"
                 " exceeds it, shed load off that engine regardless of spread. A safety"
                 " valve for critically-saturated engines, best set high (e.g. 0.9)."
-                " Backend must report token_usage. Defaults to 1.0 (disabled)."
+                " Backend must report token_usage. Finite and > 0.0; >= 1.0 disables"
+                " it. Defaults to 1.0 (disabled)."
             ),
         )
         routing_group.add_argument(
@@ -723,6 +837,19 @@ class RouterArgs:
             ),
         )
         routing_group.add_argument(
+            f"--{prefix}worker-stale-secs",
+            type=int,
+            default=RouterArgs.worker_stale_secs,
+            help=(
+                "Seconds without any contact (a load record, a poll answer, a probe,"
+                " a token) from a worker whose KV-event stream pushes load records,"
+                " after which it is excluded from routing as unreachable until it is"
+                " heard from again; workers that never pushed a record are not"
+                " judged by it. Keep it above the load-monitor interval. 0 disables."
+                " Defaults to 15."
+            ),
+        )
+        routing_group.add_argument(
             f"--{prefix}worker-warmup-secs",
             type=int,
             default=RouterArgs.worker_warmup_secs,
@@ -738,7 +865,10 @@ class RouterArgs:
             f"--{prefix}worker-warmup-share",
             type=float,
             default=RouterArgs.worker_warmup_share,
-            help="Share of cache misses offered to warming workers (0.0 to 1.0). Defaults to 0.25.",
+            help=(
+                "Share of cache misses offered to warming workers (a finite value from"
+                " 0.0 to 1.0). Defaults to 0.25."
+            ),
         )
         routing_group.add_argument(
             f"--{prefix}worker-warmup-blocks",
@@ -756,8 +886,8 @@ class RouterArgs:
             help=(
                 "A worker whose index holds less than this share of the fleet's"
                 " median (or nothing) is thin and receives the warm-up slice until"
-                " it has grown by --worker-warmup-blocks, whatever emptied it. 0"
-                " keeps the age rule alone. Defaults to 0.5."
+                " it has grown by --worker-warmup-blocks, whatever emptied it. A"
+                " finite value from 0.0 to 1.0; 0 keeps the age rule alone. Defaults to 0.5."
             ),
         )
         routing_group.add_argument(
@@ -936,6 +1066,19 @@ class RouterArgs:
                 " pauses while the worker applies backpressure, so a slow"
                 " worker read never trips it. Applies only to streamed"
                 " request bodies. 0 disables"
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}sse-keepalive-secs",
+            type=_non_negative_int,
+            default=RouterArgs.sse_keepalive_secs,
+            help=(
+                "Seconds of upstream silence after which an open SSE stream"
+                " carries a keep-alive frame (an SSE comment on the"
+                " OpenAI-shaped endpoints, the ping event on /v1/messages), so"
+                " an idle-timeout proxy does not cut a stream that is waiting"
+                " on a long prefill. Nothing is sent while frames flow."
+                " 0 sends none"
             ),
         )
         routing_group.add_argument(
@@ -1132,7 +1275,8 @@ class RouterArgs:
                 " once; a request that fits waits briefly for room, then gets"
                 " 429, and one larger than the whole budget gets 413 straight"
                 " away. A waiting request still holds its media, so size memory"
-                " for about twice this value. Zero is refused, not read as unset"
+                " for about twice this value. Counted in whole KiB: a value under 1024 (one"
+                " 1 KiB unit, zero included) is refused, not read as unset"
             ),
         )
         parser.add_argument(
@@ -1153,9 +1297,11 @@ class RouterArgs:
             help=(
                 "Where media for vLLM gRPC workers is fetched and preprocessed: auto"
                 " (worker when the model spec and the worker both allow it, else"
-                " router), router (always the gateway), worker (always the engine;"
-                " models without worker expansion are rejected). Falls back to"
-                " SMG_MM_PROCESSING, then auto"
+                " router), router (always the gateway), worker (the engine, except"
+                " that a request whose items carry per-item hints"
+                " (max_long_side_pixel, fps) is preprocessed by the gateway, which"
+                " applies them; models without worker expansion are rejected)."
+                " Falls back to SMG_MM_PROCESSING, then auto"
             ),
         )
         parser.add_argument(
@@ -1178,6 +1324,26 @@ class RouterArgs:
             ),
         )
         parser.add_argument(
+            f"--{prefix}mm-allowed-media-domains",
+            type=lambda value: [host.strip() for host in value.split(",") if host.strip()],
+            default=RouterArgs.mm_allowed_media_domains,
+            help=(
+                "Hosts the router fetches client-supplied media URLs from when it"
+                " processes media itself, comma-separated; a redirect to any other"
+                " host is refused. Unset allows any host the address policy passes"
+            ),
+        )
+        parser.add_argument(
+            f"--{prefix}mm-allow-private-media-hosts",
+            action="store_true",
+            default=RouterArgs.mm_allow_private_media_hosts,
+            help=(
+                "Allow client-supplied media URLs that name or resolve to a loopback,"
+                " link-local or private address (an internal media origin); by default"
+                " such URLs are refused. Falls back to SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS"
+            ),
+        )
+        parser.add_argument(
             f"--{prefix}rdma-listen-ip",
             type=str,
             default=RouterArgs.rdma_listen_ip,
@@ -1191,8 +1357,8 @@ class RouterArgs:
             type=_non_negative_int,
             default=RouterArgs.rdma_slot_ttl_s,
             help=(
-                "Seconds a leased RDMA pixel slot lives without a free notification;"
-                " must exceed the worker's hold or it is ignored. Falls back to"
+                "Seconds a leased RDMA pixel slot lives without a free notification"
+                " (at least 1); must exceed the worker's hold or it is ignored. Falls back to"
                 " SMG_RDMA_SLOT_TTL_S"
             ),
         )
@@ -1209,7 +1375,9 @@ class RouterArgs:
             type=str,
             default=None,
             help=(
-                "Directory to store log files. If not specified, logs are only output to console."
+                "Directory for the log files, created at start-up when missing (under a"
+                " writable directory); an existing path must be a writable directory. If not"
+                " specified, logs are only output to console."
             ),
         )
         logging_group.add_argument(
@@ -1242,6 +1410,24 @@ class RouterArgs:
             choices=DISCOVERY_PROVIDER_CHOICES,
             default=None,
             help="Worker discovery provider. Give this or --service-discovery, not both",
+        )
+        file_discovery_group.add_argument(
+            f"--{prefix}discovery-file",
+            type=str,
+            default=None,
+            help=(
+                "JSON manifest listing the workers, for --discovery-provider file."
+                " It may be created after startup"
+            ),
+        )
+        file_discovery_group.add_argument(
+            f"--{prefix}discovery-check-interval-secs",
+            type=int,
+            default=None,
+            help=(
+                "Seconds between periodic rereads of the --discovery-file manifest,"
+                " which is also reread as soon as it changes (default: 30)"
+            ),
         )
         k8s_group.add_argument(
             f"--{prefix}selector",
@@ -1337,7 +1523,9 @@ class RouterArgs:
             help=(
                 "Accept an extra client-facing model name for a served model."
                 " Format: <alias>=<canonical>. Repeat for multiple aliases."
-                " Matching is case-sensitive."
+                " Matching is case-sensitive. A vendor-named alias (kimi-*,"
+                " minimax-*, ...) also gives the served model that vendor's"
+                " contract profile under both names."
             ),
         )
         # Prometheus configuration
@@ -1345,18 +1533,16 @@ class RouterArgs:
             f"--{prefix}prometheus-port",
             type=int,
             default=29000,
-            help=(
-                "Port to expose Prometheus metrics (default: 29000)."
-                " 0 binds an OS-assigned ephemeral port, logged at startup."
-            ),
+            help="Port to expose Prometheus metrics (at least 1; default: 29000)",
         )
         prometheus_group.add_argument(
             f"--{prefix}prometheus-host",
             type=str,
-            default="0.0.0.0",
+            default=None,
             help=(
                 "Host address to bind the Prometheus metrics server. Supports IPv4, IPv6"
-                " (e.g., ::, ::1), or 0.0.0.0 for all interfaces"
+                " (e.g., ::, ::1), or 0.0.0.0 for all interfaces. Default: the unspecified"
+                " address of --host's family (:: for an IPv6 host, 0.0.0.0 otherwise)"
             ),
         )
         prometheus_group.add_argument(
@@ -1365,6 +1551,17 @@ class RouterArgs:
             nargs="+",
             action="extend",
             help="Buckets for Prometheus duration metrics",
+        )
+        profiling_group.add_argument(
+            f"--{prefix}jemalloc-prof-dir",
+            type=str,
+            default=None,
+            help=(
+                "Directory where POST /heap_profile (an admin route) writes a jemalloc heap"
+                " profile of the router. Needs a build with the jemalloc-profiling feature,"
+                " started with _RJEM_MALLOC_CONF=prof:true,prof_active:true; unset, the route"
+                " answers 404"
+            ),
         )
 
         # Request handling configuration
@@ -1375,7 +1572,9 @@ class RouterArgs:
             action="extend",
             help=(
                 "Custom HTTP headers to check for request IDs (e.g., x-request-id x-trace-id)."
-                " If not specified, uses common defaults."
+                " If not specified, uses common defaults. The first header present is honoured"
+                " when its value is 1 to 128 visible-ASCII characters; otherwise a fresh id is"
+                " generated."
             ),
         )
         request_group.add_argument(
@@ -1402,12 +1601,64 @@ class RouterArgs:
             help="Grace period in seconds to wait for in-flight requests during shutdown",
         )
         request_group.add_argument(
+            f"--{prefix}header-read-timeout-secs",
+            type=int,
+            default=RouterArgs.header_read_timeout_secs,
+            help=(
+                "Close a connection that has not sent a complete request head"
+                " within this many seconds of being accepted (and a keep-alive"
+                " connection whose next request head stalls for this long after"
+                " its first byte). 0 disables"
+            ),
+        )
+        request_group.add_argument(
+            f"--{prefix}idle-connection-timeout-secs",
+            type=int,
+            default=RouterArgs.idle_connection_timeout_secs,
+            help=(
+                "Close a keep-alive connection that has had no request in flight"
+                " for this many seconds; an open streaming response counts as in"
+                " flight. The bound starts with the connection's first request (a"
+                " connection that never sends one is bounded by"
+                " --header-read-timeout-secs alone). Keep it above the idle"
+                " timeout of any proxy or load balancer in front of the gateway,"
+                " so that side closes an idle connection first; otherwise a"
+                " request can be sent on a connection the gateway is closing and"
+                " fail with a reset. A connection the proxy opened ahead of time"
+                " and never used is bounded by --header-read-timeout-secs"
+                " instead: keep the proxy's idle timeout under that too, or do"
+                " not pre-open. 0 keeps idle connections open until the client"
+                " closes them"
+            ),
+        )
+        request_group.add_argument(
+            f"--{prefix}trust-tenant-header",
+            action="store_true",
+            default=False,
+            help=(
+                "Trust an upstream-provided tenant header for canonical tenant resolution."
+                " Stored responses and conversations are scoped to the tenant that created"
+                " them: another tenant's id answers 404; records stored without a tenant"
+                " identity stay readable by every caller."
+            ),
+        )
+        request_group.add_argument(
+            f"--{prefix}tenant-header-name",
+            type=str,
+            default=RouterArgs.tenant_header_name,
+            help="Header name to use when --trust-tenant-header is enabled.",
+        )
+        request_group.add_argument(
             f"--{prefix}cors-allowed-origins",
             type=str,
             nargs="*",
             action="extend",
             default=[],
-            help="CORS allowed origins (e.g., http://localhost:3000 https://example.com)",
+            help=(
+                "Origins a browser may call the gateway from (e.g., http://localhost:3000"
+                " https://example.com), or '*' alone for any origin. Without this flag the"
+                " gateway makes no cross-origin allowance."
+            ),
         )
 
         # Rate limiting configuration
@@ -1418,7 +1669,8 @@ class RouterArgs:
             help=(
                 "Maximum standing concurrent requests; each admission permit"
                 " is held for the full response, including streaming bodies."
-                " Set to -1 to disable."
+                " -1 (default) derives the bound from the host (1024 per"
+                " available core, at least 4096); 0 disables it."
             ),
         )
         rate_limit_group.add_argument(
@@ -1441,9 +1693,76 @@ class RouterArgs:
             type=int,
             default=RouterArgs.rate_limit_tokens_per_second,
             help=(
-                "Token bucket refill rate (tokens per second). Unset or 0 ="
-                " no refill: --max-concurrent-requests bounds standing"
-                " concurrency alone."
+                "Sustained admission rate in requests per second, bursting up"
+                " to --max-concurrent-requests, which keeps bounding standing"
+                " concurrency. Unset or 0 = no rate limit."
+            ),
+        )
+        rate_limit_group.add_argument(
+            f"--{prefix}max-background-responses",
+            type=int,
+            default=RouterArgs.max_background_responses,
+            help=(
+                "Most Responses API requests with background: true in flight"
+                " at once; one beyond answers 429. 0 switches background mode"
+                " off: such requests then run in the foreground."
+            ),
+        )
+
+        # Priority scheduler configuration
+        scheduler_group.add_argument(
+            f"--{prefix}priority-scheduler-enabled",
+            action="store_true",
+            default=False,
+            help=(
+                "Enable the priority-aware admission scheduler. When unset (default),"
+                " the legacy concurrency-limit middleware stays wired."
+            ),
+        )
+        scheduler_group.add_argument(
+            f"--{prefix}priority-scheduler-default-max-class",
+            type=str,
+            default=RouterArgs.priority_scheduler_default_max_class,
+            help=(
+                "Max priority class for tenants not listed in the scheduler YAML"
+                " (system | interactive | default | bulk)."
+            ),
+        )
+        scheduler_group.add_argument(
+            f"--{prefix}priority-scheduler-config",
+            type=str,
+            default=None,
+            help=(
+                "Optional path to the priority-scheduler YAML config. With "
+                "--priority-scheduler-enabled, a file that cannot be read, parsed "
+                "or validated is a start-up error; without a path the built-in "
+                "class defaults apply."
+            ),
+        )
+        scheduler_group.add_argument(
+            f"--{prefix}priority-scheduler-tenant-metric-top-n",
+            type=int,
+            default=RouterArgs.priority_scheduler_tenant_metric_top_n,
+            help='Cap on per-tenant scheduler metric label cardinality (top-N + "other").',
+        )
+
+        # Tenant rate limit configuration
+        tenant_rate_limit_group.add_argument(
+            f"--{prefix}tenant-rate-limit-enabled",
+            action="store_true",
+            default=False,
+            help=(
+                "Enable per-tenant LLM token/request rate limiting. When unset (default),"
+                " no rate limiter is constructed."
+            ),
+        )
+        tenant_rate_limit_group.add_argument(
+            f"--{prefix}tenant-rate-limit-config",
+            type=str,
+            default=None,
+            help=(
+                "Path to the tenant-rate-limit YAML. Required when"
+                " --tenant-rate-limit-enabled is set."
             ),
         )
 
@@ -1470,7 +1789,7 @@ class RouterArgs:
             f"--{prefix}retry-backoff-multiplier",
             type=float,
             default=RouterArgs.retry_backoff_multiplier,
-            help="Multiplier for exponential backoff between retries",
+            help="Multiplier for exponential backoff between retries (finite, at least 1.0)",
         )
         retry_group.add_argument(
             f"--{prefix}retry-jitter-factor",
@@ -1522,25 +1841,34 @@ class RouterArgs:
             f"--{prefix}health-failure-threshold",
             type=int,
             default=RouterArgs.health_failure_threshold,
-            help=("Number of consecutive health check failures before marking worker unhealthy"),
+            help=(
+                "Number of consecutive health check failures before marking worker unhealthy"
+                " (at least 1)"
+            ),
         )
         health_group.add_argument(
             f"--{prefix}health-success-threshold",
             type=int,
             default=RouterArgs.health_success_threshold,
-            help=("Number of consecutive health check successes before marking worker healthy"),
+            help=(
+                "Number of consecutive health check successes before marking worker healthy"
+                " (at least 1)"
+            ),
         )
         health_group.add_argument(
             f"--{prefix}health-check-timeout-secs",
             type=int,
             default=RouterArgs.health_check_timeout_secs,
-            help="Timeout in seconds for health check requests",
+            help="Timeout in seconds for health check requests (at least 1)",
         )
         health_group.add_argument(
             f"--{prefix}health-check-interval-secs",
             type=int,
             default=RouterArgs.health_check_interval_secs,
-            help="Interval in seconds between runtime health checks",
+            help=(
+                "Interval in seconds between runtime health checks (at least 1;"
+                f" --{prefix}disable-health-check turns probing off)"
+            ),
         )
         health_group.add_argument(
             f"--{prefix}health-check-endpoint",
@@ -1574,19 +1902,29 @@ class RouterArgs:
             f"--{prefix}model",
             type=str,
             default=None,
-            help="Model path for loading tokenizer (HuggingFace model ID or local path)",
+            help=(
+                "Model path for loading tokenizer (HuggingFace model ID, fetched lazily, or a"
+                " local path: one that exists must hold a tokenizer layout; one that does not"
+                " is left to the worker's tokenizer where a gRPC worker can still register"
+                " (gRPC worker URLs, IGW mode, worker discovery)"
+                " and refused otherwise). Not read as a tokenizer source when tokenizer_path"
+                " is set."
+            ),
         )
         tokenizer_group.add_argument(
             f"--{prefix}tokenizer-path",
             type=str,
             default=None,
-            help="Explicit tokenizer path (overrides model_path tokenizer if provided)",
+            help=(
+                "Explicit tokenizer path (overrides model_path tokenizer if provided); a local"
+                " path follows the same rule as model_path"
+            ),
         )
         tokenizer_group.add_argument(
             f"--{prefix}chat-template",
             type=str,
             default=None,
-            help="Chat template path (optional)",
+            help="Chat template path (optional): an existing, non-empty template file",
         )
         tokenizer_group.add_argument(
             f"--{prefix}disable-tokenizer-autoload",
@@ -1594,6 +1932,18 @@ class RouterArgs:
             default=RouterArgs.disable_tokenizer_autoload,
             help="Disable automatic tokenizer loading at startup. "
             "Use this when tokenizers are not needed (e.g., pure load balancing).",
+        )
+        tokenizer_group.add_argument(
+            f"--{prefix}parser",
+            type=str,
+            default=RouterArgs.parser,
+            choices=["legacy", "symphony"],
+            help="Which parser reads a chat completion's reasoning and tool calls: the per-model "
+            "parsers (legacy, the default) or Symphony. With Symphony, the parser names set for a model "
+            "decide (its worker labels, else --tool-call-parser and --reasoning-parser): a Symphony table's "
+            "name reads with that table, a legacy parser's keeps the legacy parsers, and no name takes "
+            "Symphony's registry for the models it knows. A request's X-SMG-Parser header overrides the "
+            "flag for that request.",
         )
         tokenizer_group.add_argument(
             f"--{prefix}tokenizer-cache-enable-l0",
@@ -1614,6 +1964,12 @@ class RouterArgs:
             help="Enable L1 (prefix matching) tokenizer cache (default: False)",
         )
         tokenizer_group.add_argument(
+            f"--{prefix}tokenizer-cache-l0-max-memory",
+            type=int,
+            default=RouterArgs.tokenizer_cache_l0_max_memory,
+            help="Maximum memory for L0 tokenizer cache in bytes: texts, ids and per-entry overhead (default: 256MB)",
+        )
+        tokenizer_group.add_argument(
             f"--{prefix}tokenizer-cache-l1-max-memory",
             type=int,
             default=RouterArgs.tokenizer_cache_l1_max_memory,
@@ -1627,7 +1983,9 @@ class RouterArgs:
             type=str,
             default=None,
             choices=reasoning_parser_choices,
-            help="Specify the parser for reasoning models (e.g., deepseek_r1, qwen3)",
+            help="Specify the parser for reasoning models (e.g., deepseek_r1, qwen3). Under --parser symphony, "
+            "a Symphony table's name here (and in --tool-call-parser, or here alone) reads every model with "
+            "that table; a legacy parser's name keeps the legacy parsers",
         )
         tool_call_parser_choices = get_available_tool_call_parsers()
         parser_group.add_argument(
@@ -1635,7 +1993,9 @@ class RouterArgs:
             type=str,
             default=None,
             choices=tool_call_parser_choices,
-            help="Specify the parser for tool-call interactions (e.g., json, qwen)",
+            help="Specify the parser for tool-call interactions (e.g., json, qwen). Under --parser symphony, "
+            "a Symphony table's name here (and in --reasoning-parser, or here alone) reads every model with "
+            "that table; a legacy parser's name keeps the legacy parsers",
         )
         parser_group.add_argument(
             f"--{prefix}mcp-config-path",
@@ -1684,6 +2044,38 @@ class RouterArgs:
             default=RouterArgs.history_backend,
             choices=["memory", "none", "oracle", "postgres", "redis"],
             help="History storage backend for conversations and responses (default: memory)",
+        )
+        backend_group.add_argument(
+            f"--{prefix}history-memory-max-responses",
+            type=int,
+            default=RouterArgs.history_memory_max_responses,
+            help=(
+                "Most stored responses the memory history backend keeps; the oldest go"
+                " first, on every write (memory backend only; a stored response takes"
+                " about 12 KB)."
+            ),
+        )
+        backend_group.add_argument(
+            f"--{prefix}history-memory-max-items",
+            type=int,
+            default=RouterArgs.history_memory_max_items,
+            help=(
+                "Most conversation items the memory history backend keeps; the oldest go"
+                " first and leave every conversation that listed them (memory backend"
+                " only; an item takes about 1.5 KB)."
+            ),
+        )
+        backend_group.add_argument(
+            f"--{prefix}history-memory-retention-secs",
+            type=int,
+            default=RouterArgs.history_memory_retention_secs,
+            help=(
+                "How long the memory history backend keeps a record, in seconds, checked"
+                " on every write; 0 keeps a record until a count bound drops it. A"
+                " conversation is kept that long after its last use (created, read or"
+                " updated); a background response still running is not dropped by a"
+                " count bound."
+            ),
         )
 
         # Oracle configuration
@@ -1755,6 +2147,13 @@ class RouterArgs:
             default=int(os.getenv("POSTGRES_POOL_MAX", RouterArgs.postgres_pool_max)),
             help="Maximum PostgreSQL connection pool size (default: 16, env: POSTGRES_POOL_MAX)",
         )
+        postgres_group.add_argument(
+            f"--{prefix}postgres-op-timeout-secs",
+            type=int,
+            default=int(os.getenv("POSTGRES_OP_TIMEOUT_SECS", RouterArgs.postgres_op_timeout_secs)),
+            help="Bound in seconds on each call to the PostgreSQL store (pool wait, connect and the statement); "
+            "a call past it is answered 503 storage_unavailable (default: 5, env: POSTGRES_OP_TIMEOUT_SECS)",
+        )
 
         # Redis configuration
         redis_group.add_argument(
@@ -1773,7 +2172,18 @@ class RouterArgs:
             f"--{prefix}redis-retention-days",
             type=int,
             default=int(os.getenv("REDIS_RETENTION_DAYS", RouterArgs.redis_retention_days)),
-            help="Redis data retention in days (-1 for persistent, default: 30, env: REDIS_RETENTION_DAYS)",
+            help=(
+                "Redis data retention in days (at least 1; -1 for persistent, default: 30,"
+                " env: REDIS_RETENTION_DAYS)"
+            ),
+        )
+        redis_group.add_argument(
+            f"--{prefix}redis-op-timeout-secs",
+            type=int,
+            default=int(os.getenv("REDIS_OP_TIMEOUT_SECS", RouterArgs.redis_op_timeout_secs)),
+            help="Bound in seconds on each call to the Redis store (pool wait, connect and the command; replaces the "
+            "client library's 500 ms / 1 s defaults); a call past it is answered 503 storage_unavailable "
+            "(default: 5, env: REDIS_OP_TIMEOUT_SECS)",
         )
 
         # Schema configuration
@@ -1781,7 +2191,9 @@ class RouterArgs:
             f"--{prefix}schema-config",
             type=str,
             default=None,
-            help="Path to a YAML schema config file for storage table/column remapping",
+            help="Path to a YAML schema config file for storage table/column remapping; "
+            "auto_migrate: true in it applies pending schema migrations at start-up "
+            "(the environment variable DB_AUTO_MIGRATE=true does the same without a file)",
         )
 
         # TLS/mTLS configuration
@@ -1845,6 +2257,20 @@ class RouterArgs:
             help=(
                 "The api key used for the authorization with the worker."
                 " Useful when the dp aware scheduling strategy is enabled."
+            ),
+        )
+        dp_auth_group.add_argument(
+            f"--{prefix}tenant-api-key",
+            type=str,
+            action="append",
+            default=[],
+            metavar="TENANT_ID:KEY",
+            help=(
+                "Per-tenant API keys for serving-path auth (format: tenant_id:key,"
+                " repeatable). Layers on top of --api-key, each resolving to its own"
+                " tenant identity. Stored responses and conversations are scoped to the"
+                " tenant that created them: another tenant's id answers 404; records"
+                " stored without a tenant identity stay readable by every caller."
             ),
         )
         auth_group.add_argument(
@@ -1948,6 +2374,28 @@ class RouterArgs:
             default=[],
             help="Peer mesh server addresses to join (format: host:port)",
         )
+        mesh_group.add_argument(
+            f"--{prefix}mesh-tls-ca-cert",
+            type=str,
+            default=None,
+            help=(
+                "CA certificate (PEM) the mesh peers' certificates chain to. With"
+                " --mesh-tls-cert and --mesh-tls-key the mesh listener serves TLS and requires"
+                " peer certificates, and every dial presents this node's."
+            ),
+        )
+        mesh_group.add_argument(
+            f"--{prefix}mesh-tls-cert",
+            type=str,
+            default=None,
+            help="This mesh node's certificate (PEM), with the node's IP as a SAN",
+        )
+        mesh_group.add_argument(
+            f"--{prefix}mesh-tls-key",
+            type=str,
+            default=None,
+            help="This mesh node's private key (PKCS#8 PEM)",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace, use_router_prefix: bool = False) -> RouterArgs:
@@ -1979,12 +2427,9 @@ class RouterArgs:
             ):
                 args_dict[attr.name] = cli_args_dict[attr.name]
 
-            # Special handling for CLI args with dashes vs dataclass fields with underscores
-            # e.g. --tls-cert-path maps to tls_cert_path in args namespace,
-            # but we might want server_cert_path in dataclass
-            # Wait, dataclass fields are server_cert_path/server_key_path
-            # CLI args are tls_cert_path/tls_key_path
-            # We need to manually map them if names don't match
+        # The fields whose option is named differently, or whose value has a
+        # shape, are read below: --tls-cert-path/--tls-key-path onto
+        # server_cert_path/server_key_path, and the parsed lists and maps.
 
         # --disable-worker-overload-protection is the CLI spelling of
         # worker_overload_protection=False; the prefixed form wins, the
@@ -2045,6 +2490,11 @@ class RouterArgs:
             cli_args_dict.get(f"{prefix}jwt_role_mapping", [])
         )
 
+        # Parse per-tenant data-plane API keys
+        args_dict["tenant_api_keys"] = cls._parse_tenant_api_keys(
+            cli_args_dict.get(f"{prefix}tenant_api_key", [])
+        )
+
         return cls(**args_dict)
 
     def selected_discovery_provider(self) -> str | None:
@@ -2090,6 +2540,12 @@ class RouterArgs:
 
     @staticmethod
     def _parse_selector(selector_list):
+        """``key=value`` entries as ``{key: value}``: the label selectors, and
+        ``--storage-context-headers``, whose key is the header name and whose
+        value is the context key (the same orientation as the Rust CLI's). A
+        token without ``=`` is skipped here where the Rust CLI refuses it, and
+        one argv item may carry several space-separated pairs: the launcher's
+        own allowances (smg-lab#431 tracks the first)."""
         if not selector_list:
             return {}
 
@@ -2208,14 +2664,35 @@ class RouterArgs:
         for key_str in api_keys_list:
             parts = key_str.split(":", 3)  # Split into at most 4 parts
             if len(parts) != 4:
-                raise ValueError(
-                    f"Invalid API key format: '{key_str}'. Expected 'id:name:role:key'"
-                )
+                # The entry is not shown: it carries the credential.
+                raise ValueError("Invalid control-plane API key entry: expected 'id:name:role:key'")
             key_id, name, role, key = parts
             role_lower = role.lower()
             if role_lower not in ("admin", "user"):
-                raise ValueError(f"Invalid role: '{role}'. Must be 'admin' or 'user'")
+                # Nor the role field: with the fields out of order it is the credential.
+                raise ValueError("Invalid control-plane API key role: must be 'admin' or 'user'")
             parsed_keys.append((key_id, name, key, role_lower))
+        return parsed_keys
+
+    @staticmethod
+    def _parse_tenant_api_keys(api_keys_list):
+        """Parse per-tenant data-plane keys from --tenant-api-key arguments.
+
+        Format: tenant_id:key, split at the first ':' with both parts trimmed,
+        as the Rust CLI parses it. The key is never echoed in an error.
+        """
+        if not api_keys_list:
+            return []
+
+        parsed_keys = []
+        for key_str in api_keys_list:
+            tenant_id, sep, key = key_str.partition(":")
+            if not sep:
+                raise ValueError(
+                    "Invalid --tenant-api-key value: expected 'tenant_id:key'"
+                    " (missing ':' separator)"
+                )
+            parsed_keys.append((tenant_id.strip(), key.strip()))
         return parsed_keys
 
     @staticmethod

@@ -2,15 +2,21 @@
 
 use std::fmt::Write as _;
 
-use serde_json::{json, Value};
+use serde_json::Value;
 use thiserror::Error;
 
-// `find_last_user_index` and `at_or_after_last_user` are byte-for-byte
-// identical to the V4-family copies; shared via `deepseek_common` rather than
-// duplicated a third time. V3.2's other tool/drop-thinking helpers are
-// genuinely different algorithms (not just a naming coincidence) and are
-// intentionally kept local to this file.
-use super::deepseek_common::{at_or_after_last_user, find_last_user_index};
+// The index predicates, the JSON spelling and the OpenAI-shape readers are
+// the V4 family's too and come from `deepseek_common`. V3.2's tool-message
+// handling, drop-thinking role set, DSML argument rendering and tools
+// template are different algorithms and texts and stay here.
+use super::{
+    deepseek_common::{
+        after_last_user, at_or_after_last_user, find_last_user_index, to_json,
+        tool_calls_from_openai_format, tool_schemas, tools_from_openai_format,
+    },
+    RendererProfile,
+};
+use crate::chat_template::{ThinkingKeyName, ThinkingToggle};
 
 /// Mode for thinking/reasoning rendering.
 ///
@@ -84,6 +90,22 @@ pub const THINKING_START_TOKEN: &str = "<think>";
 pub const THINKING_END_TOKEN: &str = "</think>";
 pub const DSML_TOKEN: &str = "｜DSML｜";
 
+/// What this renderer answers around a render (see [`RendererProfile`]).
+pub(crate) const PROFILE: RendererProfile = RendererProfile {
+    // No opinion on content parts: the (usually absent) template's format.
+    content_format: None,
+    // Thinking is gated on the `thinking` kwarg, default off.
+    thinking_toggle: ThinkingToggle::DefaultOff,
+    thinking_key_name: ThinkingKeyName::Thinking,
+    // Switches off on the protocol's `none` / `minimal`: no words of its own.
+    native_effort_values: &[],
+    native_effort_off_values: &[],
+    // `<｜Assistant｜><think>` ends the prompt when thinking is on.
+    think_in_prefill: true,
+    capabilities: RendererProfile::NO_CAPABILITIES,
+    thinking_mode: None,
+};
+
 const USER_PREFIX: &str = "<｜User｜>";
 const ASSISTANT_SUFFIX: &str = "<｜Assistant｜>";
 
@@ -144,39 +166,6 @@ fn user_msg(content: &str) -> String {
     format!("{USER_PREFIX}{content}{ASSISTANT_SUFFIX}")
 }
 
-// ---------------------------------------------------------------------------
-// JSON helpers
-// ---------------------------------------------------------------------------
-
-/// Mirrors the Python `to_json` helper: `json.dumps(value, ensure_ascii=False)`,
-/// which uses spaced `", "` / `": "` separators. Compact `serde_json::to_string`
-/// would change the prompt bytes vLLM renders from.
-fn to_json(value: &Value) -> String {
-    crate::json_dumps::to_string(value)
-}
-
-/// `[tool["function"] for tool in tools]`
-fn tools_from_openai_format(tools: &[Value]) -> Vec<Value> {
-    tools
-        .iter()
-        .filter_map(|t| t.get("function").cloned())
-        .collect()
-}
-
-/// `[{ "name": tc["function"]["name"], "arguments": tc["function"]["arguments"] } for tc in tool_calls]`
-fn tool_calls_from_openai_format(tool_calls: &[Value]) -> Vec<Value> {
-    tool_calls
-        .iter()
-        .filter_map(|tc| {
-            let f = tc.get("function")?;
-            Some(json!({
-                "name": f.get("name").cloned().unwrap_or(Value::Null),
-                "arguments": f.get("arguments").cloned().unwrap_or(Value::Null),
-            }))
-        })
-        .collect()
-}
-
 /// Mirrors `encode_arguments_to_dsml`. `tool_call["arguments"]` is a JSON
 /// *string* in OpenAI schema; the Python code does `json.loads(...)` and
 /// iterates over the resulting dict.
@@ -216,16 +205,7 @@ fn encode_arguments_to_dsml(tool_call: &Value) -> Result<String, DsEncodingError
 }
 
 fn render_tools(tools: &[Value]) -> String {
-    let schemas: Vec<String> = tools.iter().map(to_json).collect();
-    render_tools_template(&schemas.join("\n"))
-}
-
-/// Returns `true` when `index > last_user_idx` in the Python sense.
-fn after_last_user(index: usize, last_user_idx: Option<usize>) -> bool {
-    match last_user_idx {
-        Some(idx) => index > idx,
-        None => true,
-    }
+    render_tools_template(&tool_schemas(tools))
 }
 
 /// Returns `true` when `index == last_user_idx`.

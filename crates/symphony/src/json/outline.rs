@@ -12,10 +12,11 @@
 //! difference to the previous serialization, so that clients saw `{"city":"Paris"}` where the model
 //! had written `{"city": "Paris"}`.
 //!
-//! The member names a call uses are the ones the old crate accepted: `name` or `tool_name` for the
-//! name, `arguments` or `parameters` for the arguments; the first of each that appears counts. The
-//! outline says nothing about whether the name is a declared tool or whether the arguments are an
-//! object; those are the format's decisions, made with the span in hand.
+//! The member names a call uses are the ones the old crate accepted, `name` or `tool_name` for the
+//! name and `arguments` or `parameters` for the arguments, and `args`, which Inkling's template
+//! writes; the first of each that appears counts. The outline says nothing about whether the name
+//! is a declared tool or whether the arguments are an object; those are the format's decisions,
+//! made with the span in hand.
 
 use std::ops::Range;
 
@@ -60,7 +61,7 @@ impl Span {
 }
 
 const NAME_KEYS: [&str; 2] = ["name", "tool_name"];
-const ARGUMENTS_KEYS: [&str; 2] = ["arguments", "parameters"];
+const ARGUMENTS_KEYS: [&str; 3] = ["arguments", "parameters", "args"];
 
 /// Read the object in `text`, which may be cut anywhere after its opening brace.
 ///
@@ -426,6 +427,25 @@ mod tests {
         assert_eq!(found.name.as_deref(), Some("f"));
         assert_eq!(
             found.arguments.expect("arguments").text(text),
+            r#"{"a": 1}"#
+        );
+    }
+
+    #[test]
+    fn inklings_args_names_the_arguments_for_every_syntax_that_reads_the_outline() {
+        // `args` is Inkling's spelling, and the outline is shared, so a JSON call of any family
+        // written with it has its arguments; the members are read in their order, so the first
+        // member named for the arguments is the arguments.
+        let text = r#"{"name": "f", "args": {"a": 1}}"#;
+        let found = outline(text);
+        assert_eq!(found.name.as_deref(), Some("f"));
+        assert_eq!(
+            found.arguments.expect("arguments").text(text),
+            r#"{"a": 1}"#
+        );
+        let text = r#"{"name": "f", "arguments": {"a": 1}, "args": {"b": 2}}"#;
+        assert_eq!(
+            outline(text).arguments.expect("arguments").text(text),
             r#"{"a": 1}"#
         );
     }

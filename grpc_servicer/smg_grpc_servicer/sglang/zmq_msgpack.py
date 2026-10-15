@@ -41,6 +41,9 @@ from typing import TYPE_CHECKING, Any
 import msgspec
 import zmq
 
+from smg_grpc_servicer.sglang.config_view import EngineConfigView
+from smg_grpc_servicer.sglang.request_traces import TRACE_HEADERS_KEY, RequestTraces
+
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import (
         BatchEmbeddingOutput,
@@ -407,6 +410,7 @@ _ENC = msgspec.msgpack.Encoder()
 _DEC_ABORT = msgspec.msgpack.Decoder(list[str])
 _DEC_CONTROL = msgspec.msgpack.Decoder(tuple[int, str, list])
 _DEC_INIT = msgspec.msgpack.Decoder(WireHandshakeInitMessage)
+_DEC_META = msgspec.msgpack.Decoder(dict)
 _DEC_ADD: msgspec.msgpack.Decoder | None = None
 
 
@@ -489,18 +493,35 @@ def decode_init(payload: bytes) -> WireHandshakeInitMessage:
     return _DEC_INIT.decode(payload)
 
 
-def decode_request_frames(frames: list[bytes]) -> list:
+def request_meta(frame: bytes) -> dict:
+    """An ADD's metadata frame: what the scheduler's own struct has no slot
+    for (the caller's W3C trace context under ``trace_headers``), a msgpack
+    map with every key optional. A frame this side cannot read counts as
+    empty: the request itself is intact."""
+    try:
+        meta = _DEC_META.decode(frame)
+    except Exception as exc:
+        logger.warning("zmq msgpack: ignoring an unreadable request metadata frame: %s", exc)
+        return {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def decode_request_frames(frames: list[bytes], traces: RequestTraces | None = None) -> list:
     """Decode one ``[type_byte, payload, *aux]`` message into io_structs. An
-    ADD yields exactly one request (generation or embedding); an ABORT may
-    carry several request ids and yields one ``AbortReq`` each; a CONTROL
-    yields the scheduler's control request for the call."""
+    ADD yields exactly one request (generation or embedding), and starts its
+    trace in ``traces`` when a metadata frame carries the caller's context;
+    an ABORT may carry several request ids and yields one ``AbortReq`` each;
+    a CONTROL yields the scheduler's control request for the call."""
     from sglang.srt.managers.io_struct import AbortReq
 
     if len(frames) < 2:
         raise ValueError(f"request needs >= 2 frames (type, payload), got {len(frames)}")
     type_byte = bytes(frames[0])
     if type_byte == REQ_TYPE_ADD:
-        return [_request_decoder().decode(frames[1])]
+        request = _request_decoder().decode(frames[1])
+        if traces is not None and len(frames) > 2:
+            traces.attach(request, request_meta(frames[2]).get(TRACE_HEADERS_KEY))
+        return [request]
     if type_byte == REQ_TYPE_ABORT:
         return [AbortReq(rid=rid) for rid in _DEC_ABORT.decode(frames[1])]
     if type_byte == REQ_TYPE_CONTROL:
@@ -556,6 +577,9 @@ class MsgpackSendSocket:
         # scheduler was not; the receiver's next drain aborts them there.
         self.pending_aborts: deque[str] = deque()
         self._relay_failures_logged: set[tuple[str, str]] = set()
+        # The traces of the requests in flight (started by the receiver from
+        # the caller's context, ended here on the terminal output).
+        self.traces = RequestTraces()
 
     def attach(
         self,
@@ -658,12 +682,14 @@ class MsgpackSendSocket:
                     output, engine_index=self.engine_index, **self._load_tail()
                 )
             )
+            self.traces.finish_batch(output.rids, getattr(output, "finished_reasons", None) or [])
         elif isinstance(output, BatchEmbeddingOutput):
             self._send_slim(
                 BatchEmbeddingSlimOutput.from_full(
                     output, engine_index=self.engine_index, **self._load_tail()
                 )
             )
+            self.traces.finish_batch(output.rids, getattr(output, "finished_reasons", None) or [])
         elif isinstance(output, (FlushCacheReqOutput, ProfileReqOutput)):
             # The scheduler hands the answered request back; its rid names
             # the call. A reply for a request this side did not issue (the
@@ -713,6 +739,7 @@ class MsgpackSendSocket:
                 **self._load_tail(),
             )
         )
+        self.traces.finish(rid)
 
     def send_engine_dead(self) -> None:
         """Best-effort ENGINE_CORE_DEAD on shutdown or crash; never raises."""
@@ -751,11 +778,15 @@ class MsgpackRecvSocket:
         tokenizer: object | None = None,
         control_reply: Callable[[int, bool, str | None], None] | None = None,
         pending_aborts: deque[str] | None = None,
+        traces: RequestTraces | None = None,
     ) -> None:
         self.socket = socket
         self._vocab_size = vocab_size
         self._reject = reject
         self._control_reply = control_reply
+        # The sender's registry of request traces: an ADD's metadata frame
+        # starts one, the terminal output ends it.
+        self._traces = traces
         # The sender's queue of requests it already ended on SMG's side.
         self._pending_aborts = pending_aborts if pending_aborts is not None else deque()
         # The scheduler's tokenizer when it keeps one (grammar-constrained
@@ -806,7 +837,7 @@ class MsgpackRecvSocket:
                 break
             frames = [frame.buffer for frame in frames]
             try:
-                decoded = decode_request_frames(frames)
+                decoded = decode_request_frames(frames, self._traces)
             except ControlError as exc:
                 logger.warning("zmq msgpack: control call %d refused: %s", exc.call_id, exc)
                 if self._control_reply is not None:
@@ -933,6 +964,7 @@ def connect_msgpack_engine(
         tokenizer,
         control_reply=sender.send_control_reply,
         pending_aborts=sender.pending_aborts,
+        traces=sender.traces,
     )
 
 
@@ -946,30 +978,57 @@ def _sglang_version() -> str:
 
 
 def scheduler_dp_rank(scheduler: Scheduler) -> int:
-    """The scheduler's DP rank, 0 without DP. SGLang <= 0.5.20 keeps it on the
-    scheduler's own parallel state; later versions publish it on the parallel
-    context (which the older context raises for)."""
+    """The scheduler's rank among the engine's schedulers, 0 without DP: the
+    identity it dials with and the ``data_parallel_rank`` it reports. SGLang
+    <= 0.5.20 keeps the DP rank on the scheduler's own parallel state; later
+    versions publish it on the parallel context (which the older context
+    raises for). On the pinned release ``dp_rank`` is the attention-DP rank
+    under ``--enable-dp-attention``. The newer releases, which resolve the
+    flag into ``attn_dp_size``, keep the attention group's rank in
+    ``attn_dp_rank``: that is the scheduler's rank once ``attn_dp_size`` is
+    above one, whichever index ``dp_rank`` then carries (the engine runs one
+    of ``dp_size`` and ``attn_dp_size`` at 1: attention DP does not run inside
+    replicas); plain data parallelism on those releases resolves to an
+    ``attn_dp_size`` of 1 and keeps ``dp_rank``, the replica index, so every
+    scheduler dials with its own identity."""
     state = getattr(scheduler, "ps", None)
     if state is None:
         from sglang.srt.runtime_context import get_parallel
 
         state = get_parallel()
+    rank = _parallel_rank(state, "dp_rank") or 0
+    if (EngineConfigView(scheduler.server_args).server_args.attn_dp_size or 1) <= 1:
+        return rank
+    attn_rank = _parallel_rank(state, "attn_dp_rank")
+    return rank if attn_rank is None else attn_rank
+
+
+def _parallel_rank(state: Any, name: str) -> int | None:
+    """``state.<name>`` as an int; ``None`` when the state has no such rank."""
     try:
-        rank = state.dp_rank
+        rank = getattr(state, name)
     except AttributeError:
-        rank = None
-    return int(rank) if rank is not None else 0
+        return None
+    return int(rank) if rank is not None else None
 
 
 def ready_response_for_scheduler(scheduler: Scheduler) -> WireEngineCoreReadyResponse:
     """The facts SMG reads at registration, from a loaded scheduler."""
     args = scheduler.server_args
+    view = EngineConfigView(args).server_args
     page_size = int(getattr(scheduler, "page_size", 1) or 1)
     max_total = int(getattr(scheduler, "max_total_num_tokens", 0) or 0)
     chunked_prefill_size = getattr(scheduler, "chunked_prefill_size", None) or 0
-    tp_size, pp_size, dp_size = int(args.tp_size), int(args.pp_size), int(args.dp_size)
-    # Attention DP splits the TP group; otherwise each DP rank is a full replica.
-    attn_tp_size = tp_size // dp_size if args.enable_dp_attention else tp_size
+    tp_size, pp_size = int(args.tp_size), int(args.pp_size)
+    # The attention-DP width on either engine release (the pinned release's
+    # `dp_size` under `--enable-dp-attention`, the newer releases' resolved
+    # `attn_dp_size`): attention DP splits the TP group across it, and the
+    # newer releases' attention context parallelism (`attn_cp_size`) splits
+    # one attention group's TP width further; otherwise each data-parallel
+    # rank is a full replica with the whole TP group.
+    attention_dp_width = view.attention_dp_width
+    attention_split = attention_dp_width * (view.attn_cp_size or 1)
+    attn_tp_size = max(1, tp_size // attention_split) if attention_split > 1 else tp_size
     return WireEngineCoreReadyResponse(
         max_model_len=int(scheduler.model_config.context_len),
         num_gpu_blocks=max_total // page_size,
@@ -977,11 +1036,17 @@ def ready_response_for_scheduler(scheduler: Scheduler) -> WireEngineCoreReadyRes
         dtype=wire_dtype(scheduler.model_config.dtype),
         vllm_version=f"sglang-{_sglang_version()}",
         world_size=tp_size * pp_size,
-        data_parallel_size=dp_size,
+        # The schedulers the engine runs, one handshake each, as the launcher
+        # counts them (`data_parallel_size` in its server facts).
+        data_parallel_size=view.scheduler_count,
         tensor_parallel_size=attn_tp_size,
         pipeline_parallel_size=pp_size,
         data_parallel_rank=scheduler_dp_rank(scheduler),
-        max_num_seqs=int(getattr(scheduler, "max_running_requests", 0) or 0),
+        # The scheduler's bound is one attention-DP worker's share of the
+        # flag; the Rust servicer reports the handshake's figure as the
+        # worker's window, so it goes out in the flag's units (what an
+        # explicit --max-running-requests reports), as GetServerInfo's does.
+        max_num_seqs=int(getattr(scheduler, "max_running_requests", 0) or 0) * attention_dp_width,
         # A disabled chunked prefill is -1 here; the wire field is a cap >= 0.
         max_num_batched_tokens=max(0, int(chunked_prefill_size)),
         instance_id=str(args.served_model_name or scheduler.model_config.model_path),

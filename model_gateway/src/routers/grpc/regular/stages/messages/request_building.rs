@@ -4,21 +4,26 @@ use async_trait::async_trait;
 use axum::response::Response;
 use tracing::error;
 
-use crate::routers::{
-    error,
-    grpc::{
-        client::GenerateRequestBuildOptions,
-        common::stages::{helpers, BuildStage},
-        context::{
-            AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan, ExecutionPlanKind,
-            PreparationOutput, RequestContext,
+use crate::{
+    config::ParserChoice,
+    routers::{
+        error,
+        grpc::{
+            client::GenerateRequestBuildOptions,
+            common::stages::{helpers, BuildStage},
+            context::{
+                AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan, ExecutionPlanKind,
+                PreparationOutput, RequestContext,
+            },
+            multimodal::{
+                assemble_media_refs, assemble_multimodal_data,
+                assemble_multimodal_data_after_encode, assembly_error_response,
+                reserve_multimodal_inflight,
+            },
+            regular::symphony,
+            spec::{MessagesResponseSpec, ResponseSpec},
+            utils,
         },
-        multimodal::{
-            assemble_media_refs, assemble_multimodal_data, assemble_multimodal_data_after_encode,
-            reserve_multimodal_inflight,
-        },
-        spec::{MessagesResponseSpec, ResponseSpec},
-        utils,
     },
 };
 
@@ -113,7 +118,7 @@ impl BuildStage for MessageRequestBuildingStage {
             };
             Some(assembled.map_err(|e| {
                 error!(function = "MessageRequestBuildingStage::build", error = %e, "Failed to assemble multimodal request");
-                error::bad_request("multimodal_not_supported", format!("{e}"))
+                assembly_error_response(&e)
             })?)
         } else {
             None
@@ -129,25 +134,79 @@ impl BuildStage for MessageRequestBuildingStage {
             .await?;
         }
 
-        // A structural tag that already opens with the reasoning block runs
-        // from the first token; asking SGLang to also defer the grammar past
-        // `</think>` would make the model owe a second one.
-        let require_reasoning = ctx.tokenizer_arc().is_some_and(|tokenizer| {
-            utils::messages_reasoning_starts_in_prefill(&messages_request, tokenizer.as_ref())
-        }) && !utils::constraint_covers_reasoning(
-            &ctx.components.tool_parser_factory,
+        let continued_final_message = processed_messages.continued_final_message;
+        // Native Gemma4 channels follow the rendered prompt; other parsers keep
+        // their tokenizer-driven preference for the engine's reasoning gate.
+        let reasoning_in_prefill = utils::rendered_prompt_reasoning_in_prefill(
+            &ctx.components.reasoning_parser_factory,
             ctx.components
                 .parser_resolver
-                .tool_parser(&messages_request.model)
+                .reasoning_parser(&messages_request.model)
                 .as_deref(),
-            tool_constraints.as_ref(),
+            &messages_request.model,
+            &processed_messages.text,
         );
+        let require_reasoning = reasoning_in_prefill.unwrap_or_else(|| {
+            ctx.tokenizer_arc().is_some_and(|tokenizer| {
+                utils::messages_reasoning_starts_in_prefill(
+                    &messages_request,
+                    continued_final_message,
+                    tokenizer.as_ref(),
+                )
+            })
+        });
 
+        // Now that the worker is known, a forced call's grammar takes the
+        // shape its engine needs: the bare calls behind a reasoning parser's
+        // gate, the thought and then the calls from the first token (the
+        // worker's `constrained_decoding_start` label; see
+        // `utils::tool_constraints_for_worker`).
+        // The unshaped constraint stays on the attempt stamp: a retry gives
+        // the worker it selects the same shaping (`helpers::ToolConstraintStamp`).
+        let tool_parser = ctx
+            .components
+            .parser_resolver
+            .tool_parser(&messages_request.model);
+        let unshaped_tool_constraints = tool_constraints.clone();
+        let tool_constraints = utils::tool_constraints_for_worker(
+            &ctx.components.tool_parser_factory,
+            tool_parser.as_deref(),
+            tool_constraints,
+            ctx.state.workers.as_ref(),
+        )
+        .map_err(|e| {
+            error!(function = "MessageRequestBuildingStage::build", error = %e, "Failed to shape the tool constraint for the worker");
+            error::internal_error("invalid_tool_constraint", format!("Invalid tool constraint: {e}"))
+        })?;
+
+        // The ids are the prompt; the text rides along only when the request
+        // carries media (see `helpers::wire_prompt_text`).
+        // Symphony's assignment, taken while the rendered prompt is still here (see
+        // `regular::symphony`): the response spec carries it to the drivers, and the state
+        // records which parser reads the message for the response's header.
+        let names = ctx
+            .components
+            .parser_resolver
+            .names(&messages_request.model);
+        let assignment = symphony::assign_messages(
+            ctx.state.parser.unwrap_or_default(),
+            &names,
+            messages_request.as_ref(),
+            tool_constraints.as_ref(),
+            &processed_messages.text,
+            &ctx.components.templates,
+        )
+        .map_err(|why| error::bad_request("invalid_parser_configuration", why))?;
+        ctx.state.parser = Some(match assignment {
+            Some(_) => ParserChoice::Symphony,
+            None => ParserChoice::Legacy,
+        });
+        let carries_media = multimodal_data.is_some() || ctx.state.multimodal_refs.is_some();
         let mut proto_request = builder_client
             .build_messages_request(
                 request_id,
                 &messages_request,
-                processed_messages.text,
+                helpers::wire_prompt_text(processed_messages.text, carries_media),
                 token_ids,
                 GenerateRequestBuildOptions {
                     multimodal_inputs: multimodal_data,
@@ -210,14 +269,24 @@ impl BuildStage for MessageRequestBuildingStage {
             ctx.state.media_refs_forwarded = true;
         }
 
+        let tool_constraint = helpers::ToolConstraintStamp::capture(
+            unshaped_tool_constraints,
+            tool_parser.as_deref(),
+            &proto_request,
+        );
+        let mut spec = MessagesResponseSpec::from(messages_request.as_ref());
+        spec.reasoning_in_prefill = reasoning_in_prefill;
+        spec.symphony = assignment;
+        spec.continues_final_assistant = continued_final_message;
         Ok(BuildOutput {
             plan: ExecutionPlan::generate(self.plan_kind, proto_request),
-            spec: ResponseSpec::Messages(MessagesResponseSpec::from(messages_request.as_ref())),
+            spec: ResponseSpec::Messages(Box::new(spec)),
             stamp: AttemptStamp {
                 id: id_stamp,
                 sampling_mask,
                 sampling_baseline,
                 inject_pd_metadata: self.inject_pd_metadata,
+                tool_constraint,
             },
         })
     }

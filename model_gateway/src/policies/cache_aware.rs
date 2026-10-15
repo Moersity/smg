@@ -56,8 +56,10 @@
     Configuration Parameters:
     ------------------------
     cache_threshold:         Min prefix match ratio for highest-match routing (0.0-1.0)
-    balance_abs_threshold:   Absolute load diff threshold for imbalance detection
-    balance_rel_threshold:   Relative load ratio threshold for imbalance detection
+    balance_abs_threshold:   Absolute margin of the spill gate (requests above the fleet mean); capped at
+                             the in-flight count's natural swing at the pool's mean, never under four
+                             unless the configured value itself is lower (0: the relative part alone)
+    balance_rel_threshold:   Relative margin of the spill gate (multiple of the fleet mean)
     eviction_interval_secs:  Interval between LRU eviction / TTL sweep cycles
     max_tree_size:           Max total size (chars/tokens) of each model's approximate tree,
                              shared across all workers; enforced by eviction
@@ -138,6 +140,14 @@ const POOL_TABLE_REFRESH_MS: u64 = 1_000;
 /// Pool tables kept at once: one per routing pool the policy sees (a model's
 /// regular pool, the PD legs' pools); past this the oldest goes.
 const POOL_TABLES_KEPT: usize = 8;
+
+/// The floor of the swing-sized absolute margin of the spill gate: with a
+/// configured `balance_abs_threshold` of at least this, a worker at most this
+/// many requests above the fleet mean is never over the gate, so a handful of
+/// requests on an otherwise idle fleet keep their cache affinity; a lower
+/// configured value lowers the margin below it (see
+/// [`CacheAwarePolicy::absolute_margin`]).
+const MIN_ABSOLUTE_MARGIN: f64 = 4.0;
 
 /// Cache-aware routing policy
 ///
@@ -1785,15 +1795,50 @@ impl CacheAwarePolicy {
         )
     }
 
+    /// The count-pressure gate's comparison alone, with no trace record: a
+    /// worker holding more than `balance_rel_threshold` times the mean load
+    /// AND the absolute margin ([`Self::absolute_margin`]) above it is over
+    /// the gate. The affinity path records its decision through
+    /// [`Self::candidate_requires_spill`]; the warm-up slice checks its
+    /// candidates here, so a thin-overlap miss writes no gate entries for
+    /// workers it did not pick.
+    fn over_count_pressure_gate(&self, load: f64, avg_load: f64) -> bool {
+        load > avg_load * f64::from(self.config.balance_rel_threshold)
+            && load > avg_load + self.absolute_margin(avg_load)
+    }
+
+    /// The gate's absolute margin at `avg_load`: `balance_abs_threshold`
+    /// requests above the mean, capped at the in-flight count's natural
+    /// swing at this mean (two standard deviations of a Poisson count,
+    /// `2 * sqrt(avg_load)`, rounded up to whole requests) and never under
+    /// [`MIN_ABSOLUTE_MARGIN`] unless the configured value is lower still
+    /// (0 leaves the relative margin to decide alone). A fixed absolute margin sized for a large
+    /// pool cannot clear in a pool whose per-worker in-flight count stays
+    /// below it (two workers at 32 in flight: the busier one would need 80
+    /// at a margin of 64), so cache affinity there was never balanced at
+    /// all, whatever the skew. Sized to the swing, the margin still tells
+    /// steady-state variance from pressure at every mean: a worker two
+    /// standard deviations above the fleet is not noise (a mean of 16: eight
+    /// requests; a mean of 4: four), the configured value caps it, and the
+    /// floor keeps a handful of requests on an otherwise idle fleet from
+    /// counting as pressure. The margin is not tied to the relative one, so
+    /// a tight relative threshold (1.1) does not turn one idle worker in a
+    /// loaded fleet into a spill of every busy holder.
+    fn absolute_margin(&self, avg_load: f64) -> f64 {
+        let configured = self.config.balance_abs_threshold as f64;
+        let swing = (2.0 * avg_load.sqrt()).ceil();
+        configured.min(swing.max(MIN_ABSOLUTE_MARGIN))
+    }
+
     /// Per-request count-pressure predicate: over
-    /// `balance_rel_threshold` times the healthy-fleet mean load AND
-    /// `balance_abs_threshold` requests above it, the request spills to the
-    /// expected-wait worker instead. Affinity paths insert for the spill
-    /// target, so a prefix whose home saturates gains an additional tenant —
-    /// hot prefixes replicate instead of queueing behind one engine. Both
-    /// margins must clear so the gate neither fires on steady-state variance
-    /// (relative alone would, at low means) nor stays blind to a deep queue
-    /// (absolute alone would, at high means).
+    /// `balance_rel_threshold` times the healthy-fleet mean load AND the
+    /// absolute margin above it, the request spills to the expected-wait
+    /// worker instead. Affinity paths insert for the spill target, so a
+    /// prefix whose home saturates gains an additional tenant — hot prefixes
+    /// replicate instead of queueing behind one engine. Both margins must
+    /// clear so the gate neither fires on steady-state variance (relative
+    /// alone would, at low means) nor stays blind to a deep queue (absolute
+    /// alone would, at high means).
     fn candidate_requires_spill(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -1801,13 +1846,13 @@ impl CacheAwarePolicy {
         avg_load: f64,
     ) -> bool {
         let load = workers[selected].load() as f64;
-        let spill = load > avg_load * f64::from(self.config.balance_rel_threshold)
-            && load > avg_load + self.config.balance_abs_threshold as f64;
+        let spill = self.over_count_pressure_gate(load, avg_load);
         if cache_trace::enabled() {
             cache_trace::gate(serde_json::json!({
                 "worker": workers[selected].url(), "load": load, "average_load": avg_load,
                 "relative_threshold": self.config.balance_rel_threshold,
-                "absolute_threshold": self.config.balance_abs_threshold, "spill": spill,
+                "absolute_threshold": self.config.balance_abs_threshold,
+                "absolute_margin": self.absolute_margin(avg_load), "spill": spill,
             }));
         }
         spill
@@ -1825,7 +1870,12 @@ impl CacheAwarePolicy {
     /// workers inside the warm-up window unless every worker is (a young
     /// fleet slices nothing, a miss getting a load-balanced pick anyway); a
     /// settled fleet pays nothing here. Each candidate is checked live before
-    /// the pick, and the pick is credited through the expected-wait selector
+    /// the pick: still eligible, still warming, and under the count-pressure
+    /// gate an affinity pick obeys (`balance_rel_threshold` times the mean
+    /// in-flight and the absolute margin above it), so a thin worker that
+    /// cannot admit what it is sent (an in-transit backlog, a throttled
+    /// admission) is not fed one miss in `1 / share` while the rest of the
+    /// pool idles. The pick is credited through the expected-wait selector
     /// like any other.
     fn warmup_slice(
         &self,
@@ -1833,6 +1883,7 @@ impl CacheAwarePolicy {
         table: &PoolTable,
         indexer: &KvIndex,
         info: &SelectWorkerInfo,
+        avg_load: f64,
     ) -> Option<usize> {
         if table.warming.is_empty() {
             return None;
@@ -1861,6 +1912,9 @@ impl CacheAwarePolicy {
                 indexed.unwrap_or(0),
                 table.fleet_level,
             ) {
+                continue;
+            }
+            if self.over_count_pressure_gate(workers[idx].load() as f64, avg_load) {
                 continue;
             }
             match pick {
@@ -1900,21 +1954,29 @@ impl CacheAwarePolicy {
     /// although another holds its prefix, the recompute accepted: shallow
     /// overlaps first (at most [`DIVERT_SHALLOW_SHARE`] of the request), any
     /// hit once a window of `divert_every` hits passed without a shallow
-    /// one; never while the thin worker has anything in flight unless its
-    /// last diversion is older than [`DIVERT_WINDOW_MS`] (the stamp lives on
-    /// the worker, so it survives the table's rebuilds), so a hot fleet is
-    /// not disturbed; and only until its index crosses the thinness ratio of
-    /// the fleet's level. Equal loads draw uniformly like the slice. A fleet
-    /// with no thin worker returns before any clock read or counter: this
-    /// costs the steady state nothing. Protection and the liveness vetoes
-    /// apply through the routing state as everywhere; the pick is credited
-    /// through the expected-wait selector like the slice's.
+    /// one, but a deep hit only away from a holder with more in flight than
+    /// the thin worker (the least loaded of the request's deepest holders in
+    /// `candidates`, where the request goes otherwise): recomputing a deep
+    /// overlap is worth it where the request would queue, not on an idle
+    /// fleet, where a single client's multi-turn continuations were
+    /// recomputed from scratch on every worker joining a scale-out, one
+    /// continuation in eight losing its whole context; never while the thin
+    /// worker has anything in flight unless its last diversion is older than
+    /// [`DIVERT_WINDOW_MS`] (the stamp lives on the worker, so it survives
+    /// the table's rebuilds), so a hot fleet is not disturbed; and only until
+    /// its index crosses the thinness ratio of the fleet's level. Equal loads
+    /// draw uniformly like the slice. A fleet with no thin worker returns
+    /// before any clock read or counter: this costs the steady state nothing.
+    /// Protection and the liveness vetoes apply through the routing state as
+    /// everywhere; the pick is credited through the expected-wait selector
+    /// like the slice's.
     fn warmup_divert(
         &self,
         workers: &[Arc<dyn Worker>],
         table: &PoolTable,
         indexer: &KvIndex,
         info: &SelectWorkerInfo,
+        candidates: &[OverlapCandidate],
         overlap_share: f64,
     ) -> Option<usize> {
         if table.thin.is_empty() {
@@ -1935,6 +1997,23 @@ impl CacheAwarePolicy {
         if !due {
             return None;
         }
+        // What a deep hit's thin worker is measured against: the least
+        // loaded of the request's deepest holders, read only once a deep hit
+        // is due. A thin worker among them recomputes nothing and is exempt.
+        let deepest: Vec<usize> = if shallow {
+            Vec::new()
+        } else {
+            let best = candidates
+                .iter()
+                .map(|candidate| candidate.raw_score)
+                .fold(0.0_f64, f64::max);
+            candidates
+                .iter()
+                .filter(|candidate| candidate.raw_score >= best)
+                .map(|candidate| candidate.idx)
+                .collect()
+        };
+        let holder_load = deepest.iter().map(|&holder| workers[holder].load()).min();
         let now = liveness::now_ms();
         let mut pick: Option<(usize, usize)> = None;
         let mut tied = 0u32;
@@ -1953,6 +2032,11 @@ impl CacheAwarePolicy {
                 continue;
             }
             if state.load > 0 && now < worker.divert_until_ms() {
+                continue;
+            }
+            if holder_load.is_some_and(|holder_load| state.load >= holder_load)
+                && !deepest.contains(&idx)
+            {
                 continue;
             }
             match pick {
@@ -2352,7 +2436,7 @@ impl CacheAwarePolicy {
         let thin_overlap = best_overlap / request_blocks <= f64::from(self.config.cache_threshold)
             || (best_overlap <= WARMUP_MISS_BLOCKS && best_overlap * 2.0 < request_blocks);
         if thin_overlap {
-            if let Some(idx) = self.warmup_slice(workers, &table, indexer, info) {
+            if let Some(idx) = self.warmup_slice(workers, &table, indexer, info, avg_load) {
                 Metrics::record_worker_cache_aware_policy_branch("warmup_slice");
                 debug!(
                     worker = workers[idx].url(),
@@ -2367,6 +2451,7 @@ impl CacheAwarePolicy {
             &table,
             indexer,
             info,
+            &candidates,
             best_overlap / request_blocks,
         ) {
             Metrics::record_worker_cache_aware_policy_branch("warmup_divert");
@@ -3553,6 +3638,45 @@ mod tests {
         policy.update_loads(&loads);
     }
 
+    /// Like [`update_expected_wait_loads`], with each report counting the
+    /// requests the router holds on its worker (`worker.load()`) as waiting
+    /// requests: the engine has every request the router dispatched to it.
+    /// The expected-wait scorer charges a worker for requests the router
+    /// holds beyond what its report and since-poll credit account for (work
+    /// in transit the engine has not seen), so a fixture that holds requests
+    /// either reports them, as here, or models that in-transit backlog.
+    fn update_expected_wait_loads_counting_held(
+        policy: &CacheAwarePolicy,
+        workers: &[Arc<dyn Worker>],
+        queued_tokens: &[i32],
+    ) {
+        let loads = workers
+            .iter()
+            .zip(queued_tokens)
+            .map(|(worker, &queued)| {
+                let mut load = expected_wait_load(queued, 0.1, 100.0);
+                load.loads[0].num_waiting_reqs = i32::try_from(worker.load()).unwrap_or(i32::MAX);
+                (worker.url().to_string(), load)
+            })
+            .collect();
+        policy.update_loads(&loads);
+    }
+
+    /// One selection for `text` through the string path.
+    fn route_text(
+        policy: &CacheAwarePolicy,
+        workers: &[Arc<dyn Worker>],
+        text: &str,
+    ) -> Option<usize> {
+        policy.select_worker(
+            workers,
+            &SelectWorkerInfo {
+                request_text: Some(text),
+                ..Default::default()
+            },
+        )
+    }
+
     fn assert_only_final_worker_credited(
         policy: &CacheAwarePolicy,
         workers: &[Arc<dyn Worker>],
@@ -3711,8 +3835,16 @@ mod tests {
         let policy = CacheAwarePolicy::with_config(test_config());
         let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
         policy.init_workers(&workers);
+        // `w2` holds one request the router dispatched, and its report counts
+        // it: one waiting request of 500 uncached tokens. Right after the
+        // update `w2` is the busier worker by count (1 vs 0) and the more
+        // expensive by wait (5 s vs 0 s), so the first miss goes to `w1`;
+        // once that miss credits `w1` with 1,024 tokens (10.24 s), `w2` is
+        // the busier by count but the cheaper by wait, which is the state the
+        // second-miss assertion checks. The report hides nothing, so the
+        // charge for requests a report does not show stays out of this test.
         workers[1].increment_load();
-        update_expected_wait_loads(&policy, &workers, &[0, 500]);
+        update_expected_wait_loads_counting_held(&policy, &workers, &[0, 500]);
 
         let route_miss = |text| {
             policy.select_worker(
@@ -3738,7 +3870,7 @@ mod tests {
             (true, 1024, 1)
         );
 
-        update_expected_wait_loads(&policy, &workers, &[0, 500]);
+        update_expected_wait_loads_counting_held(&policy, &workers, &[0, 500]);
         for worker in &workers {
             assert_eq!(
                 policy.load_scorer.load_state_for_test(worker.url()),
@@ -3750,6 +3882,97 @@ mod tests {
             route_miss("omega miss"),
             Some(0),
             "fresh backend load must reset since-poll dispatch credit"
+        );
+    }
+
+    #[test]
+    fn a_miss_avoids_the_worker_whose_report_hides_the_requests_the_router_holds() {
+        // `w2` holds five requests the router dispatched while its fresh
+        // report shows an idle engine: dispatches still in transit, the
+        // backlog that herded a fleet onto its emptiest-looking workers. `w1`
+        // reports one queued request of 10 tokens. Read from the reports
+        // alone, `w2` is the emptier worker and takes the miss; charged five
+        // mean prefills (51.2 s at 100 tokens/s) for the requests its report
+        // hides, it loses every miss to `w1` until `w1`'s own credit has
+        // grown to as much.
+        let policy = CacheAwarePolicy::with_config(test_config());
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        policy.init_workers(&workers);
+        for _ in 0..5 {
+            workers[1].increment_load();
+        }
+        let mut one_queued = expected_wait_load(10, 0.1, 100.0);
+        one_queued.loads[0].num_waiting_reqs = 1;
+        policy.update_loads(&HashMap::from([
+            (workers[0].url().to_string(), one_queued),
+            (
+                workers[1].url().to_string(),
+                expected_wait_load(0, 0.1, 100.0),
+            ),
+        ]));
+        for text in ["alpha", "bravo", "charlie", "delta", "echo"] {
+            assert_eq!(
+                route_text(&policy, &workers, text),
+                Some(0),
+                "{text}: the miss went to the worker whose report hides its load"
+            );
+        }
+        let (_, credited_tokens, credited_requests) =
+            policy.load_scorer.load_state_for_test(workers[0].url());
+        assert_eq!((credited_tokens, credited_requests), (5 * 1024, 5));
+    }
+
+    #[test]
+    fn a_request_the_report_already_counts_is_not_priced_again() {
+        // `w1` holds three requests and its report counts them as running:
+        // three mean prefills at 100 tokens/s = 30.72 s, nothing more. `w2`
+        // holds nothing and reports 3,100 queued tokens = 31 s. Charged a
+        // second time for the three, `w1` would read as 61.44 s and lose.
+        let policy = CacheAwarePolicy::with_config(test_config());
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        policy.init_workers(&workers);
+        for _ in 0..3 {
+            workers[0].increment_load();
+        }
+        let mut running = expected_wait_load(0, 0.1, 100.0);
+        running.loads[0].num_running_reqs = 3;
+        policy.update_loads(&HashMap::from([
+            (workers[0].url().to_string(), running),
+            (
+                workers[1].url().to_string(),
+                expected_wait_load(3_100, 0.1, 100.0),
+            ),
+        ]));
+        assert_eq!(route_text(&policy, &workers, "alpha"), Some(0));
+
+        // The same three requests dispatched after `w1`'s report: the
+        // since-poll credit carries them (3 × 1024 tokens = 30.72 s), and
+        // nothing is charged on top of the credit either.
+        let policy = CacheAwarePolicy::with_config(test_config());
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        policy.init_workers(&workers);
+        policy.update_loads(&HashMap::from([
+            (
+                workers[0].url().to_string(),
+                expected_wait_load(0, 0.1, 100.0),
+            ),
+            (
+                workers[1].url().to_string(),
+                expected_wait_load(3_100, 0.1, 100.0),
+            ),
+        ]));
+        for text in ["bravo", "charlie", "delta"] {
+            assert_eq!(route_text(&policy, &workers, text), Some(0));
+            workers[0].increment_load();
+        }
+        assert_eq!(
+            policy.load_scorer.load_state_for_test(workers[0].url()),
+            (true, 3 * 1024, 3)
+        );
+        assert_eq!(
+            route_text(&policy, &workers, "echo"),
+            Some(0),
+            "requests the credit carries were charged again"
         );
     }
 
@@ -4104,7 +4327,11 @@ mod tests {
         for _ in 0..10 {
             workers[2].increment_load();
         }
-        update_expected_wait_loads(&policy, &workers, &[20_000, 10_000, 0]);
+        // Every report counts the requests its worker holds (100 queued on
+        // `w1`, 10 on `w3`); `w3`'s ten queue 1,000 uncached tokens against
+        // `w2`'s 10,000, so the expected wait prefers `w3` although its live
+        // count is the higher: the spill must follow the wait, not the count.
+        update_expected_wait_loads_counting_held(&policy, &workers, &[20_000, 10_000, 1_000]);
 
         let selected = policy
             .select_worker(
@@ -4223,7 +4450,11 @@ mod tests {
         for _ in 0..10 {
             workers[2].increment_load();
         }
-        update_expected_wait_loads(&policy, &workers, &[20_000, 10_000, 0]);
+        // Every report counts the requests its worker holds (100 queued on
+        // `w1`, 10 on `w3`); `w3`'s ten queue 1,000 uncached tokens against
+        // `w2`'s 10,000, so the expected wait prefers `w3` although its live
+        // count is the higher: the spill must follow the wait, not the count.
+        update_expected_wait_loads_counting_held(&policy, &workers, &[20_000, 10_000, 1_000]);
 
         let selected = policy
             .select_worker(
@@ -4454,38 +4685,124 @@ mod tests {
         );
     }
 
-    #[test]
-    fn candidate_gate_requires_both_margins() {
-        // w1 load 10 vs avg 5: over the relative margin (10 > 5 * 1.1) but
-        // under the absolute one (10 < 5 + 32) — affinity holds.
-        let policy = CacheAwarePolicy::with_config(test_config());
+    /// The affinity pick of a two-worker pool whose prefix lives on w1, with
+    /// `w1_load` and `w2_load` requests in flight.
+    fn affinity_pick(config: CacheAwareConfig, w1_load: usize, w2_load: usize) -> usize {
+        let policy = CacheAwarePolicy::with_config(config);
         let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
         let tokens: Vec<u32> = (0..32).collect();
         seed_token_tenants(&policy, &workers, &tokens, &["http://w1:8000"]);
-        for _ in 0..10 {
+        for _ in 0..w1_load {
             workers[0].increment_load();
+        }
+        for _ in 0..w2_load {
+            workers[1].increment_load();
         }
         let info = SelectWorkerInfo {
             tokens: Some(&tokens),
             ..Default::default()
         };
-        assert_eq!(policy.select_worker(&workers, &info).unwrap(), 0);
+        policy.select_worker(&workers, &info).unwrap()
+    }
 
-        // Same loads with a small absolute margin (10 > 5 + 2): spill.
-        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
-            balance_abs_threshold: 2,
+    #[test]
+    fn candidate_gate_requires_both_margins() {
+        // w1 load 7 vs avg 5: over the relative margin (7 > 5 * 1.1) but not
+        // the absolute one (the swing at a mean of 5 is five: 7 is not
+        // > 5 + 5) — affinity holds.
+        assert_eq!(affinity_pick(test_config(), 7, 3), 0);
+        // w1 load 12 vs avg 6: both margins clear (12 > 6.6, 12 > 6 + 5):
+        // spill.
+        assert_eq!(affinity_pick(test_config(), 12, 0), 1);
+        // An absolute threshold under the floor lowers it: with none at all
+        // the relative margin decides alone, and 7 vs avg 5 spills.
+        let rel_only = CacheAwareConfig {
+            balance_abs_threshold: 0,
             ..test_config()
-        });
-        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-        seed_token_tenants(&policy, &workers, &tokens, &["http://w1:8000"]);
-        for _ in 0..10 {
-            workers[0].increment_load();
-        }
-        let info = SelectWorkerInfo {
-            tokens: Some(&tokens),
-            ..Default::default()
         };
-        assert_eq!(policy.select_worker(&workers, &info).unwrap(), 1);
+        assert_eq!(affinity_pick(rel_only, 7, 3), 1);
+    }
+
+    /// The launcher's defaults: a 64-request absolute margin and 1.5 times
+    /// the mean.
+    fn launcher_defaults() -> CacheAwareConfig {
+        CacheAwareConfig {
+            balance_abs_threshold: 64,
+            balance_rel_threshold: 1.5,
+            ..test_config()
+        }
+    }
+
+    #[test]
+    fn a_small_pool_spills_a_worker_holding_the_relative_margin_more_than_its_peer() {
+        // Two workers, 32 in flight. A 25/7 skew (the busier worker at 1.56
+        // times the mean) is over the gate: 25 > 1.5 * 16 and 25 > 16 + 8.
+        // Under a fixed 64-request margin the busier worker would have needed
+        // 81 in flight, more than the pool holds, so this never spilled.
+        assert_eq!(affinity_pick(launcher_defaults(), 25, 7), 1);
+        // A 19/13 skew (1.19 times the mean) is under the relative margin:
+        // affinity holds, as it should at this scale.
+        assert_eq!(affinity_pick(launcher_defaults(), 19, 13), 0);
+    }
+
+    #[test]
+    fn the_absolute_margin_is_capped_at_the_counts_swing_and_floored_at_four() {
+        let policy = CacheAwarePolicy::with_config(launcher_defaults());
+        // (mean, margin): the floor up to a mean of 4, two standard
+        // deviations of the count above it, the configured 64 from a mean
+        // of 1,024 on.
+        for (avg_load, margin) in [
+            (0.0, 4.0),
+            (1.0, 4.0),
+            (4.0, 4.0),
+            (5.0, 5.0),
+            (16.0, 8.0),
+            (64.0, 16.0),
+            (128.0, 23.0),
+            (400.0, 40.0),
+            (1024.0, 64.0),
+            (2000.0, 64.0),
+        ] {
+            assert_eq!(policy.absolute_margin(avg_load), margin, "mean {avg_load}");
+        }
+        // No absolute threshold at all keeps the gate relative-only.
+        let rel_only = CacheAwarePolicy::with_config(CacheAwareConfig {
+            balance_abs_threshold: 0,
+            ..launcher_defaults()
+        });
+        assert_eq!(rel_only.absolute_margin(16.0), 0.0);
+    }
+
+    #[test]
+    fn the_gate_opens_at_the_load_the_pools_mean_sets() {
+        let policy = CacheAwarePolicy::with_config(launcher_defaults());
+        // Pools of 2, 8 and 29 workers at 4, 8, 32 and 128 requests in
+        // flight: the smallest in-flight count one worker must hold for the
+        // gate to open (None: more than the pool holds). A fixed 64-request
+        // margin opened only for a worker holding 81 of 128 on 8 workers and
+        // 69 of 128 on 29.
+        for (workers, in_flight, opens_at) in [
+            (2, 4, None),
+            (2, 8, None),
+            (2, 32, Some(25)),
+            (2, 128, Some(97)),
+            (8, 4, None),
+            (8, 8, Some(6)),
+            (8, 32, Some(9)),
+            (8, 128, Some(25)),
+            (29, 4, None),
+            (29, 8, Some(5)),
+            (29, 32, Some(6)),
+            (29, 128, Some(10)),
+        ] {
+            let avg_load = f64::from(in_flight) / f64::from(workers);
+            let first = (0..=in_flight)
+                .find(|&load| policy.over_count_pressure_gate(f64::from(load), avg_load));
+            assert_eq!(first, opens_at, "{workers} workers, {in_flight} in flight");
+        }
+        // At high means the relative margin decides, with either rule.
+        assert!(!policy.over_count_pressure_gate(290.0, 200.0));
+        assert!(policy.over_count_pressure_gate(301.0, 200.0));
     }
 
     #[test]
@@ -5509,7 +5826,14 @@ mod tests {
         update_expected_wait_loads(&policy, &workers, &[0, 0]);
         let held: Vec<u32> = (1..=4_400).collect();
         let monitor = Arc::new(KvEventMonitor::new(Some(4)));
-        let indexer = setup_indexer_with_blocks("http://w1:8000", &[&held], 4);
+        // Stored as 1,100 blocks of four, as the index receives them, so the
+        // fleet's level is 1,100 and w2 is thin against it; as one block of
+        // 4,400 tokens the level would be one, below the warm-up blocks,
+        // nobody would be thin, and the slice would never run.
+        let indexer = Arc::new(KvIndex::positional(4));
+        let holder = indexer.intern_worker("http://w1:8000").unwrap();
+        indexer.intern_worker("http://w2:8000").unwrap();
+        store_blocks(&indexer, holder, &held, 4, 1);
         monitor.indexers.insert("unknown".to_string(), indexer);
         policy.set_kv_event_monitor(Some(monitor));
         // w1's first block (the shared head) followed by eleven novel blocks.
@@ -5533,6 +5857,47 @@ mod tests {
             "the emptied worker got its slice of the thin-overlap requests: {picks:?}"
         );
         assert!(picks.contains(&0), "the holder kept the rest: {picks:?}");
+    }
+
+    #[test]
+    fn a_thin_worker_that_holds_more_than_the_gate_allows_gets_no_slice() {
+        // Seven holders of 1,100 blocks each and an eighth worker with nothing
+        // indexed: thin against the fleet's level, the slice's only candidate.
+        // The router holds 100 requests on it that its report does not show
+        // (dispatches queued in front of an engine that admits slowly), far
+        // over the count-pressure gate (the mean in-flight is 12.5), so the
+        // slice skips it and every thin-overlap request (one block of a
+        // holder's head, eleven of its own) stays with its holder. Without
+        // the gate the slice would feed it one such miss in four.
+        let HolderFleet {
+            policy,
+            workers,
+            heads,
+            ..
+        } = fleet_with_holders(7);
+        for _ in 0..100 {
+            workers[7].increment_load();
+        }
+        let mut request: Vec<u32> = heads[0][..4].to_vec();
+        request.extend(90_000..90_044);
+        let picks: Vec<usize> = (0..8)
+            .map(|_| {
+                policy
+                    .select_worker(
+                        &workers,
+                        &SelectWorkerInfo {
+                            tokens: Some(&request),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            picks,
+            vec![0; 8],
+            "the slice fed the thin worker that holds more than the gate allows"
+        );
     }
 
     /// Store `tokens` for `worker` as blocks of `block` tokens, with sequence
@@ -5619,6 +5984,11 @@ mod tests {
             indexer,
             heads,
         } = fleet_with_holders(7);
+        // The holders are busy, as on those runs: a deep hit is diverted
+        // only from a holder with more in flight than the thin worker.
+        for holder in &workers[..7] {
+            holder.increment_load();
+        }
         let emptied = indexer.worker_id("http://w7:8000").unwrap();
         // A request: a holder's 60-block head and a four-block tail of its own.
         let request = |i: usize| -> Vec<u32> {
@@ -5710,6 +6080,13 @@ mod tests {
             indexer,
             heads,
         } = fleet_with_holders_of(7, 4_096);
+        // The holders are busy (twenty in flight each, a loaded fleet): the
+        // diverted requests pile up on the thin worker, below that.
+        for holder in &workers[..7] {
+            for _ in 0..20 {
+                holder.increment_load();
+            }
+        }
         let thin = indexer.worker_id("http://w7:8000").unwrap();
         // The growth baselines date from the first table, built on the empty
         // fleet as on the run; the regrowth comes after.
@@ -5816,6 +6193,55 @@ mod tests {
     }
 
     #[test]
+    fn a_deep_continuation_stays_with_its_idle_holder() {
+        // A scale-out under one client: the joining worker is thin, and
+        // every continuation of the client's sessions is a deep hit (60 of
+        // 64 blocks) on a holder with nothing in flight. Diverting one
+        // recomputes its whole context on the empty worker for a wait it
+        // would not have had: none is diverted, however many hits pass.
+        let HolderFleet {
+            policy,
+            workers,
+            heads,
+            ..
+        } = fleet_with_holders(7);
+        let request = |i: usize| -> Vec<u32> {
+            let mut tokens = heads[i % 7].clone();
+            tokens.extend((0..16).map(|t| 90_000_000 + i as u32 * 16 + t));
+            tokens
+        };
+        let select = |tokens: &[u32]| -> usize {
+            policy
+                .select_worker(
+                    &workers,
+                    &SelectWorkerInfo {
+                        tokens: Some(tokens),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+        };
+        for i in 0..64 {
+            assert_eq!(
+                select(&request(i)),
+                i % 7,
+                "a deep hit left its idle holder for the thin worker (decision {i})"
+            );
+        }
+        // Busy holders: the recompute buys the request a shorter wait and
+        // the thin worker its cache, so the diversion resumes at once (the
+        // hits above have long passed a window).
+        for holder in &workers[..7] {
+            holder.increment_load();
+        }
+        assert_eq!(
+            select(&request(64)),
+            7,
+            "with busy holders a due deep hit goes to the thin worker"
+        );
+    }
+
+    #[test]
     fn a_fleet_without_a_thin_worker_sees_no_diversion() {
         let fleet = fleet_with_holders(8);
         for i in 0..64 {
@@ -5877,7 +6303,11 @@ mod tests {
         for _ in 0..10 {
             workers[2].increment_load();
         }
-        update_expected_wait_loads(&policy, &workers, &[20_000, 10_000, 0]);
+        // Every report counts the requests its worker holds (100 queued on
+        // `w1`, 10 on `w3`); `w3`'s ten queue 1,000 uncached tokens against
+        // `w2`'s 10,000, so the expected wait prefers `w3` although its live
+        // count is the higher: the spill must follow the wait, not the count.
+        update_expected_wait_loads_counting_held(&policy, &workers, &[20_000, 10_000, 1_000]);
 
         let monitor = Arc::new(KvEventMonitor::new(Some(4)));
         let indexer = setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4]], 4);
@@ -6470,7 +6900,11 @@ mod tests {
         for _ in 0..10 {
             workers[2].increment_load();
         }
-        update_expected_wait_loads(&policy, &workers, &[20_000, 10_000, 0]);
+        // Every report counts the requests its worker holds (100 queued on
+        // `w1`, 10 on `w3`); `w3`'s ten queue 1,000 uncached tokens against
+        // `w2`'s 10,000, so the expected wait prefers `w3` although its live
+        // count is the higher: the spill must follow the wait, not the count.
+        update_expected_wait_loads_counting_held(&policy, &workers, &[20_000, 10_000, 1_000]);
 
         let selected = route_tokens(&policy, &workers, &tokens);
         assert_eq!(selected, 2, "spill must use expected wait over the fleet");

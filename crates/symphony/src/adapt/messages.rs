@@ -27,61 +27,16 @@
 //! fragment to its call, and once its text has substance keeps every run of whitespace in it, the
 //! separators after a call included.
 //!
-//! The blocks are the ones SMG's gateway builds today from a finished turn, in the order the
-//! Messages API uses:
-//!
-//! - one `thinking` block when there was reasoning, with an empty `signature`: the engines sign
-//!   nothing, and a signature a client could verify needs a decision of its own;
-//! - one `text` block when the content is not whitespace, every content and malformed text in
-//!   order;
-//! - one `tool_use` block per call in the order the calls started, its `input` the joined argument
-//!   fragments parsed as JSON.
-//!
-//! This is the same folding as `chat::message` and `responses::output`, so the three adapters agree
-//! on what a turn contains.
-//!
-//! Ids: a call id of the form `call_<suffix>` becomes `toolu_<suffix>`, the prefix Anthropic SDKs
-//! and tooling pattern-match; any other shape passes through unchanged, since a model family whose
-//! id format is load-bearing in the prompt must keep it. The rule is deterministic, so a client
-//! echoing the id back names the same call.
-//!
-//! Stop reason, from the `Finish` event: `length` is `max_tokens`, and parsed calls do not override
-//! a truncation; `tool_calls`, and any other reason after at least one tool call, are `tool_use`,
-//! since a message with `tool_use` blocks says so whatever stopped the model, as the API itself
-//! does; `stop` is `end_turn`; `abort` and engine-specific reasons are `end_turn` too when no call
-//! was made, since the Messages API has no word for them and the driver decides whether a failed
-//! generation is a message at all. A sequence without `Finish` has no stop reason.
-//!
-//! Policy this adapter sets, where the events say more than the Messages API can:
-//!
-//! - `ReasoningStart` and `Dropped` shape nothing, and `ReasoningEnd` and `ToolCallEnd` only close
-//!   their blocks in the stream: the markers a format consumes never reach the client.
-//! - `Malformed` text is content, as in `chat`: the model wrote it, and the client sees it rather
-//!   than losing it.
-//! - A call whose argument fragments are not a whole JSON value, because the output was cut or the
-//!   model wrote something else, has `{}` as its `input`: `input` must be a JSON value, and the
-//!   fragments are not one. Chat carries the fragments as a string and Responses marks the call
-//!   `incomplete`; here `max_tokens` is all a client learns. A call the model closed without
-//!   arguments has `{}` too.
-//! - Argument fragments for a call that never started cannot occur under the `Event` contract;
-//!   should one arrive, its text joins the content so that no byte is lost. In the stream the same
-//!   goes for a fragment whose call has no open `tool_use` block because other text, or another
-//!   call, came between the call's start and the fragment: the Messages API streams one block at a
-//!   time and cannot reopen a closed one, so the fragment is text, where the fold still gives it to
-//!   its call. The formats parse a call from one contiguous region, so this does not happen for
-//!   them, and nothing is dropped if it does; the old driver dropped such fragments.
-//! - In the stream, the thinking block stops when the reasoning region ends rather than when the
-//!   next text arrives, as the old driver did, so a client sees the block close as soon as the
-//!   model stops thinking.
-//! - In the stream, whitespace-only text opens no block until text with substance joins it; the old
-//!   driver opened a text block for any non-empty text, so a separator between a thinking block
-//!   and a call became a block holding one newline.
+//! Notes on what this module decides, and on what it leaves open: `docs/adapters.md`.
 
 use std::mem;
 
-use openai_protocol::messages::{ContentBlock, ContentBlockDelta, MessageStreamEvent, StopReason};
+use openai_protocol::messages::{
+    ContentBlock, ContentBlockDelta, MessageStreamEvent, StopReason, ToolUseCaller,
+};
 use serde_json::{Map, Value};
 
+use super::fold::fold;
 use crate::event::{Event, FinishReason};
 
 /// A whole output as the Messages API reports it: the content blocks and the stop reason.
@@ -94,70 +49,34 @@ pub struct Output {
     pub stop_reason: Option<StopReason>,
 }
 
-/// One started call and what its events said.
-struct Call {
-    index: u32,
-    id: String,
-    name: String,
-    arguments: String,
-}
-
 /// The message's content and stop reason, folded from a whole event sequence.
 pub fn output<'a>(events: impl IntoIterator<Item = &'a Event>) -> Output {
-    let mut content = String::new();
-    let mut reasoning = String::new();
-    let mut calls: Vec<Call> = Vec::new();
-    let mut stop_reason = None;
-    for event in events {
-        match event {
-            Event::Content(text) | Event::Malformed { text, .. } => content.push_str(&text.text),
-            Event::Reasoning(text) => reasoning.push_str(&text.text),
-            Event::ToolCallStart {
-                index, id, name, ..
-            } => calls.push(Call {
-                index: *index,
-                id: id.clone(),
-                name: name.clone(),
-                arguments: String::new(),
-            }),
-            Event::ToolCallArguments { index, json, .. } => {
-                match calls.iter_mut().find(|call| call.index == *index) {
-                    Some(call) => call.arguments.push_str(json),
-                    None => content.push_str(json),
-                }
-            }
-            Event::Finish {
-                reason, tool_calls, ..
-            } => stop_reason = Some(stop(reason, *tool_calls)),
-            Event::ReasoningStart
-            | Event::ReasoningEnd
-            | Event::ToolCallEnd { .. }
-            | Event::Dropped { .. } => {}
-        }
-    }
-
+    let folded = fold(events);
     let mut blocks = Vec::new();
-    if !reasoning.is_empty() {
+    if !folded.reasoning.is_empty() {
         blocks.push(ContentBlock::Thinking {
-            thinking: reasoning,
+            thinking: folded.reasoning,
             signature: String::new(),
         });
     }
-    if !content.trim().is_empty() {
+    if !folded.content.trim().is_empty() {
         blocks.push(ContentBlock::Text {
-            text: content,
+            text: folded.content,
             citations: None,
         });
     }
-    blocks.extend(calls.into_iter().map(|call| ContentBlock::ToolUse {
+    blocks.extend(folded.calls.into_iter().map(|call| ContentBlock::ToolUse {
         id: tool_use_id(&call.id),
         name: call.name,
         input: input(&call.arguments),
+        caller: ToolUseCaller::Direct,
     }));
 
     Output {
         content: blocks,
-        stop_reason,
+        stop_reason: folded
+            .finish
+            .map(|finish| stop(&finish.reason, finish.tool_calls)),
     }
 }
 
@@ -212,6 +131,7 @@ impl Stream {
                     id: tool_use_id(id),
                     name: name.clone(),
                     input: Value::Object(Map::new()),
+                    caller: ToolUseCaller::Direct,
                 },
                 out,
             ),
@@ -436,6 +356,7 @@ mod tests {
                     "id": "toolu_0",
                     "name": "get_weather",
                     "input": {"city": "Paris"},
+                    "caller": {"type": "direct"},
                 },
             ])
         );
@@ -488,8 +409,10 @@ mod tests {
         assert_eq!(
             wire(&output(&events).content),
             json!([
-                {"type": "tool_use", "id": "toolu_0", "name": "get_weather", "input": {"city": "Paris"}},
-                {"type": "tool_use", "id": "toolu_1", "name": "get_time", "input": {"zone": "CET"}},
+                {"type": "tool_use", "id": "toolu_0", "name": "get_weather", "input": {"city": "Paris"},
+                 "caller": {"type": "direct"}},
+                {"type": "tool_use", "id": "toolu_1", "name": "get_time", "input": {"zone": "CET"},
+                 "caller": {"type": "direct"}},
             ])
         );
     }
@@ -651,7 +574,8 @@ mod tests {
                  "delta": {"type": "text_delta", "text": "check."}},
                 {"type": "content_block_stop", "index": 1},
                 {"type": "content_block_start", "index": 2,
-                 "content_block": {"type": "tool_use", "id": "toolu_0", "name": "get_weather", "input": {}}},
+                 "content_block": {"type": "tool_use", "id": "toolu_0", "name": "get_weather", "input": {},
+                                   "caller": {"type": "direct"}}},
                 {"type": "content_block_delta", "index": 2,
                  "delta": {"type": "input_json_delta", "partial_json": "{\"city\":"}},
                 {"type": "content_block_delta", "index": 2,

@@ -9,7 +9,7 @@ use image::DynamicImage;
 
 use super::{preprocessor_config::PreProcessorConfig, transforms::TransformError};
 pub use crate::encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs};
-use crate::types::RgbFrameRef;
+use crate::{encoder_inputs::EncoderDtype, types::RgbFrameRef};
 
 /// Helper to extract a dimension from encoder_input given an ndim-dependent axis index.
 /// Returns `Err` if the ndim is not 4 or 5.
@@ -86,6 +86,16 @@ pub trait VisionPreProcessor: Send + Sync {
         false
     }
 
+    /// Whether this processor takes an image that carries an alpha channel as
+    /// decoded and composites or drops the channel itself, because its
+    /// reference is handed the image as stored by the serving engines'
+    /// loaders. A frame for such a processor is decoded under
+    /// [`TransparencyPolicy::KeepAlpha`](crate::TransparencyPolicy::KeepAlpha)
+    /// whatever the destination engine's own rule.
+    fn keeps_alpha(&self) -> bool {
+        false
+    }
+
     /// Default normalization mean for this model family.
     fn default_mean(&self) -> [f64; 3];
 
@@ -105,6 +115,22 @@ pub trait VisionPreProcessor: Send + Sync {
         images: &[DynamicImage],
         config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError>;
+
+    /// Preprocess a batch of images straight into `dtype`, the wire's dtype,
+    /// when the processor can lay the patches out and normalize them in one
+    /// pass (an [`EncoderInput::Wire`](crate::encoder_inputs::EncoderInput::Wire)
+    /// result); `None` when it cannot, which leaves the caller
+    /// [`preprocess`](Self::preprocess) and the per-destination write. The
+    /// bytes a `Wire` carries are the bytes `preprocess` followed by a write
+    /// in `dtype` would produce.
+    fn preprocess_wire(
+        &self,
+        _images: &[DynamicImage],
+        _config: &PreProcessorConfig,
+        _dtype: EncoderDtype,
+    ) -> Option<Result<PreprocessedEncoderInputs, TransformError>> {
+        None
+    }
 
     /// Preprocess one decoded video clip represented as sampled frames.
     ///
@@ -139,13 +165,22 @@ pub trait VisionPreProcessor: Send + Sync {
     /// Calculate the number of vision tokens for a given image size.
     ///
     /// This is used to determine how many placeholder tokens to insert
-    /// in the text input before the image has been fully processed.
+    /// in the text input before the image has been fully processed. A
+    /// config the implementation cannot read, or a size its resize rule
+    /// refuses, is the error the preprocessing reports for it, never a count
+    /// of zero or one taken from other settings; the arithmetic itself
+    /// cannot fail.
     ///
     /// # Arguments
     /// * `width` - Image width after preprocessing
     /// * `height` - Image height after preprocessing
     /// * `config` - Preprocessor configuration
-    fn calculate_num_tokens(&self, width: u32, height: u32, config: &PreProcessorConfig) -> usize;
+    fn calculate_num_tokens(
+        &self,
+        width: u32,
+        height: u32,
+        config: &PreProcessorConfig,
+    ) -> Result<usize, TransformError>;
 
     /// Get the model family name for identification.
     fn model_name(&self) -> &'static str;
@@ -216,6 +251,7 @@ impl VisionProcessorRegistry {
     ///
     /// Currently registers:
     /// - `deepseek_v41` / `deepseek-v4.1` -> DeepseekV41Processor (gray-padded contain fit)
+    /// - `gemma4` / `gemma-4` -> Gemma4Processor (block-aligned resize, padded patches)
     /// - `glm-5.3-flash` / `glm5_next` -> Glm53FlashProcessor
     /// - `llava-next` -> LlavaNextProcessor
     /// - `llava-1.5` / `llava-v1.5` -> LlavaProcessor
@@ -236,6 +272,19 @@ impl VisionProcessorRegistry {
                 pattern,
                 Box::new(super::processors::DeepseekV41Processor::new()),
             );
+        }
+
+        // Nemotron-H Omni (the HF model_type and the released ids' spelling).
+        for pattern in ["nemotronh_nano_omni", "nemotron-3-nano-omni"] {
+            registry.register(
+                pattern,
+                Box::new(super::processors::NemotronOmniProcessor::new()),
+            );
+        }
+
+        // Gemma 4 (the HF model_type and the released ids' spelling).
+        for pattern in ["gemma4", "gemma-4"] {
+            registry.register(pattern, Box::new(super::processors::Gemma4Processor::new()));
         }
 
         for pattern in [
@@ -476,6 +525,23 @@ mod tests {
                 .expect("GLM-5.3-Flash processor");
             assert_eq!(processor.model_name(), "glm-5.3-flash");
         }
+    }
+
+    #[test]
+    fn test_registry_finds_gemma4_by_id_and_model_type() {
+        let registry = VisionProcessorRegistry::with_defaults();
+        for (model_id, model_type) in [
+            ("google/gemma-4-26B-A4B-it", None),
+            ("/models/local-checkpoint", Some("gemma4")),
+        ] {
+            let processor = registry
+                .find(model_id, model_type)
+                .expect("Gemma 4 vision processor");
+            assert_eq!(processor.model_name(), "gemma4", "{model_id}");
+        }
+        assert!(registry
+            .find("/models/local-checkpoint", Some("gemma3"))
+            .is_none());
     }
 
     #[test]

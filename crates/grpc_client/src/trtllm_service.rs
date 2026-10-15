@@ -133,7 +133,7 @@ impl TrtllmServiceClient {
 
         let stop = Self::extract_stop_strings(body.stop.as_ref());
 
-        let max_tokens = body.max_completion_tokens.unwrap_or(2048);
+        let max_tokens = body.output_token_cap().unwrap_or(2048);
 
         let grpc_request = proto::GenerateRequest {
             request_id,
@@ -588,7 +588,7 @@ impl TrtllmServiceClient {
     ) -> Result<proto::GenerateRequest, String> {
         let sampling_config = Self::build_sampling_config_from_completion(body);
         let output_config = proto::OutputConfig {
-            logprobs: body.logprobs.map(|v| v.min(5) as i32),
+            logprobs: body.logprobs.map(|v| v.min(20) as i32),
             prompt_logprobs: None,
             return_context_logits: false,
             return_generation_logits: false,

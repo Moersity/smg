@@ -15,7 +15,9 @@ pub mod common_proto {
 }
 pub mod abort_on_drop;
 pub mod channel;
+pub mod codec;
 pub mod engine_load;
+pub mod media_fault;
 pub mod mlx_engine;
 pub mod sglang_scheduler;
 pub mod tokenizer_bundle;
@@ -29,8 +31,13 @@ use std::sync::Arc;
 
 pub use abort_on_drop::{AbortOnDropClient, AbortOnDropStream};
 pub use channel::{
-    connect_channel, connect_channel_with_timeout, normalize_grpc_endpoint, DEFAULT_CONNECT_TIMEOUT,
+    connect_channel, connect_channel_with_timeout, is_transport_failure, normalize_grpc_endpoint,
+    DEFAULT_CONNECT_TIMEOUT,
 };
+/// The HTTP/2 layer under the channels, re-exported for callers that build
+/// or classify the transport faults [`is_transport_failure`] recognises.
+pub use h2;
+pub use media_fault::WorkerMediaFault;
 pub use mlx_engine::{proto as mlx_proto, MlxEngineClient};
 pub use sglang_scheduler::{
     proto as sglang_proto, SglangGenerateRequestOptions, SglangSchedulerClient,
@@ -173,23 +180,66 @@ macro_rules! impl_admin_ops {
 }
 pub(crate) use impl_admin_ops;
 
+/// The largest `KvEventBatch` a KV event stream decodes, in place of tonic's
+/// 4 MiB default. A batch carries its blocks' token ids, and a servicer's
+/// state snapshot is cut into chunks of 2,048 blocks: about 4.8 MB at
+/// 1,152-token blocks, which a subscriber at the default limit failed on at
+/// every reconnect. 64 MiB covers such a chunk at any block size an engine
+/// uses while still bounding what one message may allocate.
+pub const KV_EVENT_MAX_DECODING_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
+
 /// Shared `subscribe_kv_events()` implementation for all engine clients.
 ///
 /// Each engine's generated proto client has a `subscribe_kv_events` RPC method
 /// with identical signature (using common proto types). This macro provides
-/// the wrapper that returns a `tonic::Streaming<KvEventBatch>`.
+/// the wrapper that returns a `tonic::Streaming<KvEventBatch>`, decoding up to
+/// [`KV_EVENT_MAX_DECODING_MESSAGE_SIZE`] per message.
 macro_rules! impl_subscribe_kv_events {
     () => {
         /// Subscribe to KV cache events from the backend.
-        /// Returns a long-lived server-streaming response.
+        /// Returns a long-lived server-streaming response. The servicer's
+        /// load records (`KvEventBatch.load`) start with the publisher's
+        /// first batch; a caller that skips `load_only` batches before any
+        /// sequence check can have them from the subscription on through
+        /// [`Self::subscribe_kv_events_with_load_records`].
         pub async fn subscribe_kv_events(
             &self,
             start_sequence_number: u64,
         ) -> Result<tonic::Streaming<$crate::common_proto::KvEventBatch>, tonic::Status> {
+            self.subscribe_kv_events_asking(start_sequence_number, false)
+                .await
+        }
+
+        /// [`Self::subscribe_kv_events`] asking the servicer for its load
+        /// records before the publisher's first batch
+        /// (`SubscribeKvEventsRequest.load_records_before_first_batch`):
+        /// `load_only` batches numbered 0 arrive from the subscription on,
+        /// the engine's silence on its first request among them. The caller
+        /// must skip `load_only` batches before any sequence check: one that
+        /// dedupes by `sequence_number` alone would take the publisher's
+        /// first batch for a repeat of them, and belongs on
+        /// [`Self::subscribe_kv_events`].
+        pub async fn subscribe_kv_events_with_load_records(
+            &self,
+            start_sequence_number: u64,
+        ) -> Result<tonic::Streaming<$crate::common_proto::KvEventBatch>, tonic::Status> {
+            self.subscribe_kv_events_asking(start_sequence_number, true)
+                .await
+        }
+
+        async fn subscribe_kv_events_asking(
+            &self,
+            start_sequence_number: u64,
+            load_records_before_first_batch: bool,
+        ) -> Result<tonic::Streaming<$crate::common_proto::KvEventBatch>, tonic::Status> {
             let request = tonic::Request::new($crate::common_proto::SubscribeKvEventsRequest {
                 start_sequence_number,
+                load_records_before_first_batch,
             });
-            let mut client = self.client.clone();
+            let mut client = self
+                .client
+                .clone()
+                .max_decoding_message_size($crate::KV_EVENT_MAX_DECODING_MESSAGE_SIZE);
             let response = client.subscribe_kv_events(request).await?;
             Ok(response.into_inner())
         }

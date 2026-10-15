@@ -146,6 +146,7 @@ mod pd_routing_unit_tests {
                 },
                 PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 5,
+                    load_metric: Default::default(),
                 },
             ),
             (
@@ -229,7 +230,7 @@ mod pd_routing_unit_tests {
                     MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
                 };
 
-                let client = reqwest::Client::new();
+                let client = smg::http_client::client();
 
                 // Initialize rate limiter
                 let rate_limiter = Some(Arc::new(TokenBucket::new(64, 64)));

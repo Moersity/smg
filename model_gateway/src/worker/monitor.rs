@@ -475,6 +475,45 @@ impl WorkerMonitor {
         }
     }
 
+    /// The absolute overload verdict of one load report (`None`: a poll that
+    /// brought none, which clears the veto; absent means no opinion),
+    /// applied to `worker` under its effective thresholds (resolved at
+    /// registration; nothing happens while they are off). An edge is an
+    /// INFO line with the report's figures, the thresholds and `source`:
+    /// a worker vetoed by overload reads as "unavailable" in a refusal line
+    /// exactly like one with an open breaker, and the breaker and the
+    /// liveness veto log their edges already. Re-asserting the verdict the
+    /// worker carries writes nothing; the counters and the gauge move once
+    /// per edge, in the registry.
+    fn apply_overload_verdict(
+        &self,
+        worker: &Arc<dyn Worker>,
+        load: Option<&WorkerLoadResponse>,
+        source: &'static str,
+    ) {
+        let overload = worker.metadata().overload;
+        if !overload.is_enabled() {
+            return;
+        }
+        let verdict = load.is_some_and(|load| overload.is_overloaded(load));
+        if !self.worker_registry.set_worker_overloaded(worker, verdict) {
+            return;
+        }
+        let waiting = load.map_or(0, WorkerLoadResponse::total_waiting_reqs);
+        let kv_pressure = load.map_or(0.0, WorkerLoadResponse::effective_kv_pressure);
+        info!(
+            worker_url = %worker.url(),
+            overloaded = verdict,
+            waiting_requests = waiting,
+            kv_pressure,
+            waiting_threshold = ?overload.waiting_requests,
+            kv_pressure_threshold = ?overload.token_usage,
+            source,
+            "Worker overload veto {}",
+            if verdict { "set" } else { "cleared" }
+        );
+    }
+
     /// A load record pushed on a worker's KV-event stream (`KvEventBatch.load`,
     /// the servicer's `GetLoads` figures for `dp_rank`, received at
     /// `received_at`): the same input as a poll of that worker. It replaces
@@ -493,6 +532,9 @@ impl WorkerMonitor {
         let age = Duration::from_millis(u64::from(record.age_ms)) + PUSHED_ONE_WAY_MARGIN;
         let sampled_at = received_at.checked_sub(age).unwrap_or(received_at);
         let url = worker.url().to_string();
+        // The stream pushes: silence from this worker is judged by the
+        // stream's cadence from now on (`liveness`, the stale rule).
+        worker.note_load_record();
         // The poll decision reads the receipt, not the sample's age: a record
         // that arrives is a stream that works, whatever the engine's clock.
         self.pushed_at
@@ -522,17 +564,21 @@ impl WorkerMonitor {
         };
         // What a poll does with a fresh report, minus the DP-rank token cache
         // (a record carries no absolute token counts).
-        let overload = worker.metadata().overload;
-        if overload.is_enabled() {
-            self.worker_registry
-                .set_worker_overloaded(worker, overload.is_overloaded(&response));
-        }
+        self.apply_overload_verdict(worker, Some(&response), "pushed record");
         let waiting: i64 = response
             .loads
             .iter()
             .map(|rank| i64::from(rank.num_waiting_reqs))
             .sum();
-        liveness::on_load_report(worker, waiting);
+        liveness::on_load_report(
+            worker,
+            waiting,
+            record
+                .engine_silence_ms
+                .map(|ms| Duration::from_millis(u64::from(ms))),
+            record.engine_reports_steps.unwrap_or(false),
+            record.prefill_pending_tokens.map(u64::from),
+        );
         let single: HashMap<String, WorkerLoadResponse> =
             HashMap::from([(url.clone(), (*response).clone())]);
         for policy in self.policy_registry.get_all_load_aware_policies() {
@@ -1431,15 +1477,7 @@ async fn poll_group_once(
         // on a request path, against the worker's effective thresholds
         // (resolved at registration). A failed fetch means no fresh
         // signal, which clears the flag — absent means no opinion.
-        let overload = worker.metadata().overload;
-        if overload.is_enabled() {
-            let verdict = response
-                .as_ref()
-                .is_some_and(|load| overload.is_overloaded(load));
-            monitor
-                .worker_registry
-                .set_worker_overloaded(&worker, verdict);
-        }
+        monitor.apply_overload_verdict(&worker, response.as_ref(), "poll");
         if let Some(mut load) = response {
             load.sampled_at = Some(Instant::now());
             // The wedged rule reads the queue depth off every report.
@@ -1448,7 +1486,7 @@ async fn poll_group_once(
                 .iter()
                 .map(|rank| i64::from(rank.num_waiting_reqs))
                 .sum();
-            liveness::on_load_report(&worker, waiting);
+            liveness::on_load_report(&worker, waiting, None, false, None);
             // Only feed the DP-rank cache from responses that carry real
             // absolute per-rank token counts. Ratio-only snapshots,
             // which would otherwise poison with a fake `{0: 0}`
@@ -1624,7 +1662,7 @@ mod worker_monitor_tests {
         config::types::PolicyConfig,
         observability::metrics::test_support::render_with_recorder,
         policies::PolicyRegistry,
-        worker::{BasicWorkerBuilder, ConnectionMode, WorkerType},
+        worker::{overload::OverloadThresholds, BasicWorkerBuilder, ConnectionMode, WorkerType},
     };
 
     fn ready_worker(url: &str, model: &str) -> Arc<dyn Worker> {
@@ -1997,6 +2035,111 @@ mod worker_monitor_tests {
             sample: 1,
             ..Default::default()
         }
+    }
+
+    /// A pushed record that carries the engine's own silence past the wedge
+    /// threshold vetoes the worker with nothing of this gateway's in flight
+    /// on it; the record that shows the engine producing again lifts it.
+    #[tokio::test]
+    async fn a_pushed_record_with_the_engines_silence_vetoes_the_worker() {
+        let (registry, monitor) = build_monitor();
+        let worker = ready_worker("grpc://w1:9000", "llama-3");
+        registry.register(Arc::clone(&worker)).unwrap();
+        let mut record = pushed(1);
+        monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
+        assert!(worker.stall_reason().is_none(), "no silence reported");
+        record.engine_silence_ms = Some(5_000);
+        record.engine_reports_steps = Some(true);
+        monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
+        assert_eq!(
+            worker.stall_reason(),
+            Some(super::super::worker::StallReason::Wedged)
+        );
+        assert!(!worker.is_healthy_and_eligible());
+        record.engine_silence_ms = None;
+        monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
+        assert!(worker.stall_reason().is_none(), "the engine produces again");
+    }
+
+    /// The overload veto's edges are INFO lines with the report's figures:
+    /// a record at the waiting threshold sets it, the next under it clears
+    /// it, and a record that re-asserts the verdict the worker carries
+    /// writes nothing new.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn the_overload_vetos_edges_are_logged_with_their_figures() {
+        let (registry, monitor) = build_monitor();
+        let worker: Arc<dyn Worker> = {
+            let worker = BasicWorkerBuilder::new("grpc://w1:9000")
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Http)
+                .model(ModelCard::new("llama-3"))
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .overload_defaults(OverloadThresholds {
+                    waiting_requests: Some(8),
+                    token_usage: Some(0.8),
+                })
+                .build();
+            worker.set_status(WorkerStatus::Ready);
+            Arc::new(worker)
+        };
+        registry.register(Arc::clone(&worker)).unwrap();
+        let mut record = pushed(1);
+        record.waiting_requests = 8;
+        monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
+        assert!(worker.is_overloaded(), "eight waiting is the threshold");
+        assert!(logs_contain("Worker overload veto set"));
+        assert!(logs_contain("waiting_requests=8"));
+        assert!(logs_contain("pushed record"));
+        assert!(!logs_contain("Worker overload veto cleared"));
+        record.sample = 2;
+        monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
+        logs_assert(|lines: &[&str]| {
+            let edges = lines
+                .iter()
+                .filter(|line| line.contains("Worker overload veto"))
+                .count();
+            if edges == 1 {
+                Ok(())
+            } else {
+                Err(format!("{edges} edge lines for one edge"))
+            }
+        });
+        record.waiting_requests = 0;
+        record.sample = 3;
+        monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
+        assert!(!worker.is_overloaded(), "the queue drained");
+        assert!(logs_contain("Worker overload veto cleared"));
+    }
+
+    /// A worker's first pushed record may be a `load_only` one the servicer
+    /// sends before the engine's first batch (from the subscription on, to
+    /// a gateway that asks for them): with the engine's silence on it, it
+    /// vetoes the worker like any later record, so an engine frozen on the
+    /// first request it ever receives leaves routing within the threshold
+    /// rather than never.
+    #[tokio::test]
+    async fn the_first_record_a_worker_pushes_is_judged_before_any_event_batch() {
+        let (registry, monitor) = build_monitor();
+        let worker = ready_worker("grpc://w1:9000", "llama-3");
+        registry.register(Arc::clone(&worker)).unwrap();
+        let record = EngineLoad {
+            engine_silence_ms: Some(5_000),
+            engine_reports_steps: Some(true),
+            prefill_pending_tokens: Some(47),
+            load_only: true,
+            sample: 1,
+            ..Default::default()
+        };
+        monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
+        assert_eq!(
+            worker.stall_reason(),
+            Some(super::super::worker::StallReason::Wedged)
+        );
+        assert!(!worker.is_healthy_and_eligible());
     }
 
     /// A record's telemetry feeds the `smg_engine_*` gauges, the PD gauges

@@ -1,7 +1,7 @@
 //! The contract between a worker-discovery provider and the shared reconciler.
 //!
-//! A provider turns its source — Kubernetes Pods today; files, Slurm and Consul
-//! next — into these types and nothing else. The reconciler sees only these, so
+//! A provider turns its source — Kubernetes Pods or a JSON manifest today;
+//! Slurm and Consul next — into these types and nothing else. The reconciler sees only these, so
 //! it never learns which kind of source produced a worker beyond the
 //! [`DiscoveryKind`] it is handed.
 
@@ -15,6 +15,7 @@ use crate::{observability::metrics::metrics_labels, worker::endpoint::Endpoint};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum DiscoveryKind {
     Kubernetes,
+    File,
 }
 
 impl DiscoveryKind {
@@ -27,6 +28,7 @@ impl DiscoveryKind {
     pub(super) fn as_label(self) -> &'static str {
         match self {
             DiscoveryKind::Kubernetes => "kubernetes",
+            DiscoveryKind::File => "file",
         }
     }
 
@@ -34,6 +36,7 @@ impl DiscoveryKind {
     pub(super) fn metric_label(self) -> &'static str {
         match self {
             DiscoveryKind::Kubernetes => metrics_labels::DISCOVERY_KUBERNETES,
+            DiscoveryKind::File => metrics_labels::DISCOVERY_FILE,
         }
     }
 }
@@ -49,7 +52,8 @@ impl DiscoveryKind {
 pub(super) struct DiscoveredWorker {
     /// The provider's stable identity for this worker instance, unique within a
     /// snapshot. A different value at an endpoint means a different instance
-    /// there, which the reconciler replaces.
+    /// there, which the reconciler removes and re-registers. The same instance
+    /// republished with a different [`Self::fingerprint`] is updated in place.
     ///
     /// Kubernetes uses `{pod_uid}:{port}`: one Pod can serve several ports, and
     /// a Pod *recreated* at the same address — a rescheduled StatefulSet Pod,
@@ -87,6 +91,11 @@ impl DiscoveredWorker {
     /// spelling decides how the worker is registered (`h:p` dual-probes HTTP
     /// and gRPC; `grpc://h:p` does not). Two spellings that parse to the same
     /// endpoint render, and so hash, identically.
+    ///
+    /// The reconciler stamps this on every worker it registers. When the stamp
+    /// on the same instance no longer matches the published record, it
+    /// re-registers the record with an Upsert, which updates the worker in
+    /// place: no removal and no drain, unlike a new `discovery_id`.
     ///
     /// Never log this next to the endpoint: the rendered form can carry
     /// credentials, and the pair would let a reader test guesses offline.

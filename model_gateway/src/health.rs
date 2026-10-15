@@ -195,8 +195,10 @@ impl ProbeState {
         // A worker reports healthy (engine SERVING) as soon as its process is
         // up, but the gateway autoloads each gRPC-pipeline worker's tokenizer
         // asynchronously afterward (`SubmitTokenizerJobStep`,
-        // fire-and-forget). Until that lands, generation requests fail with
-        // `tokenizer_not_found`, so `/readiness` must not report ready yet.
+        // fire-and-forget). Until that lands, generation requests are answered
+        // 503 `tokenizer_not_ready` (503 `tokenizer_load_failed` once a load
+        // was skipped or failed for good, or the tokenizer was removed), so
+        // `/readiness` must not report ready yet.
         // Hold readiness until every healthy gRPC and ZMQ worker's tokenizer
         // is registered — both ride the gRPC pipeline and speak tokens on the
         // wire. HTTP/proxy workers never autoload a local tokenizer and are
@@ -424,16 +426,14 @@ pub fn start_probe_listener(
     port: u16,
     probe_state: Arc<ProbeState>,
 ) -> Result<SocketAddr, String> {
-    // Parse host+port exactly like the main listener (server.rs): a
-    // `host:port` SocketAddr parse handles bracketed IPv6 literals
-    // (`[::1]`, `[::]`) that a bare `IpAddr::parse` of the host rejects, and
-    // a bad host is a hard error rather than a silent rebind to 0.0.0.0
-    // (which would hide a config typo and widen exposure). `port` may be 0
-    // here on purpose — the ephemeral-port tests bind through this path; the
-    // config-sourced value is rejected for 0 at the validation layer.
-    let addr: SocketAddr = format!("{host}:{port}")
-        .parse()
-        .map_err(|err| format!("invalid probe listener host '{host}': {err}"))?;
+    // Parse host+port exactly like the main listener (server.rs), through the
+    // shared bind-host rule: IPv6 with or without brackets (`::`, `[::]`,
+    // `::1`), and a bad host is a hard error rather than a silent rebind to
+    // 0.0.0.0 (which would hide a config typo and widen exposure). `port` may
+    // be 0 here on purpose — the ephemeral-port tests bind through this path;
+    // the config-sourced value is rejected for 0 at the validation layer.
+    let addr = crate::config::bind_socket_addr(host, port)
+        .map_err(|err| format!("probe listener: {err}"))?;
 
     let listener = std::net::TcpListener::bind(addr)
         .map_err(|err| format!("failed to bind probe listener on {addr}: {err}"))?;
@@ -880,6 +880,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn probe_listener_accepts_ipv6_with_or_without_brackets() {
+        // Nothing to assert on a host without an IPv6 loopback.
+        if std::net::TcpListener::bind("[::1]:0").is_err() {
+            return;
+        }
+        let state = ProbeState::new(InFlightRequestTracker::new());
+        for host in ["::1", "[::1]"] {
+            let addr = start_probe_listener(host, 0, state.clone()).unwrap();
+            assert!(addr.ip().is_ipv6(), "host {host} bound {addr}");
+        }
+        let err = start_probe_listener("probe-host", 0, state).unwrap_err();
+        assert!(err.contains("invalid bind host 'probe-host'"), "got: {err}");
+    }
+
+    #[tokio::test]
     async fn probe_listener_serves_on_dedicated_runtime() {
         let inflight_tracker = InFlightRequestTracker::new();
         let state = ProbeState::new(inflight_tracker.clone());
@@ -890,26 +905,39 @@ mod tests {
         let addr = start_probe_listener("127.0.0.1", 0, state.clone()).unwrap();
         let base = format!("http://{addr}");
 
-        let resp = reqwest::get(format!("{base}/liveness")).await.unwrap();
+        let client = crate::http_client::client();
+        let resp = client.get(format!("{base}/liveness")).send().await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.text().await.unwrap(), "OK");
 
-        let resp = reqwest::get(format!("{base}/readiness")).await.unwrap();
+        let resp = client
+            .get(format!("{base}/readiness"))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         registry
             .register(http_worker("http://w1:8080", WorkerStatus::Ready))
             .unwrap();
         recompute(&state, &registry, &router_config);
-        let resp = reqwest::get(format!("{base}/readiness")).await.unwrap();
+        let resp = client
+            .get(format!("{base}/readiness"))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
         // Drain flips readiness on the dedicated listener; liveness stays OK.
         inflight_tracker.begin_drain();
-        let resp = reqwest::get(format!("{base}/readiness")).await.unwrap();
+        let resp = client
+            .get(format!("{base}/readiness"))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(resp.text().await.unwrap().contains("draining"));
-        let resp = reqwest::get(format!("{base}/health")).await.unwrap();
+        let resp = client.get(format!("{base}/health")).send().await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 

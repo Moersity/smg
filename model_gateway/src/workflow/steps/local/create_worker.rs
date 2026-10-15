@@ -13,7 +13,11 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 
 use super::discover_dp::DpInfo;
 use crate::{
-    routers::grpc::{multimodal::SUPPORTS_VISION_LABEL, zmq_client::zmq_handshake_address},
+    config::ParserChoice,
+    routers::grpc::{
+        multimodal::SUPPORTS_VISION_LABEL, regular::symphony::check_names, utils::Names,
+        zmq_client::zmq_handshake_address,
+    },
     worker::{
         circuit_breaker::CircuitBreakerConfig, overload::OverloadThresholds,
         resilience::resolve_resilience, worker::RuntimeType, BasicWorkerBuilder, ConnectionMode,
@@ -101,6 +105,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         validate_parser_overrides(
             &model_card,
             &config.url,
+            app_context.router_config.parser,
             app_context.tool_parser_factory.as_ref(),
             app_context.reasoning_parser_factory.as_ref(),
         )
@@ -257,7 +262,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                     .health_config(health_config.clone())
                     .health_endpoint(health_endpoint)
                     .overload_defaults(overload_defaults)
-                    .labels(labels.clone());
+                    .labels(labels_for_rank(&labels, dp, &config.labels));
 
                 if let Some((rank, size)) = dp {
                     builder = builder.dp_config(rank, size);
@@ -394,33 +399,35 @@ fn warn_on_conflicting_parser_overrides(
     }
 }
 
-/// Reject parser-override names the registries don't know. Skipped when a
-/// factory is absent (parsers unused in that configuration).
+/// Reject parser-override names the registries don't know: the legacy parsers', and, under
+/// `--parser symphony`, Symphony's tables (`regular::symphony::check_names`). A name whose
+/// factory is absent is not checked (parsers unused in that configuration).
 fn validate_parser_overrides(
     card: &ModelCard,
     worker_url: &str,
+    parser: ParserChoice,
     tool_parser_factory: Option<&tool_parser::ParserFactory>,
     reasoning_parser_factory: Option<&reasoning_parser::ParserFactory>,
 ) -> Result<(), String> {
-    if let (Some(name), Some(factory)) = (card.tool_parser.as_deref(), tool_parser_factory) {
-        if !factory.registry().has_parser(name) {
-            return Err(format!(
-                "worker {} declares unknown tool_parser '{}' for model '{}'",
-                worker_url, name, card.id
-            ));
-        }
-    }
-    if let (Some(name), Some(factory)) =
-        (card.reasoning_parser.as_deref(), reasoning_parser_factory)
-    {
-        if !factory.registry().has_parser(name) {
-            return Err(format!(
-                "worker {} declares unknown reasoning_parser '{}' for model '{}'",
-                worker_url, name, card.id
-            ));
-        }
-    }
-    Ok(())
+    let names = Names {
+        tool: card.tool_parser.clone(),
+        reasoning: card.reasoning_parser.clone(),
+    };
+    let legacy_tool = match (&names.tool, tool_parser_factory) {
+        (Some(name), Some(factory)) => factory.registry().has_parser(name),
+        _ => true,
+    };
+    let legacy_reasoning = match (&names.reasoning, reasoning_parser_factory) {
+        (Some(name), Some(factory)) => factory.registry().has_parser(name),
+        _ => true,
+    };
+    check_names(parser, &names, legacy_tool, legacy_reasoning).map_err(|why| {
+        format!(
+            "worker {worker_url} declares a parser override for model '{}' the gateway cannot \
+             read with: {why}",
+            card.id
+        )
+    })
 }
 
 fn build_model_card(
@@ -724,14 +731,84 @@ fn validate_zmq_worker_type(
     Ok(())
 }
 
-/// Reject a data-parallel worker the ZMQ path cannot serve.
-///
-/// dp-aware expansion creates one rank-pinned worker per DP rank, but each
-/// ZMQ worker owns its own socket bind — N expanded workers would fight over
-/// the same ipc paths. ZMQ DP runs as a *grouped* worker instead (`dp_size: N`
-/// on the worker spec: one worker, one socket set, N engines dialing in), so
-/// reject the expansion loudly and point at the grouped form. gRPC/HTTP
-/// expansion and single-engine ZMQ are fine.
+/// The labels of one dp-aware rank worker: the engine's labels as they are,
+/// except the running window of an engine that splits it across its
+/// attention-DP workers (the `enable_dp_attention` / `attn_dp_size` labels:
+/// the flag and the servicer's computed figure alike name the whole engine's
+/// window), which becomes the rank's share, so the PD admission gate and the
+/// capacity sum bound each rank worker by what its rank runs instead of the
+/// whole engine's window `size` times over. Engines whose figure is per rank
+/// already (`max_num_seqs`) carry no such label and keep theirs; an
+/// unexpanded worker stands for the whole engine and keeps the whole window.
+/// A window the operator set by hand on the worker (`set_by_hand`, the
+/// spec's own labels, which win the merge) is the operator's statement
+/// about each rank worker: it stays as set and is the rank worker's only
+/// window (a discovered window under the other name is dropped, since the
+/// reader prefers `max_num_seqs` to `max_running_requests` and would
+/// otherwise take the engine's figure over the operator's); only a
+/// discovered window is shared.
+fn labels_for_rank(
+    labels: &HashMap<String, String>,
+    dp: Option<(usize, usize)>,
+    set_by_hand: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut labels = labels.clone();
+    let Some((_, size)) = dp.filter(|(_, size)| *size > 1) else {
+        return labels;
+    };
+    let Some(width) = attention_dp_width(&labels, size) else {
+        return labels;
+    };
+    if WINDOW_LABELS
+        .iter()
+        .any(|key| set_by_hand.contains_key(*key))
+    {
+        for key in WINDOW_LABELS {
+            if !set_by_hand.contains_key(key) {
+                labels.remove(key);
+            }
+        }
+        return labels;
+    }
+    for key in WINDOW_LABELS {
+        let Some(window) = labels
+            .get(key)
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|window| *window > 0)
+        else {
+            continue;
+        };
+        let share = (window / width).max(1);
+        labels.insert(key.to_string(), share.to_string());
+    }
+    labels
+}
+
+/// The labels that name a worker's running window, in the order the reader
+/// prefers them.
+const WINDOW_LABELS: [&str; 2] = ["max_num_seqs", "max_running_requests"];
+
+/// How many attention-DP workers the engine's labels say its running window
+/// is split across, `None` for an engine that runs the whole window on every
+/// rank: `attn_dp_size` above one (the engine's newer releases resolve the
+/// flag into it, and `dp_size` then counts replicas, each running the whole
+/// window, so the dp-aware width of `dp_size x attn_dp_size` ranks is not the
+/// divisor), else the dp-aware width `size` under `enable_dp_attention` (the
+/// pinned release, where `dp_size` is the attention-DP width).
+fn attention_dp_width(labels: &HashMap<String, String>, size: usize) -> Option<u64> {
+    let resolved = labels
+        .get("attn_dp_size")
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|width| *width > 1);
+    if resolved.is_some() {
+        return resolved;
+    }
+    labels
+        .get("enable_dp_attention")
+        .is_some_and(|value| value == "true")
+        .then_some(size as u64)
+}
+
 /// Ranks to register for a dp-aware worker. A width above one expands into
 /// one dp-annotated worker per rank. A width-1 advertisement (older
 /// servicers emit it as a capability signal) and a missing one both
@@ -754,6 +831,14 @@ fn dp_rank_expansion(
     }
 }
 
+/// Reject a data-parallel worker the ZMQ path cannot serve.
+///
+/// dp-aware expansion creates one rank-pinned worker per DP rank, but each
+/// ZMQ worker owns its own socket bind — N expanded workers would fight over
+/// the same ipc paths. ZMQ DP runs as a *grouped* worker instead (`dp_size: N`
+/// on the worker spec: one worker, one socket set, N engines dialing in), so
+/// reject the expansion loudly and point at the grouped form. gRPC/HTTP
+/// expansion and single-engine ZMQ are fine.
 fn validate_zmq_dp(
     connection_mode: ConnectionMode,
     dp_size: usize,
@@ -795,7 +880,7 @@ mod tests {
 
         Arc::new(crate::app_context::AppContext {
             gateway_auth: AuthConfig::new(None),
-            client: reqwest::Client::new(),
+            client: crate::http_client::client(),
             router_config: router_config.clone(),
             rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
             rate_limit_manager: None,
@@ -821,6 +906,7 @@ mod tests {
             mcp_format_registry: openai_bridge::FormatRegistry::new(),
             tokenizer_registry: Arc::new(llm_tokenizer::registry::TokenizerRegistry::new()),
             multimodal_config_registry: Arc::new(MultimodalConfigRegistry::new()),
+            tokenizer_load_failures: Arc::default(),
             wasm_manager: None,
             worker_client_cache: Arc::new(crate::worker::WorkerHttpClientCache::new(
                 &router_config,
@@ -866,7 +952,7 @@ mod tests {
             create_worker_workflow_data(spec, WorkerRegistrationMode::Upsert, make_app_context());
         data.worker_kind = Some(WorkerKind::Local);
         data.connection_mode = Some(ConnectionMode::Http);
-        data.http_client_handle = Some(Arc::new(reqwest::Client::new()));
+        data.http_client_handle = Some(Arc::new(crate::http_client::client()));
         let mut ctx = WorkflowContext::new(WorkflowInstanceId::new(), data);
 
         assert_eq!(
@@ -889,6 +975,262 @@ mod tests {
         assert_eq!(spec.labels["tier"], "gold");
         assert_eq!(spec.dp_rank, None);
         assert_eq!(spec.dp_size, None);
+    }
+
+    /// A loopback port nothing listens on.
+    fn closed_loopback_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.local_addr().expect("address").port()
+    }
+
+    /// A registration context for a disaggregated leg at a loopback URL.
+    fn leg_context(
+        worker_type: WorkerType,
+        bootstrap_port: Option<u16>,
+        registration_mode: WorkerRegistrationMode,
+    ) -> WorkflowContext<WorkerWorkflowData> {
+        leg_context_on(
+            worker_type,
+            bootstrap_port,
+            registration_mode,
+            RuntimeType::Unspecified,
+            None,
+        )
+    }
+
+    /// A registration context for a disaggregated leg of `runtime` on
+    /// `kv_connector`, at a loopback URL.
+    fn leg_context_on(
+        worker_type: WorkerType,
+        bootstrap_port: Option<u16>,
+        registration_mode: WorkerRegistrationMode,
+        runtime: RuntimeType,
+        kv_connector: Option<&str>,
+    ) -> WorkflowContext<WorkerWorkflowData> {
+        use openai_protocol::worker::WorkerModels;
+        use wfaas::WorkflowInstanceId;
+
+        use crate::workflow::steps::create_worker_workflow_data;
+
+        let mut spec = WorkerSpec::new("http://127.0.0.1:18000");
+        spec.models = WorkerModels::Single(Box::new(ModelCard::new("m")));
+        spec.worker_type = worker_type;
+        spec.bootstrap_port = bootstrap_port;
+        spec.runtime_type = runtime;
+        spec.kv_connector = kv_connector.map(str::to_string);
+        let mut data = create_worker_workflow_data(spec, registration_mode, make_app_context());
+        data.worker_kind = Some(WorkerKind::Local);
+        data.connection_mode = Some(ConnectionMode::Http);
+        data.http_client_handle = Some(Arc::new(crate::http_client::client()));
+        WorkflowContext::new(WorkflowInstanceId::new(), data)
+    }
+
+    /// The probe's count once it lands: the probe runs off the path, within
+    /// its own timeout.
+    async fn wait_for_probe_count(
+        handle: &metrics_exporter_prometheus::PrometheusHandle,
+    ) -> String {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let rendered = handle.render();
+            if let Some(line) = rendered
+                .lines()
+                .find(|line| line.starts_with("smg_pd_rendezvous_failures_total{"))
+            {
+                return line.to_string();
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the failed probe is counted within its timeout:\n{rendered}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// This step builds a prefill leg with the bootstrap port and host its
+    /// spec carries and probes nothing: the port is probed once the leg is
+    /// registered (the register step), so a workflow that fails between the
+    /// two is not reported as a registered leg with a dead port.
+    #[tokio::test]
+    async fn a_prefill_legs_bootstrap_port_is_probed_once_the_leg_is_registered() {
+        use crate::workflow::steps::RegisterWorkersStep;
+
+        let closed_port = closed_loopback_port();
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let mut ctx = leg_context(
+            WorkerType::Prefill,
+            Some(closed_port),
+            WorkerRegistrationMode::Upsert,
+        );
+        assert_eq!(
+            CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
+            StepResult::Success
+        );
+        let worker = Arc::clone(&ctx.data.actual_workers.as_ref().unwrap()[0]);
+        assert_eq!(worker.bootstrap_port(), Some(closed_port));
+        assert_eq!(worker.bootstrap_host(), "127.0.0.1");
+        // Built, not registered: nothing is probed yet.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !handle.render().contains("smg_pd_rendezvous_failures_total"),
+            "{}",
+            handle.render()
+        );
+
+        assert_eq!(
+            RegisterWorkersStep.execute(&mut ctx).await.unwrap(),
+            StepResult::Success
+        );
+        let counted = wait_for_probe_count(&handle).await;
+        assert!(
+            counted.contains(r#"leg="prefill""#)
+                && counted.contains(r#"phase="probe""#)
+                && counted.ends_with(" 1"),
+            "{counted}"
+        );
+    }
+
+    /// A leg whose registration the register step refuses never joined the
+    /// registry, so its port is not probed and no probe failure is counted
+    /// for it; a decode leg without a bootstrap port is not probed either,
+    /// since no partner is handed a port for it.
+    #[tokio::test]
+    async fn a_leg_the_registry_refuses_or_a_decode_leg_without_a_bootstrap_port_is_not_probed() {
+        use crate::workflow::steps::RegisterWorkersStep;
+
+        let closed_port = closed_loopback_port();
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        // The replacement of a worker the registry no longer holds is refused.
+        let refused = WorkerRegistrationMode::ReplaceById {
+            worker_id: "worker-gone".to_string(),
+            expected_revision: 0,
+        };
+        let mut ctx = leg_context(WorkerType::Prefill, Some(closed_port), refused);
+        assert_eq!(
+            CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
+            StepResult::Success
+        );
+        assert!(RegisterWorkersStep.execute(&mut ctx).await.is_err());
+
+        let mut ctx = leg_context(WorkerType::Decode, None, WorkerRegistrationMode::Upsert);
+        assert_eq!(
+            CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
+            StepResult::Success
+        );
+        assert_eq!(
+            RegisterWorkersStep.execute(&mut ctx).await.unwrap(),
+            StepResult::Success
+        );
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !handle.render().contains("smg_pd_rendezvous_failures_total"),
+            "{}",
+            handle.render()
+        );
+    }
+
+    /// Whether something on this host answers on the default bootstrap port:
+    /// the tests of a leg registered without a port cannot tell a probe that
+    /// found a listener there from one that never ran, so they stand down.
+    fn something_listens_on_the_default_bootstrap_port() -> bool {
+        use std::net::{SocketAddr, TcpStream};
+
+        let address = SocketAddr::from(([127, 0, 0, 1], crate::worker::DEFAULT_BOOTSTRAP_PORT));
+        TcpStream::connect_timeout(&address, Duration::from_millis(500)).is_ok()
+    }
+
+    /// A prefill leg registered without a bootstrap port (a `POST /workers`
+    /// without the field, a discovered pod without the annotation) is handed
+    /// the default port on the request path, so the default port is what is
+    /// probed for it: with nothing listening there, the failed probe is
+    /// counted once the leg is registered, like a registered port's.
+    #[tokio::test]
+    async fn a_prefill_leg_registered_without_a_bootstrap_port_is_probed_on_the_default_port() {
+        use crate::workflow::steps::RegisterWorkersStep;
+
+        if something_listens_on_the_default_bootstrap_port() {
+            return;
+        }
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let mut ctx = leg_context(WorkerType::Prefill, None, WorkerRegistrationMode::Upsert);
+        assert_eq!(
+            CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
+            StepResult::Success
+        );
+        let worker = Arc::clone(&ctx.data.actual_workers.as_ref().unwrap()[0]);
+        assert_eq!(
+            worker.bootstrap_port(),
+            None,
+            "the spec keeps what was registered"
+        );
+        assert_eq!(
+            RegisterWorkersStep.execute(&mut ctx).await.unwrap(),
+            StepResult::Success
+        );
+        let counted = wait_for_probe_count(&handle).await;
+        assert!(
+            counted.contains(r#"leg="prefill""#)
+                && counted.contains(r#"phase="probe""#)
+                && counted.ends_with(" 1"),
+            "{counted}"
+        );
+    }
+
+    /// A prefill leg on a KV store registered with the bootstrap port the
+    /// rendezvous recipe carries: no partner is ever handed it, so nothing is
+    /// probed and no probe failure is counted once the leg is registered.
+    #[tokio::test]
+    async fn a_store_prefill_legs_registered_bootstrap_port_is_not_probed() {
+        use crate::workflow::steps::RegisterWorkersStep;
+
+        let closed_port = closed_loopback_port();
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let mut ctx = leg_context_on(
+            WorkerType::Prefill,
+            Some(closed_port),
+            WorkerRegistrationMode::Upsert,
+            RuntimeType::Vllm,
+            Some("MooncakeStoreConnector"),
+        );
+        assert_eq!(
+            CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
+            StepResult::Success
+        );
+        let worker = Arc::clone(&ctx.data.actual_workers.as_ref().unwrap()[0]);
+        assert_eq!(
+            worker.bootstrap_port(),
+            Some(closed_port),
+            "the spec keeps what was registered"
+        );
+        assert_eq!(
+            worker.metadata().spec.kv_connector.as_deref(),
+            Some("MooncakeStoreConnector")
+        );
+        assert_eq!(
+            RegisterWorkersStep.execute(&mut ctx).await.unwrap(),
+            StepResult::Success
+        );
+        // A probe of the closed loopback port is refused and counted at once;
+        // wait longer than that before reading nothing.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let rendered = handle.render();
+        assert!(
+            !rendered.contains("smg_pd_rendezvous_failures_total"),
+            "{rendered}"
+        );
     }
 
     /// The dedicated `kv_role` field follows the same precedence as the
@@ -1365,6 +1707,90 @@ mod tests {
         assert_eq!(card.reasoning_parser.as_deref(), Some("basic"));
     }
 
+    /// An engine's own reasoning parser rides in its own label
+    /// (`engine_reasoning_parser`), not in `reasoning_parser`, the per-model
+    /// parser override registration validates against the gateway's registry:
+    /// the engine's parser names are the engine's (`openai_gptoss`, `kimi_k2`),
+    /// which the gateway may not have, and a shared name must not outrank the
+    /// configured `--reasoning-parser`. Such a worker registers, its card
+    /// carries no override, and its grammar start reads as advertised.
+    #[test]
+    fn an_engines_advertised_reasoning_parser_is_not_a_parser_override() {
+        use tool_parser::GrammarStart;
+
+        use crate::routers::grpc::client::ServerInfo;
+
+        let tool_factory = tool_parser::ParserFactory::default();
+        let reasoning_factory = reasoning_parser::ParserFactory::default();
+        let spec = WorkerSpec::new("grpc://engine:50051");
+        for name in ["openai_gptoss", "kimi_k2", "qwen3", "glm45"] {
+            let info = ServerInfo::Vllm(Box::new(
+                smg_grpc_client::vllm_proto::GetServerInfoResponse {
+                    engine_reasoning_parser: name.to_string(),
+                    constrained_decoding_start: "after_reasoning".to_string(),
+                    ..Default::default()
+                },
+            ));
+            let labels = info.to_labels();
+            assert_eq!(
+                labels.get("engine_reasoning_parser").map(String::as_str),
+                Some(name)
+            );
+            let card = build_model_card("m", &spec, &labels, &HashMap::new());
+            assert_eq!(
+                card.reasoning_parser, None,
+                "{name}: no override from the engine's fact"
+            );
+            assert_eq!(card.tool_parser, None);
+            validate_parser_overrides(
+                &card,
+                "grpc://engine:50051",
+                ParserChoice::Legacy,
+                Some(&tool_factory),
+                Some(&reasoning_factory),
+            )
+            .unwrap_or_else(|e| panic!("{name}: the worker must register: {e}"));
+            assert_eq!(
+                GrammarStart::from_label(labels.get(GrammarStart::LABEL).map(String::as_str)),
+                GrammarStart::AfterReasoning,
+                "{name}: the grammar start reads as advertised"
+            );
+        }
+    }
+
+    #[test]
+    fn a_symphony_table_is_a_parser_override_under_parser_symphony_alone() {
+        let tool_factory = tool_parser::ParserFactory::default();
+        let reasoning_factory = reasoning_parser::ParserFactory::default();
+        let mut card = ModelCard::new("m");
+        card.tool_parser = Some("ling".to_string());
+        card.reasoning_parser = Some("ling".to_string());
+        let check = |card: &ModelCard, parser| {
+            validate_parser_overrides(
+                card,
+                "http://w:1",
+                parser,
+                Some(&tool_factory),
+                Some(&reasoning_factory),
+            )
+        };
+        assert!(check(&card, ParserChoice::Symphony).is_ok());
+        let err = check(&card, ParserChoice::Legacy).expect_err("a table is no legacy parser");
+        assert!(
+            err.contains("'ling'") && err.contains("--parser symphony"),
+            "{err}"
+        );
+        // A table no legacy parser shares binds the other override to the same table.
+        card.reasoning_parser = Some("qwen3".to_string());
+        let err = check(&card, ParserChoice::Symphony).expect_err("bound to the table");
+        assert!(err.contains("same table"), "{err}");
+        // A name both registries have passes under either parser.
+        card.tool_parser = Some("kimi_k3".to_string());
+        card.reasoning_parser = Some("kimi_k3".to_string());
+        assert!(check(&card, ParserChoice::Symphony).is_ok());
+        assert!(check(&card, ParserChoice::Legacy).is_ok());
+    }
+
     #[test]
     fn unknown_parser_override_fails_validation() {
         let tool_factory = tool_parser::ParserFactory::default();
@@ -1375,6 +1801,7 @@ mod tests {
         assert!(validate_parser_overrides(
             &card,
             "http://w:1",
+            ParserChoice::Legacy,
             Some(&tool_factory),
             Some(&reasoning_factory)
         )
@@ -1382,20 +1809,155 @@ mod tests {
 
         // Known tool parser passes; unknown names fail loudly.
         let card = ModelCard::new("m").with_tool_parser("json");
-        assert!(validate_parser_overrides(&card, "http://w:1", Some(&tool_factory), None).is_ok());
+        assert!(validate_parser_overrides(
+            &card,
+            "http://w:1",
+            ParserChoice::Legacy,
+            Some(&tool_factory),
+            None
+        )
+        .is_ok());
 
         let card = ModelCard::new("m").with_tool_parser("definitely-not-a-parser");
-        let err = validate_parser_overrides(&card, "http://w:1", Some(&tool_factory), None)
-            .expect_err("unknown tool parser must fail registration");
+        let err = validate_parser_overrides(
+            &card,
+            "http://w:1",
+            ParserChoice::Legacy,
+            Some(&tool_factory),
+            None,
+        )
+        .expect_err("unknown tool parser must fail registration");
         assert!(err.contains("definitely-not-a-parser"), "{err}");
 
         let card = ModelCard::new("m").with_reasoning_parser("definitely-not-a-parser");
-        let err = validate_parser_overrides(&card, "http://w:1", None, Some(&reasoning_factory))
-            .expect_err("unknown reasoning parser must fail registration");
+        let err = validate_parser_overrides(
+            &card,
+            "http://w:1",
+            ParserChoice::Legacy,
+            None,
+            Some(&reasoning_factory),
+        )
+        .expect_err("unknown reasoning parser must fail registration");
         assert!(err.contains("definitely-not-a-parser"), "{err}");
 
         // Absent factories skip validation (parsers unused in that config).
         let card = ModelCard::new("m").with_tool_parser("definitely-not-a-parser");
-        assert!(validate_parser_overrides(&card, "http://w:1", None, None).is_ok());
+        assert!(
+            validate_parser_overrides(&card, "http://w:1", ParserChoice::Legacy, None, None)
+                .is_ok()
+        );
+    }
+}
+
+#[cfg(test)]
+mod rank_window_tests {
+    use std::collections::HashMap;
+
+    use super::labels_for_rank;
+
+    fn labels(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    /// The rank's labels when every label was discovered (none set by hand).
+    fn discovered(
+        engine: &HashMap<String, String>,
+        dp: Option<(usize, usize)>,
+    ) -> HashMap<String, String> {
+        labels_for_rank(engine, dp, &HashMap::new())
+    }
+
+    /// A window the operator set by hand on the worker is the operator's
+    /// statement about each rank worker: it stays as set, while a
+    /// discovered window under the other name is dropped rather than
+    /// divided, so the reader's preference between the names cannot
+    /// override the operator's figure; the other labels ride along.
+    #[test]
+    fn a_window_the_operator_set_by_hand_stays_as_set() {
+        let by_hand = labels(&[("max_running_requests", "2048")]);
+        let engine = labels(&[
+            ("max_running_requests", "2048"),
+            ("max_num_seqs", "8192"),
+            ("enable_dp_attention", "true"),
+            ("dp_size", "8"),
+        ]);
+        let rank = labels_for_rank(&engine, Some((3, 8)), &by_hand);
+        assert_eq!(
+            rank.get("max_running_requests").map(String::as_str),
+            Some("2048")
+        );
+        assert_eq!(rank.get("max_num_seqs"), None);
+        assert_eq!(rank.get("dp_size").map(String::as_str), Some("8"));
+
+        let by_hand = labels(&[("max_num_seqs", "512")]);
+        let engine = labels(&[
+            ("max_running_requests", "16384"),
+            ("max_num_seqs", "512"),
+            ("attn_dp_size", "8"),
+        ]);
+        let rank = labels_for_rank(&engine, Some((0, 8)), &by_hand);
+        assert_eq!(rank.get("max_num_seqs").map(String::as_str), Some("512"));
+        assert_eq!(rank.get("max_running_requests"), None);
+    }
+
+    /// An engine that splits its running window across its attention-DP
+    /// workers advertises the whole engine's window; each of its rank
+    /// workers gets its share, whichever way the engine's release spells
+    /// the split; the other labels ride along. Replicas of attention-DP
+    /// groups (`dp_size` next to a resolved `attn_dp_size`) each run the
+    /// whole window: the share is by the attention-DP width, not by the
+    /// dp-aware width of every rank.
+    #[test]
+    fn an_attention_dp_engines_window_is_each_ranks_share() {
+        let engine = labels(&[
+            ("max_running_requests", "16384"),
+            ("enable_dp_attention", "true"),
+            ("dp_size", "8"),
+        ]);
+        let rank = discovered(&engine, Some((3, 8)));
+        assert_eq!(
+            rank.get("max_running_requests").map(String::as_str),
+            Some("2048")
+        );
+        assert_eq!(rank.get("dp_size").map(String::as_str), Some("8"));
+        let newer = labels(&[("max_running_requests", "16384"), ("attn_dp_size", "8")]);
+        assert_eq!(
+            discovered(&newer, Some((0, 8)))
+                .get("max_running_requests")
+                .map(String::as_str),
+            Some("2048")
+        );
+        let replicas_of_groups = labels(&[
+            ("max_running_requests", "4096"),
+            ("dp_size", "2"),
+            ("attn_dp_size", "4"),
+        ]);
+        assert_eq!(
+            discovered(&replicas_of_groups, Some((5, 8)))
+                .get("max_running_requests")
+                .map(String::as_str),
+            Some("1024")
+        );
+    }
+
+    /// Plain data parallelism runs the whole flag on every rank, an engine
+    /// whose figure is per rank already keeps it, and a worker that stands
+    /// for the whole engine (no expansion, or a width of one) keeps the
+    /// whole window.
+    #[test]
+    fn a_per_rank_window_and_an_unexpanded_worker_keep_their_labels() {
+        let replicas = labels(&[("max_running_requests", "2048"), ("dp_size", "8")]);
+        assert_eq!(discovered(&replicas, Some((1, 8))), replicas);
+        let per_rank = labels(&[("max_num_seqs", "256"), ("dp_size", "4")]);
+        assert_eq!(discovered(&per_rank, Some((0, 4))), per_rank);
+        let attention = labels(&[
+            ("max_running_requests", "16384"),
+            ("enable_dp_attention", "true"),
+        ]);
+        assert_eq!(discovered(&attention, None), attention);
+        assert_eq!(discovered(&attention, Some((0, 1))), attention);
     }
 }

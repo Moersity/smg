@@ -4,7 +4,10 @@
 //! `<|im_start|>assistant`, so the prompt's replay starts there. Recorded as
 //! `lfm2.5-1.2b-instruct` (LiquidAI/LFM2.5-1.2B-Instruct).
 
-use crate::format::{CallSyntax, Emits, Format};
+use crate::{
+    format::{CallSyntax, Emits, Format},
+    pythonic::Dialect,
+};
 
 /// The LFM2.5 table.
 pub fn lfm2_5() -> Format {
@@ -20,7 +23,7 @@ pub fn lfm2_5() -> Format {
         .transition("reasoning", "think_close", "content")
         .transition("content", "calls_open", "calls")
         .transition("calls", "calls_close", "content")
-        .calls(CallSyntax::Pythonic)
+        .calls(CallSyntax::Pythonic(Dialect::LFM2_5))
         .opens_turn("<|im_start|>assistant")
 }
 

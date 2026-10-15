@@ -14,6 +14,7 @@ import logging
 import openai
 import pytest
 import smg_client
+from infra.constants import get_parser
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +106,9 @@ PYTHONIC_MESSAGES = [
 @pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed")
 @pytest.mark.gpu(1)
 @pytest.mark.model("meta-llama/Llama-3.2-1B-Instruct")
-@pytest.mark.gateway(extra_args=["--tool-call-parser", "llama", "--history-backend", "memory"])
+@pytest.mark.gateway(
+    reuse=True, extra_args=["--tool-call-parser", "llama", "--history-backend", "memory"]
+)
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 @pytest.mark.parametrize("api_client", ["openai", "smg"], indirect=True)
 class TestOpenAIServerFunctionCalling:
@@ -721,7 +724,9 @@ class TestOpenAIServerFunctionCalling:
 @pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed")
 @pytest.mark.gpu(1)
 @pytest.mark.model("meta-llama/Llama-3.1-8B-Instruct")
-@pytest.mark.gateway(extra_args=["--tool-call-parser", "pythonic", "--history-backend", "memory"])
+@pytest.mark.gateway(
+    reuse=True, extra_args=["--tool-call-parser", "pythonic", "--history-backend", "memory"]
+)
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 @pytest.mark.parametrize("api_client", ["openai", "smg"], indirect=True)
 class TestOpenAIPythonicFunctionCalling:
@@ -964,6 +969,55 @@ def get_travel_messages():
             "role": "user",
         },
     ]
+
+
+# Two tools whose `$defs` give one name, DataType, two definitions. The pair is valid, since each
+# tool's parameters is its own schema document. The legacy path merges every tool into one schema
+# and refuses the pair with a 400; a structural-tag path serves it with each tool's own definition.
+CONFLICTING_DEFS_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "tool1",
+            "description": "Tool 1 with conflicting $defs",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "data": {"$ref": "#/$defs/DataType"},
+                },
+                "required": ["data"],
+                "$defs": {
+                    "DataType": {
+                        "type": "object",
+                        "properties": {"value": {"type": "string"}},
+                        "required": ["value"],
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tool2",
+            "description": "Tool 2 with conflicting $defs",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "data": {"$ref": "#/$defs/DataType"},
+                },
+                "required": ["data"],
+                "$defs": {
+                    "DataType": {  # Different definition for DataType
+                        "type": "object",
+                        "properties": {"value": {"type": "number"}},
+                        "required": ["value"],
+                    },
+                },
+            },
+        },
+    },
+]
 
 
 class _TestToolChoiceBase:
@@ -1593,50 +1647,7 @@ class _TestToolChoiceBase:
     def test_conflicting_defs_required_tool_choice(self, model, api_client):
         """Test that conflicting $defs with required tool_choice returns 400 error."""
 
-        conflicting_tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "tool1",
-                    "description": "Tool 1 with conflicting $defs",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "data": {"$ref": "#/$defs/DataType"},
-                        },
-                        "required": ["data"],
-                        "$defs": {
-                            "DataType": {
-                                "type": "object",
-                                "properties": {"value": {"type": "string"}},
-                                "required": ["value"],
-                            },
-                        },
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "tool2",
-                    "description": "Tool 2 with conflicting $defs",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "data": {"$ref": "#/$defs/DataType"},
-                        },
-                        "required": ["data"],
-                        "$defs": {
-                            "DataType": {  # Different definition for DataType
-                                "type": "object",
-                                "properties": {"value": {"type": "number"}},
-                                "required": ["value"],
-                            },
-                        },
-                    },
-                },
-            },
-        ]
+        conflicting_tools = CONFLICTING_DEFS_TOOLS
 
         messages = [
             {
@@ -1671,7 +1682,9 @@ class _TestToolChoiceBase:
 @pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed")
 @pytest.mark.gpu(1)
 @pytest.mark.model("meta-llama/Llama-3.2-1B-Instruct")
-@pytest.mark.gateway(extra_args=["--tool-call-parser", "llama", "--history-backend", "memory"])
+@pytest.mark.gateway(
+    reuse=True, extra_args=["--tool-call-parser", "llama", "--history-backend", "memory"]
+)
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 @pytest.mark.parametrize("api_client", ["openai", "smg"], indirect=True)
 class TestToolChoiceLlama(_TestToolChoiceBase):
@@ -1695,7 +1708,9 @@ class TestToolChoiceLlama(_TestToolChoiceBase):
 @pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed")
 @pytest.mark.gpu(1)
 @pytest.mark.model("Qwen/Qwen3-4B-Instruct-2507")
-@pytest.mark.gateway(extra_args=["--tool-call-parser", "qwen", "--history-backend", "memory"])
+@pytest.mark.gateway(
+    reuse=True, extra_args=["--tool-call-parser", "qwen", "--history-backend", "memory"]
+)
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 @pytest.mark.parametrize("api_client", ["openai", "smg"], indirect=True)
 class TestToolChoiceQwen(_TestToolChoiceBase):
@@ -1703,6 +1718,32 @@ class TestToolChoiceQwen(_TestToolChoiceBase):
 
     # No flaky tests for Qwen
     FLAKY_TESTS: set[str] = set()
+
+    def test_conflicting_defs_required_tool_choice(self, model, api_client):
+        """Under --parser symphony the pair is served: the Qwen3 table gives the forced call a
+        structural tag that carries each tool's own `$defs`, so the call's arguments follow the
+        called tool's definition (a string for tool1, a number for tool2). On the legacy path the
+        merged schema refuses the pair, as the base test expects."""
+        if get_parser() != "symphony":
+            super().test_conflicting_defs_required_tool_choice(model, api_client)
+            return
+        response = api_client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": "Test the conflicting tools"}],
+            max_tokens=100,
+            temperature=0.1,
+            tools=CONFLICTING_DEFS_TOOLS,
+            tool_choice="required",
+            stream=False,
+        )
+        calls = response.choices[0].message.tool_calls
+        assert calls, "tool_choice=required forces a call"
+        call = calls[0]
+        value = json.loads(call.function.arguments)["data"]["value"]
+        expected = {"tool1": str, "tool2": (int, float)}[call.function.name]
+        assert isinstance(value, expected), (
+            f"{call.function.name} got value {value!r}: not its own DataType definition"
+        )
 
 
 # =============================================================================
@@ -1713,7 +1754,9 @@ class TestToolChoiceQwen(_TestToolChoiceBase):
 @pytest.mark.engine("sglang", "vllm", "trtllm")
 @pytest.mark.gpu(1)
 @pytest.mark.model("mistralai/Mistral-7B-Instruct-v0.3")
-@pytest.mark.gateway(extra_args=["--tool-call-parser", "mistral", "--history-backend", "memory"])
+@pytest.mark.gateway(
+    reuse=True, extra_args=["--tool-call-parser", "mistral", "--history-backend", "memory"]
+)
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 @pytest.mark.parametrize("api_client", ["openai", "smg"], indirect=True)
 class TestToolChoiceMistral(_TestToolChoiceBase):
@@ -1767,7 +1810,9 @@ WEATHER_TOOL = {
 @pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed")
 @pytest.mark.gpu(1)
 @pytest.mark.model("Qwen/Qwen3-4B-Instruct-2507")
-@pytest.mark.gateway(extra_args=["--tool-call-parser", "qwen", "--history-backend", "memory"])
+@pytest.mark.gateway(
+    reuse=True, extra_args=["--tool-call-parser", "qwen", "--history-backend", "memory"]
+)
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 @pytest.mark.parametrize("api_client", ["openai", "smg"], indirect=True)
 class TestMultiTurnToolCall:

@@ -27,10 +27,19 @@ from sglang.srt.utils import kill_process_tree
 from sglang.utils import get_exception_traceback
 from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 
+from smg_grpc_servicer.hostport import host_port, loopback_target
+from smg_grpc_servicer.rust_lifecycle import (
+    EXIT_GRACE_SECS,
+    ServicerConfigError,
+    configuration_exit,
+    guarded_exit,
+)
+from smg_grpc_servicer.sglang.config_view import EngineConfigView
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
-from smg_grpc_servicer.sglang.request_manager import GrpcRequestManager
-from smg_grpc_servicer.sglang.rust import SERVICER_IMPL_ENV, resolve_servicer_impl, serve_rust
+from smg_grpc_servicer.sglang.request_manager import GrpcRequestManager, init_request_tracing
+from smg_grpc_servicer.sglang.rust import SERVICER_IMPL_ENV, serve_rust, servicer_impl_source
 from smg_grpc_servicer.sglang.scheduler_launcher import (
+    SchedulerStartError,
     launch_scheduler_process_only,
     terminate_scheduler_processes,
 )
@@ -109,16 +118,24 @@ async def serve_grpc(
             callback signature is a public contract.
     """
 
-    # One flag selects the Rust request path; the entrypoint and every
+    # One flag selects the Rust request path (--servicer-impl, this package's
+    # flag on SGLang's parser, else the environment); the entrypoint and every
     # ServerArgs flag stay the same, and the Router cannot tell them apart.
-    if resolve_servicer_impl() == "rust":
-        if on_request_manager_ready is not None:
-            logger.warning(
-                "%s=rust: SGLang's HTTP sidecar (metrics, profiling endpoints) stays off; "
-                "the Rust servicer has no request manager to wire it to",
-                SERVICER_IMPL_ENV,
-            )
-        raise SystemExit(await serve_rust(server_args))
+    try:
+        impl, origin = servicer_impl_source(server_args)
+        logger.info("Servicer implementation: %s (source=%s)", impl, origin)
+        if impl == "rust":
+            if on_request_manager_ready is not None:
+                logger.warning(
+                    "%s=rust: SGLang's HTTP sidecar (metrics, profiling endpoints) stays off; "
+                    "the Rust servicer has no request manager to wire it to",
+                    SERVICER_IMPL_ENV,
+                )
+            raise SystemExit(await serve_rust(server_args))
+    except ServicerConfigError as error:
+        # A knob the servicer cannot use: one named ERROR line and exit code
+        # 2, before any scheduler or engine work, not a traceback.
+        raise configuration_exit(error, logger) from None
 
     # Install the process-wide runtime context before any sglang machinery
     # runs here. Since 0.5.18 the config is published per process and read
@@ -131,6 +148,12 @@ async def serve_grpc(
     # Re-publish is last-publish-wins upstream, so this is safe if the caller
     # already published.
     publish(server_args, role="tokenizer")
+
+    # Tracing, as SGLang's own HTTP frontend initializes it in the process that
+    # fills the tokenizer manager's role: the request manager starts each
+    # request's trace from the Router's context in the call's metadata.
+    if init_request_tracing():
+        logger.info("Request tracing enabled: the engine's spans join the Router's trace")
 
     # Start bootstrap server BEFORE launching scheduler processes (only in PREFILL mode)
     # This ensures the bootstrap server is ready when prefill schedulers try to register
@@ -146,15 +169,22 @@ async def serve_grpc(
 
     # Launch only the scheduler process(es) (no tokenizer/detokenizer needed for gRPC)
     logger.info("Launching scheduler process(es)...")
-    (
-        scheduler_info,
-        port_args,
-        scheduler_procs,
-        request_manager,
-    ) = await _launch_scheduler_with_request_manager(
-        server_args=server_args,
-        bootstrap_server=bootstrap_server,
-    )
+    try:
+        (
+            scheduler_info,
+            port_args,
+            scheduler_procs,
+            request_manager,
+        ) = await _launch_scheduler_with_request_manager(
+            server_args=server_args,
+            bootstrap_server=bootstrap_server,
+        )
+    except SchedulerStartError as error:
+        # A scheduler process that died during its start, or reported a
+        # failed start: there is no engine to serve, so the servicer exits
+        # (code 1) instead of waiting on it, and says why without a traceback.
+        logger.error("The scheduler process(es) did not start: %s", error)
+        raise guarded_exit(1) from None
 
     server = None
     health_servicer = None
@@ -166,15 +196,8 @@ async def serve_grpc(
         if model_info is None:
             # Extract classification labels from HuggingFace config (if available)
             # Match logic in serving_classify.py::_get_id2label_mapping
-            hf_config = model_config.hf_config
-            id2label = getattr(hf_config, "id2label", None)
-            num_labels = getattr(hf_config, "num_labels", 0) or 0
-
-            # If no id2label but num_labels exists, create default mapping
-            if not id2label and num_labels:
-                id2label = {i: f"LABEL_{i}" for i in range(num_labels)}
-            elif id2label and not num_labels:
-                num_labels = len(id2label)
+            facts = EngineConfigView(server_args, model_config).model
+            id2label, num_labels = facts.id2label, facts.num_labels
 
             # Convert to JSON string for proto transport
             # id2label is a dict like {0: "negative", 1: "positive"}
@@ -187,8 +210,8 @@ async def serve_grpc(
                 ),
                 "vocab_size": scheduler_info.get("vocab_size", 128256),
                 "supports_vision": scheduler_info.get("supports_vision", False),
-                "model_type": getattr(hf_config, "model_type", None),
-                "architectures": getattr(hf_config, "architectures", None),
+                "model_type": facts.model_type or None,
+                "architectures": facts.architectures or None,
                 "max_req_input_len": scheduler_info.get("max_req_input_len", 8192),
                 "eos_token_ids": scheduler_info.get("eos_token_ids", []),
                 "pad_token_id": scheduler_info.get("pad_token_id", 0),
@@ -243,7 +266,7 @@ async def serve_grpc(
         reflection.enable_server_reflection(SERVICE_NAMES, server)
 
         # Start server
-        listen_addr = f"{server_args.host}:{server_args.port}"
+        listen_addr = host_port(server_args.host, server_args.port)
         if server_args.ssl_certfile and server_args.ssl_keyfile:
             if server_args.ssl_keyfile_password:
                 raise ValueError(
@@ -373,6 +396,7 @@ async def serve_grpc(
         raise
 
     warmup_thread = None
+    scheduler_exit: SystemExit | None = None
     try:
         # Start warmup in a separate thread
         warmup_thread = threading.Thread(
@@ -392,7 +416,13 @@ async def serve_grpc(
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, signal_handler)
 
-        await wait_for_scheduler_shutdown(scheduler_procs, stop_event)
+        if await wait_for_scheduler_shutdown(scheduler_procs, stop_event):
+            # The engine ended on its own: the servicer exits with it, non-zero,
+            # so an orchestrator restarts the pod instead of keeping a worker
+            # that can no longer serve. The guard is armed here, ahead of the
+            # shutdown below (the request manager's own tear-down can block),
+            # with a grace that covers its bounded steps.
+            scheduler_exit = guarded_exit(1, grace_secs=EXIT_GRACE_SECS + 10.0)
     finally:
         logger.info("Shutting down gRPC server")
 
@@ -416,12 +446,16 @@ async def serve_grpc(
         # The scheduler processes have SIGINT ignored, so they won't get KeyboardInterrupt
         terminate_scheduler_processes(scheduler_procs)
 
+    if scheduler_exit is not None:
+        logger.error("A scheduler process exited on its own; the servicer exits with code 1")
+        raise scheduler_exit
+
 
 def _execute_grpc_server_warmup(server_args: ServerArgs):
     """Execute warmup for gRPC server by checking health and sending test request."""
     try:
         # Connect to the gRPC server
-        grpc_url = f"{server_args.host}:{server_args.port}"
+        grpc_url = loopback_target(server_args.host, server_args.port)
         channel = grpc.insecure_channel(
             grpc_url,
             options=[

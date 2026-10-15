@@ -1,30 +1,28 @@
-//! Helpers shared by the DeepSeek V4-family renderers (V4, V4.1, ...).
+//! What the DeepSeek renderers (V3.2, V4, V4.1) share, implemented and
+//! tested once: the JSON spelling and the OpenAI-shape readers every one of
+//! them uses, the last-user index predicates, the quick-instruction task
+//! tokens, and the V4 family's message preprocessing (tool-message merging,
+//! tool-result sorting, drop-thinking, DSML argument rendering, the tools
+//! template), which V4 and V4.1 run with their own DSML tag strings (V4 bare
+//! `invoke`/`parameter`; V4.1 ` invoke`/` parameter` with a leading space).
 //!
-//! `deepseek_v4.rs` and the upcoming `deepseek_v41.rs` are otherwise
-//! standalone 1:1 ports of their respective Python encoders — message
-//! merging, tool-result sorting, drop-thinking, and DSML argument rendering
-//! are identical between the two revisions except for the DSML tag strings
-//! (V4 uses bare `invoke`/`parameter`; V4.1 uses ` invoke`/` parameter` with a
-//! leading space). This module holds exactly that shared behaviour so it is
-//! implemented, and tested, once.
-//!
-//! V3.2 is intentionally *not* wired through this module beyond the two index
-//! predicates it shares (`find_last_user_index`, `at_or_after_last_user`): its
-//! tool-message handling and drop-thinking role set are genuinely different
-//! algorithms that merely happen to share some function names, not the same
-//! logic.
+//! V3.2's tool-message handling, drop-thinking role set, DSML argument
+//! rendering and tools template are different algorithms and texts under
+//! some of the same names; they stay in `deepseek_v32.rs`.
 
 use serde_json::{json, Value};
 use thiserror::Error;
 
 const DSML_TOKEN: &str = "｜DSML｜";
+const THINKING_START_TOKEN: &str = "<think>";
+const THINKING_END_TOKEN: &str = "</think>";
 
 /// DSML tag strings that differ between the V4-family DSML dialects.
 ///
 /// V4 uses bare `invoke`/`parameter`; V4.1 uses ` invoke`/` parameter` (a
-/// leading space on each). The block name (`tool_calls` vs. ` calls`) is not
-/// included here since it is only ever used by each renderer's own
-/// `render_message`/tools-template code, never by the shared helpers below.
+/// leading space on each). The block name (`tool_calls` vs. ` calls`) is
+/// passed beside the tags where it is needed ([`render_v4_tools_template`]),
+/// since each renderer's `render_message` writes it on its own as well.
 #[derive(Debug)]
 pub(super) struct DsmlTags {
     pub invoke: &'static str,
@@ -89,6 +87,30 @@ pub(super) fn at_or_after_last_user(index: usize, last_user_idx: Option<usize>) 
     match last_user_idx {
         Some(idx) => index >= idx,
         None => true,
+    }
+}
+
+/// Returns `true` when `index > last_user_idx` in the Python sense, with the
+/// same reading of "no user message" as [`at_or_after_last_user`].
+pub(super) fn after_last_user(index: usize, last_user_idx: Option<usize>) -> bool {
+    match last_user_idx {
+        Some(idx) => index > idx,
+        None => true,
+    }
+}
+
+/// The quick-instruction task tokens (`<｜action｜>`, `<｜query｜>`, ...) of
+/// the V4 family, by the `task` a user message names; `None` for a task the
+/// encoders reject.
+pub(super) fn task_sp_token(task: &str) -> Option<&'static str> {
+    match task {
+        "action" => Some("<｜action｜>"),
+        "query" => Some("<｜query｜>"),
+        "authority" => Some("<｜authority｜>"),
+        "domain" => Some("<｜domain｜>"),
+        "title" => Some("<｜title｜>"),
+        "read_url" => Some("<｜read_url｜>"),
+        _ => None,
     }
 }
 
@@ -276,7 +298,7 @@ pub(super) fn drop_thinking_messages(
 
 /// Encode a single tool call's `arguments` value into `<DSML_TOKEN><parameter>`
 /// blocks, mirroring the reference `encode_arguments_to_dsml` (HF
-/// `encoding.py`, identical in vLLM's port).
+/// `encoding.py`, identical in the engine's port).
 ///
 /// `arguments` may arrive as a JSON *string* (raw OpenAI tool_calls) or as an
 /// already-parsed value — `model_gateway`'s `process_tool_call_arguments`
@@ -324,13 +346,86 @@ pub(super) fn encode_arguments_to_dsml(arguments: &Value, tags: &DsmlTags) -> St
     parts.join("\n")
 }
 
-// Python's `to_json` is `json.dumps(value, ensure_ascii=False)`: spaced
-// separators, raw UTF-8. Compact `serde_json::to_string` would change the
-// prompt bytes vLLM trained on. Each renderer module keeps its own copy of
-// this tiny wrapper (see `deepseek_v4::to_json`); this one is for
-// `encode_arguments_to_dsml`'s exclusive use.
-fn to_json(value: &Value) -> String {
+/// Python's `to_json`: `json.dumps(value, ensure_ascii=False)`, spaced
+/// separators and raw UTF-8. Compact `serde_json::to_string` would change the
+/// prompt bytes the model was trained on.
+pub(super) fn to_json(value: &Value) -> String {
     crate::json_dumps::to_string(value)
+}
+
+/// `[tool["function"] for tool in tools]`
+pub(super) fn tools_from_openai_format(tools: &[Value]) -> Vec<Value> {
+    tools
+        .iter()
+        .filter_map(|tool| tool.get("function").cloned())
+        .collect()
+}
+
+/// `[{ "name": tc["function"]["name"], "arguments": tc["function"]["arguments"] } for tc in tool_calls]`
+pub(super) fn tool_calls_from_openai_format(tool_calls: &[Value]) -> Vec<Value> {
+    tool_calls
+        .iter()
+        .filter_map(|tool_call| {
+            let function = tool_call.get("function")?;
+            Some(json!({
+                "name": function.get("name").cloned().unwrap_or(Value::Null),
+                "arguments": function.get("arguments").cloned().unwrap_or(Value::Null),
+            }))
+        })
+        .collect()
+}
+
+/// The tool schemas as the tools templates take them: each tool's JSON, one
+/// per line.
+pub(super) fn tool_schemas(tools: &[Value]) -> String {
+    let schemas: Vec<String> = tools.iter().map(to_json).collect();
+    schemas.join("\n")
+}
+
+/// Python's `if msg.get("tools"):` — absent, null and `[]` are all falsy.
+pub(super) fn has_tools(msg: &Value) -> bool {
+    msg.get("tools")
+        .and_then(|v| v.as_array())
+        .is_some_and(|tools| !tools.is_empty())
+}
+
+/// The V4 family's `TOOLS_TEMPLATE`, one text for both dialects: `block` is
+/// the tool-calls block name (`tool_calls` for V4, ` calls` for V4.1) and
+/// `tags` the invoke and parameter tags, around the `tool_schemas` lines.
+pub(super) fn render_v4_tools_template(block: &str, tags: &DsmlTags, tool_schemas: &str) -> String {
+    let dsml = DSML_TOKEN;
+    let invoke = tags.invoke;
+    let parameter = tags.parameter;
+    let tstart = THINKING_START_TOKEN;
+    let tend = THINKING_END_TOKEN;
+    format!(
+"## Tools
+
+You have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<{dsml}{block}>\" block like the following:
+
+<{dsml}{block}>
+<{dsml}{invoke} name=\"$TOOL_NAME\">
+<{dsml}{parameter} name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</{dsml}{parameter}>
+...
+</{dsml}{invoke}>
+<{dsml}{invoke} name=\"$TOOL_NAME2\">
+...
+</{dsml}{invoke}>
+</{dsml}{block}>
+
+String parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.
+
+If thinking_mode is enabled (triggered by {tstart}), you MUST output your complete reasoning inside {tstart}...{tend} BEFORE any tool calls or final response.
+
+Otherwise, output directly after {tend} with tool calls or final response.
+
+### Available Tool Schemas
+
+{tool_schemas}
+
+You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.
+"
+    )
 }
 
 #[cfg(test)]

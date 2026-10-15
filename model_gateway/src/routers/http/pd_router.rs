@@ -33,9 +33,14 @@ use serde_json::{
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, warn, Instrument};
 
-use super::request_body::RawBody;
+use super::{
+    request_body::RawBody,
+    stream_failure::{
+        head_success_recorded, mark_head_success_recorded, note_sent, RelaySource, UpstreamCut,
+    },
+};
 use crate::{
     config::types::RetryConfig,
     middleware::TenantRequestMeta,
@@ -57,7 +62,7 @@ use crate::{
                 NIXL_PREFILL_KV_PARAMS,
             },
             overload,
-            placement::{self, PairFailure, PlacementFailure, PlacementInputs},
+            placement::{self, PairFailure, PlacementFailure, PlacementInputs, RefusalSite},
             request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
             retry::{is_retryable_response, RetryExecutor},
             serialize_json_sized,
@@ -65,7 +70,7 @@ use crate::{
             trim_serialization_slack,
         },
         error,
-        grpc::utils::{error_type_from_status, route_to_endpoint},
+        grpc::utils::{error_type_for_response, error_type_from_status, route_to_endpoint},
         http::router::send_with_stale_conn_retry,
         prefill_queue_full, prefill_queue_timeout, RouterTrait, PD_PREFILL_QUEUE_FULL,
         PD_PREFILL_QUEUE_TIMEOUT,
@@ -295,17 +300,38 @@ impl PDRouter {
             PdSelectionFailure::QueueFull => prefill_queue_full(),
             PdSelectionFailure::QueueTimeout => prefill_queue_timeout(),
             PdSelectionFailure::Unavailable(error) => {
-                error!("Failed to select PD pair error={}", error);
                 // Same code the regular HTTP router and the gRPC routers use
                 // for a leg that is merely down, so a client can key its
                 // retry on one code whatever the transport; the message
-                // still names the leg.
-                error::service_unavailable(
-                    "no_available_workers",
-                    format!("No available servers: {error}"),
-                )
+                // still names the leg. Its log line is written by
+                // [`Self::report_refusal`], once and rate-limited, not here.
+                placement::no_available_workers(format!("No available servers: {error}"))
             }
         }
+    }
+
+    /// The line and marker of a refusal this router answers on its own (the
+    /// `no_available_workers` 503 of a leg that is down): one WARN per
+    /// refusal, rate-limited, with both legs' state, through
+    /// [`placement::report_refusal`]; the access log then keeps quiet about
+    /// it. Every other response passes through unchanged.
+    fn report_refusal(&self, model_id: &str, refusal: Response) -> Response {
+        placement::report_refusal(
+            &self.worker_registry,
+            RefusalSite {
+                function: "PDRouter::execute_dual_dispatch_attempt",
+                mode: "PrefillDecode",
+                legs: &[
+                    ("prefill", RoutingPool::HttpPrefill),
+                    ("decode", RoutingPool::HttpDecode),
+                ],
+            },
+            // The line is written inside the request's span, which carries
+            // the id.
+            None,
+            model_id,
+            refusal,
+        )
     }
 
     fn handle_serialization_error(error: impl std::fmt::Display) -> Response {
@@ -422,6 +448,7 @@ impl PDRouter {
         let canonical_model = self.worker_registry.resolve_model_alias(context.model_id);
         let model = canonical_model.as_deref().unwrap_or(context.model_id);
         context.model_id = model;
+        let model_label = self.worker_registry.metric_model_label(model);
         let endpoint = route_to_endpoint(route);
 
         // Record request start (Layer 2)
@@ -429,7 +456,7 @@ impl PDRouter {
             metrics_labels::ROUTER_HTTP,
             metrics_labels::BACKEND_PD,
             metrics_labels::CONNECTION_HTTP,
-            model,
+            model_label,
             endpoint,
             bool_to_static_str(context.is_stream),
         );
@@ -504,7 +531,7 @@ impl PDRouter {
                 metrics_labels::ROUTER_HTTP,
                 metrics_labels::BACKEND_PD,
                 metrics_labels::CONNECTION_HTTP,
-                model,
+                model_label,
                 endpoint,
                 duration,
             );
@@ -513,9 +540,9 @@ impl PDRouter {
                 metrics_labels::ROUTER_HTTP,
                 metrics_labels::BACKEND_PD,
                 metrics_labels::CONNECTION_HTTP,
-                model,
+                model_label,
                 endpoint,
-                error_type_from_status(response.status()),
+                error_type_for_response(&response),
             );
         }
 
@@ -552,6 +579,7 @@ impl PDRouter {
                     rid_key: rid_key.as_deref(),
                     cache_namespace,
                     candidate_filter: None,
+                    tried: &[],
                 },
                 sticky_key,
             )
@@ -559,7 +587,8 @@ impl PDRouter {
         let ((prefill, decode), guards) = match selected {
             Ok(admitted) => admitted,
             Err(e) => {
-                return Self::handle_server_selection_error(*e);
+                return self
+                    .report_refusal(context.model_id, Self::handle_server_selection_error(*e));
             }
         };
 
@@ -856,6 +885,7 @@ impl PDRouter {
             decode.as_ref(),
             response.status(),
             prefill_outcome,
+            head_success_recorded(&response),
         );
         response
     }
@@ -863,18 +893,23 @@ impl PDRouter {
     /// Record an attempt's outcome on both legs. On the early-commit path the
     /// drain records the prefill's once its body is known: the attempt's
     /// status is the decode's there, and recording it on the prefill would
-    /// reset the failures the drain counts.
+    /// reset the failures the drain counts. A streamed decode head's success
+    /// was recorded before its relay task was spawned
+    /// (`create_streaming_response`), so it is not recorded again.
     fn record_attempt_outcomes(
         prefill: &dyn Worker,
         decode: &dyn Worker,
         status: StatusCode,
         prefill_outcome: PrefillOutcome,
+        decode_head_recorded: bool,
     ) {
         let attempt_records_prefill = prefill_outcome == PrefillOutcome::FromStatus;
         if attempt_records_prefill {
             prefill.record_outcome(status.as_u16());
         }
-        decode.record_outcome(status.as_u16());
+        if !(decode_head_recorded && status.is_success()) {
+            decode.record_outcome(status.as_u16());
+        }
 
         // Record worker errors for server errors (5xx)
         if status.is_server_error() {
@@ -925,13 +960,12 @@ impl PDRouter {
             );
             let error_stream = tokio_stream::once(Ok(Bytes::from(sse_data)));
 
-            let decode_url = decode.url().to_string();
             self.create_streaming_response(
                 error_stream,
                 status,
                 None,
                 context.return_logprob,
-                Some(decode_url),
+                RelaySource::decode_leg(context.model_id, context.route, decode),
                 Some(response_headers),
                 decode_guard,
             )
@@ -1511,7 +1545,10 @@ impl PDRouter {
                 None
             }
             (
-                KvConnectorMode::Nixl | KvConnectorMode::MoriIo | KvConnectorMode::Passthrough,
+                KvConnectorMode::Nixl
+                | KvConnectorMode::MoriIo
+                | KvConnectorMode::Store
+                | KvConnectorMode::Passthrough,
                 Some(params),
             ) if relay => Some(params),
             (KvConnectorMode::Nixl, None) if relay => {
@@ -1569,7 +1606,12 @@ impl PDRouter {
 
         let status = StatusCode::from_u16(decode_response.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        Self::record_sequential_leg(decode.as_ref(), metrics_labels::WORKER_DECODE, status);
+        // A streamed decode head's success is the relay's to record, before
+        // it spawns its task (`create_streaming_response`); the leg's other
+        // outcomes are recorded here, before the body is forwarded.
+        if !(context.is_stream && status.is_success()) {
+            Self::record_sequential_leg(decode.as_ref(), metrics_labels::WORKER_DECODE, status);
+        }
         if !status.is_success() {
             error!(
                 "Decode server returned error status decode_url={} status={}",
@@ -1808,7 +1850,12 @@ impl PDRouter {
         events::RequestReceivedEvent {}.emit();
         let status = StatusCode::from_u16(decode_response.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        Self::record_sequential_leg(decode.as_ref(), metrics_labels::WORKER_DECODE, status);
+        // A streamed decode head's success is the relay's to record, before
+        // it spawns its task (`create_streaming_response`); the leg's other
+        // outcomes are recorded here, before the body is forwarded.
+        if !(context.is_stream && status.is_success()) {
+            Self::record_sequential_leg(decode.as_ref(), metrics_labels::WORKER_DECODE, status);
+        }
         if !status.is_success() {
             error!(
                 "Decode server returned error status decode_url={} status={}",
@@ -1903,7 +1950,7 @@ impl PDRouter {
                 status,
                 prefill_logprobs,
                 context.return_logprob,
-                None,
+                RelaySource::decode_leg(context.model_id, context.route, decode),
                 Some(response_headers),
                 decode_guard,
             )
@@ -2054,6 +2101,10 @@ impl PDRouter {
         }
     }
 
+    /// The client's streaming response, read from the decode leg's body. A
+    /// body the decode worker ends with an error after a successful head is
+    /// accounted to `source` and, when the head was SSE, ended with the typed
+    /// error event, as the regular relay ends one.
     #[expect(clippy::too_many_arguments)]
     #[expect(
         clippy::unused_self,
@@ -2065,7 +2116,7 @@ impl PDRouter {
         status: StatusCode,
         prefill_logprobs: Option<Value>,
         return_logprob: bool,
-        decode_url: Option<String>,
+        source: RelaySource,
         headers: Option<HeaderMap>,
         decode_guard: WorkerLoadGuard,
     ) -> Response {
@@ -2073,55 +2124,107 @@ impl PDRouter {
 
         let (tx, rx) = mpsc::channel(SSE_CHANNEL_BUFFER);
 
+        // The same rule as the regular relay: a successful stream with no
+        // content type is relayed as SSE. Read from the decode leg's own
+        // headers, before the response's content type is set below.
+        let upstream_sse = match headers
+            .as_ref()
+            .and_then(|headers| headers.get(CONTENT_TYPE))
+            .and_then(|value| value.to_str().ok())
+        {
+            Some(content_type) => content_type.starts_with("text/event-stream"),
+            None => status.is_success(),
+        };
+        // The head's success is the decode worker's before the relay can
+        // sample the body's failure: on a multi-threaded runtime the task may
+        // run first with a body error already buffered behind the head, and
+        // the head's success recorded by the attempt afterwards would reset
+        // the breaker's failure streak and erase the cut's sample. A failed
+        // head stays the attempt's to record; the relay never accounts its
+        // body.
+        let head_success_recorded = status.is_success();
+        if head_success_recorded {
+            source.worker().record_outcome(status.as_u16());
+        }
+
+        // The relay runs under the request's span, so a failure after the
+        // head went out is logged with the request's id.
+        let span = tracing::Span::current();
+
         #[expect(
             clippy::disallowed_methods,
             reason = "fire-and-forget stream relay; gateway shutdown need not wait for decode stream forwarding"
         )]
-        tokio::spawn(async move {
-            futures_util::pin_mut!(stream);
-            // Reusable SSE encoder for the logprob-merge re-encode path.
-            let mut encoder = SseEncoder::new();
-            // Whether the next chunk begins at an SSE line boundary (i.e. the
-            // previous chunk ended with an EOL); used to anchor the [DONE]
-            // sentinel detection when the match sits at the start of a chunk.
-            let mut at_line_start = true;
-            while let Some(chunk_result) = stream.next().await {
-                match chunk_result {
-                    Ok(chunk) => {
-                        let is_done = Self::chunk_contains_done_event(&chunk, at_line_start);
-                        if let Some(&last) = chunk.last() {
-                            at_line_start = last == b'\n' || last == b'\r';
+        tokio::spawn(
+            async move {
+                futures_util::pin_mut!(stream);
+                // Reusable SSE encoder for the logprob-merge re-encode path.
+                let mut encoder = SseEncoder::new();
+                // Whether the next chunk begins at an SSE line boundary (i.e. the
+                // previous chunk ended with an EOL); used to anchor the [DONE]
+                // sentinel detection when the match sits at the start of a chunk.
+                let mut at_line_start = true;
+                // What the client has been sent, for the record of a cut, and
+                // its last bytes, so the event that ends a cut SSE body is
+                // written on a frame boundary.
+                let mut relayed: u64 = 0;
+                let mut sent_tail: Vec<u8> = Vec::with_capacity(4);
+                while let Some(chunk_result) = stream.next().await {
+                    match chunk_result {
+                        Ok(chunk) => {
+                            let is_done = Self::chunk_contains_done_event(&chunk, at_line_start);
+                            if let Some(&last) = chunk.last() {
+                                at_line_start = last == b'\n' || last == b'\r';
+                            }
+
+                            let result = if return_logprob && prefill_logprobs.is_some() {
+                                Self::merge_streaming_logprobs(
+                                    prefill_logprobs.as_ref(),
+                                    &chunk,
+                                    &mut encoder,
+                                )
+                                .unwrap_or(chunk)
+                            } else {
+                                chunk
+                            };
+
+                            relayed += result.len() as u64;
+                            note_sent(&mut sent_tail, &result);
+                            if tx.send(Ok(result)).await.is_err() {
+                                break;
+                            }
+
+                            if is_done {
+                                break;
+                            }
                         }
-
-                        let result = if return_logprob && prefill_logprobs.is_some() {
-                            Self::merge_streaming_logprobs(
-                                prefill_logprobs.as_ref(),
-                                &chunk,
-                                &mut encoder,
-                            )
-                            .unwrap_or(chunk)
-                        } else {
-                            chunk
-                        };
-
-                        if tx.send(Ok(result)).await.is_err() {
+                        Err(e) => {
+                            // A head that was a success was answered as one; the
+                            // decode body ending in an error after it is the decode
+                            // worker's failure, counted here, and an SSE response is
+                            // ended with the typed event and the stream's own end. A
+                            // failed head was counted when it arrived; its body is
+                            // cut as before.
+                            if status.is_success() {
+                                let cut = UpstreamCut::of(&e);
+                                source.account(&cut, relayed);
+                                if upstream_sse {
+                                    // On its own frame: a cut inside a frame leaves
+                                    // a partial line the event must not merge into.
+                                    let event =
+                                        source.error_event_on_its_own_frame(&cut, &sent_tail);
+                                    let _ = tx.send(Ok(event)).await;
+                                    break;
+                                }
+                            }
+                            let _ = tx.send(Err(format!("Stream error: {e}"))).await;
                             break;
                         }
-
-                        if is_done {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        if let Some(ref url) = decode_url {
-                            error!("Stream error from decode server {}: {}", url, e);
-                        }
-                        let _ = tx.send(Err(format!("Stream error: {e}"))).await;
-                        break;
                     }
                 }
             }
-        });
+            .instrument(span),
+        );
 
         let stream = ReceiverStream::new(rx);
         let body = Body::from_stream(stream);
@@ -2132,6 +2235,9 @@ impl PDRouter {
         let mut response_headers = headers.unwrap_or_default();
         response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
         *response.headers_mut() = response_headers;
+        if head_success_recorded {
+            mark_head_success_recorded(&mut response);
+        }
 
         AttachedBody::wrap_response(response, decode_guard)
     }
@@ -2287,6 +2393,8 @@ impl PDRouter {
         connection_close: bool,
     ) -> reqwest::RequestBuilder {
         let endpoint_url = worker.endpoint_url(route);
+        // Every leg built here is sent; counted per leg, on its worker.
+        Metrics::record_worker_request(worker.url(), worker.model_id());
         let mut request = attach_sized_body(
             worker
                 .http_client()
@@ -2643,6 +2751,9 @@ impl RouterTrait for PDRouter {
         body: CreateMessageRequest,
         model_id: &str,
     ) -> Response {
+        if let Some(refused) = super::refuse_max_tokens_zero(&body) {
+            return refused;
+        }
         let is_stream = body.stream.unwrap_or(false);
 
         let request_text = if self.policies_need_request_text() {
@@ -2700,6 +2811,7 @@ impl RouterTrait for PDRouter {
                 rid_key: None,
                 cache_namespace: None,
                 candidate_filter: None,
+                tried: &[],
             },
         ) else {
             return error::service_unavailable(
@@ -2737,6 +2849,7 @@ impl RouterTrait for PDRouter {
             headers,
             worker.api_key(),
         );
+        Metrics::record_worker_request(worker.url(), worker.model_id());
         let res = match send_with_stale_conn_retry(request).await {
             Ok(res) => res,
             Err(e) => {
@@ -2893,12 +3006,14 @@ impl RouterTrait for PDRouter {
 
 #[cfg(test)]
 mod tests {
+    use axum::http::header::RETRY_AFTER;
     use openai_protocol::model_card::ModelCard;
     use tokio::sync::oneshot;
 
     use super::*;
     use crate::{
         config::{types::PdPairingMode, PolicyConfig},
+        middleware::ReportedRefusal,
         tenant::TenantKey,
         worker::{BasicWorkerBuilder, WorkerType},
     };
@@ -2919,6 +3034,29 @@ mod tests {
             prefill_admission: None,
             moriio_dp_turn: AtomicUsize::new(0),
         }
+    }
+
+    /// A leg that is merely down answers the same 503 as the other routers,
+    /// Retry-After included, so a client keys its back-off on one answer
+    /// whatever the transport.
+    #[test]
+    fn an_unavailable_leg_answers_503_with_retry_after() {
+        let response = PDRouter::handle_server_selection_error(PdSelectionFailure::Unavailable(
+            "No prefill workers available".to_string(),
+        ));
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "no_available_workers"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
     }
 
     fn create_test_worker(url: String, worker_type: WorkerType, healthy: bool) -> Box<dyn Worker> {
@@ -3438,6 +3576,61 @@ mod tests {
             .is_empty());
     }
 
+    /// The prefill/decode relay renders no prompt either: `max_tokens: 0` is
+    /// refused with the 400 naming the field before any leg is dispatched, and
+    /// neither worker sees the request; a positive `max_tokens` takes both legs.
+    #[tokio::test]
+    async fn max_tokens_zero_is_refused_before_the_prefill_decode_dispatch() {
+        let (prefill_url, prefill_seen) = spawn_recording_stub("{}").await;
+        let (decode_url, decode_seen) = spawn_recording_stub("{}").await;
+
+        let router = create_test_pd_router();
+        for (url, worker_type) in [
+            (prefill_url, WorkerType::Prefill),
+            (decode_url, WorkerType::Decode),
+        ] {
+            router
+                .worker_registry
+                .register_or_replace(Arc::from(create_test_worker(url, worker_type, true)));
+        }
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let request = |max_tokens: u32| -> CreateMessageRequest {
+            serde_json::from_value(json!({
+                "model": "m",
+                "max_tokens": max_tokens,
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .expect("valid messages request")
+        };
+
+        let response = router
+            .route_messages(None, &tenant, request(0), UNKNOWN_MODEL_ID)
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "max_tokens_zero_not_relayed"
+        );
+        for seen in [&prefill_seen, &decode_seen] {
+            assert!(seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty());
+        }
+
+        let response = router
+            .route_messages(None, &tenant, request(16), UNKNOWN_MODEL_ID)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        for seen in [&prefill_seen, &decode_seen] {
+            let seen = seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].0, "/v1/messages");
+        }
+    }
+
     /// Serves `app` on an ephemeral loopback port.
     #[expect(
         clippy::disallowed_methods,
@@ -3533,6 +3726,7 @@ mod tests {
                     decode.as_ref(),
                     StatusCode::OK,
                     outcome,
+                    false,
                 );
             }
             assert_eq!(!prefill.circuit_breaker_can_execute(), trips, "{outcome:?}");
@@ -5456,6 +5650,324 @@ mod tests {
         }
     }
 
+    /// A breaker that opens on two failures, whose timeout is over at once
+    /// and which closes again after `successes` successes.
+    fn breaker_closing_after(successes: u32) -> crate::worker::CircuitBreakerConfig {
+        crate::worker::CircuitBreakerConfig {
+            failure_threshold: 2,
+            success_threshold: successes,
+            timeout_duration: std::time::Duration::ZERO,
+            ..Default::default()
+        }
+    }
+
+    /// A ready decode worker built from `builder` whose breaker is half-open:
+    /// it opened on two failures, its timeout is over, and `successes`
+    /// successes close it, so the order of a head's success and a cut's
+    /// failure is readable from its state.
+    fn half_open_decode_worker_closing_after(
+        builder: BasicWorkerBuilder,
+        successes: u32,
+    ) -> Arc<dyn Worker> {
+        use crate::worker::circuit_breaker::CircuitState;
+
+        let worker: Arc<dyn Worker> = Arc::new(
+            builder
+                .worker_type(WorkerType::Decode)
+                .circuit_breaker_config(breaker_closing_after(successes))
+                .build(),
+        );
+        worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+        worker.record_circuit_breaker_outcome(false);
+        worker.record_circuit_breaker_outcome(false);
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::HalfOpen);
+        worker
+    }
+
+    /// A decode worker whose half-open breaker closes on one success.
+    fn half_open_decode_worker() -> Arc<dyn Worker> {
+        half_open_decode_worker_closing_after(BasicWorkerBuilder::new("http://decode:8000"), 1)
+    }
+
+    /// A ready prefill worker at `url`, a regular engine's.
+    fn ready_prefill_worker(url: String) -> Arc<dyn Worker> {
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Prefill)
+                .build(),
+        );
+        worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+        worker
+    }
+
+    /// The successful head of a decode stream is recorded on the decode
+    /// worker before the relay task is spawned, so a body the worker cuts
+    /// right behind the head is sampled after the head's success and stands.
+    /// Read on a current-thread runtime, where the relay cannot run before
+    /// the body is polled: the half-open breaker is closed by the head as
+    /// soon as the head is relayed, the response is marked so the attempt
+    /// does not record it again, and the cut read afterwards is the one
+    /// standing failure.
+    #[tokio::test]
+    async fn a_decode_heads_success_is_recorded_before_the_relay_can_sample_a_cut() {
+        use crate::worker::circuit_breaker::CircuitState;
+
+        let router = create_test_pd_router();
+        let decode = half_open_decode_worker();
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let sample = |family: &str| {
+            handle
+                .render()
+                .lines()
+                .find(|line| {
+                    line.starts_with(family) && line.contains(r#"worker="http://decode:8000""#)
+                })
+                .map(str::to_string)
+        };
+        let items: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+            )),
+            Err(std::io::Error::other("the engine went away")),
+        ];
+        let upstream = http::Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "text/event-stream")
+            .body(reqwest::Body::wrap_stream(futures_util::stream::iter(
+                items,
+            )))
+            .unwrap();
+
+        let response = router.create_streaming_response(
+            reqwest::Response::from(upstream).bytes_stream(),
+            StatusCode::OK,
+            None,
+            false,
+            RelaySource::decode_leg(
+                UNKNOWN_MODEL_ID,
+                "/v1/chat/completions",
+                Arc::clone(&decode),
+            ),
+            None,
+            WorkerLoadGuard::new(Arc::clone(&decode), None),
+        );
+
+        // The head is out and the relay has not run: the success is recorded.
+        assert!(head_success_recorded(&response));
+        assert_eq!(decode.circuit_breaker_state(), CircuitState::Closed);
+        assert!(
+            sample("smg_worker_cb_outcomes_total{")
+                .is_some_and(|line| line.contains(r#"outcome="success""#) && line.ends_with(" 1")),
+            "{}",
+            handle.render()
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(
+            body.contains("stream_error") && body.ends_with("data: [DONE]\n\n"),
+            "{body}"
+        );
+        // The cut is the one failure after the success: sampled and standing.
+        assert_eq!(decode.circuit_breaker_state(), CircuitState::Closed);
+        assert_eq!(
+            sample("smg_worker_cb_consecutive_failures{").as_deref(),
+            Some(r#"smg_worker_cb_consecutive_failures{worker="http://decode:8000"} 1"#),
+            "{}",
+            handle.render()
+        );
+    }
+
+    /// The attempt does not record a decode head the relay already recorded:
+    /// a second success sample would count twice toward closing a half-open
+    /// breaker.
+    #[test]
+    fn the_attempt_skips_a_decode_head_the_relay_recorded() {
+        use crate::worker::circuit_breaker::CircuitState;
+
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://prefill:8000")
+                .worker_type(WorkerType::Prefill)
+                .build(),
+        );
+        let recorded = half_open_decode_worker();
+        PDRouter::record_attempt_outcomes(
+            prefill.as_ref(),
+            recorded.as_ref(),
+            StatusCode::OK,
+            PrefillOutcome::FromStatus,
+            true,
+        );
+        assert_eq!(recorded.circuit_breaker_state(), CircuitState::HalfOpen);
+
+        let unrecorded = half_open_decode_worker();
+        PDRouter::record_attempt_outcomes(
+            prefill.as_ref(),
+            unrecorded.as_ref(),
+            StatusCode::OK,
+            PrefillOutcome::FromStatus,
+            false,
+        );
+        assert_eq!(unrecorded.circuit_breaker_state(), CircuitState::Closed);
+    }
+
+    /// The head's success is recorded once per request on each PD path: with
+    /// a breaker that closes after two successes, one clean streamed request
+    /// leaves the decode worker half-open with one success sample. On the
+    /// parallel path the attempt skips the head the relay recorded; the
+    /// sequential path, which records the decode leg before it forwards the
+    /// body, leaves a streamed head's success to the relay.
+    #[tokio::test]
+    async fn a_streamed_decode_heads_success_is_recorded_once_on_the_parallel_and_sequential_paths()
+    {
+        use crate::worker::circuit_breaker::CircuitState;
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let success_samples = |url: &str| {
+            handle
+                .render()
+                .lines()
+                .find(|line| {
+                    line.starts_with("smg_worker_cb_outcomes_total{")
+                        && line.contains(&format!(r#"worker="{url}""#))
+                        && line.contains(r#"outcome="success""#)
+                })
+                .map(str::to_string)
+        };
+
+        // The parallel path: a regular prefill engine's server.
+        let (prefill_url, _seen) = spawn_recording_stub("{}").await;
+        let decode_url = spawn_cut_stub(
+            "/v1/chat/completions",
+            "text/event-stream",
+            CHAT_SSE_CHUNKS,
+            false,
+        )
+        .await;
+        let decode =
+            half_open_decode_worker_closing_after(BasicWorkerBuilder::new(decode_url.clone()), 2);
+        let router = create_test_pd_router();
+        router
+            .worker_registry
+            .register_or_replace(ready_prefill_worker(prefill_url));
+        router
+            .worker_registry
+            .register_or_replace(Arc::clone(&decode));
+        let response = stream_chat_through(&router).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.starts_with(CHAT_SSE_CHUNKS[0].as_bytes()), "{body:?}");
+        assert_eq!(
+            decode.circuit_breaker_state(),
+            CircuitState::HalfOpen,
+            "the parallel path recorded the head's success once"
+        );
+        assert!(
+            success_samples(&decode_url).is_some_and(|line| line.ends_with(" 1")),
+            "{}",
+            handle.render()
+        );
+
+        // The sequential path: a prefill engine whose leg must finish first,
+        // its server answering the handoff the decode leg carries.
+        let (prefill_url, _seen) = spawn_recording_stub(
+            r#"{"kv_transfer_params":{"remote_engine_id":"eng0","remote_block_ids":[1,2]}}"#,
+        )
+        .await;
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(prefill_url)
+                .worker_type(WorkerType::Prefill)
+                .runtime_type(RuntimeType::Vllm)
+                .kv_connector("NixlConnector")
+                .build(),
+        );
+        prefill.set_status(openai_protocol::worker::WorkerStatus::Ready);
+        let decode_url = spawn_cut_stub(
+            "/v1/chat/completions",
+            "text/event-stream",
+            CHAT_SSE_CHUNKS,
+            false,
+        )
+        .await;
+        let decode = half_open_decode_worker_closing_after(
+            BasicWorkerBuilder::new(decode_url.clone()).runtime_type(RuntimeType::Vllm),
+            2,
+        );
+        let router = create_test_pd_router();
+        router.worker_registry.register_or_replace(prefill);
+        router
+            .worker_registry
+            .register_or_replace(Arc::clone(&decode));
+        let response = stream_chat_through(&router).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.starts_with(CHAT_SSE_CHUNKS[0].as_bytes()), "{body:?}");
+        assert_eq!(
+            decode.circuit_breaker_state(),
+            CircuitState::HalfOpen,
+            "the sequential path recorded the head's success once"
+        );
+        assert!(
+            success_samples(&decode_url).is_some_and(|line| line.ends_with(" 1")),
+            "{}",
+            handle.render()
+        );
+    }
+
+    /// Through the chat route on a multi-threaded runtime, against a decode
+    /// engine's server that writes the head and dies at once (the body's
+    /// error waits behind the head): the relay task could sample the cut
+    /// before the attempt recorded the head, and the head's success then
+    /// erased the sample. With the head recorded before the relay is spawned,
+    /// the half-open decode breaker is closed by the head and left closed by
+    /// the cut, every time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cut_right_behind_the_decode_head_is_sampled_after_the_heads_success() {
+        use crate::worker::circuit_breaker::CircuitState;
+
+        const ROUNDS: usize = 40;
+        let decode_url = spawn_abrupt_cut_stub("/v1/chat/completions", CHAT_SSE_CHUNKS[0]).await;
+        let (prefill_url, _seen) = spawn_recording_stub("{}").await;
+        let mut reopened = Vec::new();
+        for round in 0..ROUNDS {
+            let router = create_test_pd_router();
+            let decode = half_open_decode_worker_closing_after(
+                BasicWorkerBuilder::new(decode_url.clone()),
+                1,
+            );
+            router
+                .worker_registry
+                .register_or_replace(ready_prefill_worker(prefill_url.clone()));
+            router
+                .worker_registry
+                .register_or_replace(Arc::clone(&decode));
+            let response = stream_chat_through(&router).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let state = decode.circuit_breaker_state();
+            if state != CircuitState::Closed {
+                reopened.push((round, state));
+            }
+        }
+        assert!(
+            reopened.is_empty(),
+            "the cut was sampled before the head's success in {} of {ROUNDS} rounds: {reopened:?}",
+            reopened.len()
+        );
+    }
+
     #[tokio::test]
     async fn test_streaming_load_tracking() {
         use futures_util::StreamExt;
@@ -5501,7 +6013,7 @@ mod tests {
                 StatusCode::OK,
                 None,
                 false,
-                None,
+                RelaySource::decode_leg(UNKNOWN_MODEL_ID, "/generate", Arc::clone(&decode_ref)),
                 None,
                 decode_guard,
             );
@@ -5528,5 +6040,424 @@ mod tests {
         // Guards dropped when response dropped
         assert_eq!(prefill_ref.load(), 0);
         assert_eq!(decode_ref.load(), 0);
+    }
+
+    /// [`spawn_cut_stub`] without the pauses: the head and one chunk leave
+    /// the engine's server, and the cut follows as soon as the server has
+    /// flushed them (one yield of its task), so the body's error is right
+    /// behind the head when the relay starts.
+    async fn spawn_abrupt_cut_stub(path: &'static str, chunk: &'static str) -> String {
+        let app = axum::Router::new().route(
+            path,
+            axum::routing::post(move || async move {
+                let head =
+                    futures_util::stream::iter(vec![Ok(Bytes::from_static(chunk.as_bytes()))]);
+                let cut = futures_util::stream::once(async {
+                    tokio::task::yield_now().await;
+                    Err::<Bytes, std::io::Error>(std::io::Error::other("the engine went away"))
+                });
+                (
+                    [(CONTENT_TYPE, "text/event-stream")],
+                    Body::from_stream(head.chain(cut)),
+                )
+            }),
+        );
+        spawn_stub(app).await
+    }
+
+    /// A decode engine's server on `path`: answers `content_type` with
+    /// `chunks`, one write each, and with `cut` ends the body with an error,
+    /// so the server closes the connection before the transfer's end, as an
+    /// engine's own server that dies mid-stream does.
+    async fn spawn_cut_stub(
+        path: &'static str,
+        content_type: &'static str,
+        chunks: &'static [&'static str],
+        cut: bool,
+    ) -> String {
+        let app = axum::Router::new().route(
+            path,
+            axum::routing::post(move || async move {
+                let items: Vec<Result<Bytes, std::io::Error>> = chunks
+                    .iter()
+                    .map(|chunk| Ok(Bytes::from_static(chunk.as_bytes())))
+                    .chain(cut.then(|| Err(std::io::Error::other("the engine went away"))))
+                    .collect();
+                let body = futures_util::stream::iter(items).then(|item| async move {
+                    // One write per chunk: the relay reads them before the cut.
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    item
+                });
+                ([(CONTENT_TYPE, content_type)], Body::from_stream(body))
+            }),
+        );
+        spawn_stub(app).await
+    }
+
+    /// A worker of `worker_type` at `url` whose circuit breaker opens on the
+    /// first failure, ready to be paired.
+    fn fragile_worker(url: String, worker_type: WorkerType) -> Arc<dyn Worker> {
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(worker_type)
+                .circuit_breaker_config(crate::worker::CircuitBreakerConfig {
+                    failure_threshold: 1,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+        worker
+    }
+
+    /// The router's one pair: a prefill worker whose server answers `{}` and
+    /// a decode worker at `decode_url`, both with threshold-1 breakers, so a
+    /// charge to either leg shows.
+    async fn register_fragile_pair(
+        router: &PDRouter,
+        decode_url: String,
+    ) -> (Arc<dyn Worker>, Arc<dyn Worker>) {
+        let (prefill_url, _seen) = spawn_recording_stub("{}").await;
+        let prefill = fragile_worker(prefill_url, WorkerType::Prefill);
+        let decode = fragile_worker(decode_url, WorkerType::Decode);
+        router
+            .worker_registry
+            .register_or_replace(Arc::clone(&prefill));
+        router
+            .worker_registry
+            .register_or_replace(Arc::clone(&decode));
+        (prefill, decode)
+    }
+
+    async fn stream_chat_through(router: &PDRouter) -> Response {
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        router
+            .route_chat(None, &tenant, streaming_chat(), UNKNOWN_MODEL_ID)
+            .await
+    }
+
+    /// The events of an SSE body, blank-line separated.
+    fn sse_events(body: &str) -> Vec<&str> {
+        body.split("\n\n")
+            .filter(|event| !event.is_empty())
+            .collect()
+    }
+
+    const CHAT_SSE_CHUNKS: &[&str] = &[
+        "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n",
+    ];
+
+    const MESSAGES_SSE_CHUNKS: &[&str] = &[
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\
+         \"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"m\",\
+         \"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\
+         \"output_tokens\":0}}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\
+         \"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+    ];
+
+    /// A decode engine's server that closes the connection mid-stream used
+    /// to leave the client a transfer that ended in an error: no event said
+    /// why, and nothing counted the decode worker's failure. The relay ends
+    /// the SSE response the way the regular relay and the gRPC path do, with
+    /// a `stream_error` event and `[DONE]`, and the decode worker is charged;
+    /// the prefill worker, whose leg completed, is not.
+    #[tokio::test]
+    async fn a_decode_cut_mid_stream_ends_the_sse_response_with_a_typed_error_event_and_done() {
+        let decode_url = spawn_cut_stub(
+            "/v1/chat/completions",
+            "text/event-stream",
+            CHAT_SSE_CHUNKS,
+            true,
+        )
+        .await;
+        let router = create_test_pd_router();
+        let (prefill, decode) = register_fragile_pair(&router, decode_url).await;
+
+        let response = stream_chat_through(&router).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the body ends cleanly after the error event");
+        let body = std::str::from_utf8(&body).unwrap();
+        let events = sse_events(body);
+        assert_eq!(events.len(), 4, "{body}");
+        assert_eq!(events[0], CHAT_SSE_CHUNKS[0].trim_end());
+        assert_eq!(events[1], CHAT_SSE_CHUNKS[1].trim_end());
+        let error: Value = serde_json::from_str(events[2].strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(error["error"]["type"], "stream_error", "{body}");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("Stream error: "),
+            "{body}"
+        );
+        assert_eq!(events[3], "data: [DONE]");
+        assert!(
+            !decode.circuit_breaker_can_execute(),
+            "the cut is the decode worker's failure: its threshold-1 breaker opens"
+        );
+        assert!(
+            prefill.circuit_breaker_can_execute(),
+            "the prefill leg completed and is not charged"
+        );
+    }
+
+    /// A cut that lands inside a frame (the decode engine died mid-write)
+    /// leaves the partial line as it is and writes the error event on its
+    /// own frame, so a client that parses frame by frame still reads the
+    /// typed error.
+    #[tokio::test]
+    async fn a_decode_cut_inside_a_frame_writes_the_error_event_on_its_own_frame() {
+        const CHUNKS: &[&str] = &[
+            "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"con",
+        ];
+        let decode_url =
+            spawn_cut_stub("/v1/chat/completions", "text/event-stream", CHUNKS, true).await;
+        let router = create_test_pd_router();
+        let (_prefill, decode) = register_fragile_pair(&router, decode_url).await;
+
+        let response = stream_chat_through(&router).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the body ends cleanly after the error event");
+        let body = std::str::from_utf8(&body).unwrap();
+        let events = sse_events(body);
+        assert_eq!(events.len(), 4, "{body}");
+        assert_eq!(events[0], CHUNKS[0].trim_end());
+        assert_eq!(events[1], CHUNKS[1], "the partial frame stands alone");
+        let error: Value = serde_json::from_str(events[2].strip_prefix("data: ").unwrap())
+            .expect("the error event is a frame of its own");
+        assert_eq!(error["error"]["type"], "stream_error", "{body}");
+        assert_eq!(events[3], "data: [DONE]");
+        assert!(!decode.circuit_breaker_can_execute());
+    }
+
+    /// On the Messages API the same cut ends the stream with the API's own
+    /// error event, typed `api_error` as the gRPC path types a worker's
+    /// failure there; the protocol has no `[DONE]`.
+    #[tokio::test]
+    async fn a_decode_cut_on_a_messages_stream_ends_it_with_the_api_s_error_event() {
+        let decode_url = spawn_cut_stub(
+            "/v1/messages",
+            "text/event-stream",
+            MESSAGES_SSE_CHUNKS,
+            true,
+        )
+        .await;
+        let router = create_test_pd_router();
+        let (_prefill, decode) = register_fragile_pair(&router, decode_url).await;
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m",
+            "max_tokens": 16,
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .unwrap();
+
+        let response = router
+            .route_messages(None, &tenant, request, UNKNOWN_MODEL_ID)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the body ends cleanly after the error event");
+        let body = std::str::from_utf8(&body).unwrap();
+        let events = sse_events(body);
+        assert_eq!(events.len(), 3, "{body}");
+        let (name, data) = events[2].split_once("\ndata: ").unwrap();
+        assert_eq!(name, "event: error", "{body}");
+        let error: Value = serde_json::from_str(data).unwrap();
+        assert_eq!(error["type"], "error");
+        assert_eq!(error["error"]["type"], "api_error");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("Stream error: "),
+            "{body}"
+        );
+        assert!(!body.contains("[DONE]"), "{body}");
+        assert!(!decode.circuit_breaker_can_execute());
+    }
+
+    /// A body the decode engine streams under any other content type is cut
+    /// as before, so a partial document is not taken for a complete one, and
+    /// the decode worker is charged the same.
+    #[tokio::test]
+    async fn a_decode_cut_on_a_non_sse_body_still_ends_the_transfer_in_error_and_is_counted() {
+        let decode_url = spawn_cut_stub(
+            "/v1/chat/completions",
+            "application/json",
+            &["{\"choices\":[{\"message\":{\"content\":\"par"],
+            true,
+        )
+        .await;
+        let router = create_test_pd_router();
+        let (_prefill, decode) = register_fragile_pair(&router, decode_url).await;
+
+        let response = stream_chat_through(&router).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .is_err(),
+            "a cut JSON body is not made to look complete"
+        );
+        assert!(
+            !decode.circuit_breaker_can_execute(),
+            "the cut is the decode worker's failure: its threshold-1 breaker opens"
+        );
+    }
+
+    /// A stream the decode engine completes is relayed as it was: nothing is
+    /// added and neither worker is charged.
+    #[tokio::test]
+    async fn a_decode_stream_that_completes_is_relayed_unchanged() {
+        let decode_url = spawn_cut_stub(
+            "/v1/chat/completions",
+            "text/event-stream",
+            CHAT_SSE_CHUNKS,
+            false,
+        )
+        .await;
+        let router = create_test_pd_router();
+        let (prefill, decode) = register_fragile_pair(&router, decode_url).await;
+
+        let response = stream_chat_through(&router).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            CHAT_SSE_CHUNKS.concat()
+        );
+        assert!(decode.circuit_breaker_can_execute());
+        assert!(prefill.circuit_breaker_can_execute());
+    }
+
+    /// Counts, on this thread's subscriber, the ERROR events and the refusal
+    /// lines (the events carrying a `suppressed` field).
+    struct RefusalLineCounter {
+        errors: Arc<AtomicUsize>,
+        refusal_lines: Arc<AtomicUsize>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RefusalLineCounter {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() == tracing::Level::ERROR {
+                self.errors.fetch_add(1, Ordering::Relaxed);
+            }
+            if event.metadata().fields().field("suppressed").is_some() {
+                self.refusal_lines.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// A request with no prefill/decode pair to take it is refused with the
+    /// `no_available_workers` 503, marked as reported for the access log,
+    /// and written at WARN within the per-second allowance, never at ERROR:
+    /// two ERROR lines per refusal made a client's retry loop a log storm.
+    #[tokio::test]
+    async fn a_refusal_for_a_leg_that_is_down_is_marked_and_written_at_warn_within_the_allowance() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let errors = Arc::new(AtomicUsize::new(0));
+        let refusal_lines = Arc::new(AtomicUsize::new(0));
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::Registry::default().with(RefusalLineCounter {
+                errors: Arc::clone(&errors),
+                refusal_lines: Arc::clone(&refusal_lines),
+            }),
+        );
+        let router = create_test_pd_router();
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let allowance = usize::try_from(placement::REFUSAL_LINES_PER_SECOND).unwrap();
+
+        let refusals = 5 * allowance;
+        for _ in 0..refusals {
+            let chat: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .expect("valid chat request");
+            let response = router
+                .route_chat(None, &tenant, chat, UNKNOWN_MODEL_ID)
+                .await;
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                error::extract_error_code_from_response(&response),
+                placement::NO_AVAILABLE_WORKERS_CODE
+            );
+            assert!(
+                response.extensions().get::<ReportedRefusal>().is_some(),
+                "the refusal is marked as reported, so the access log keeps quiet"
+            );
+        }
+        assert_eq!(
+            errors.load(Ordering::Relaxed),
+            0,
+            "a refusal is not an error of the gateway"
+        );
+        assert!(
+            refusal_lines.load(Ordering::Relaxed) <= allowance,
+            "{refusals} refusals inside one second write at most {allowance} lines"
+        );
+    }
+
+    /// A refusal this router answers on its own (no prefill/decode pair to
+    /// take the request) is counted as `unavailable`, not as a backend's
+    /// error: no worker was contacted.
+    #[test]
+    fn a_refusal_this_router_answers_is_counted_as_unavailable() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let router = create_test_pd_router();
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let chat: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .expect("valid chat request");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let response = metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(router.route_chat(None, &tenant, chat, UNKNOWN_MODEL_ID))
+        });
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            placement::NO_AVAILABLE_WORKERS_CODE
+        );
+        let rendered = handle.render();
+        let line = rendered
+            .lines()
+            .find(|line| {
+                line.starts_with("smg_router_request_errors_total{")
+                    && line.contains("router_type=\"http\"")
+                    && line.contains("backend_type=\"pd\"")
+            })
+            .unwrap_or_else(|| panic!("a router error is counted:\n{rendered}"));
+        assert!(line.contains("error_type=\"unavailable\""), "{line}");
+        assert!(line.ends_with(" 1"), "{line}");
     }
 }

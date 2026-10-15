@@ -18,8 +18,10 @@
 //! that leaves it unset or empty replays every case. A second parity test replays
 //! every Qwen checkpoint bellwether has recorded ([`MODELS`]): the Qwen3 table with the JSON call
 //! syntax, the same table with the tagged syntax (Qwen 3.5 and later, Qwen3-Coder), typed by each
-//! case's request tools, and the Qwen2.5 table, each after the prompt tail its template leaves; it
-//! skips the slugs bellwether has not recorded yet, and says so. When a preview run sets
+//! case's request tools, and the Qwen2.5 table, each after the prompt tail its template leaves,
+//! on as many threads as the run has CPUs, each model's report written in the table's order as
+//! soon as it and the models before it are done; it skips the slugs bellwether has not recorded
+//! yet, and says so. When a preview run sets
 //! `SYMPHONY_CORPUS_ALLOWANCES=1`, that test also allows the classes of difference the recorded
 //! sets have ([`Allowance`]): a reference argument whose type contradicts the one the tool
 //! declares, which the template writes the same way as the string; reasoning in a reference whose
@@ -37,6 +39,10 @@
 //! the bitwise cases, the parallel calls, owe their count to the adapter rather than the parser:
 //! there the parser's content is nothing but the separator between the calls, and the adapter's
 //! rule that whitespace-only content is absent folds the difference away before the comparison.
+//! A template that re-serializes the arguments (Inkling's `tojson(sort_keys=true,
+//! separators=(",", ":"))`) has the model write the keys sorted and the spaces dropped, and the
+//! parser hands on the model's bytes; a case whose arguments differ from the reference's only so,
+//! equal as values, is counted as "respelled", and only for a family whose template does that.
 //! Bellwether #16: two probe cases put marker strings inside text, and the parser reads them as
 //! markers like every marker parser; they are listed in [`KNOWN_DIFFERENCES`] with their reason and
 //! with the call count and finish reason the parser gives, so the list allows that difference and
@@ -45,10 +51,28 @@
 //! engine finish the reference implies. A second test replays the fixtures' token-level chunk
 //! plans, each delta carrying its tokens' pieces as bellwether records them in `output_pieces`, and
 //! checks that every token is counted once, in the event that carries its first byte.
+//!
+//! What a replay prints, per model: the cases that differ from the reference and nothing allows
+//! (`DIFFERS`, up to [`SHOWN`] of them) and the summary line of its sets. The per-case report, one
+//! verdict line per case with the reason of a listed one, followed by the failures, goes to a file
+//! per test under `BELLWETHER_REPORT_DIR`, or under the build's `target/tmp` when the variable is
+//! not set, and the run says where. `BELLWETHER_VERBOSE=1` prints the per-case report on stdout
+//! too, as the run did before it went to a file.
 
 mod common;
 
-use std::{collections::BTreeMap, fs, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::{BufRead, BufReader, BufWriter, Write},
+    num::NonZeroUsize,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
+    },
+    time::{Duration, Instant},
+};
 
 use common::{bytes_of, chunkings, prompt, replay, replay_after};
 use openai_protocol::common::Tool;
@@ -56,10 +80,11 @@ use serde::Deserialize;
 use symphony::{
     adapt,
     formats::{
-        deepseek_v4_1, glm, hy4, iquest, kimi_k3, lfm2_5, ling, minimax_m3, olmo3, plain, qwen2_5,
-        qwen3, seed_oss, xlam,
+        deepseek_v4_1, dots3, for_model, function_gemma, gemma4, glm, glm4, groups, hy4, inkling,
+        iquest, json, k2_horizon, kimi_k3, lfm2_5, ling, llama_nemotron, minicpm5, minimax_m2,
+        minimax_m3, mistral_v13, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
     },
-    tagged::Spelling,
+    tagged::{Placement, Spelling},
     CallSyntax, Declared, DropReason, Engine, EngineFinish, Event, Events, Input, ParseError,
     Parser, TokenSpan,
 };
@@ -70,6 +95,13 @@ const FIXTURES_ENV: &str = "BELLWETHER_FIXTURES";
 /// thousand cases in minutes, and a nightly run, which leaves it unset, replays them all. The
 /// hand-written [`COMMON_SET`] is replayed whole whatever the step. The run says so.
 const SAMPLE_ENV: &str = "SYMPHONY_SAMPLE_EVERY";
+/// Set to anything but empty or `0`, the per-case report is printed on stdout as well.
+const VERBOSE_ENV: &str = "BELLWETHER_VERBOSE";
+/// The directory the per-case reports are written to; the build's `target/tmp` when it is not set.
+const REPORT_DIR_ENV: &str = "BELLWETHER_REPORT_DIR";
+/// How many differing cases of a model stdout shows, and how many failures the run's message
+/// lists; the rest are in the per-case report.
+const SHOWN: usize = 20;
 /// The hand-written set in every slug's directory: the probes (bellwether #16) and the parallel
 /// calls, a few cases that a sample must not thin.
 const COMMON_SET: &str = "common";
@@ -78,6 +110,20 @@ const COMMON_SET: &str = "common";
 /// its size (a 252 KB swebench case took 80 minutes and 13 GB under every split).
 const EVERY_SPLIT_UP_TO: usize = 256;
 const SLUG: &str = "qwen3-8b";
+/// Slugs the replay over [`MODELS`] leaves out for now, each with the reason
+/// and where it is tracked: a family whose parser is known to differ from the
+/// reference on whole sets, which no per-case list could carry. The slug stays
+/// in the table so its family and prompt tail are kept; the issue brings it
+/// back.
+const SKIPPED: &[(&str, &str)] = &[
+    // bellwether #149 recorded its sets again without the common set (the 16 cases are gone from
+    // main 25b7767791), so the probes its family lists have no fixture to meet; replayed again
+    // once bellwether records them.
+    (
+        "step-3.5-flash",
+        "bellwether #149 dropped its common set, so the listed probes have no fixture to meet",
+    ),
+];
 /// bellwether's slugs for the checkpoints the tables read, in its manifests' spelling, each with
 /// the table that reads it and how its template ends the generation prompt. The fixtures carry
 /// the request and the output, not the rendered prompt, so the prompt's tail is stated here until
@@ -105,6 +151,11 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         Family::Qwen3,
         GenerationPrompt::ModelWritesTheThought,
     ),
+    (
+        "qwen3-30b-a3b",
+        Family::Qwen3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
     // The 2507 line, Qwen3-Next and Qwen3-VL split into instruct, with no thought, and thinking,
     // whose template always opens the thought in the prompt.
     (
@@ -124,6 +175,11 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
     ),
     (
         "qwen3-4b-thinking-2507",
+        Family::Qwen3,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    (
+        "qwen3-30b-a3b-thinking-2507",
         Family::Qwen3,
         GenerationPrompt::AlwaysOpensTheThought,
     ),
@@ -202,6 +258,18 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         Family::Qwen3,
         GenerationPrompt::AlwaysOpensTheThought,
     ),
+    // Qwen3-Omni: the Qwen3 template over audio and video content too, so the same syntax and
+    // the same switch; both checkpoints leave the thought to the model.
+    (
+        "qwen3-omni-30b-a3b-instruct",
+        Family::Qwen3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "qwen3-omni-30b-a3b-thinking",
+        Family::Qwen3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
     // Qwen2.5: no thought at all.
     (
         "qwen2.5-7b-instruct-1m",
@@ -228,7 +296,7 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         Family::Qwen2_5,
         GenerationPrompt::Plain,
     ),
-    ("qwen2.5-omni-3b", Family::Qwen2_5, GenerationPrompt::Plain),
+    ("qwen2.5-omni-7b", Family::Qwen2_5, GenerationPrompt::Plain),
     // Qwen 3.5 and later write calls as tags and open the thought in the prompt; Qwen3-Coder
     // writes tags and has no thought.
     // Qwen3.5-0.8B's template has no thought.
@@ -357,9 +425,10 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         Family::Qwen3Tagged,
         GenerationPrompt::OpensTheThought,
     ),
+    // MiMo writes Qwen 3.5's tags with the value between them directly, and its own `<think>`.
     (
         "mimo-v2.5",
-        Family::Qwen3Tagged,
+        Family::MiMo,
         GenerationPrompt::ModelWritesTheThought,
     ),
     (
@@ -391,6 +460,25 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         Family::Glm,
         GenerationPrompt::AlwaysOpensTheThought,
     ),
+    // GLM 4.5 and 4.6 write Ling's syntax with a newline after each pair instead of before the
+    // close, under GLM's turn opener, and the model writes its own
+    // `<think>`; the template closes an empty thought in the prompt only when the request turns
+    // thinking off (as `\n<think></think>`; the tail's newlines are not read, its markers are).
+    (
+        "glm-4.6",
+        Family::Glm4,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    // K2-Horizon writes GLM 4.6's keyed spelling under `ifm|`-prefixed tags in a block, and its
+    // prompt opens the thought whatever the request says (the template has no thinking switch;
+    // `reasoning_effort` picks the tag, `<ifm|think>` by default). The template raises on an
+    // assistant turn without a thinking field, so bellwether records five of its sixteen common
+    // cases, the reasoning ones and the thinking-on call.
+    (
+        "k2-horizon-36b",
+        Family::K2Horizon,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
     (
         "iquest-q1",
         Family::IQuest,
@@ -408,12 +496,13 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         Family::Plain,
         GenerationPrompt::Plain,
     ),
-    // Python calls: Olmo 3 has no thought; LFM2.5 writes its own `<think>`.
+    // Python calls: Olmo 3 has no thought; LFM2.5's template adds nothing to the turn opener in
+    // either thinking setting (its render set), and the model writes `<think>` itself or not.
     ("olmo-3-7b-instruct", Family::Olmo3, GenerationPrompt::Plain),
     (
         "lfm2.5-1.2b-instruct",
         Family::Lfm2_5,
-        GenerationPrompt::ModelWritesTheThought,
+        GenerationPrompt::ModelDecides,
     ),
     // A bare JSON list of calls, or content; no thought.
     (
@@ -427,6 +516,402 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         "minimax-m3",
         Family::MinimaxM3,
         GenerationPrompt::ModelDecides,
+    ),
+    // MiniMax M2 and M2.7 write `<think>` blocks and `<minimax:tool_call>` blocks of invokes
+    // whose parameter tags name their key in an attribute; their prompt opens the thought on its
+    // own line whatever the request says (the template has no thinking switch).
+    (
+        "minimax-m2",
+        Family::MinimaxM2,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    (
+        "minimax-m2.7",
+        Family::MinimaxM2,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    // Inkling: the generation prompt is the first message's opener and nothing more, whatever the
+    // request says (a system message carries the reasoning effort); the model writes the thought
+    // or not, and its markers are its own.
+    ("inkling", Family::Inkling, GenerationPrompt::ModelDecides),
+    // MiniCPM5: the model writes its own `<think>`, as Qwen3 does; thinking off closes it in the
+    // prompt.
+    (
+        "minicpm5-2b",
+        Family::MiniCpm5,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    // dots3: the model writes its own `<think>`, as Qwen3 does; thinking off closes it in the
+    // prompt.
+    (
+        "dots3-note-prev",
+        Family::Dots3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    // Laguna writes GLM 4.5's spelling (a newline after the name, each key and each value) under
+    // its own turn opener; its prompt ends in the thought's opener or its closer alone.
+    ("laguna-xs.2", Family::Glm4, GenerationPrompt::MarkerAlone),
+    // Gemma 4: the prompt is the turn's opener alone, whatever the request says (the template opens
+    // the thought channel only after a tool response); the model writes `<|channel>thought` or not.
+    (
+        "gemma-4-e4b-it",
+        Family::Gemma4,
+        GenerationPrompt::ModelDecides,
+    ),
+    // Qwen3's JSON calls under other templates (bellwether main 5bcd7b0b0): each as its own
+    // template writes the thought.
+    (
+        "agentcpm-explore",
+        Family::Qwen3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "ai21-jamba-reasoning-3b",
+        Family::Qwen3,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    (
+        "astabrief-8b",
+        Family::Qwen3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "baichuan-m3-235b",
+        Family::Qwen3,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    ("caprl-qwen3vl-4b", Family::Qwen3, GenerationPrompt::Plain),
+    ("caprl-video-4b", Family::Qwen3, GenerationPrompt::Plain),
+    (
+        "contextpilot-14b",
+        Family::Qwen3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "falcon-h1r-7b",
+        Family::Qwen3,
+        GenerationPrompt::ModelDecides,
+    ),
+    (
+        "nemotron-cascade-14b-thinking",
+        Family::Qwen3,
+        GenerationPrompt::ModelDecides,
+    ),
+    (
+        "nemotron-orchestrator-8b",
+        Family::Qwen3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    // Qwen2.5's JSON calls, no thought.
+    (
+        "falcon-h1-tiny-90m-instruct",
+        Family::Qwen2_5,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "nemotron-research-goosereason-4b-instruct",
+        Family::Qwen2_5,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "opencodereasoning-nemotron-7b",
+        Family::Qwen2_5,
+        GenerationPrompt::Plain,
+    ),
+    // Qwen 3.5's tagged calls, the thought opened in the prompt and closed there when the
+    // request turns thinking off.
+    (
+        "arex-2",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "arex-base",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "arex-turbo",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "cosmos3-edge",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "cosmos3-edge-policy-droid",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "nemotron-cascade-2-30b-a3b",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "nvidia-nemotron-3-nano-4b-bf16",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "nvidia-nemotron-3-super-120b-a12b-bf16",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "nvidia-nemotron-3-ultra-550b-a55b-bf16",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "nvidia-nemotron-3.5-lightning-30b-a3b-bf16",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "nvidia-nemotron-labs-3-elastic-30b-a3b-bf16",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "nvidia-nemotron-labs-3-puzzle-75b-a9b-bf16",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    // GLM 4.5's keyed spelling (a newline after the name, each key and each value); the model
+    // writes its own `<think>`, closed in the prompt when thinking is off.
+    (
+        "glm-4.5v",
+        Family::Glm4,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "glm-4.6v",
+        Family::Glm4,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "glm-4.6v-flash",
+        Family::Glm4,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    // GLM's compact keyed spelling; the prompt opens the thought, or closes it when the request
+    // turns thinking off; GLM-5.3 opens it whatever the request says.
+    (
+        "atria-dawn-preview",
+        Family::Glm,
+        GenerationPrompt::OpensTheThought,
+    ),
+    ("glm-4.7", Family::Glm, GenerationPrompt::OpensTheThought),
+    (
+        "glm-4.7-flash",
+        Family::Glm,
+        GenerationPrompt::OpensTheThought,
+    ),
+    ("glm-5", Family::Glm, GenerationPrompt::OpensTheThought),
+    ("glm-5.1", Family::Glm, GenerationPrompt::OpensTheThought),
+    ("glm-5.2", Family::Glm, GenerationPrompt::OpensTheThought),
+    (
+        "glm-5.3",
+        Family::Glm,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    // MiniMax M2's blocks of invokes; the prompt opens the thought whatever the request says.
+    (
+        "minimax-m2.5",
+        Family::MinimaxM2,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    // LFM2.5's Python calls under d1's template, which adds nothing to the turn opener in either
+    // thinking setting; the model writes `<think>` itself or not.
+    ("d1-3b", Family::Lfm2_5, GenerationPrompt::ModelDecides),
+    // Mistral: `[THINK]` and `[/THINK]` the model's own, `[TOOL_CALLS]name[ARGS]{…}` per call; the
+    // prompt ends at `[/INST]` whatever the request says. The instruct templates have no thought.
+    (
+        "devstral-2-123b-instruct-2512",
+        Family::MistralV13,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "ministral-3-14b-instruct-2512-bf16",
+        Family::MistralV13,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "ministral-3-14b-reasoning-2512",
+        Family::MistralV13,
+        GenerationPrompt::ModelDecides,
+    ),
+    (
+        "ministral-3-3b-instruct-2512",
+        Family::MistralV13,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "ministral-3-3b-instruct-2512-bf16",
+        Family::MistralV13,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "ministral-3-8b-instruct-2512-bf16",
+        Family::MistralV13,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "mistral-medium-3.5-128b",
+        Family::MistralV13,
+        GenerationPrompt::ModelDecides,
+    ),
+    (
+        "mistral-small-4-119b-2603",
+        Family::MistralV13,
+        GenerationPrompt::ModelDecides,
+    ),
+    // Llama Nemotron: one JSON list of calls between `<TOOLCALL>` and `</TOOLCALL>`. The Super
+    // template has a thought the model writes itself (`/no_think` in the system prompt closes it
+    // in the prompt; the request's switch changes nothing); the Nano and DLER templates have none.
+    (
+        "dler-llama-nemotron-8b-merge-research",
+        Family::LlamaNemotron,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "llama-3-3-nemotron-super-49b-v1-5",
+        Family::LlamaNemotron,
+        GenerationPrompt::ModelDecides,
+    ),
+    (
+        "llama-3.1-nemotron-nano-8b-v1",
+        Family::LlamaNemotron,
+        GenerationPrompt::Plain,
+    ),
+    // Qwen3's JSON calls under other templates (bellwether main 8029536af5): EXAONE 4.5 opens the
+    // thought in the prompt under its own opener; AReaL-SEA and the tau2 SFT open it whatever the
+    // request says; the boba-2 line and the tau2 user SFT leave it to the model.
+    (
+        "areal-boba-2-14b",
+        Family::Qwen3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "areal-boba-2-32b",
+        Family::Qwen3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "areal-boba-2-8b",
+        Family::Qwen3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "areal-sea-235b-a22b",
+        Family::Qwen3,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    (
+        "areal-tau2-telecom-sft-30b",
+        Family::Qwen3,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    (
+        "areal-tau2-telecom-user-sft-30b",
+        Family::Qwen3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "exaone-4.5-33b",
+        Family::Qwen3,
+        GenerationPrompt::OpensTheThought,
+    ),
+    // Qwen2.5's JSON calls, no thought: A.X under its own opener (`<|im_start|><|assistant|>`,
+    // the object without newlines), the Seed-OSS alternate tokenizer under Llama 3's header, the
+    // rest under Qwen2.5's own template.
+    ("a.x-3.1-light", Family::Qwen2_5, GenerationPrompt::Plain),
+    ("a.x-4.0", Family::Qwen2_5, GenerationPrompt::Plain),
+    ("a.x-4.0-light", Family::Qwen2_5, GenerationPrompt::Plain),
+    (
+        "baichuanmed-ocr-7b",
+        Family::Qwen2_5,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "bytedance-seed-oss-36b-alternate-tokenizer",
+        Family::Qwen2_5,
+        GenerationPrompt::Plain,
+    ),
+    ("caller", Family::Qwen2_5, GenerationPrompt::Plain),
+    ("caprl-3b", Family::Qwen2_5, GenerationPrompt::Plain),
+    ("caprl-eval-3b", Family::Qwen2_5, GenerationPrompt::Plain),
+    (
+        "cogalign-internvl2-5-mpo-4b",
+        Family::Qwen2_5,
+        GenerationPrompt::Plain,
+    ),
+    ("crispers-7b-v1", Family::Qwen2_5, GenerationPrompt::Plain),
+    ("ernie-image-aes", Family::Qwen2_5, GenerationPrompt::Plain),
+    // Qwen 3.5's tagged calls, the thought opened in the prompt and closed there when the
+    // request turns thinking off.
+    (
+        "fara1.5-27b",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "fara1.5-9b",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "h2o-lightning-4b",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    (
+        "huatuogpt-3-27b",
+        Family::Qwen3Tagged,
+        GenerationPrompt::OpensTheThought,
+    ),
+    // Llama 3.1's own template under the Nemotron Ultra, UltraLong, Safety Guard and Reward
+    // checkpoints: one call object alone in the turn, `parameters` naming the arguments, no
+    // thought; the template refuses parallel calls and content beside a call.
+    (
+        "llama-3-1-nemotron-ultra-253b-cpt-v1",
+        Family::Json,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "llama-3.1-nemotron-8b-ultralong-1m-instruct",
+        Family::Json,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "llama-3.1-nemotron-8b-ultralong-2m-instruct",
+        Family::Json,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "llama-3.1-nemotron-8b-ultralong-4m-instruct",
+        Family::Json,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "llama-3.1-nemotron-safety-guard-8b-v3",
+        Family::Json,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "llama-3.3-nemotron-70b-reward-principle",
+        Family::Json,
+        GenerationPrompt::Plain,
+    ),
+    // FunctionGemma: Gemma's calls between `<start_function_call>` and `<end_function_call>`,
+    // `<escape>` around a string and `None` for a null; the template has no thought.
+    (
+        "functiongemma-270m-it",
+        Family::FunctionGemma,
+        GenerationPrompt::Plain,
     ),
 ];
 
@@ -443,6 +928,39 @@ const OPENERS: &[(&str, &str)] = &[
         "granite-4.1-3b",
         "<|start_of_role|>assistant<|end_of_role|>",
     ),
+    ("laguna-xs.2", "<assistant>"),
+    ("a.x-3.1-light", "<|im_start|><|assistant|>"),
+    ("a.x-4.0", "<|im_start|><|assistant|>"),
+    ("a.x-4.0-light", "<|im_start|><|assistant|>"),
+    (
+        "bytedance-seed-oss-36b-alternate-tokenizer",
+        "<|start_header_id|>assistant<|end_header_id|>",
+    ),
+    ("exaone-4.5-33b", "<|assistant|>"),
+    (
+        "llama-3-1-nemotron-ultra-253b-cpt-v1",
+        "<|start_header_id|>assistant<|end_header_id|>",
+    ),
+    (
+        "llama-3.1-nemotron-8b-ultralong-1m-instruct",
+        "<|start_header_id|>assistant<|end_header_id|>",
+    ),
+    (
+        "llama-3.1-nemotron-8b-ultralong-2m-instruct",
+        "<|start_header_id|>assistant<|end_header_id|>",
+    ),
+    (
+        "llama-3.1-nemotron-8b-ultralong-4m-instruct",
+        "<|start_header_id|>assistant<|end_header_id|>",
+    ),
+    (
+        "llama-3.1-nemotron-safety-guard-8b-v3",
+        "<|start_header_id|>assistant<|end_header_id|>",
+    ),
+    (
+        "llama-3.3-nemotron-70b-reward-principle",
+        "<|start_header_id|>assistant<|end_header_id|>",
+    ),
 ];
 
 /// The table that reads a checkpoint's output.
@@ -452,26 +970,49 @@ enum Family {
     Qwen3,
     /// [`qwen3`] with the tagged call syntax, typed by the case's request tools.
     Qwen3Tagged,
+    /// [`qwen3`] with the tagged call syntax and the value between the tags directly: MiMo.
+    MiMo,
     /// [`qwen2_5`].
     Qwen2_5,
     /// [`deepseek_v4_1`]: DSML, whose parameter tags type their own values.
     DeepSeekV4_1,
     /// [`seed_oss`]: the tagged syntax under Seed-OSS's markers, typed by the request tools.
     SeedOss,
-    /// [`hy4`], [`ling`], [`iquest`], [`glm`]: keyed arguments, typed by the request tools.
+    /// [`hy4`], [`ling`], [`iquest`], [`glm`], [`glm4`], [`k2_horizon`]: keyed arguments, typed
+    /// by the request tools.
     Hy4,
     Ling,
     IQuest,
     Glm,
+    Glm4,
+    K2Horizon,
     /// [`olmo3`], [`lfm2_5`]: Python calls.
     Olmo3,
     Lfm2_5,
     /// [`xlam`]: a bare JSON list of calls.
     Xlam,
+    /// [`json`]: one call object, or a list of them, alone in the turn.
+    Json,
+    /// [`mistral_v13`]: the tool's name, `[ARGS]` and the arguments object after `[TOOL_CALLS]`.
+    MistralV13,
+    /// [`llama_nemotron`]: one JSON list of calls between `<TOOLCALL>` and `</TOOLCALL>`.
+    LlamaNemotron,
+    /// [`minimax_m2`]: parameters named by an attribute, typed by the request tools.
+    MinimaxM2,
     /// [`minimax_m3`]: an XML tree of arguments, typed by the request tools at every depth.
     MinimaxM3,
     /// [`kimi_k3`]: XTML, whose argument tags name their own values' types.
     KimiK3,
+    /// [`inkling`]: a turn of messages, a call as the tool's name, a marker and a JSON object.
+    Inkling,
+    /// [`minicpm5`]: `<function name="…">` calls of `<param name="…">` tags, no block, CDATA.
+    MiniCpm5,
+    /// [`dots3`]: MiniMax M2's tags in a block per call, every value on a line of its own.
+    Dots3,
+    /// [`gemma4`]: `call:NAME{…}` calls in Gemma's spelling, the thought a channel.
+    Gemma4,
+    /// [`function_gemma`]: Gemma's calls in FunctionGemma's tokens, no thought.
+    FunctionGemma,
     /// [`plain`]: content and nothing else.
     Plain,
 }
@@ -485,36 +1026,65 @@ impl Family {
             Self::Hy4 => ("<think:opensource>", "</think:opensource>"),
             Self::MinimaxM3 => ("<mm:think>", "</mm:think>"),
             Self::KimiK3 => ("<|open|>think<|sep|>", "<|close|>think<|sep|>"),
+            Self::Inkling => ("<|content_thinking|>", "<|end_message|>"),
+            Self::Gemma4 => ("<|channel>thought\n", "<channel|>"),
+            Self::K2Horizon => ("<ifm|think>", "</ifm|think>"),
+            Self::MistralV13 => ("[THINK]", "[/THINK]"),
             _ => ("<think>", "</think>"),
         }
     }
 
-    /// The engine for one of the model's cases: the family's table, with the model's own turn
-    /// opener when its template is not the table's ([`OPENERS`]), and the case's tools.
-    fn engine(self, slug: &str, fixture: &Fixture) -> Engine {
+    /// Whether the family's template re-serializes a call's arguments, so the model writes them
+    /// with the keys sorted and the spaces dropped, as Inkling's `tojson(sort_keys=true,
+    /// separators=(",", ":"))` does: a case whose arguments differ from the reference's only so,
+    /// equal as values, is counted as respelled, not as a difference.
+    fn respells_arguments(self) -> bool {
+        matches!(self, Self::Inkling | Self::Gemma4 | Self::FunctionGemma)
+    }
+
+    /// The table for one of the model's cases: the family's, with the model's own turn opener
+    /// when its template is not the table's ([`OPENERS`]).
+    fn table(self, slug: &str) -> symphony::Format {
         let mut format = self.format();
         if let Some((_, opener)) = OPENERS.iter().find(|(model, _)| *model == slug) {
             format = format.opens_turn(opener);
         }
-        Engine::new(format, Declared::of(&fixture.request.tools))
+        format
+    }
+
+    /// The engine for one of the model's cases: the model's table and the case's tools.
+    fn engine(self, slug: &str, fixture: &Fixture) -> Engine {
+        Engine::new(self.table(slug), Declared::of(&fixture.request.tools))
     }
 
     fn format(self) -> symphony::Format {
         match self {
             Self::Qwen3 => qwen3(CallSyntax::Json),
-            Self::Qwen3Tagged => qwen3(CallSyntax::Tagged(Spelling::Json)),
+            Self::Qwen3Tagged => qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine)),
+            Self::MiMo => qwen3(CallSyntax::Tagged(Spelling::Json, Placement::Direct)),
             Self::Qwen2_5 => qwen2_5(),
             Self::DeepSeekV4_1 => deepseek_v4_1(),
             Self::SeedOss => seed_oss(),
             Self::Hy4 => hy4(),
             Self::Ling => ling(),
             Self::Glm => glm(),
+            Self::Glm4 => glm4(),
+            Self::K2Horizon => k2_horizon(),
             Self::IQuest => iquest(),
             Self::Olmo3 => olmo3(),
             Self::Lfm2_5 => lfm2_5(),
             Self::Xlam => xlam(),
+            Self::Json => json(),
+            Self::MistralV13 => mistral_v13(),
+            Self::LlamaNemotron => llama_nemotron(),
+            Self::MinimaxM2 => minimax_m2(),
             Self::MinimaxM3 => minimax_m3(),
             Self::KimiK3 => kimi_k3(),
+            Self::Inkling => inkling(),
+            Self::MiniCpm5 => minicpm5(),
+            Self::Dots3 => dots3(),
+            Self::Gemma4 => gemma4(),
+            Self::FunctionGemma => function_gemma(),
             Self::Plain => plain(),
         }
     }
@@ -525,18 +1095,34 @@ impl Family {
     fn known_differences(self, slug: &str, prompt: GenerationPrompt) -> Vec<KnownDifference> {
         let list = match self {
             Self::Qwen3 | Self::Qwen2_5 => KNOWN_DIFFERENCES,
-            Self::Qwen3Tagged => KNOWN_TAGGED_DIFFERENCES,
-            // Seed-OSS, Hy4, Olmo 3, xLAM, Kimi K3 and the plain table read neither of the probes'
-            // Qwen markers: `</think>` stays reasoning text and the fenced `<tool_call>` block
-            // stays content, as the reference says.
-            Self::SeedOss | Self::Hy4 | Self::Olmo3 | Self::Xlam | Self::KimiK3 | Self::Plain => {
-                &[]
-            }
+            Self::Qwen3Tagged | Self::MiMo => KNOWN_TAGGED_DIFFERENCES,
+            // Seed-OSS, Hy4, Olmo 3, xLAM, the json table, Kimi K3, K2-Horizon, Inkling, Gemma 4
+            // and the plain table read neither of the probes' Qwen markers: `</think>` stays
+            // reasoning text and the fenced `<tool_call>` block stays content, as the reference
+            // says.
+            Self::SeedOss
+            | Self::Hy4
+            | Self::Olmo3
+            | Self::Xlam
+            | Self::Json
+            | Self::KimiK3
+            | Self::K2Horizon
+            | Self::Inkling
+            | Self::Gemma4
+            | Self::FunctionGemma
+            | Self::MistralV13
+            | Self::Plain => &[],
             // Ling and GLM read `<tool_call>` and `</think>`, so their two probes are the
-            // tagged ones' (no call comes of the fence); IQuest, DSML and LFM2.5 read `</think>`
-            // but not `<tool_call>`.
-            Self::Ling | Self::Glm => KNOWN_TAGGED_DIFFERENCES,
-            Self::IQuest | Self::DeepSeekV4_1 | Self::Lfm2_5 => KNOWN_REASONING_PROBE,
+            // tagged ones' (no call comes of the fence); IQuest, DSML, LFM2.5, MiniMax M2,
+            // MiniCPM5, dots3 and Llama Nemotron read `</think>` but not `<tool_call>`.
+            Self::Ling | Self::Glm | Self::Glm4 => KNOWN_TAGGED_DIFFERENCES,
+            Self::IQuest
+            | Self::DeepSeekV4_1
+            | Self::Lfm2_5
+            | Self::MinimaxM2
+            | Self::MiniCpm5
+            | Self::Dots3
+            | Self::LlamaNemotron => KNOWN_REASONING_PROBE,
             Self::MinimaxM3 => KNOWN_M3_DIFFERENCES,
         };
         // A template that writes no thought for the probe's request leaves the reasoning out, so
@@ -563,7 +1149,13 @@ impl Family {
         let mut allowed = Vec::new();
         if matches!(
             self,
-            Self::Qwen3Tagged | Self::SeedOss | Self::Hy4 | Self::Ling | Self::IQuest | Self::Glm
+            Self::Qwen3Tagged
+                | Self::MiMo
+                | Self::SeedOss
+                | Self::Hy4
+                | Self::Ling
+                | Self::IQuest
+                | Self::Glm
         ) {
             allowed.push(Allowance::DeclaredTypeConflict);
         }
@@ -580,7 +1172,7 @@ impl Family {
             allowed.push(Allowance::DeclaredTypeConflict);
             allowed.push(Allowance::NullNotWritten);
         }
-        if self == Self::Qwen3Tagged {
+        if matches!(self, Self::Qwen3Tagged | Self::MiMo) {
             allowed.push(Allowance::ContentTrimmed);
         }
         allowed
@@ -611,6 +1203,10 @@ enum GenerationPrompt {
     /// the requests do not set), and the template has a thought: the model writes `<mm:think>`
     /// itself or closes an empty thought with `</mm:think>` at once.
     ModelDecides,
+    /// Laguna: the thought's opener alone, with no newline, when the request turns thinking on,
+    /// so the output starts inside the thought; otherwise (the default) its closer alone, which
+    /// closes a thought never opened and leaves the output in content.
+    MarkerAlone,
 }
 
 impl GenerationPrompt {
@@ -632,6 +1228,8 @@ impl GenerationPrompt {
             (Self::OpensTheThought, false) | (Self::AlwaysOpensTheThought, _) => opened,
             (Self::OpensTheThoughtWhenAsked, _) if request.thinking_on() => opened,
             (Self::OpensTheThoughtWhenAsked, _) => closed,
+            (Self::MarkerAlone, _) if request.thinking_on() => open.to_string(),
+            (Self::MarkerAlone, _) => close.to_string(),
         }
     }
 
@@ -639,8 +1237,40 @@ impl GenerationPrompt {
     /// reasoning probe's does, so its reasoning is not in the output and the case is refused or
     /// allowed, not listed.
     fn writes_no_thought_unasked(self) -> bool {
-        matches!(self, Self::Plain | Self::OpensTheThoughtWhenAsked)
+        matches!(
+            self,
+            Self::Plain | Self::OpensTheThoughtWhenAsked | Self::MarkerAlone
+        )
     }
+}
+
+/// Every recorded model reads with the table the registry gives its slug, opener included: the
+/// replays below check the families' tables and openers against the recorded outputs, and this
+/// ties them to `formats::for_model`, which the gateway asks, so a correction here reaches it.
+#[test]
+fn every_recorded_model_reads_with_the_registrys_table() {
+    for (slug, family, _) in MODELS {
+        let model = model_of(slug);
+        let registered = for_model(&model).unwrap_or_else(|| panic!("{slug}: not in the registry"));
+        assert_eq!(registered, family.table(slug), "{slug}");
+    }
+}
+
+/// The id the registry knows `slug` by. Bellwether's slug is the repository name in lower case
+/// with `_` written `-`, which the registry's case-insensitive match reads as it is, except for a
+/// name with an underscore (AstaBrief_8B): that one is found through the registry's own groups.
+fn model_of(slug: &str) -> String {
+    let slug_of = |id: &str| {
+        id.rsplit('/')
+            .next()
+            .unwrap_or(id)
+            .to_ascii_lowercase()
+            .replace('_', "-")
+    };
+    groups()
+        .flat_map(|(model, also, _)| std::iter::once(model).chain(also.iter().copied()))
+        .find(|id| slug_of(id) == slug)
+        .map_or_else(|| slug.to_string(), str::to_string)
 }
 
 /// The variable a preview run sets to allow the corpus classes below; CI, on sets bellwether
@@ -657,7 +1287,7 @@ const CONTENT_OR_CALLS: &[&str] = &[
     "qwen2.5-vl-3b-instruct",
     "qwen2.5-vl-7b-instruct",
     "qwen2.5-vl-32b-instruct",
-    "qwen2.5-omni-3b",
+    "qwen2.5-omni-7b",
 ];
 
 /// A class of difference the recorded sets have, allowed for what the fixture shows rather than
@@ -668,7 +1298,7 @@ const CONTENT_OR_CALLS: &[&str] = &[
 enum Allowance {
     /// The reference's argument is a boolean, a number or null for a parameter the tool declares
     /// `string`, so the template writes it as it writes the string, and the parser gives the
-    /// string back, as vLLM does (BFCL declares `smoking_allowed` an enum of `"True"`, `"False"`
+    /// string back, as the engine's parser does (BFCL declares `smoking_allowed` an enum of `"True"`, `"False"`
     /// and `"dontcare"` and answers `false`). Bellwether #56 refuses such a case.
     DeclaredTypeConflict,
     /// The template writes no thought, so the reasoning the reference carries is not in the output
@@ -727,10 +1357,36 @@ const KNOWN_DIFFERENCES: &[KnownDifference] = &[
 /// difference cannot be among that slug's fixtures, so the check that the list has not rotted
 /// skips it there.
 const REFUSED_PROBES: &[(&str, &str)] = &[
+    // Its template refuses the reasoning probe's request (the recorded common set has the fence
+    // probe and ten more, not it).
+    ("laguna-xs.2", "parse/reasoning-with-marker-text"),
     // Its template raises on a request that turns thinking off, and the content probe's does.
     (
         "qwen3.8-2.4t-a95b",
         "parse/content-with-marker-in-code-fence",
+    ),
+    // bellwether's reference refuses the reasoning probe for its template: twelve of the sixteen
+    // common cases are recorded, and that one is not among them.
+    ("glm-4.6", "parse/reasoning-with-marker-text"),
+    // Probes bellwether's reference refused for these templates (main 5bcd7b0b0): each slug's
+    // common set holds its other cases and not these.
+    (
+        "ai21-jamba-reasoning-3b",
+        "parse/content-with-marker-in-code-fence",
+    ),
+    ("glm-4.5v", "parse/reasoning-with-marker-text"),
+    ("glm-4.6v", "parse/reasoning-with-marker-text"),
+    ("glm-4.6v-flash", "parse/reasoning-with-marker-text"),
+    ("glm-4.7", "parse/reasoning-with-marker-text"),
+    ("glm-4.7-flash", "parse/reasoning-with-marker-text"),
+    ("glm-5", "parse/reasoning-with-marker-text"),
+    ("glm-5.1", "parse/reasoning-with-marker-text"),
+    ("glm-5.2", "parse/reasoning-with-marker-text"),
+    // Its template renders no `reasoning_content`, so bellwether refused the reasoning probe's
+    // request (the recorded common set holds the fence probe and ten more, not it).
+    (
+        "llama-3-3-nemotron-super-49b-v1-5",
+        "parse/reasoning-with-marker-text",
     ),
 ];
 
@@ -759,9 +1415,9 @@ const FENCE_PROBE: KnownDifference = KnownDifference {
 /// Under the tagged syntax both probes differ.
 const KNOWN_TAGGED_DIFFERENCES: &[KnownDifference] = &[REASONING_PROBE, FENCE_PROBE];
 
-/// Under a table that reads `</think>` but not `<tool_call>` (DSML, IQuest), only the reasoning
-/// probe differs: the fence holds Qwen's syntax, which the table never reads as a call, so it is
-/// content, as the reference says.
+/// Under a table that reads `</think>` but not `<tool_call>`, only the reasoning probe differs:
+/// the fence holds Qwen's syntax, which the table never reads as a call, so it is content, as the
+/// reference says. The match on the family says which tables these are.
 const KNOWN_REASONING_PROBE: &[KnownDifference] = &[REASONING_PROBE];
 
 /// Under the MiniMax M3 table only the code-fence probe differs: the fence holds `<tool_call>`,
@@ -893,6 +1549,23 @@ impl Said {
         }
     }
 
+    /// Whether `other` says the same, the calls' arguments compared as JSON values: a template that
+    /// re-serializes the arguments (Inkling's `tojson(sort_keys=true, separators=(",", ":"))`)
+    /// writes the keys sorted and the spaces dropped, and the parser hands on what the model
+    /// wrote, so the bytes differ from the reference's while the values are the same.
+    fn same_values(&self, other: &Self) -> bool {
+        let value = |text: &str| serde_json::from_str::<serde_json::Value>(text).ok();
+        self.content == other.content
+            && self.reasoning == other.reasoning
+            && self.finish == other.finish
+            && self.calls.len() == other.calls.len()
+            && self.calls.iter().zip(&other.calls).all(
+                |((name, args), (other_name, other_args))| {
+                    name == other_name && value(args).is_some() && value(args) == value(other_args)
+                },
+            )
+    }
+
     /// The same, with the separator bytes trimmed from content and reasoning (bellwether #17). The
     /// template's separators are newlines, so only newlines are trimmed: any other whitespace the
     /// parser kept or lost still counts as a difference.
@@ -915,7 +1588,8 @@ impl Said {
 #[test]
 #[expect(
     clippy::print_stderr,
-    reason = "the skip notice is test diagnostic output"
+    clippy::print_stdout,
+    reason = "the skip notice and the per-case report are test diagnostic output"
 )]
 fn qwen3_parse_fixtures_match_the_reference() {
     let Some(root) = std::env::var_os(FIXTURES_ENV).map(PathBuf::from) else {
@@ -932,23 +1606,118 @@ fn qwen3_parse_fixtures_match_the_reference() {
         "no parse fixtures under {}",
         root.display()
     );
-    let failures = parity(
+    let Parity {
+        report,
+        summary,
+        failures,
+    } = parity(
         &fixtures,
         &ids,
         &|fixture| Family::Qwen3.engine(SLUG, fixture),
         &|_| String::new(),
-        KNOWN_DIFFERENCES,
-        &[],
-        Family::Qwen3.think_markers(),
+        Rules {
+            known_differences: KNOWN_DIFFERENCES,
+            allowed: &[],
+            think_markers: Family::Qwen3.think_markers(),
+            respells_arguments: false,
+        },
     );
-    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    let verbose = verbose();
+    let mut file = ReportFile::create("bellwether_parse_fixtures-qwen3-8b.txt")
+        .unwrap_or_else(|e| panic!("{e}"));
+    file.write(&report);
+    print!("{}", if verbose { &report } else { &summary });
+    let path = file.finish(&failures).unwrap_or_else(|e| panic!("{e}"));
+    println!("per-case report: {}", path.display());
+    assert!(
+        failures.is_empty(),
+        "\n{}",
+        message(&failures, verbose, &path)
+    );
+}
+
+/// Whether [`VERBOSE_ENV`] asks for the per-case report on stdout: set to anything but empty or
+/// `0`.
+fn verbose() -> bool {
+    std::env::var(VERBOSE_ENV).is_ok_and(|value| !value.is_empty() && value != "0")
+}
+
+/// A per-case report being written: `name` under [`REPORT_DIR_ENV`] or the build's `target/tmp`.
+/// A write that fails is kept and reported when the file is finished, so that the replay's
+/// closures need not handle it.
+struct ReportFile {
+    path: PathBuf,
+    file: BufWriter<fs::File>,
+    error: Option<std::io::Error>,
+}
+
+impl ReportFile {
+    /// Create the file, and its directory.
+    fn create(name: &str) -> Result<Self, String> {
+        let dir = std::env::var_os(REPORT_DIR_ENV)
+            .map_or_else(|| PathBuf::from(env!("CARGO_TARGET_TMPDIR")), PathBuf::from);
+        fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        let path = dir.join(name);
+        let file = fs::File::create(&path)
+            .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+        Ok(Self {
+            path,
+            file: BufWriter::new(file),
+            error: None,
+        })
+    }
+
+    /// Append `text`.
+    fn write(&mut self, text: &str) {
+        if let Err(e) = self.file.write_all(text.as_bytes()) {
+            self.error.get_or_insert(e);
+        }
+    }
+
+    /// Append the failures and close the file; its path, or the first error met.
+    fn finish(mut self, failures: &[String]) -> Result<PathBuf, String> {
+        for failure in failures {
+            self.write(failure);
+            self.write("\n");
+        }
+        if let Err(e) = self.file.flush() {
+            self.error.get_or_insert(e);
+        }
+        match self.error {
+            Some(e) => Err(format!("cannot write {}: {e}", self.path.display())),
+            None => Ok(self.path),
+        }
+    }
+}
+
+/// The run's failure message: every failure when the run is verbose, else [`capped`].
+fn message(failures: &[String], verbose: bool, report: &std::path::Path) -> String {
+    if verbose {
+        failures.join("\n")
+    } else {
+        capped(failures, report)
+    }
+}
+
+/// The first [`SHOWN`] of `failures`; the rest are counted, and the reader sent to the per-case
+/// report at `report`.
+fn capped(failures: &[String], report: &std::path::Path) -> String {
+    if failures.len() <= SHOWN {
+        return failures.join("\n");
+    }
+    format!(
+        "{}\n... and {} more, every one in {}",
+        failures[..SHOWN].join("\n"),
+        failures.len() - SHOWN,
+        report.display()
+    )
 }
 
 #[test]
 #[expect(
     clippy::print_stderr,
     clippy::print_stdout,
-    reason = "the skip notice and the per-case report are test diagnostic output"
+    reason = "the skip notices and the per-case reports are test diagnostic output"
 )]
 fn every_recorded_qwen_model_parses_like_its_reference() {
     let Some(root) = std::env::var_os(FIXTURES_ENV).map(PathBuf::from) else {
@@ -960,61 +1729,246 @@ fn every_recorded_qwen_model_parses_like_its_reference() {
     };
     let mut failures = Vec::new();
     let mut recorded = 0;
-    for &(slug, family, prompt) in MODELS {
-        let dir = root.join(slug).join("parse");
-        if !dir.is_dir() {
-            eprintln!("skipping {slug}: bellwether has not recorded its parse sets yet");
-            continue;
-        }
-        let Cases { fixtures, ids } = read_fixtures(&dir).unwrap_or_else(|e| panic!("{e}"));
-        println!("{slug} ({family:?}, {prompt:?}):");
-        failures.extend(parity(
-            &fixtures,
-            &ids,
-            &|fixture| family.engine(slug, fixture),
-            &|fixture| prompt.tail(fixture, family),
-            &family.known_differences(slug, prompt),
-            &family.allowances(slug, prompt),
-            family.think_markers(),
-        ));
-        recorded += 1;
-    }
+    let verbose = verbose();
+    let mut file = ReportFile::create("bellwether_parse_fixtures-models.txt")
+        .unwrap_or_else(|e| panic!("{e}"));
+    in_order(
+        MODELS,
+        |&(slug, family, prompt)| replay_model(&root, slug, family, prompt),
+        |replayed| match replayed {
+            Replayed::Skipped(notice) => eprintln!("{notice}"),
+            Replayed::Compared {
+                report,
+                summary,
+                failures: of_model,
+            } => {
+                file.write(&report);
+                print!("{}", if verbose { &report } else { &summary });
+                failures.extend(of_model);
+                recorded += 1;
+            }
+        },
+    );
     if recorded == 0 {
         eprintln!(
             "skipping: none of the table's slugs is recorded under {}",
             root.display()
         );
     }
-    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    let path = file.finish(&failures).unwrap_or_else(|e| panic!("{e}"));
+    println!("per-case report: {}", path.display());
+    assert!(
+        failures.is_empty(),
+        "\n{}",
+        message(&failures, verbose, &path)
+    );
+}
+
+/// What replaying one of [`MODELS`] gave: the notice for a slug the run leaves out, or the
+/// report a serial run would have printed for the model, what stdout shows of it, and the
+/// differences nothing allows.
+enum Replayed {
+    Skipped(String),
+    Compared {
+        report: String,
+        summary: String,
+        failures: Vec<String>,
+    },
+}
+
+/// Replay one of [`MODELS`]: its parse sets under `root`, read as [`read_fixtures`] reads them,
+/// through its table after its prompt tail, with its known differences and allowances.
+#[expect(
+    clippy::panic,
+    reason = "a set that cannot be read ends the test with its path"
+)]
+fn replay_model(
+    root: &std::path::Path,
+    slug: &str,
+    family: Family,
+    prompt: GenerationPrompt,
+) -> Replayed {
+    let dir = root.join(slug).join("parse");
+    if !dir.is_dir() {
+        return Replayed::Skipped(format!(
+            "skipping {slug}: bellwether has not recorded its parse sets yet"
+        ));
+    }
+    if let Some((_, reason)) = SKIPPED.iter().find(|(skipped, _)| *skipped == slug) {
+        return Replayed::Skipped(format!("skipping {slug}: {reason}"));
+    }
+    let Cases { fixtures, ids } = read_fixtures(&dir).unwrap_or_else(|e| panic!("{e}"));
+    let known_differences = family.known_differences(slug, prompt);
+    let allowed = family.allowances(slug, prompt);
+    let Parity {
+        report,
+        summary,
+        failures,
+    } = parity(
+        &fixtures,
+        &ids,
+        &|fixture| family.engine(slug, fixture),
+        &|fixture| prompt.tail(fixture, family),
+        Rules {
+            known_differences: &known_differences,
+            allowed: &allowed,
+            think_markers: family.think_markers(),
+            respells_arguments: family.respells_arguments(),
+        },
+    );
+    Replayed::Compared {
+        report: format!("{slug} ({family:?}, {prompt:?}):\n{report}"),
+        summary: format!("{slug} ({family:?}, {prompt:?}):\n{summary}"),
+        failures,
+    }
+}
+
+/// Run `each` on every item, on as many threads as the run has CPUs, each thread taking the
+/// next item from a shared index, and hand what it gives to `then` in the items' order, each
+/// as soon as it and the ones before it are done. A panic in `each` ends the run once the items
+/// in flight are done, as it would on one thread: the thread that panics raises a flag as it
+/// unwinds, and no thread takes an item once it is up.
+fn in_order<I: Sync, T: Send>(items: &[I], each: impl Fn(&I) -> T + Sync, then: impl FnMut(T)) {
+    let threads = std::thread::available_parallelism()
+        .map_or(1, NonZeroUsize::get)
+        .min(items.len())
+        .max(1);
+    in_order_on(threads, &AtomicBool::new(false), items, each, then);
+}
+
+/// [`in_order`] on `threads` threads, with `stop` as the flag the thread that panics raises as it
+/// unwinds; no thread takes an item once it is up.
+fn in_order_on<I: Sync, T: Send>(
+    threads: usize,
+    stop: &AtomicBool,
+    items: &[I],
+    each: impl Fn(&I) -> T + Sync,
+    mut then: impl FnMut(T),
+) {
+    let next = AtomicUsize::new(0);
+    let (tx, rx) = mpsc::channel();
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            let tx = tx.clone();
+            let (next, each) = (&next, &each);
+            scope.spawn(move || {
+                let _raised_on_panic = StopOnPanic(stop);
+                while !stop.load(Ordering::Relaxed) {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(item) = items.get(index) else {
+                        break;
+                    };
+                    if tx.send((index, each(item))).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(tx);
+        let mut pending = BTreeMap::new();
+        let mut done = 0;
+        for (index, outcome) in rx {
+            pending.insert(index, outcome);
+            while let Some(outcome) = pending.remove(&done) {
+                then(outcome);
+                done += 1;
+            }
+        }
+    });
+}
+
+/// Raises the flag it holds when its thread unwinds from a panic, so that the other threads of
+/// [`in_order_on`] take no further item.
+struct StopOnPanic<'a>(&'a AtomicBool);
+
+impl Drop for StopOnPanic<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// What [`parity`] gave for a set: the report, one line per case and the set's summary, as a
+/// serial run would have printed it; what stdout shows of it, the first differing cases that
+/// nothing allows and the set's summary; and every difference that nothing allows.
+struct Parity {
+    report: String,
+    summary: String,
+    failures: Vec<String>,
+}
+
+/// The first differing cases of a set, as stdout shows them.
+#[derive(Default)]
+struct Shown {
+    lines: String,
+    differing: usize,
+}
+
+impl Shown {
+    /// Count one differing case, and keep its line while fewer than [`SHOWN`] are kept.
+    fn differs(&mut self, line: &str) {
+        self.differing += 1;
+        if self.differing <= SHOWN {
+            self.lines.push_str(line);
+        }
+    }
+
+    /// The lines kept, and how many more the per-case report has.
+    fn text(mut self) -> String {
+        if self.differing > SHOWN {
+            self.lines.push_str(&format!(
+                "  ... and {} more differing cases, every one in the per-case report\n",
+                self.differing - SHOWN
+            ));
+        }
+        self.lines
+    }
+}
+
+/// What a family declares to the judge: the cases whose differences it lists, the classes it
+/// claims for the corpus, its thinking markers, and whether its template respells the arguments.
+#[derive(Clone, Copy)]
+struct Rules<'a> {
+    known_differences: &'a [KnownDifference],
+    allowed: &'a [Allowance],
+    think_markers: (&'a str, &'a str),
+    /// [`Family::respells_arguments`].
+    respells_arguments: bool,
 }
 
 /// Replays every fixture through a fresh parser from `new_parser`, after a prompt ending in the
-/// case's `prompt_tail`, on every chunking, prints one line per case, and returns every difference
-/// that neither `known_differences` nor `allowed` allows. `every_id` is the id of every case the
-/// set files hold, before any sample thinned them: a listed difference no longer among them is a
-/// failure too, so the list cannot rot.
+/// case's `prompt_tail`, on every chunking, reports one line per case and the set's summary, and
+/// returns with them every difference the family's `rules` do not account for. `every_id` is the
+/// id of every case the set files hold, before any sample thinned them: a listed difference no
+/// longer among them is a failure too, so the list cannot rot.
 #[expect(
-    clippy::print_stdout,
     clippy::panic,
-    reason = "the per-case report is diagnostic output; a fixture that cannot be replayed ends \
-              the test with its id"
+    reason = "a fixture that cannot be replayed ends the test with its id"
 )]
 fn parity(
     fixtures: &[Fixture],
     every_id: &[String],
     new_parser: &dyn Fn(&Fixture) -> Engine,
     prompt_tail: &dyn Fn(&Fixture) -> String,
-    known_differences: &[KnownDifference],
-    allowed: &[Allowance],
-    think_markers: (&str, &str),
-) -> Vec<String> {
+    rules: Rules<'_>,
+) -> Parity {
+    let Rules {
+        known_differences,
+        allowed,
+        think_markers,
+        respells_arguments,
+    } = rules;
     let known = |id: &str| {
         known_differences
             .iter()
             .find(|known| known.id == after_slug(id))
     };
     let mut failures = Vec::new();
-    let (mut bitwise, mut separators_only, mut listed, mut allowed_count) = (0, 0, 0, 0);
+    let mut out = String::new();
+    let mut shown = Shown::default();
+    let (mut bitwise, mut separators_only, mut respelled, mut listed, mut allowed_count) =
+        (0, 0, 0, 0, 0);
     let (mut token_plans_run, mut without_pieces) = (0, 0);
     for fixture in fixtures {
         let text = fixture.reference.text.as_str();
@@ -1104,6 +2058,9 @@ fn parity(
         } else if said.trimmed() == expected.trimmed() {
             separators_only += 1;
             "separators only (bellwether #17)"
+        } else if respells_arguments && said.trimmed().same_values(&expected.trimmed()) {
+            respelled += 1;
+            "respelled arguments (the template re-serializes them)"
         } else if let Some(listed_case) = known(&fixture.id) {
             if said.calls.len() != listed_case.calls || said.finish != listed_case.finish {
                 failures.push(format!(
@@ -1143,9 +2100,13 @@ fn parity(
                 fixture.id
             ));
         }
-        println!("  {verdict:34} {}", fixture.id);
+        let line = format!("  {verdict:34} {}\n", fixture.id);
+        if verdict == "DIFFERS" {
+            shown.differs(&line);
+        }
+        out.push_str(&line);
         if let Some(listed_case) = known(&fixture.id) {
-            println!("  {:34} {}", "", listed_case.reason);
+            out.push_str(&format!("  {:34} {}\n", "", listed_case.reason));
         }
     }
     // A listed case that is no longer among the fixtures would let the list rot. The check reads
@@ -1159,13 +2120,18 @@ fn parity(
         }
     }
     let sample = sample_note(sample_every());
-    println!(
-        "{} cases{sample}: {bitwise} bitwise, {separators_only} separators only, \
-         {listed} listed, {allowed_count} allowed for the corpus; {token_plans_run} token plans \
-         replayed, {without_pieces} cases without output_pieces",
+    let totals = format!(
+        "{} cases{sample}: {bitwise} bitwise, {separators_only} separators only, {respelled} \
+         respelled, {listed} listed, {allowed_count} allowed for the corpus; {token_plans_run} \
+         token plans replayed, {without_pieces} cases without output_pieces\n",
         fixtures.len()
     );
-    failures
+    out.push_str(&totals);
+    Parity {
+        report: out,
+        summary: shown.text() + &totals,
+        failures,
+    }
 }
 
 /// The allowance that covers the difference between `said` and `expected`, if one of `allowed`
@@ -1679,9 +2645,10 @@ fn step_for(file: &std::path::Path, every: usize) -> usize {
     }
 }
 
-/// Every `every`-th of `items`, the first included: the same slice of a set every run.
-fn sampled<T>(items: Vec<T>, every: usize) -> Vec<T> {
-    items.into_iter().step_by(every.max(1)).collect()
+/// Whether the case at `index` of its set is in the sample: every `every`-th from the first, the
+/// same slice of a set every run.
+fn kept(index: usize, every: usize) -> bool {
+    index.is_multiple_of(every.max(1))
 }
 
 /// The cases a slug's set files gave.
@@ -1707,19 +2674,27 @@ fn read_fixtures(dir: &std::path::Path) -> Result<Cases, String> {
     let mut fixtures = Vec::new();
     let mut ids = Vec::new();
     for file in files {
-        let text = fs::read_to_string(&file)
-            .map_err(|e| format!("cannot read {}: {e}", file.display()))?;
-        let mut of_this_set = Vec::new();
-        for (number, line) in text.lines().enumerate() {
+        let step = step_for(&file, every);
+        let reader = BufReader::new(
+            fs::File::open(&file).map_err(|e| format!("cannot read {}: {e}", file.display()))?,
+        );
+        // The set is read a line at a time, every case parsed as before, and a case outside the
+        // sample dropped as it is read, so the run holds the sampled cases and one line of a
+        // set, however many models are in flight.
+        let mut index = 0;
+        for (number, line) in reader.lines().enumerate() {
+            let line = line.map_err(|e| format!("cannot read {}: {e}", file.display()))?;
             if line.trim().is_empty() {
                 continue;
             }
-            let fixture: Fixture = serde_json::from_str(line)
+            let fixture: Fixture = serde_json::from_str(&line)
                 .map_err(|e| format!("{}:{}: {e}", file.display(), number + 1))?;
-            of_this_set.push(fixture);
+            ids.push(fixture.id.clone());
+            if kept(index, step) {
+                fixtures.push(fixture);
+            }
+            index += 1;
         }
-        ids.extend(of_this_set.iter().map(|fixture| fixture.id.clone()));
-        fixtures.extend(sampled(of_this_set, step_for(&file, every)));
     }
     Ok(Cases { fixtures, ids })
 }
@@ -1759,12 +2734,128 @@ fn a_template_that_opens_the_thought_only_when_asked_closes_it_otherwise() {
         .all(|known| known.id != REASONING_PROBE.id));
 }
 
+/// Spins until `ready` holds, for at most ten seconds, so that a test waiting on another thread's
+/// progress fails with `never` rather than hangs.
+fn wait_until(ready: impl Fn() -> bool, never: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ready() {
+        assert!(Instant::now() < deadline, "{never}");
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn stdout_shows_the_first_differing_cases_and_counts_the_rest() {
+    let mut shown = Shown::default();
+    for i in 0..SHOWN + 3 {
+        shown.differs(&format!("  DIFFERS  m/parse/common-{i}\n"));
+    }
+    let text = shown.text();
+    assert_eq!(text.lines().count(), SHOWN + 1, "{text}");
+    assert!(
+        text.starts_with("  DIFFERS  m/parse/common-0\n")
+            && text
+                .ends_with("  ... and 3 more differing cases, every one in the per-case report\n"),
+        "{text}"
+    );
+    let mut few = Shown::default();
+    few.differs("  DIFFERS  m/parse/common-0\n");
+    assert_eq!(few.text(), "  DIFFERS  m/parse/common-0\n");
+    // The run's message lists the first failures the same way.
+    let failures: Vec<String> = (0..SHOWN + 2)
+        .map(|i| format!("m/parse/common-{i}: differs from the reference"))
+        .collect();
+    let report = std::path::Path::new("reports/parse.txt");
+    let listed = capped(&failures, report);
+    assert_eq!(listed.lines().count(), SHOWN + 1, "{listed}");
+    assert!(
+        listed.starts_with(&failures[0])
+            && listed.ends_with("\n... and 2 more, every one in reports/parse.txt"),
+        "{listed}"
+    );
+    assert_eq!(capped(&failures[..2], report), failures[..2].join("\n"));
+    // A verbose run's message is whole.
+    assert_eq!(message(&failures, true, report), failures.join("\n"));
+    assert_eq!(message(&failures, false, report), listed);
+}
+
+#[test]
+fn the_fan_out_hands_the_items_over_in_their_order_however_they_finish() {
+    // Item 0 waits until item 1 is done, so on two threads item 1 finishes first and items 2
+    // and 3 may follow it, all before item 0; `then` still sees them in the items' order.
+    let item_1_done = AtomicBool::new(false);
+    let items = [0, 1, 2, 3];
+    let mut handed = Vec::new();
+    in_order_on(
+        2,
+        &AtomicBool::new(false),
+        &items,
+        |&item| {
+            if item == 0 {
+                wait_until(
+                    || item_1_done.load(Ordering::Relaxed),
+                    "item 1 never finished",
+                );
+            }
+            if item == 1 {
+                item_1_done.store(true, Ordering::Relaxed);
+            }
+            item * 10
+        },
+        |outcome| handed.push(outcome),
+    );
+    assert_eq!(handed, [0, 10, 20, 30]);
+}
+
+#[test]
+fn a_panic_in_the_fan_out_leaves_the_other_threads_their_item_in_flight_and_no_more() {
+    // On two threads, item 0 panics once the other thread has an item in flight, and that item
+    // ends once the panic has raised the flag: the other thread finishes the one item it had,
+    // finds the flag up when it looks for the next, and takes none of the six left. Nothing
+    // here waits a length of time; the item in flight waits for the flag itself, however long
+    // the unwind takes on a loaded host.
+    let stop = AtomicBool::new(false);
+    let started = AtomicUsize::new(0);
+    let items: Vec<usize> = (0..8).collect();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        in_order_on(
+            2,
+            &stop,
+            &items,
+            |&item| {
+                if item == 0 {
+                    wait_until(
+                        || started.load(Ordering::Relaxed) >= 1,
+                        "the other thread never started an item",
+                    );
+                    panic!("item 0");
+                }
+                started.fetch_add(1, Ordering::Relaxed);
+                wait_until(
+                    || stop.load(Ordering::Relaxed),
+                    "item 0's panic never raised the flag",
+                );
+                item
+            },
+            |_| {},
+        );
+    }));
+    assert!(outcome.is_err(), "the panic reaches the caller");
+    assert!(stop.load(Ordering::Relaxed), "the panic raised the flag");
+    assert_eq!(
+        started.load(Ordering::Relaxed),
+        1,
+        "the other thread finishes the item it had in flight and takes no more"
+    );
+}
+
 #[test]
 fn a_sample_keeps_every_nth_case_of_a_set_from_its_first() {
-    assert_eq!(sampled((0..10).collect::<Vec<_>>(), 3), [0, 3, 6, 9]);
-    assert_eq!(sampled((0..4).collect::<Vec<_>>(), 1), [0, 1, 2, 3]);
-    assert_eq!(sampled((0..4).collect::<Vec<_>>(), 10), [0]);
-    assert!(sampled(Vec::<u8>::new(), 2).is_empty());
+    let sampled = |cases: usize, every| (0..cases).filter(|&i| kept(i, every)).collect::<Vec<_>>();
+    assert_eq!(sampled(10, 3), [0, 3, 6, 9]);
+    assert_eq!(sampled(4, 1), [0, 1, 2, 3]);
+    assert_eq!(sampled(4, 10), [0]);
+    assert!(sampled(0, 2).is_empty());
 }
 
 #[test]
@@ -1794,4 +2885,14 @@ fn the_common_set_is_replayed_whole_whatever_the_step() {
     let parse = std::path::Path::new("fixtures/qwen3-8b/parse");
     assert_eq!(step_for(&parse.join("common.jsonl"), 10), 1);
     assert_eq!(step_for(&parse.join("gsm8k-test-content.jsonl"), 10), 10);
+}
+
+#[test]
+fn every_skipped_slug_is_in_the_table() {
+    for (slug, _) in SKIPPED {
+        assert!(
+            MODELS.iter().any(|(listed, _, _)| listed == slug),
+            "{slug} is skipped but not in MODELS"
+        );
+    }
 }

@@ -13,9 +13,11 @@
 //! The scheduler joins SMG's transport through the SGLang plugin that ships
 //! in `smg_grpc_servicer.sglang` (no SGLang change): it dials the handshake,
 //! decodes `[type_byte, payload]` requests (`ADD = 0x00`, `ABORT = 0x01`, the
-//! abort payload a plain msgpack `list[str]` of request ids) and answers with
-//! that plugin's [`output::BatchTokenIDSlimOutput`]: the token columns a
-//! frontend that detokenizes itself needs, plus a scheduler-load tail.
+//! abort payload a plain msgpack `list[str]` of request ids; an ADD may carry
+//! one more frame, the request's metadata map, see [`request::RequestMeta`])
+//! and answers with that plugin's [`output::BatchTokenIDSlimOutput`]: the
+//! token columns a frontend that detokenizes itself needs, plus a
+//! scheduler-load tail.
 //!
 //! The positional-array helpers (`next_field`, `expect_tag`, `drain_trailing`)
 //! are shared with the TokenSpeed dialect, whose structs follow the same
@@ -33,7 +35,7 @@ use crate::{
     protocol::{
         sglang::{
             output::{SglangOutput, SglangWireOutput},
-            request::{SglangRequest, SglangRequestType},
+            request::{RequestMeta, SglangRequest, SglangRequestType},
         },
         EngineBatch, EngineLoad, EngineProtocol, UtilityReply,
     },
@@ -56,6 +58,33 @@ impl EngineProtocol for SglangProtocol {
         SglangRequestType::Abort.to_frame()
     }
 
+    fn prompt_tokens(request: &Self::Request) -> u64 {
+        match request {
+            SglangRequest::Generate(request) => request.input_ids.len() as u64,
+            SglangRequest::Embed(request) => request.input_ids.len() as u64,
+        }
+    }
+
+    fn reported_every_step(request: &Self::Request) -> bool {
+        match request {
+            // The scheduler's `stream_output_generation` sends a request
+            // that does not stream every `DEFAULT_FORCE_STREAM_INTERVAL`
+            // (50) decoded tokens and at its end, and a streaming one every
+            // `stream_interval` tokens: the request's own, else the server's
+            // `--stream-interval` (1 unless raised). Only a streaming request
+            // at an interval of one is reported every step.
+            SglangRequest::Generate(request) => {
+                request.stream
+                    && request
+                        .sampling_params
+                        .stream_interval
+                        .is_none_or(|interval| interval <= 1)
+            }
+            // One forward, one output: nothing to report in between.
+            SglangRequest::Embed(_) => true,
+        }
+    }
+
     fn request_id(request: &Self::Request) -> &str {
         request.rid()
     }
@@ -72,7 +101,18 @@ impl EngineProtocol for SglangProtocol {
     }
 
     fn encode_add(request: &Self::Request) -> Result<(Vec<u8>, Vec<Bytes>)> {
-        Ok((encode_msgpack(request)?, Vec::new()))
+        let payload = encode_msgpack(request)?;
+        // The request's metadata (the caller's trace context) rides as one
+        // more frame: the positional array is the scheduler's own struct.
+        let meta = match request {
+            SglangRequest::Generate(request) => RequestMeta::for_request(request),
+            SglangRequest::Embed(_) => None,
+        };
+        let aux_frames = match meta {
+            Some(meta) => vec![Bytes::from(encode_msgpack(&meta)?)],
+            None => Vec::new(),
+        };
+        Ok((payload, aux_frames))
     }
 
     fn encode_abort(request_id: &str) -> Result<Vec<u8>> {
@@ -197,6 +237,51 @@ mod tests {
             finished_status: vec![None, None],
             ..Default::default()
         }
+    }
+
+    /// Which requests the engine reports every step, for the silence count:
+    /// a streaming generation at an interval of one (the request's own, or
+    /// the server's default when unset) and an embedding; a generation that
+    /// does not stream, or streams every so many tokens, is reported at
+    /// intervals. Every prompt counts as pending prefill.
+    #[test]
+    fn a_streaming_generation_at_interval_one_or_an_embedding_is_reported_every_step() {
+        use crate::protocol::sglang::{
+            request::{TokenizedEmbeddingReqInput, TokenizedGenerateReqInput},
+            sampling::SamplingParams,
+        };
+        let generate = |stream: bool, stream_interval: Option<u32>| {
+            SglangRequest::Generate(TokenizedGenerateReqInput {
+                input_ids: vec![1, 2, 3],
+                stream,
+                sampling_params: SamplingParams {
+                    stream_interval,
+                    ..SamplingParams::default()
+                },
+                ..TokenizedGenerateReqInput::default()
+            })
+        };
+        assert!(SglangProtocol::reported_every_step(&generate(true, None)));
+        assert!(SglangProtocol::reported_every_step(&generate(
+            true,
+            Some(1)
+        )));
+        assert!(!SglangProtocol::reported_every_step(&generate(
+            true,
+            Some(8)
+        )));
+        assert!(!SglangProtocol::reported_every_step(&generate(false, None)));
+        assert!(!SglangProtocol::reported_every_step(&generate(
+            false,
+            Some(1)
+        )));
+        let embed = SglangRequest::Embed(TokenizedEmbeddingReqInput {
+            input_ids: vec![1, 2],
+            ..TokenizedEmbeddingReqInput::default()
+        });
+        assert!(SglangProtocol::reported_every_step(&embed));
+        assert_eq!(SglangProtocol::prompt_tokens(&generate(false, None)), 3);
+        assert_eq!(SglangProtocol::prompt_tokens(&embed), 2);
     }
 
     #[test]

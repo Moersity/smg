@@ -15,9 +15,8 @@ use openai_protocol::{
         ResponseInputOutputItem, ResponseOutputItem, ResponseUsage, ResponsesRequest,
     },
 };
-use smg_data_connector::{
-    self as data_connector, ConversationId, ResponseId, ResponseStorageError,
-};
+use serde_json::Value;
+use smg_data_connector::{self as data_connector, ConversationId, ResponseStorage};
 use smg_mcp::McpToolSession;
 use tracing::{debug, warn};
 
@@ -29,7 +28,9 @@ use crate::{
             persistence_utils::split_stored_message_content,
         },
         error,
-        grpc::common::responses::{utils::resolve_function_identity, ResponsesContext},
+        grpc::common::responses::{
+            previous_response_chain, utils::resolve_function_identity, ResponsesContext,
+        },
     },
 };
 
@@ -75,21 +76,19 @@ impl ToolLoopState {
         let Some(usage) = usage else {
             return;
         };
-        let total = self.usage.get_or_insert(ResponseUsage {
+        let total = self.usage.get_or_insert_with(|| ResponseUsage {
             input_tokens: 0,
             output_tokens: 0,
             total_tokens: 0,
-            input_tokens_details: None,
-            output_tokens_details: None,
+            input_tokens_details: InputTokensDetails::default(),
+            output_tokens_details: OutputTokensDetails::default(),
         });
         total.input_tokens = total.input_tokens.saturating_add(usage.prompt_tokens);
         total.output_tokens = total.output_tokens.saturating_add(usage.completion_tokens);
         total.total_tokens = total.total_tokens.saturating_add(usage.total_tokens);
         if let Some(details) = &usage.prompt_tokens_details {
-            let accumulated = total
+            total.input_tokens_details.cached_tokens = total
                 .input_tokens_details
-                .get_or_insert(InputTokensDetails { cached_tokens: 0 });
-            accumulated.cached_tokens = accumulated
                 .cached_tokens
                 .saturating_add(details.cached_tokens);
         }
@@ -98,12 +97,10 @@ impl ToolLoopState {
             .as_ref()
             .and_then(|details| details.reasoning_tokens)
         {
-            let accumulated = total
+            total.output_tokens_details.reasoning_tokens = total
                 .output_tokens_details
-                .get_or_insert(OutputTokensDetails {
-                    reasoning_tokens: 0,
-                });
-            accumulated.reasoning_tokens = accumulated.reasoning_tokens.saturating_add(tokens);
+                .reasoning_tokens
+                .saturating_add(tokens);
         }
     }
 
@@ -224,7 +221,7 @@ pub(super) fn has_unfinished_mcp_call(
 ) -> bool {
     calls.iter().any(|call| {
         session.has_exposed_tool(&call.name)
-            && serde_json::from_str::<serde_json::Value>(&call.arguments).is_err()
+            && serde_json::from_str::<Value>(&call.arguments).is_err()
     })
 }
 
@@ -265,77 +262,59 @@ pub(super) fn convert_mcp_tools_to_chat_tools(session: &McpToolSession<'_>) -> V
 // Conversation History Loading
 // ============================================================================
 
-/// Load conversation history and response chains, returning modified request
+/// Load conversation history and response chains, returning modified request.
+///
+/// `tenant` is the caller's tenant: a previous response or a conversation of
+/// another tenant answers as a missing one does.
 pub(super) async fn load_conversation_history(
     ctx: &ResponsesContext,
     request: &ResponsesRequest,
+    tenant: Option<&str>,
 ) -> Result<ResponsesRequest, Response> {
     let mut modified_request = request.clone();
     let mut conversation_items: Option<Vec<ResponseInputOutputItem>> = None;
 
     // Handle previous_response_id by loading response chain
     if let Some(ref prev_id_str) = modified_request.previous_response_id {
-        let prev_id = ResponseId::from(prev_id_str.as_str());
-        match ctx
-            .response_storage
-            .get_response_chain(&prev_id, None)
-            .await
-        {
-            Ok(chain) if !chain.responses.is_empty() => {
-                let mut items = Vec::new();
-                for stored in &chain.responses {
-                    // Convert input items from stored input (which is now a JSON array)
-                    if let Some(input_arr) = stored.input.as_array() {
-                        for item in input_arr {
-                            match serde_json::from_value::<ResponseInputOutputItem>(item.clone()) {
-                                Ok(input_item) => {
-                                    items.push(input_item);
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "Failed to deserialize stored input item: {}. Item: {}",
-                                        e, item
-                                    );
-                                }
-                            }
+        let responses = previous_response_chain(&ctx.response_storage, prev_id_str, tenant).await?;
+        let mut items = Vec::new();
+        for stored in &responses {
+            // Convert input items from stored input (which is now a JSON array)
+            if let Some(input_arr) = stored.input.as_array() {
+                for item in input_arr {
+                    match serde_json::from_value::<ResponseInputOutputItem>(item.clone()) {
+                        Ok(input_item) => {
+                            items.push(input_item);
                         }
-                    }
-
-                    // Convert output items from stored raw_response["output"] (which is a JSON array)
-                    if let Some(output_arr) =
-                        stored.raw_response.get("output").and_then(|v| v.as_array())
-                    {
-                        for item in output_arr {
-                            match serde_json::from_value::<ResponseInputOutputItem>(item.clone()) {
-                                Ok(output_item) => {
-                                    items.push(output_item);
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "Failed to deserialize stored output item: {}. Item: {}",
-                                        e, item
-                                    );
-                                }
-                            }
+                        Err(e) => {
+                            warn!(
+                                "Failed to deserialize stored input item: {}. Item: {}",
+                                e, item
+                            );
                         }
                     }
                 }
-                conversation_items = Some(items);
-                modified_request.previous_response_id = None;
             }
-            Ok(_) | Err(ResponseStorageError::ResponseNotFound(_)) => {
-                return Err(error::bad_request(
-                    "previous_response_not_found",
-                    format!("Previous response with id '{prev_id_str}' not found."),
-                ));
-            }
-            Err(e) => {
-                return Err(error::internal_error(
-                    "load_previous_response_chain_failed",
-                    format!("Failed to load previous response chain for {prev_id_str}: {e}"),
-                ));
+
+            // Convert output items from stored raw_response["output"] (which is a JSON array)
+            if let Some(output_arr) = stored.raw_response.get("output").and_then(|v| v.as_array()) {
+                for item in output_arr {
+                    match serde_json::from_value::<ResponseInputOutputItem>(item.clone()) {
+                        Ok(output_item) => {
+                            items.push(output_item);
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to deserialize stored output item: {}. Item: {}",
+                                e, item
+                            );
+                        }
+                    }
+                }
             }
         }
+        conversation_items = Some(items);
+        modified_request.previous_response_id = None;
     }
 
     // Handle conversation by loading conversation history
@@ -349,13 +328,15 @@ pub(super) async fn load_conversation_history(
             .get_conversation(&conv_id)
             .await
             .map_err(|e| {
-                error::internal_error(
+                error::storage_failure(
                     "check_conversation_failed",
-                    format!("Failed to check conversation: {e}"),
+                    "Failed to check conversation",
+                    &e,
                 )
             })?;
 
-        if conversation.is_none() {
+        // A conversation of another tenant answers as a missing one.
+        if !conversation.is_some_and(|conversation| conversation.is_visible_to(tenant)) {
             return Err(error::not_found(
                 "conversation_not_found",
                 format!(
@@ -423,7 +404,15 @@ pub(super) async fn load_conversation_history(
                 modified_request.input = ResponseInput::Items(items);
             }
             Err(e) => {
-                warn!("Failed to load conversation history: {}", e);
+                // A listing the store did not answer (or refused) is not an
+                // answer without the conversation's context: the client reads
+                // a 503 for a timed-out store and a 500 for any other failure,
+                // as every other store-dependent answer of this path does.
+                return Err(error::storage_failure(
+                    "load_conversation_history_failed",
+                    "Failed to load conversation history",
+                    &e,
+                ));
             }
         }
     }
@@ -456,6 +445,21 @@ pub(super) async fn load_conversation_history(
         modified_request.input = ResponseInput::Items(items);
     }
 
+    // Resolve `item_reference` input items against what this request already
+    // loaded (the previous_response_id chain, the conversation history) and,
+    // failing that, the response store.
+    if let ResponseInput::Items(items) = &modified_request.input {
+        if items
+            .iter()
+            .any(|item| matches!(item, ResponseInputOutputItem::ItemReference { .. }))
+        {
+            let resolved =
+                resolve_item_references(ctx.response_storage.as_ref(), items.clone(), tenant)
+                    .await?;
+            modified_request.input = ResponseInput::Items(resolved);
+        }
+    }
+
     debug!(
         has_previous_response = request.previous_response_id.is_some(),
         has_conversation = request.conversation.is_some(),
@@ -463,6 +467,114 @@ pub(super) async fn load_conversation_history(
     );
 
     Ok(modified_request)
+}
+
+/// Replace every `item_reference` input item by the item it points to: an item
+/// already in the list (loaded from the previous_response_id chain or the
+/// conversation history) or an output item of a stored response the caller's
+/// `tenant` may see. An unknown id answers 404, as the public API does, and
+/// so does an item of another tenant's response.
+pub(super) async fn resolve_item_references(
+    storage: &dyn ResponseStorage,
+    items: Vec<ResponseInputOutputItem>,
+    tenant: Option<&str>,
+) -> Result<Vec<ResponseInputOutputItem>, Response> {
+    let mut resolved: Vec<ResponseInputOutputItem> = Vec::with_capacity(items.len());
+    for item in items {
+        let ResponseInputOutputItem::ItemReference { id, .. } = &item else {
+            resolved.push(item);
+            continue;
+        };
+        if let Some(found) = resolved
+            .iter()
+            .find(|candidate| input_item_id(candidate) == Some(id.as_str()))
+            .cloned()
+        {
+            resolved.push(found);
+            continue;
+        }
+        let stored = storage
+            .find_response_by_output_item(id)
+            .await
+            .map_err(|e| {
+                error::storage_failure(
+                    "resolve_item_reference_failed",
+                    format!("Failed to resolve item '{id}'"),
+                    &e,
+                )
+            })?
+            // The items of a response its client asked not to store are not
+            // stored items (its record is kept for its polling window only),
+            // and a response of another tenant has none the caller may see.
+            .filter(|response| {
+                !data_connector::is_unstored(response) && response.is_visible_to(tenant)
+            });
+        let candidate = stored
+            .as_ref()
+            .and_then(|response| response.raw_response.get("output"))
+            .and_then(Value::as_array)
+            .and_then(|output| {
+                output
+                    .iter()
+                    .find(|candidate| candidate.get("id").and_then(Value::as_str) == Some(id))
+            });
+        let Some(candidate) = candidate else {
+            return Err(error::not_found(
+                "item_not_found",
+                format!("Item with id '{id}' not found."),
+            ));
+        };
+        // a stored item that has no input form (a built-in tool call, an older
+        // schema) exists but cannot be re-injected: say so, not "not found"
+        match serde_json::from_value::<ResponseInputOutputItem>(candidate.clone()) {
+            Ok(found) => resolved.push(found),
+            Err(e) => {
+                let item_type = candidate
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                warn!(
+                    "item_reference '{id}' (type '{item_type}') names a stored output item that cannot be used as input: {e}"
+                );
+                return Err(error::bad_request(
+                    "item_not_usable_as_input",
+                    format!("Item '{id}' of type '{item_type}' cannot be used as an input item."),
+                ));
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+/// The id an input item carries, for `item_reference` resolution. Every
+/// variant is named, so a new one has to say whether it carries an id.
+fn input_item_id(item: &ResponseInputOutputItem) -> Option<&str> {
+    match item {
+        ResponseInputOutputItem::Message { id, .. }
+        | ResponseInputOutputItem::Reasoning { id, .. }
+        | ResponseInputOutputItem::McpApprovalRequest { id, .. }
+        | ResponseInputOutputItem::ImageGenerationCall { id, .. }
+        | ResponseInputOutputItem::ComputerCall { id, .. }
+        | ResponseInputOutputItem::LocalShellCall { id, .. }
+        | ResponseInputOutputItem::LocalShellCallOutput { id, .. }
+        | ResponseInputOutputItem::McpCall { id, .. }
+        | ResponseInputOutputItem::McpListTools { id, .. } => Some(id.as_str()),
+        ResponseInputOutputItem::FunctionToolCall { id, .. }
+        | ResponseInputOutputItem::FunctionCallOutput { id, .. }
+        | ResponseInputOutputItem::McpApprovalResponse { id, .. }
+        | ResponseInputOutputItem::Compaction { id, .. }
+        | ResponseInputOutputItem::ComputerCallOutput { id, .. }
+        | ResponseInputOutputItem::CustomToolCall { id, .. }
+        | ResponseInputOutputItem::CustomToolCallOutput { id, .. }
+        | ResponseInputOutputItem::ShellCall { id, .. }
+        | ResponseInputOutputItem::ShellCallOutput { id, .. }
+        | ResponseInputOutputItem::ApplyPatchCall { id, .. }
+        | ResponseInputOutputItem::ApplyPatchCallOutput { id, .. } => id.as_deref(),
+        // a reference is what gets resolved, never a resolution; a bare input
+        // message carries no id
+        ResponseInputOutputItem::ItemReference { .. }
+        | ResponseInputOutputItem::SimpleInputMessage { .. } => None,
+    }
 }
 
 /// Build next request with updated conversation history
@@ -504,6 +616,7 @@ pub(super) fn build_next_request(
         user: current_request.user,
         metadata: current_request.metadata,
         include: current_request.include,
+        background: current_request.background,
         reasoning: current_request.reasoning,
         service_tier: current_request.service_tier,
         top_logprobs: current_request.top_logprobs,
@@ -591,5 +704,161 @@ mod usage_tests {
                 "output_tokens_details":{"reasoning_tokens":3},
             })
         );
+    }
+
+    fn stored_response_with_message(item_id: &str, text: &str) -> data_connector::StoredResponse {
+        let mut stored = data_connector::StoredResponse::new(None);
+        stored.raw_response = json!({
+            "id": "resp_stored",
+            "output": [{
+                "type": "message", "id": item_id, "role": "assistant", "status": "completed",
+                "content": [{"type": "output_text", "text": text, "annotations": []}]
+            }]
+        });
+        stored
+    }
+
+    fn reference(id: &str) -> ResponseInputOutputItem {
+        serde_json::from_value(json!({"type": "item_reference", "id": id})).unwrap()
+    }
+
+    #[tokio::test]
+    async fn item_reference_resolves_a_stored_output_item() {
+        let storage = data_connector::MemoryResponseStorage::new();
+        storage
+            .store_response(stored_response_with_message("msg_stored", "earlier answer"))
+            .await
+            .unwrap();
+        let user = responses::normalize_input_item(
+            &serde_json::from_value(json!({"role": "user", "content": "continue"})).unwrap(),
+        );
+
+        let resolved = resolve_item_references(&storage, vec![reference("msg_stored"), user], None)
+            .await
+            .expect("a stored output item resolves");
+
+        assert_eq!(resolved.len(), 2);
+        match &resolved[0] {
+            ResponseInputOutputItem::Message {
+                id, role, content, ..
+            } => {
+                assert_eq!(id, "msg_stored");
+                assert_eq!(role, "assistant");
+                assert!(matches!(
+                    &content[0],
+                    ResponseContentPart::OutputText { text, .. } if text == "earlier answer"
+                ));
+            }
+            other => panic!("expected the stored message, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_item_reference_to_an_unstored_response_is_not_found() {
+        let storage = data_connector::MemoryResponseStorage::new();
+        let mut unstored = stored_response_with_message("msg_unstored", "a background answer");
+        unstored.raw_response["store"] = json!(false);
+        storage.store_response(unstored).await.unwrap();
+
+        let refused = resolve_item_references(&storage, vec![reference("msg_unstored")], None)
+            .await
+            .expect_err("an unstored response's item is no stored item");
+
+        assert_eq!(refused.status(), http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn item_reference_prefers_an_item_already_loaded() {
+        let storage = data_connector::MemoryResponseStorage::new();
+        let loaded = ResponseInputOutputItem::Message {
+            id: "msg_loaded".to_string(),
+            role: "assistant".to_string(),
+            content: vec![ResponseContentPart::OutputText {
+                text: "from the chain".to_string(),
+                annotations: vec![],
+                logprobs: None,
+            }],
+            status: Some("completed".to_string()),
+            phase: None,
+        };
+
+        let resolved =
+            resolve_item_references(&storage, vec![loaded, reference("msg_loaded")], None)
+                .await
+                .expect("an item already in the list resolves without storage");
+
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(input_item_id(&resolved[1]), Some("msg_loaded"));
+        assert!(!matches!(
+            resolved[1],
+            ResponseInputOutputItem::ItemReference { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn item_reference_to_a_stored_item_with_no_input_form_is_400() {
+        let storage = data_connector::MemoryResponseStorage::new();
+        let mut stored = data_connector::StoredResponse::new(None);
+        stored.raw_response = json!({
+            "id": "resp_stored",
+            "output": [{"type": "web_search_call", "id": "ws_1", "status": "completed"}]
+        });
+        storage.store_response(stored).await.unwrap();
+
+        let response = resolve_item_references(&storage, vec![reference("ws_1")], None)
+            .await
+            .expect_err("a stored item without an input form is refused");
+
+        assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn item_reference_finds_a_loaded_custom_tool_call_by_its_id() {
+        let storage = data_connector::MemoryResponseStorage::new();
+        let loaded: ResponseInputOutputItem = serde_json::from_value(json!({
+            "type": "custom_tool_call", "id": "ctc_1", "call_id": "call_1",
+            "name": "lookup", "input": "weather"
+        }))
+        .unwrap();
+
+        let resolved = resolve_item_references(&storage, vec![loaded, reference("ctc_1")], None)
+            .await
+            .expect("an item already in the list resolves without storage");
+
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(input_item_id(&resolved[1]), Some("ctc_1"));
+    }
+
+    /// An output item of another tenant's response is as unknown as a missing
+    /// one; the owner's reference resolves.
+    #[tokio::test]
+    async fn item_reference_to_another_tenants_output_item_is_404() {
+        let storage = data_connector::MemoryResponseStorage::new();
+        let mut stored = stored_response_with_message("msg_a", "a's answer");
+        stored.tenant = Some("header:tenant-a".to_string());
+        storage.store_response(stored).await.unwrap();
+
+        for caller in [Some("header:tenant-b"), None] {
+            let response = resolve_item_references(&storage, vec![reference("msg_a")], caller)
+                .await
+                .expect_err("another tenant's item is refused");
+            assert_eq!(response.status(), http::StatusCode::NOT_FOUND, "{caller:?}");
+        }
+        let resolved =
+            resolve_item_references(&storage, vec![reference("msg_a")], Some("header:tenant-a"))
+                .await
+                .expect("the owner's reference resolves");
+        assert_eq!(input_item_id(&resolved[0]), Some("msg_a"));
+    }
+
+    #[tokio::test]
+    async fn item_reference_to_an_unknown_id_is_404() {
+        let storage = data_connector::MemoryResponseStorage::new();
+
+        let response = resolve_item_references(&storage, vec![reference("msg_missing")], None)
+            .await
+            .expect_err("an unknown item is refused");
+
+        assert_eq!(response.status(), http::StatusCode::NOT_FOUND);
     }
 }

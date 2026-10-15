@@ -29,7 +29,7 @@ use super::{
     SchedulerError, SchedulerGuardBody, HEADER_X_SMG_PREEMPTED, PRIORITY_HEADER,
 };
 use crate::{
-    middleware::RouteRequestMeta,
+    middleware::{tenant_resolution::restamp_accepted_at, RouteRequestMeta},
     observability::metrics::{metrics_labels, Metrics},
     tenant::TenantKey,
 };
@@ -112,12 +112,13 @@ pub async fn priority_admission_middleware(
         sched_metrics::record_clamp(resolved.requested, class, tenant.as_str());
     }
 
-    // RPS sibling check (only set when an explicit per-second limit is
-    // configured). Checked before admission so a rejected request never
-    // consumes a slot. Tokens are not returned — refill is time-based.
-    // Tracked by smg_http_rate_limit_total, so not double-counted here.
+    // Per-second check (only set when an explicit rate is configured),
+    // run before admission so a rejected request never consumes a slot.
+    // `try_take` spends rate budget without a concurrency slot: the
+    // scheduler owns concurrency. Tracked by smg_http_rate_limit_total, so
+    // not double-counted here.
     if let Some(bucket) = &state.rate_limiter {
-        if bucket.try_acquire(1.0).is_err() {
+        if bucket.try_take(1.0).is_err() {
             Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
             return SchedulerError::QueueFull.into_response();
         }
@@ -128,14 +129,19 @@ pub async fn priority_admission_middleware(
     // NOTE: client-disconnect detection during the queue wait is not yet
     // wired (axum does not surface it to a middleware pre-`next.run`), so we
     // pass a fresh token; queued waits are bounded by `queue_timeout`. A
-    // real disconnect drops the response future (and the SchedulerGuardBody)
-    // once admitted, releasing the slot.
+    // real disconnect drops the response future: while queued, the scheduler
+    // records that exit as `client_cancelled` and reaps the waiter; once
+    // admitted, the SchedulerGuardBody is dropped with it, releasing the
+    // slot.
     let cancel = CancellationToken::new();
 
     match state.scheduler.admit(class, request_id, cancel).await {
         AdmitOutcome::Admitted(permit) => {
             // Hand the handler the cancel token (for preemption select!).
             req.extensions_mut().insert(permit.cancel_token());
+            // The class's queue wait was the scheduler's, bounded by its own
+            // timeout; the bound ahead of worker selection counts from here.
+            restamp_accepted_at(req.extensions_mut());
             let response = next.run(req).await;
             // Best-effort: the handler's PreemptionGuard tags a *pre-response*
             // preemption (a 503 carrying this header), which we count as

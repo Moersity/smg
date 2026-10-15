@@ -36,6 +36,8 @@ pub struct Prefix {
     at: usize,
     /// Where the bytes stopped being a prefix, once they did.
     invalid: Option<usize>,
+    /// Where the top-level value ended, once something ended it.
+    ended: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,6 +127,7 @@ impl Default for Prefix {
             token: Token::None,
             at: 0,
             invalid: None,
+            ended: None,
         }
     }
 }
@@ -144,11 +147,38 @@ impl Prefix {
             }
             let at = self.at + offset;
             self.step(at, c);
+            if self.ended.is_none() && self.expect == Expect::End {
+                // The character closed the value, or came after a number or a word that it ended
+                // and was refused, as nothing may follow the value.
+                self.ended = Some(if self.invalid == Some(at) {
+                    at
+                } else {
+                    at + c.len_utf8()
+                });
+            }
         }
         if self.invalid.is_none() {
             self.at += bytes.len();
         }
         self.invalid
+    }
+
+    /// Where the top-level value ended, once something ended it: just past its closing quote or
+    /// bracket, or before the character that ended a number or a word. Whether the bytes up to
+    /// there are whole JSON is the caller's to say: this judge also ends a value it tolerates
+    /// unfinished, such as an array a brace cut short (`[1}`) or a literal's prefix (`nu`).
+    pub fn ended(&self) -> Option<usize> {
+        self.ended
+    }
+
+    /// Where the word under way starts, while one is: a literal being spelled (`nu`), which is a
+    /// prefix of `null` so far, and which the judge refuses from its first letter if it turns out
+    /// to be no literal.
+    pub fn word_start(&self) -> Option<usize> {
+        match self.token {
+            Token::Lit { start, .. } if self.invalid.is_none() => Some(start),
+            _ => None,
+        }
     }
 
     /// One character, at byte offset `at` of the whole text.

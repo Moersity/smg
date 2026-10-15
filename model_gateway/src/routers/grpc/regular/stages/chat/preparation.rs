@@ -8,20 +8,36 @@ use openai_protocol::{
 };
 use tracing::{debug, error};
 
-use crate::routers::{
-    error,
-    grpc::{
-        common::stages::PipelineStage,
-        context::{PreparationOutput, RequestContext},
-        multimodal, utils, ProcessedMessages,
+use crate::{
+    config::ParserChoice,
+    routers::{
+        error,
+        grpc::{
+            common::stages::PipelineStage,
+            context::{PreparationOutput, RequestContext},
+            multimodal,
+            regular::symphony,
+            utils, ProcessedMessages,
+        },
     },
+    worker::RoutingPool,
 };
 
 /// Chat preparation stage
 ///
 /// Extracts chat-specific preparation logic from the old unified PreparationStage.
 /// This is a direct extraction without architectural changes.
-pub(crate) struct ChatPreparationStage;
+pub(crate) struct ChatPreparationStage {
+    /// The pools whose workers this pipeline's requests can reach (the
+    /// mode's legs): the multimodal wire dtype is resolved over them.
+    wire_pools: &'static [RoutingPool],
+}
+
+impl ChatPreparationStage {
+    pub(crate) fn new(wire_pools: &'static [RoutingPool]) -> Self {
+        Self { wire_pools }
+    }
+}
 
 #[async_trait]
 impl PipelineStage for ChatPreparationStage {
@@ -42,8 +58,15 @@ impl ChatPreparationStage {
         ctx: &mut RequestContext,
         request: &ChatCompletionRequest,
     ) -> Result<(), Response> {
+        // Which parser reads this response: the request's X-SMG-Parser header
+        // when it carries one, else the gateway's --parser flag (see
+        // `regular::symphony`). Decided once here; the constraint below and
+        // request building read the same choice.
+        let parser = symphony::choice(ctx.components.parser, ctx.input.headers.as_ref())
+            .map_err(|why| error::bad_request("invalid_parser_header", why))?;
+        ctx.state.parser = Some(parser);
         let (token_ids, processed_messages, tool_constraints) =
-            prepare_chat_like(ctx, request).await?;
+            prepare_chat_like(ctx, request, self.wire_pools).await?;
         ctx.state.preparation = Some(PreparationOutput::Chat {
             token_ids,
             processed_messages,
@@ -64,6 +87,7 @@ impl ChatPreparationStage {
 pub(crate) async fn prepare_chat_like(
     ctx: &mut RequestContext,
     request: &ChatCompletionRequest,
+    wire_pools: &'static [RoutingPool],
 ) -> Result<(Vec<u32>, ProcessedMessages, Option<(String, String)>), Response> {
     utils::validate_chat_content_parts(&request.messages)
         .map_err(|e| error::bad_request("unsupported_content_part", e))?;
@@ -72,8 +96,11 @@ pub(crate) async fn prepare_chat_like(
         let tokenizer =
             utils::resolve_tokenizer(ctx, "ChatPreparationStage::prepare_chat").map_err(|e| *e)?;
 
-        // Step 1: Filter tools if needed
-        let body_ref = utils::filter_chat_request_by_tool_choice(request);
+        // Step 1: the request whose tools the template renders (every tool
+        // for a named tool_choice; the constraint built below forces the call;
+        // under `none` the tools stay only for a renderer that declares them
+        // itself)
+        let body_ref = utils::request_as_rendered(request, tokenizer.renderer_capabilities());
 
         // Resolve media-part ordering from the model registry so it stays owned
         // by the per-model spec. Falls back to vLLM-compatible media-first when
@@ -101,6 +128,15 @@ pub(crate) async fn prepare_chat_like(
         // Normalize media once. The same plan drives placeholder resolution,
         // rendering, fetching, preprocessing, and final count validation.
         let media_plan = multimodal::media_plan_chat(&request.messages);
+        // A pool whose every worker runs without a vision encoder takes no
+        // images or video: the engine admits such a request and never
+        // schedules it. Refuse it here, before any byte of media is decoded
+        // or sent.
+        multimodal::ensure_model_accepts_media(
+            &ctx.components.worker_registry,
+            model_id,
+            &media_plan,
+        )?;
         let (placeholder_tokens, mm_context) = if media_plan.is_empty() {
             (None, None)
         } else if let Some(mm_components) = ctx.components.multimodal.as_ref() {
@@ -120,6 +156,10 @@ pub(crate) async fn prepare_chat_like(
                 }
             };
 
+            // The per-request media limits the model's workers advertise for
+            // their engine, which the plan is held to before any fetch.
+            let engine_limits =
+                multimodal::engine_item_limits(&ctx.components.worker_registry, model_id);
             let placeholders = multimodal::prepare_placeholder_tokens(
                 &media_plan,
                 model_id,
@@ -127,6 +167,14 @@ pub(crate) async fn prepare_chat_like(
                 mm_components,
                 &tokenizer_id,
                 &tokenizer_source,
+                &engine_limits,
+                |format| {
+                    multimodal::fleet_reads_format(
+                        &ctx.components.worker_registry,
+                        model_id,
+                        format,
+                    )
+                },
             )
             .await
             .map_err(|e| {
@@ -243,6 +291,24 @@ pub(crate) async fn prepare_chat_like(
                 );
                 multimodal_refs = Some(media_plan);
             } else {
+                // The dtype every worker the selection can pick reads image
+                // pixels in, when they agree and the one-pass write is opted
+                // in (`ONE_PASS_WIRE_ENV`): the preprocessor then writes it
+                // directly; otherwise `None`, and the write happens at
+                // assembly. Resolved over the pools of this pipeline's mode,
+                // the legs the pixels can reach, as the selection draws them.
+                let image_wire_dtype = multimodal::mm_shared_image_wire_dtype_over(
+                    &ctx.components.worker_registry,
+                    model_id,
+                    wire_pools,
+                );
+                // The frames decode under the destination engine's own
+                // transparency rule, resolved over the same legs as the dtype.
+                let transparency = multimodal::engine_transparency_policy(
+                    &ctx.components.worker_registry,
+                    model_id,
+                    wire_pools,
+                );
                 match multimodal::process_multimodal_plan(
                     media_plan,
                     model_id,
@@ -251,6 +317,8 @@ pub(crate) async fn prepare_chat_like(
                     mm_components,
                     &tokenizer_id,
                     &tokenizer_source,
+                    image_wire_dtype,
+                    transparency,
                 )
                 .await
                 {
@@ -264,15 +332,13 @@ pub(crate) async fn prepare_chat_like(
                         multimodal_intermediate = Some(output.intermediate);
                     }
                     Err(e) => {
+                        let message = multimodal::processing_failed_message(&e);
                         error!(
                             function = "ChatPreparationStage::execute",
-                            error = %e,
+                            error = %message,
                             "Multimodal processing failed"
                         );
-                        return Err(error::bad_request(
-                            "multimodal_processing_failed",
-                            format!("Multimodal processing failed: {e}"),
-                        ));
+                        return Err(error::bad_request("multimodal_processing_failed", message));
                     }
                 }
             }
@@ -287,18 +353,36 @@ pub(crate) async fn prepare_chat_like(
         // the choice lets the model call, dynamic tools declared on messages
         // included (see `ChatCompletionRequest::callable_tools`).
         let constraint_tools = request.callable_tools();
-        let tool_call_constraint = if let (false, Some(tool_choice)) =
-            (constraint_tools.is_empty(), request.tool_choice.as_ref())
-        {
-            let reasoning = utils::chat_reasoning_starts_in_prefill(request, tokenizer.as_ref());
-            ctx.components
+        let reasoning = utils::chat_reasoning_starts_in_rendered_prefill(
+            request,
+            processed_messages.continued_final_message,
+            tokenizer.as_ref(),
+        );
+        // When Symphony reads the response, its table gives a forced call, or a
+        // JSON response_format, its tag, so the output comes back in the syntax
+        // the table parses (see `regular::symphony`, which decides both with one
+        // predicate); the older registry decides for every other request. Only
+        // the chat stage chooses a parser: transcription, which shares this
+        // preparation, keeps the legacy parsers.
+        let parser: ParserChoice = ctx.state.parser.unwrap_or_default();
+        let names = ctx.components.parser_resolver.names(&request.model);
+        let symphony_constraint = symphony::constraint(
+            parser,
+            &names,
+            request,
+            &constraint_tools,
+            reasoning,
+            &ctx.components.templates,
+        )
+        .map_err(|why| error::bad_request("invalid_parser_configuration", why))?;
+        let tool_call_constraint = match (symphony_constraint, request.tool_choice.as_ref()) {
+            (Some(constraint), _) => Some(constraint),
+            (None, Some(tool_choice)) if !constraint_tools.is_empty() => ctx
+                .components
                 .tool_parser_factory
                 .registry()
                 .generate_tool_constraint(
-                    ctx.components
-                        .parser_resolver
-                        .tool_parser(&request.model)
-                        .as_deref(),
+                    names.tool.as_deref(),
                     &constraint_tools,
                     tool_choice,
                     reasoning,
@@ -309,9 +393,8 @@ pub(crate) async fn prepare_chat_like(
                         "invalid_tool_configuration",
                         format!("Invalid tool configuration: {e}"),
                     )
-                })?
-        } else {
-            None
+                })?,
+            (None, _) => None,
         };
 
         let preserve_reasoning_special_tokens = request.separate_reasoning

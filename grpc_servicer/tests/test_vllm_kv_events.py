@@ -280,3 +280,170 @@ class TestServicerWiring:
         servicer = VllmEngineServicer(_Engine(), start_time=0.0)
         assert servicer._kv_events_config is not None
         assert hasattr(servicer, "SubscribeKvEvents")
+
+
+# --- The servicer hands its load record to the relay (no vLLM import) ---
+
+
+def _subscribe_method(namespace):
+    """The real ``SubscribeKvEvents`` method of the vLLM servicer, compiled on
+    its own (the servicer module imports the engine)."""
+    import ast
+    from collections.abc import AsyncIterator
+
+    import grpc
+    from smg_grpc_proto.generated import common_pb2
+
+    source_path = Path(__file__).parents[1] / "smg_grpc_servicer" / "vllm" / "servicer.py"
+    tree = ast.parse(source_path.read_text())
+    method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "SubscribeKvEvents"
+    )
+    namespace.update({"AsyncIterator": AsyncIterator, "common_pb2": common_pb2, "grpc": grpc})
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(source_path), "exec"), namespace)
+    return namespace["SubscribeKvEvents"]
+
+
+@pytest.mark.asyncio
+async def test_servicer_hands_its_load_record_to_the_relay():
+    from types import SimpleNamespace
+
+    from smg_grpc_proto.generated import common_pb2
+
+    calls = []
+
+    async def fake_relay(sources, engine, start, context, **options):
+        calls.append((sources, engine, start, context, options))
+        yield common_pb2.KvEventBatch(sequence_number=1)
+
+    method = _subscribe_method(
+        {
+            "relay": fake_relay,
+            "rank_sources_for": lambda config, engine: ["rank-0"],
+            "Engine": SimpleNamespace(VLLM="vllm"),
+        }
+    )
+    config = SimpleNamespace(endpoint="tcp://*:5557", topic="kv", hwm=None)
+
+    def load_record(dp_rank):
+        return None
+
+    servicer = SimpleNamespace(_kv_events_config=config, engine=object(), _load_record=load_record)
+    context = SimpleNamespace()
+    request = common_pb2.SubscribeKvEventsRequest(start_sequence_number=0)
+    batches = [batch async for batch in method(servicer, request, context)]
+    assert [b.sequence_number for b in batches] == [1]
+    ((sources, engine, start, got_context, options),) = calls
+    assert (sources, engine, start, got_context) == (["rank-0"], "vllm", 0, context)
+    assert options["topic"] == "kv" and options["load_source"] is load_record
+
+
+# --- The servicer's record is the batch's rank's own (no vLLM import) ---
+
+
+def _servicer_over(stat_logger, managed=(0,)):
+    """Bind the real push method without importing the optional vLLM engine."""
+    import ast
+    from types import MethodType, SimpleNamespace
+
+    from smg_grpc_proto import vllm_engine_pb2
+    from smg_grpc_proto.generated import common_pb2
+    from smg_grpc_servicer.load_record import engine_load_from
+    from smg_grpc_servicer.vllm.loads import RankLoadTrackers
+    from smg_grpc_servicer.vllm.scheduler_loads import build_loads_response, managed_ranks
+
+    source = Path(__file__).parents[1] / "smg_grpc_servicer" / "vllm" / "servicer.py"
+    method = next(
+        node
+        for node in ast.walk(ast.parse(source.read_text()))
+        if isinstance(node, ast.FunctionDef) and node.name == "_load_record"
+    )
+    namespace = dict(
+        common_pb2=common_pb2,
+        vllm_engine_pb2=vllm_engine_pb2,
+        engine_load_from=engine_load_from,
+        build_loads_response=build_loads_response,
+        managed_ranks=managed_ranks,
+    )
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"), namespace)
+    engine = SimpleNamespace(
+        logger_manager=SimpleNamespace(stat_loggers=[stat_logger], engine_indexes=managed),
+        vllm_config=SimpleNamespace(
+            cache_config=SimpleNamespace(kv_cache_size_tokens=8000),
+            scheduler_config=SimpleNamespace(max_num_seqs=32),
+        ),
+    )
+    servicer = SimpleNamespace(engine=engine, _loads=RankLoadTrackers(managed))
+    servicer._load_record = MethodType(namespace["_load_record"], servicer)
+    return servicer
+
+
+def _stats(running, waiting, usage):
+    """Build an engine-free scheduler snapshot."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(num_running_reqs=running, num_waiting_reqs=waiting, kv_cache_usage=usage)
+
+
+@pytest.mark.parametrize("shape", ["aggregated_logger", "per_engine_loggers"])
+def test_pushed_loads_match_polled_loads_for_each_global_rank(shape):
+    """Push and poll share global ranks, skipped queues and rank-local estimates."""
+    from types import SimpleNamespace
+
+    from smg_grpc_proto import vllm_engine_pb2
+    from smg_grpc_servicer.load_record import engine_load_from
+    from smg_grpc_servicer.vllm.scheduler_loads import build_loads_response
+
+    stats = {4: _stats(3, 2, 0.25), 5: _stats(5, 1, 0.5)}
+    stats[5].num_skipped_waiting_reqs = 2
+    if shape == "aggregated_logger":
+        logger = SimpleNamespace(last_scheduler_stats_dict=stats)
+    else:
+        logger = SimpleNamespace(
+            per_engine_stat_loggers={
+                rank: SimpleNamespace(last_scheduler_stats=value) for rank, value in stats.items()
+            }
+        )
+    servicer = _servicer_over(logger, managed=(4, 5))
+    servicer._loads.for_rank(4).submitted("a", 100)
+    servicer._loads.for_rank(5).submitted("b", 300)
+    response = build_loads_response(
+        servicer.engine, vllm_engine_pb2.GetLoadsRequest(), trackers=servicer._loads
+    )
+    for load in response.loads:
+        assert servicer._load_record(load.dp_rank) == engine_load_from(load, queued_token_work=True)
+    assert servicer._load_record(4).waiting_uncached_tokens == 100
+    assert servicer._load_record(5).waiting_uncached_tokens == 300
+    assert servicer._load_record(None) is None
+    assert servicer._load_record(0) is None
+
+
+@pytest.mark.parametrize("stats", [None, _stats(1, 0, float("nan"))])
+def test_missing_or_invalid_push_snapshot_is_not_idle(stats):
+    """Unavailable telemetry must never synthesize an idle pushed record."""
+    from types import SimpleNamespace
+
+    servicer = _servicer_over(SimpleNamespace(last_scheduler_stats=stats))
+    assert servicer._load_record(None) is None
+    assert servicer._load_record(0) is None
+
+
+def test_single_rank_push_can_attribute_an_unnamed_batch():
+    """An unnamed batch is unambiguous on a single nonzero managed rank."""
+    from types import SimpleNamespace
+
+    servicer = _servicer_over(SimpleNamespace(last_scheduler_stats=_stats(3, 2, 0.25)), (5,))
+    assert servicer._load_record(None) == servicer._load_record(5)
+    assert servicer._load_record(5).running_requests == 3
+    assert servicer._load_record(0) is None
+
+
+def test_multi_rank_push_rejects_scalar_aggregate():
+    """A scalar frontend aggregate cannot describe either managed DP rank."""
+    from types import SimpleNamespace
+
+    servicer = _servicer_over(SimpleNamespace(last_scheduler_stats=_stats(3, 2, 0.25)), (4, 5))
+    assert servicer._load_record(4) is None
+    assert servicer._load_record(5) is None

@@ -13,6 +13,7 @@ use openai_protocol::{
         ContentPart, FunctionCallResponse, ImageUrl, JsonSchemaFormat, ResponseFormat, ToolCall,
         ToolChoice, ToolChoiceValue, UsageInfo,
     },
+    profile::ProviderProfile,
     responses::{
         CustomToolCallOutputContent, CustomToolInputContentPart, IncludeField, IncompleteDetails,
         IncompleteReason, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
@@ -263,14 +264,27 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
 
     // 4. Build ChatCompletionRequest
     let is_streaming = req.stream.unwrap_or(false);
+    let model = if req.model.is_empty() {
+        UNKNOWN_MODEL_ID.to_string()
+    } else {
+        req.model.clone()
+    };
+
+    // A tool result under a call id the previous assistant turn did not issue
+    // is a malformed history under the contracts that say so (the public
+    // API's words for it), answered as a bad request, not sent to the engine.
+    // Only that: a result with no call before it is left to the engine, as a
+    // loaded turn may have lost its calls on the way (the stored
+    // conversation's items, the tool loop's rebuilt input).
+    if let Some(call_id) = ProviderProfile::for_model(&model).unanswerable_tool_result(&messages) {
+        return Err(format!(
+            "No tool call found for function call output with call_id '{call_id}'"
+        ));
+    }
 
     Ok(ChatCompletionRequest {
         messages,
-        model: if req.model.is_empty() {
-            UNKNOWN_MODEL_ID.to_string()
-        } else {
-            req.model.clone()
-        },
+        model,
         temperature: req.temperature,
         max_completion_tokens: req.max_output_tokens,
         stream: is_streaming,
@@ -694,6 +708,8 @@ mod tests {
                 message: ChatCompletionMessage {
                     role: "assistant".to_string(),
                     content: Some("done".to_string()),
+                    refusal: None,
+                    annotations: Vec::new(),
                     tool_calls: None,
                     reasoning_content: None,
                 },
@@ -731,6 +747,127 @@ mod tests {
         );
         assert!(usage.get("prompt_tokens").is_none());
         assert!(usage.get("completion_tokens").is_none());
+    }
+
+    /// The public API returns these fields on every Response object (the
+    /// schema marks `error`, `instructions`, `top_p` and both usage detail
+    /// blocks required); a plain chat completion without reasoning or cache
+    /// hits must still produce all of them.
+    #[test]
+    fn chat_to_responses_carries_the_always_present_fields() {
+        let chat_response = ChatCompletionResponse::builder("chatcmpl_plain", "test-model")
+            .choices(vec![ChatChoice {
+                index: 0,
+                message: ChatCompletionMessage {
+                    role: "assistant".to_string(),
+                    content: Some("done".to_string()),
+                    refusal: None,
+                    annotations: Vec::new(),
+                    tool_calls: None,
+                    reasoning_content: None,
+                },
+                logprobs: None,
+                finish_reason: Some("stop".to_string()),
+                matched_stop: None,
+                hidden_states: None,
+            }])
+            .usage(Usage::from_counts(5, 3))
+            .build();
+
+        let response = chat_to_responses(
+            &chat_response,
+            &ResponsesRequest::default(),
+            Some("resp_plain".to_string()),
+        )
+        .expect("chat response should convert");
+        let wire = serde_json::to_value(response).expect("response should serialize");
+        let body = wire.as_object().expect("object");
+
+        for key in [
+            "error",
+            "instructions",
+            "incomplete_details",
+            "previous_response_id",
+            "user",
+            "safety_identifier",
+            "prompt_cache_key",
+            "prompt_cache_retention",
+            "max_tool_calls",
+        ] {
+            assert_eq!(
+                body.get(key),
+                Some(&serde_json::Value::Null),
+                "{key} must be present and null"
+            );
+        }
+        assert_eq!(body["top_p"], serde_json::json!(1.0));
+        assert_eq!(body["truncation"], "disabled");
+        assert_eq!(body["service_tier"], "default");
+        assert_eq!(body["top_logprobs"], 0);
+        assert_eq!(body["background"], false);
+        assert_eq!(body["frequency_penalty"], serde_json::json!(0.0));
+        assert_eq!(body["presence_penalty"], serde_json::json!(0.0));
+        assert_eq!(
+            body["reasoning"],
+            serde_json::json!({"effort": null, "summary": null})
+        );
+        assert_eq!(
+            body["text"],
+            serde_json::json!({"format": {"type": "text"}, "verbosity": "medium"})
+        );
+        assert!(
+            body["completed_at"].is_i64(),
+            "completed responses are stamped"
+        );
+        assert_eq!(
+            body["usage"]["input_tokens_details"],
+            serde_json::json!({"cached_tokens": 0})
+        );
+        assert_eq!(
+            body["usage"]["output_tokens_details"],
+            serde_json::json!({"reasoning_tokens": 0})
+        );
+    }
+
+    /// A tool result under a call id the previous turn did not issue is a
+    /// malformed history under the DeepSeek contract (as under OpenAI's): the
+    /// conversion refuses it in the public API's words, naming the id; the
+    /// right id converts, a model under no such contract converts either way,
+    /// and the shapes the gateway's own loaders produce (a result with no call
+    /// before it; a stored turn's result ahead of a later call) convert.
+    #[test]
+    fn a_tool_result_under_an_unknown_call_id_does_not_convert_under_the_deepseek_contract() {
+        let request = |model: &str, input: serde_json::Value| -> ResponsesRequest {
+            serde_json::from_value(serde_json::json!({"model": model, "input": input}))
+                .expect("a responses request")
+        };
+        let with_call = |call_id: &str| {
+            serde_json::json!([
+                {"type": "message", "role": "user", "content": "Add 17 and 25."},
+                {"type": "function_call", "call_id": "call_1", "name": "add_integers",
+                 "arguments": "{\"a\":17,\"b\":25}"},
+                {"type": "function_call_output", "call_id": call_id, "output": "42"}
+            ])
+        };
+        let refused = responses_to_chat(&request("deepseek-flash", with_call("call_doesnotexist")))
+            .expect_err("an unknown call id is a malformed history");
+        assert_eq!(
+            refused,
+            "No tool call found for function call output with call_id 'call_doesnotexist'"
+        );
+        assert!(responses_to_chat(&request("deepseek-flash", with_call("call_1"))).is_ok());
+        assert!(responses_to_chat(&request("local-model", with_call("call_doesnotexist"))).is_ok());
+        let without_call = serde_json::json!([
+            {"type": "message", "role": "user", "content": "Add 17 and 25."},
+            {"type": "function_call_output", "call_id": "call_a", "output": "42"}
+        ]);
+        assert!(responses_to_chat(&request("deepseek-flash", without_call)).is_ok());
+        let loop_turn = serde_json::json!([
+            {"type": "function_call_output", "call_id": "call_a", "output": "42"},
+            {"type": "function_call", "call_id": "call_m", "name": "lookup", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_m", "output": "ok"}
+        ]);
+        assert!(responses_to_chat(&request("deepseek-flash", loop_turn)).is_ok());
     }
 
     #[test]

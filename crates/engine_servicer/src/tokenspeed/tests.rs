@@ -12,15 +12,19 @@ use bytes::Bytes;
 use engine_zmq_client::{
     codec::{decode_msgpack, encode_msgpack},
     mock_engine::{
-        connect_to_frontend, default_ready_response, MockEngineInput, MockEngineOutput,
+        connect_to_frontend, default_ready_response, hello, MockEngineInput, MockEngineOutput,
         MOCK_DEADLINE,
     },
-    protocol::tokenspeed::{
-        output::BatchTokenIDOutSlim,
-        request::{TokenSpeedRequestType, TokenizedGenerateReqInput},
+    protocol::{
+        handshake::EngineCoreReadyResponse,
+        tokenspeed::{
+            output::BatchTokenIDOutSlim,
+            request::{TokenSpeedRequestType, TokenizedGenerateReqInput},
+        },
     },
     EngineId,
 };
+use futures::StreamExt;
 use llm_tokenizer::{mock::MockTokenizer, traits::Tokenizer};
 use prost_types::value::Kind;
 use smg_grpc_client::{
@@ -49,7 +53,7 @@ fn model_info() -> TokenSpeedModelInfo {
         bos_token_id: 1,
         default_sampling_params_json: "{\"temperature\":0.7}".to_string(),
         server_args_json:
-            r#"{"model":"org/model","max_num_seqs":64,"dp_size":2,"pairing_protocol":"p1"}"#
+            r#"{"model":"org/model","max_num_seqs":64,"dp_size":2,"pairing_protocol":"p1","engine_reasoning_parser":"kimi_k25","constrained_decoding_start":"first_token"}"#
                 .to_string(),
         scheduler_info_json: r#"{"shm_namespace_id":"boot:1"}"#.to_string(),
         tokenspeed_version: "0.1.0.post20261003".to_string(),
@@ -72,6 +76,7 @@ fn config(
         tokenizer_dir: None,
         model,
         engine_startup_timeout: Duration::from_secs(10),
+        engine_startup_ceiling: None,
     }
 }
 
@@ -146,7 +151,10 @@ async fn harness(model: TokenSpeedModelInfo, tokenizer: Option<Arc<dyn Tokenizer
     let engine = connect_to_frontend(
         &handshake,
         EngineId::from_engine_index(0),
-        default_ready_response(),
+        EngineCoreReadyResponse {
+            cache_trace_epochs: vec!["capture-epoch".to_string()],
+            ..default_ready_response()
+        },
     )
     .await
     .expect("mock scheduler handshake");
@@ -245,6 +253,126 @@ fn complete(response: ts::GenerateResponse) -> ts::GenerateComplete {
     }
 }
 
+/// Nothing reaches a mock scheduler that was only handshaken.
+async fn assert_scheduler_idle(engine_in: &mut MockEngineInput) {
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), engine_in.recv())
+            .await
+            .is_err(),
+        "nothing should have reached the scheduler"
+    );
+}
+
+/// Between HELLO and READY a real scheduler loads its model, and nothing
+/// crosses the wire meanwhile. The lifecycle owner's reports that the
+/// scheduler process is alive keep the link waiting well past the silence
+/// bound, and the start then completes.
+#[tokio::test]
+async fn a_slow_scheduler_stays_linked_while_the_launcher_reports_it_alive() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let silence = Duration::from_millis(300);
+    let server = TokenSpeedServicerServer::start(TokenSpeedServicerConfig {
+        engine_startup_timeout: silence,
+        ..config(dir.path(), &handshake, model_info())
+    })
+    .unwrap();
+    // The scheduler dials in at once, then "loads" for four silences.
+    let loading = hello(&handshake, EngineId::from_engine_index(0))
+        .bounded()
+        .await
+        .expect("HELLO answered with INIT");
+    let load_time = Instant::now() + 4 * silence;
+    while Instant::now() < load_time {
+        server.note_engine_alive();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        server.last_error().unwrap(),
+        None,
+        "the link gave up on a living scheduler"
+    );
+    assert!(!server.engine_ready());
+
+    let engine = loading
+        .ready(default_ready_response())
+        .bounded()
+        .await
+        .expect("READY and registration accepted");
+    wait_until(|| server.engine_ready()).await;
+    let (mut engine_in, _engine_out) = engine.split();
+    assert_scheduler_idle(&mut engine_in).await;
+    server.stop(Duration::from_secs(5)).unwrap();
+}
+
+/// A scheduler that dials in and then falls silent, with nobody reporting it
+/// alive, fails the link at the silence bound as before.
+#[tokio::test]
+async fn a_scheduler_that_falls_silent_after_hello_fails_the_link_at_the_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let silence = Duration::from_millis(300);
+    let server = TokenSpeedServicerServer::start(TokenSpeedServicerConfig {
+        engine_startup_timeout: silence,
+        ..config(dir.path(), &handshake, model_info())
+    })
+    .unwrap();
+    let _loading = hello(&handshake, EngineId::from_engine_index(0))
+        .bounded()
+        .await
+        .expect("HELLO answered with INIT");
+    let since_hello = Instant::now();
+    let deadline = since_hello + Duration::from_secs(10);
+    let error = loop {
+        if let Some(error) = server.last_error().unwrap() {
+            break error;
+        }
+        assert!(Instant::now() < deadline, "no link failure reported");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(since_hello.elapsed() >= silence);
+    assert!(
+        error.contains("timed out while waiting for READY"),
+        "{error}"
+    );
+    assert!(error.contains("without a sign of life"), "{error}");
+    assert!(!server.engine_ready());
+    server.stop(Duration::from_secs(5)).unwrap();
+}
+
+/// The ceiling bounds a start however alive the scheduler is reported.
+#[tokio::test]
+async fn the_startup_ceiling_bounds_a_start_the_launcher_keeps_reporting_alive() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let silence = Duration::from_millis(300);
+    let ceiling = Duration::from_millis(900);
+    let server = TokenSpeedServicerServer::start(TokenSpeedServicerConfig {
+        engine_startup_timeout: silence,
+        engine_startup_ceiling: Some(ceiling),
+        ..config(dir.path(), &handshake, model_info())
+    })
+    .unwrap();
+    let started = Instant::now();
+    let _loading = hello(&handshake, EngineId::from_engine_index(0))
+        .bounded()
+        .await
+        .expect("HELLO answered with INIT");
+    let deadline = started + Duration::from_secs(10);
+    let error = loop {
+        server.note_engine_alive();
+        if let Some(error) = server.last_error().unwrap() {
+            break error;
+        }
+        assert!(Instant::now() < deadline, "no link failure reported");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(started.elapsed() >= ceiling);
+    assert!(error.contains("reached its ceiling"), "{error}");
+    assert!(!server.engine_ready());
+    server.stop(Duration::from_secs(5)).unwrap();
+}
+
 #[test]
 fn config_is_validated_before_binding() {
     let dir = tempfile::tempdir().unwrap();
@@ -275,6 +403,20 @@ fn config_is_validated_before_binding() {
             "engines",
             TokenSpeedServicerConfig {
                 engine_count: 0,
+                ..good.clone()
+            },
+        ),
+        (
+            "timeout",
+            TokenSpeedServicerConfig {
+                engine_startup_timeout: Duration::ZERO,
+                ..good.clone()
+            },
+        ),
+        (
+            "ceiling",
+            TokenSpeedServicerConfig {
+                engine_startup_ceiling: Some(Duration::ZERO),
                 ..good.clone()
             },
         ),
@@ -531,6 +673,10 @@ async fn string_stops_without_a_tokenizer_are_refused() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// `Abort` ends the stream with an `abort` Complete and reaches the
+/// scheduler. The caller's own abort stays a completion; only a shutdown
+/// under an open request is a status
+/// (`a_shutdown_ends_an_open_stream_with_unavailable_not_an_abort_completion`).
 #[tokio::test]
 async fn abort_rpc_cancels_an_in_flight_stream() {
     let mut h = harness(model_info(), None).await;
@@ -742,7 +888,26 @@ async fn info_rpcs_report_the_launcher_facts_and_the_handshake() {
         server_args.fields["pairing_protocol"].kind,
         Some(Kind::StringValue("p1".to_string()))
     );
+    // The launcher's grammar-start facts (the engine's reasoning parser and
+    // where its grammar starts on a thinking prompt) reach the Router's label
+    // source as the launcher wrote them.
+    assert_eq!(
+        server_args.fields["engine_reasoning_parser"].kind,
+        Some(Kind::StringValue("kimi_k25".to_string()))
+    );
+    assert_eq!(
+        server_args.fields["constrained_decoding_start"].kind,
+        Some(Kind::StringValue("first_token".to_string()))
+    );
     let scheduler_info = info.scheduler_info.expect("scheduler_info");
+    assert_eq!(
+        scheduler_info.fields["cache_trace_epochs"].kind,
+        Some(Kind::ListValue(prost_types::ListValue {
+            values: vec![prost_types::Value {
+                kind: Some(Kind::StringValue("capture-epoch".to_string()))
+            }]
+        }))
+    );
     assert_eq!(
         scheduler_info.fields["shm_namespace_id"].kind,
         Some(Kind::StringValue("boot:1".to_string()))
@@ -1085,4 +1250,111 @@ async fn a_scheduler_that_never_dials_in_fails_the_link_at_the_startup_bound() {
 
     server.stop(Duration::from_secs(5)).unwrap();
     assert_handshake_released(&handshake).await;
+}
+
+/// A shutdown with a stream still open is the engine side going away under
+/// the request, not an abort the caller asked for: the stream ends with
+/// `UNAVAILABLE` (the status the Router counts and logs as the worker's
+/// failure), never with a `Complete` whose finish reason is `abort`.
+#[tokio::test]
+async fn a_shutdown_ends_an_open_stream_with_unavailable_not_an_abort_completion() {
+    let mut h = harness(model_info(), None).await;
+    let mut stream = h
+        .client
+        .generate(generate_request("r8", true, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    send(&mut h.engine_out, &batch("r8", vec![10], 1, None, None)).await;
+    assert_eq!(
+        chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
+        vec![10]
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+    let status = stream
+        .message()
+        .bounded()
+        .await
+        .expect_err("a shutdown ends the stream with a status, not a completion");
+    assert_eq!(status.code(), Code::Unavailable);
+    assert!(
+        status.message().contains("shutting down"),
+        "{}",
+        status.message()
+    );
+    assert!(!h.server.running());
+}
+
+/// A request the engine finished on the tick before the shutdown keeps its
+/// completion: the finish tick's chunk went out and its `Complete` was
+/// parked for the next poll when `stop()` landed, so the stream ends with
+/// that `Complete` and no status (nothing was cut), never with `UNAVAILABLE`.
+#[tokio::test]
+async fn a_shutdown_keeps_the_completion_of_a_choice_the_engine_had_finished() {
+    let mut h = harness(model_info(), None).await;
+    let mut stream = h
+        .client
+        .generate(generate_request("r11", true, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    send(
+        &mut h.engine_out,
+        &batch("r11", vec![10], 1, Some("length"), None),
+    )
+    .await;
+    assert_eq!(
+        chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
+        vec![10]
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+    let done = complete(
+        stream
+            .message()
+            .bounded()
+            .await
+            .expect("the completion the engine had already produced, not a status")
+            .expect("a completion, not the end of the stream"),
+    );
+    assert_eq!(done.finish_reason, "length");
+    assert_eq!(done.output_ids, vec![10]);
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    assert!(!h.server.running());
+}
+
+/// The engine's own `Complete` went out and the shutdown lands before the
+/// poll that would have ended the stream (the gap h2 backpressure opens):
+/// the choice has ended and is not open, so the stream ends cleanly, never
+/// with `UNAVAILABLE` after a completion. Driven poll by poll with no
+/// transport in between, so nothing races; without the choice dropping its
+/// engine stream as the `Complete` goes out, this ends with a status.
+#[tokio::test]
+async fn a_shutdown_after_the_engines_completion_ends_the_stream_cleanly() {
+    let mut h = harness(model_info(), None).await;
+    let mut stream = generate::generate(&h.server.state, generate_request("r12", true, Vec::new()))
+        .await
+        .expect("generate");
+    recv_add(&mut h.engine_in).await;
+    send(
+        &mut h.engine_out,
+        &batch("r12", vec![10], 1, Some("length"), None),
+    )
+    .await;
+    assert_eq!(
+        chunk_tokens(stream.next().bounded().await.unwrap().unwrap()),
+        vec![10]
+    );
+    let done = complete(stream.next().bounded().await.unwrap().unwrap());
+    assert_eq!(done.finish_reason, "length");
+    assert_eq!(done.output_ids, vec![10]);
+    // The shutdown lands between the completion and the poll that ends the
+    // stream: `cancel_all` is what `stop()` fires first.
+    h.server.state.registry.cancel_all().expect("cancel_all");
+    assert!(
+        stream.next().bounded().await.is_none(),
+        "a clean end after the completion, not a status"
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }

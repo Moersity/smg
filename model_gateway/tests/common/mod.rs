@@ -1,6 +1,7 @@
 // These modules are used by tests and benchmarks
 #![allow(dead_code, clippy::allow_attributes, clippy::large_futures)]
 
+pub mod gateway_launch;
 pub mod mock_mcp_server;
 #[cfg(feature = "provider-openai")]
 pub mod mock_openai_server;
@@ -39,7 +40,7 @@ use smg::{
     workflow::Job,
 };
 use smg_data_connector::{
-    MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+    MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage, StorageBundle,
 };
 #[allow(unused_imports)]
 pub use test_config::{TestRouterConfig, TestWorkerConfig};
@@ -86,7 +87,7 @@ impl WorkerTestContext {
         endpoint: &str,
         body: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let client = reqwest::Client::builder()
+        let client = smg::http_client::client_builder()
             .no_proxy()
             .build()
             .map_err(|e| format!("test client: {e}"))?;
@@ -118,7 +119,7 @@ impl WorkerTestContext {
     ) -> Result<Vec<String>, String> {
         use futures_util::StreamExt;
 
-        let client = reqwest::Client::builder()
+        let client = smg::http_client::client_builder()
             .no_proxy()
             .build()
             .map_err(|e| format!("test client: {e}"))?;
@@ -411,11 +412,12 @@ async fn build_test_app_context(
     tool_parser_factory: Option<ToolParserFactory>,
     rate_limit_manager: Option<Arc<smg::rate_limit::RateLimitManager>>,
     mcp_config: smg_mcp::McpConfig,
+    storages: Option<StorageBundle>,
 ) -> Arc<AppContext> {
     use smg_mcp::McpOrchestrator;
 
     // See `test_app::create_test_app_context`: no environment proxy in a test's path.
-    let client = reqwest::Client::builder()
+    let client = smg::http_client::client_builder()
         .no_proxy()
         .build()
         .expect("test client");
@@ -442,10 +444,17 @@ async fn build_test_app_context(
         config.routing_key_override.clone(),
     ));
 
-    // Initialize storage backends (Memory for tests).
-    let response_storage = Arc::new(MemoryResponseStorage::new());
-    let conversation_storage = Arc::new(MemoryConversationStorage::new());
-    let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());
+    // Initialize storage backends (Memory for tests, unless the caller brought
+    // its own: a history store that is down, for one).
+    let StorageBundle {
+        response_storage,
+        conversation_storage,
+        conversation_item_storage,
+    } = storages.unwrap_or_else(|| StorageBundle {
+        response_storage: Arc::new(MemoryResponseStorage::new()),
+        conversation_storage: Arc::new(MemoryConversationStorage::new()),
+        conversation_item_storage: Arc::new(MemoryConversationItemStorage::new()),
+    });
 
     // Initialize load monitor
     let worker_monitor = Some(Arc::new(WorkerMonitor::new(
@@ -590,6 +599,34 @@ pub fn create_test_context_with_tokenizer_registry(
             Some(ToolParserFactory::new()),
             tenant_rate_limit_manager,
             empty_mcp_config(),
+            None,
+        )
+        .await
+    })
+}
+
+/// `create_test_context_with_tokenizer_registry` over the caller's storage
+/// backends instead of the in-memory ones.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+pub fn create_test_context_with_storages(
+    config: RouterConfig,
+    tokenizer_registry: Arc<TokenizerRegistry>,
+    storages: StorageBundle,
+) -> Pin<Box<dyn Future<Output = Arc<AppContext>> + Send>> {
+    Box::pin(async move {
+        let tenant_rate_limit_manager = smg::rate_limit::RateLimitManager::from_config(&config)
+            .expect("tenant rate limit config should be valid");
+        build_test_app_context(
+            config,
+            tokenizer_registry,
+            Some(ReasoningParserFactory::new()),
+            Some(ToolParserFactory::new()),
+            tenant_rate_limit_manager,
+            empty_mcp_config(),
+            Some(storages),
         )
         .await
     })
@@ -606,6 +643,7 @@ pub fn create_test_context_with_parsers(
         Some(ToolParserFactory::new()),
         None,
         empty_mcp_config(),
+        None,
     ))
 }
 
@@ -630,6 +668,7 @@ pub fn create_test_context_with_mcp_config(
             None,
             None,
             mcp_config,
+            None,
         )
         .await
     })
@@ -675,7 +714,7 @@ pub fn ensure_tokenizer_cached() -> PathBuf {
         println!("Downloading TinyLlama tokenizer from HuggingFace...");
 
         // Use blocking reqwest client since we're in tests/benchmarks
-        let client = reqwest::blocking::Client::new();
+        let client = smg::http_client::blocking_client();
         let response = client
             .get(TINYLLAMA_TOKENIZER_URL)
             .send()
@@ -736,6 +775,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -753,6 +793,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -768,6 +809,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -784,6 +826,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -799,6 +842,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -814,6 +858,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -829,6 +874,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -838,6 +884,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                 description: Some("Ping service".to_string()),
                 parameters: json!({"type": "object", "properties": {}}),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -847,6 +894,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                 description: Some("Test function".to_string()),
                 parameters: json!({"type": "object", "properties": {}}),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -865,6 +913,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -881,6 +930,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -895,6 +945,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -911,6 +962,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -927,6 +979,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -942,6 +995,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -957,6 +1011,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -971,6 +1026,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -980,6 +1036,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                 description: Some("Function 1".to_string()),
                 parameters: json!({"type": "object", "properties": {}}),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -994,6 +1051,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -1003,6 +1061,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                 description: Some("Tool 1".to_string()),
                 parameters: json!({"type": "object", "properties": {}}),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -1017,6 +1076,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
     ]

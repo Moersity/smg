@@ -32,9 +32,12 @@ from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind, StructuredOutputsParams
 
 from smg_grpc_servicer.kv_relay import Engine, relay
+from smg_grpc_servicer.load_record import engine_load_from
 from smg_grpc_servicer.tokenizer_bundle import CHUNK_SIZE, build_tokenizer_zip
+from smg_grpc_servicer.trace_context import trace_headers
 from smg_grpc_servicer.vllm import attach_vllm_logging
 from smg_grpc_servicer.vllm.admin import flush_cache
+from smg_grpc_servicer.vllm.config_view import uses_mrope
 from smg_grpc_servicer.vllm.errors import grpc_code_for
 from smg_grpc_servicer.vllm.kv_events import (
     rank_sources_for,
@@ -57,6 +60,7 @@ from smg_grpc_servicer.vllm.mm_processor import (
     MmProcessorUnavailable,
     MmSettings,
     build_mm_processor,
+    launcher_settings,
 )
 from smg_grpc_servicer.vllm.mm_salt import (
     engine_accepts_mm_inputs,
@@ -65,7 +69,10 @@ from smg_grpc_servicer.vllm.mm_salt import (
 )
 from smg_grpc_servicer.vllm.mm_tensors import tensor_from_proto
 from smg_grpc_servicer.vllm.model_info import (
+    constrained_decoding_start,
+    engine_reasoning_parser,
     mm_device_do_normalize,
+    mm_item_limits,
     model_facts,
     server_facts,
 )
@@ -126,8 +133,11 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         Args:
             async_llm: The EngineClient instance (e.g. AsyncLLM)
             start_time: The server start time, in seconds since epoch
-            mm_settings: The launcher's `--mm-*` flags; None (an older
-                launcher) resolves everything from the environment
+            mm_settings: The launcher's `--mm-*` flags; None takes the
+                settings the plugin kept from this process's launcher parse
+                (upstream's launcher builds the servicer without its
+                namespace), else an older launcher resolves everything from
+                the environment
         """
         # The Rust path takes the process before this class exists; reaching
         # here with the flag set means the launcher never consulted it.
@@ -145,7 +155,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         # from the requests this servicer forwards (vLLM's stats carry none).
         self._loads = RankLoadTrackers(managed_ranks(async_llm))
         # Flag > env > default, resolved once so each value names its source.
-        self._mm_settings = (mm_settings or MmSettings()).resolve()
+        self._mm_settings = (mm_settings or launcher_settings() or MmSettings()).resolve()
         # Worker-side media processing (media_refs); None keeps refs rejected.
         self._mm_processor = build_mm_processor(async_llm, settings=self._mm_settings)
         # One cap over all the multimodal work this servicer runs off the event
@@ -356,8 +366,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     cache_salt = mm_identity_cache_salt(mm_identity_hashes(batches))
                     if cache_salt is not None:
                         prompt["cache_salt"] = cache_salt
-                    model_config = getattr(self.engine, "model_config", None)
-                    if model_config is not None and getattr(model_config, "uses_mrope", False):
+                    if uses_mrope(getattr(self.engine, "model_config", None)):
                         logger.warning(
                             "Request %s carries mm identity but no grid tensors on an "
                             "M-RoPE model; decode-side positions will be text-only",
@@ -389,6 +398,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 sampling_params=sampling_params,
                 request_id=request_id,
                 tokenization_kwargs=tokenization_kwargs,
+                trace_headers=trace_headers(context.invocation_metadata()),
                 data_parallel_rank=(
                     request.data_parallel_rank if request.HasField("data_parallel_rank") else None
                 ),
@@ -654,6 +664,10 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             GetServerInfoResponse protobuf
         """
         facts = server_facts(self.engine.vllm_config)
+        # Older proto packages omit newer metadata fields; set them below
+        # only when their descriptors support them.
+        max_num_seqs = facts.pop("max_num_seqs", 0)
+        encoder_dtype = facts.pop("multimodal_encoder_dtype", "")
         mm_processor = ""
         mm_media_ref_schemes = ""
         # A --language-model-only engine accepts no multimodal inputs, so it
@@ -680,6 +694,20 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         # engine raw pixels; likewise absent from an older proto package.
         if "mm_device_do_normalize" in info.DESCRIPTOR.fields_by_name:
             info.mm_device_do_normalize = mm_device_do_normalize(self.engine.vllm_config)
+        if "multimodal_encoder_dtype" in info.DESCRIPTOR.fields_by_name:
+            info.multimodal_encoder_dtype = encoder_dtype
+        if max_num_seqs and "max_num_seqs" in info.DESCRIPTOR.fields_by_name:
+            info.max_num_seqs = max_num_seqs
+        # The engine's own per-prompt media limits, for the Router's media
+        # pipeline to hold requests to; likewise absent from an older package.
+        if "mm_item_limits" in info.DESCRIPTOR.fields_by_name:
+            info.mm_item_limits = mm_item_limits(self.engine.vllm_config)
+        # The engine's reasoning parser and where it starts a grammar on a
+        # thinking prompt, for the Router to shape a forced tool call's
+        # grammar by; likewise absent from an older package.
+        if "constrained_decoding_start" in info.DESCRIPTOR.fields_by_name:
+            info.engine_reasoning_parser = engine_reasoning_parser(self.engine.vllm_config)
+            info.constrained_decoding_start = constrained_decoding_start(self.engine.vllm_config)
         return info
 
     async def GetLoads(
@@ -692,6 +720,28 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             return build_loads_response(self.engine, request, VLLM_VERSION, trackers=self._loads)
         except ValueError as exc:
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
+
+    def _load_record(self, dp_rank: int | None) -> common_pb2.EngineLoad | None:
+        """Push the same rank-local snapshot as GetLoads, omitting unknown loads.
+
+        An unnamed batch is attributable only when this frontend manages one
+        rank. Missing snapshots and unmanaged ranks never become idle records.
+        """
+        ranks = managed_ranks(self.engine)
+        if dp_rank is None:
+            if len(ranks) != 1:
+                return None
+            dp_rank = ranks[0]
+        if dp_rank not in ranks:
+            return None
+        response = build_loads_response(
+            self.engine, vllm_engine_pb2.GetLoadsRequest(dp_rank=dp_rank), trackers=self._loads
+        )
+        if not response.loads:
+            return None
+        return engine_load_from(
+            response.loads[0], queued_token_work=self._loads.for_rank(dp_rank) is not None
+        )
 
     async def GetTokenizer(
         self,
@@ -1240,5 +1290,6 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             context,
             topic=str(getattr(config, "topic", "") or ""),
             hwm=getattr(config, "hwm", None),
+            load_source=self._load_record,
         ):
             yield proto_batch

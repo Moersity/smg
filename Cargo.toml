@@ -1,14 +1,20 @@
 [workspace]
-members = ["model_gateway", "crates/protocols", "crates/reasoning_parser", "crates/tool_parser", "crates/symphony", "crates/workflow", "crates/tokenizer", "crates/auth", "crates/mcp",
+members = ["model_gateway", "crates/protocols", "crates/reasoning_parser", "crates/response_template", "crates/tool_parser", "crates/symphony", "crates/workflow", "crates/tokenizer", "crates/auth", "crates/mcp",
     "crates/external_router", "crates/kv_index", "crates/data_connector", "crates/multimodal", "crates/mm_rdma", "crates/wasm", "crates/mesh", "crates/grpc_client", "crates/engine_zmq_client", "crates/engine_zmq_adapter", "crates/engine_servicer", "bindings/python", "bindings/golang", "clients/rust", "clients/openapi-gen", "crates/mock_worker", "crates/rl", "crates/radix_tree"]
 resolver = "2"
+
+[workspace.package]
+# The oldest toolchain the workspace builds with; rust-toolchain.toml pins the same release.
+rust-version = "1.98"
 
 [workspace.dependencies]
 # Internal workspace crates
 openai-protocol = { version = "1.15.0", path = "crates/protocols" }
 smg-mm-rdma = { version = "0.1.1", path = "crates/mm_rdma" }
 reasoning-parser = { version = "1.9.0", path = "crates/reasoning_parser" }
+smg-response-template = { version = "0.1.0", path = "crates/response_template" }
 tool-parser = { version = "1.9.0", path = "crates/tool_parser" }
+smg-symphony = { version = "0.0.1", path = "crates/symphony" }
 wfaas = { version = "1.1.0", path = "crates/workflow" }
 llm-tokenizer = { version = "1.9.0", path = "crates/tokenizer" }
 smg-auth = { version = "1.2.3", path = "crates/auth" }
@@ -38,6 +44,7 @@ tonic-health = "0.14.6"
 axum = { version = "0.8.9" }
 blake3 = "1.8"
 lz4_flex = "0.14"
+notify = "8.2"
 bytemuck = { version = "1.25" }
 byteorder = "1.5.0"
 bytes = "1.12.0"
@@ -67,8 +74,8 @@ tokio = { version = "1.52.3" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "chrono"] }
 uuid = { version = "1.23", features = ["v7", "serde"] }
-wasmtime = { version = "45.0", features = ["component-model", "async"] }
-wasmtime-wasi = "45.0"
+wasmtime = { version = "49.0", features = ["component-model", "async"] }
+wasmtime-wasi = "49.0"
 tokio-util = { version = "0.7", features = ["rt"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 webpki-roots = "1.0"
@@ -192,6 +199,13 @@ opt-level = 3
 [profile.release.package.tokenizers]
 opt-level = 3
 
+# v1 moves the encode hot path out of the tokenizers umbrella crate.
+[profile.release.package.tk-encode]
+opt-level = 3
+
+[profile.release.package.bitcannon]
+opt-level = 3
+
 [profile.release.package.aho-corasick]
 opt-level = 3
 
@@ -201,6 +215,12 @@ opt-level = 3
 # The cache-aware routing trees, walked on every request (the fused
 # match-and-insert walk is made non-generic in #2766 so it is built here).
 [profile.release.package.kv-index]
+opt-level = 3
+
+# The response-template parser runs on every streamed chunk, so it is built
+# like the other hot crates (#2768): 0.36 to 0.76 of the time it takes at
+# the profile's opt-level "z", 15 KB larger.
+[profile.release.package.smg-response-template]
 opt-level = 3
 
 [profile.ci]

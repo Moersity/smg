@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from smg.launch_router import RouterArgs, launch_router
-from smg.router import policy_from_str
+from smg.router import build_control_plane_auth_config, policy_from_str
 from smg.smg_rs import PolicyType
 from smg.smg_rs import Router as _Router
 
@@ -458,6 +458,16 @@ class TestDiscoveryMapping:
     def test_untagged_mapping_reads_as_kubernetes(self):
         _Router(worker_urls=[], discovery=self.kubernetes_fields())
 
+    def test_file_mapping_is_accepted(self):
+        _Router(
+            worker_urls=[],
+            discovery={"provider": "file", "path": "/run/smg/workers.json"},
+        )
+
+    def test_file_mapping_needs_a_path(self):
+        with pytest.raises(ValueError, match="path"):
+            _Router(worker_urls=[], discovery={"provider": "file"})
+
     def test_mapping_and_service_discovery_conflict(self):
         with pytest.raises(ValueError, match="not both"):
             _Router(
@@ -494,6 +504,7 @@ class TestRouterPositionalSignature:
             "kv_index",
             "worker_stall_secs",
             "worker_wedge_secs",
+            "worker_stale_secs",
             "worker_warmup_secs",
             "worker_warmup_share",
             "worker_warmup_blocks",
@@ -501,4 +512,33 @@ class TestRouterPositionalSignature:
             "worker_warmup_divert_every",
             "selection_policy",
             "selection_accounting_ttl_ms",
+            "tenant_api_keys",
+            "priority_scheduler_enabled",
+            "priority_scheduler_default_max_class",
+            "priority_scheduler_config",
+            "priority_scheduler_tenant_metric_top_n",
+            "tenant_rate_limit_enabled",
+            "tenant_rate_limit_config",
+            "jemalloc_prof_dir",
+            "tokenizer_cache_l0_max_memory",
+            "max_background_responses",
+            "header_read_timeout_secs",
+            "idle_connection_timeout_secs",
+            "mm_allowed_media_domains",
+            "mm_allow_private_media_hosts",
+            "sse_keepalive_secs",
+            "history_memory_max_responses",
+            "history_memory_max_items",
+            "history_memory_retention_secs",
         ]
+
+
+class TestControlPlaneAuthHalfJwt:
+    """An issuer without an audience (or the reverse) is refused, not a silently open control plane."""
+
+    def test_half_jwt_configuration_is_refused(self):
+        with pytest.raises(ValueError, match="jwt-audience"):
+            build_control_plane_auth_config({"jwt_issuer": "https://issuer.example"})
+        with pytest.raises(ValueError, match="jwt-issuer"):
+            build_control_plane_auth_config({"jwt_audience": "aud"})
+        assert build_control_plane_auth_config({}) is None

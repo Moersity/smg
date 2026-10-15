@@ -7,7 +7,7 @@ use std::{
 };
 
 use axum::{
-    extract::{Extension, Path, Query, Request, State},
+    extract::{Extension, Path, Query, RawQuery, Request, State},
     http::{header::InvalidHeaderName, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -38,13 +38,14 @@ use openai_protocol::{
         ListWorkersQuery, StartProfileRequest, StopProfileRequest, WorkerSpec, WorkerUpdateRequest,
     },
 };
-use rustls::crypto::ring;
 use serde::Deserialize;
 use serde_json::Value;
 use smg_mesh::{MeshServerBuilder, MeshServerConfig, MeshServerHandler};
 use tokio::{signal, spawn};
 use tracing::{debug, error, info, warn, Level};
 use wfaas::LoggingSubscriber;
+
+pub mod connection_timeouts;
 
 use crate::{
     app_context::AppContext,
@@ -54,6 +55,7 @@ use crate::{
     mesh_discovery::{start_mesh_discovery, MeshDiscoveryConfig},
     middleware::{self, AdmissionQueue, AuthConfig},
     observability::{
+        heap_profile, history_metrics,
         inflight_tracker::InFlightRequestTracker,
         logging::{self, LoggingConfig},
         metrics::{self, PrometheusConfig},
@@ -61,13 +63,18 @@ use crate::{
     },
     routers::{
         common::realtime::ws::RealtimeQueryParams,
+        error as route_error,
         gateway::Gateway,
+        grpc::common::responses::spawn_unstored_sweeper,
         http::router::{stream_eligible_request_bodies, StreamBodyState},
         RouterTrait,
     },
+    server::connection_timeouts::{ConnectionTimeoutAcceptor, ConnectionTimeouts},
     service_discovery::{start_service_discovery, RuntimeDiscoveryConfig},
+    tenant,
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
     worker::{
+        admin_json::AdminJson,
         manager::{WorkerManager, WorkerManagerConfig},
         ConnectionMode,
     },
@@ -104,8 +111,34 @@ async fn parse_reasoning(
     parse::parse_reasoning(&state.context, &req).await
 }
 
-async fn sink_handler() -> Response {
-    StatusCode::NOT_FOUND.into_response()
+/// An unknown URL: a JSON envelope, never an empty body.
+async fn sink_handler(request: Request) -> Response {
+    unknown_route(StatusCode::NOT_FOUND, "unknown_url", request).await
+}
+
+/// A known URL with the wrong method (axum adds the `Allow` header).
+async fn method_not_allowed_handler(request: Request) -> Response {
+    unknown_route(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "method_not_allowed",
+        request,
+    )
+    .await
+}
+
+/// The envelope of the API the request speaks: the Messages API's on a
+/// Messages route or when the request carries `anthropic-version` (a model
+/// lookup by an Anthropic SDK), the OpenAI-shaped one otherwise.
+async fn unknown_route(status: StatusCode, code: &str, request: Request) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let response =
+        route_error::create_error(status, code, format!("Invalid URL ({method} {path})"));
+    if middleware::wants_messages_envelope(request.headers(), &path) {
+        middleware::into_messages_envelope(response, middleware::request_id_of(&request)).await
+    } else {
+        response
+    }
 }
 
 async fn liveness() -> Response {
@@ -140,7 +173,17 @@ async fn get_server_info(State(state): State<Arc<AppState>>, req: Request) -> Re
 }
 
 async fn v1_models(State(state): State<Arc<AppState>>, req: Request) -> Response {
-    models::list_models(&state.context, req.headers()).await
+    let request_id = middleware::request_id_of(&req);
+    models::list_models(&state.context, req.headers(), request_id).await
+}
+
+async fn v1_model(
+    State(state): State<Arc<AppState>>,
+    Path(model_id): Path<String>,
+    req: Request,
+) -> Response {
+    let request_id = middleware::request_id_of(&req);
+    models::retrieve_model(&state.context, req.headers(), &model_id, request_id).await
 }
 
 async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Response {
@@ -319,6 +362,81 @@ async fn v1_embeddings(
         .await
 }
 
+/// The public Messages API knows only its dated versions: a request whose
+/// `anthropic-version` is not a calendar date of 2023 or later is refused as
+/// the public API refuses it, before anything is routed. A request without
+/// the header is served as the current version: this gateway's own SDK
+/// clients send none, and the header selects nothing here.
+fn check_anthropic_version(headers: &HeaderMap) -> Result<(), Response> {
+    let Some(value) = headers.get("anthropic-version") else {
+        return Ok(());
+    };
+    let version = value.to_str().unwrap_or_default();
+    if is_anthropic_version(version) {
+        Ok(())
+    } else {
+        Err(route_error::bad_request(
+            "invalid_anthropic_version",
+            format!("anthropic-version: \"{version}\" is not a valid version"),
+        ))
+    }
+}
+
+/// `YYYY-MM-DD`, a real calendar date, 2023 (the first public version) or
+/// later.
+fn is_anthropic_version(version: &str) -> bool {
+    let bytes = version.as_bytes();
+    let shaped = bytes.len() == 10
+        && bytes.iter().enumerate().all(|(i, b)| {
+            if i == 4 || i == 7 {
+                *b == b'-'
+            } else {
+                b.is_ascii_digit()
+            }
+        });
+    if !shaped {
+        return false;
+    }
+    let field = |range: std::ops::Range<usize>| version[range].parse::<u32>().unwrap_or(0);
+    let (year, month, day) = (field(0..4), field(5..7), field(8..10));
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => 0,
+    };
+    year >= 2023 && (1..=days).contains(&day)
+}
+
+/// `thinking.budget_tokens` must leave room under `max_tokens` for the
+/// answer, unless the interleaved-thinking beta is on: then the budget covers
+/// every thinking block of the turn and the public API takes a budget at or
+/// above `max_tokens`. The rule reads the `anthropic-beta` header, so it runs
+/// here rather than in the request's own validation.
+fn check_thinking_budget(headers: &HeaderMap, body: &CreateMessageRequest) -> Result<(), Response> {
+    let Some(openai_protocol::messages::ThinkingConfig::Enabled { budget_tokens, .. }) =
+        &body.thinking
+    else {
+        return Ok(());
+    };
+    let interleaved = headers
+        .get_all("anthropic-beta")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|beta| beta.trim().starts_with("interleaved-thinking"));
+    if interleaved || *budget_tokens < body.max_tokens {
+        Ok(())
+    } else {
+        Err(route_error::bad_request(
+            "thinking_budget_exceeds_max_tokens",
+            "`max_tokens` must be greater than `thinking.budget_tokens`",
+        ))
+    }
+}
+
 async fn v1_messages(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -326,6 +444,12 @@ async fn v1_messages(
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<CreateMessageRequest>,
 ) -> Response {
+    if let Err(refused) = check_anthropic_version(&headers) {
+        return refused;
+    }
+    if let Err(refused) = check_thinking_budget(&headers, &body) {
+        return refused;
+    }
     let model = body.model.clone();
     cancel
         .guard(
@@ -341,8 +465,11 @@ async fn v1_messages_count_tokens(
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     cancel: middleware::scheduler::PreemptionGuard,
-    Json(body): Json<CountMessageTokensRequest>,
+    ValidatedJson(body): ValidatedJson<CountMessageTokensRequest>,
 ) -> Response {
+    if let Err(refused) = check_anthropic_version(&headers) {
+        return refused;
+    }
     let model = body.model.clone();
     cancel
         .guard(
@@ -388,67 +515,116 @@ async fn v1_audio_transcriptions(
         .await
 }
 
+// The stored-state routes act for the caller's tenant (`storage_tenant` of
+// the request's route meta): a stored response or conversation of another
+// tenant answers as an unknown id does.
+
 async fn v1_responses_get(
     State(state): State<Arc<AppState>>,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Path(response_id): Path<String>,
 ) -> Response {
-    response_handlers::get_response(&state.context.response_storage, &response_id).await
+    let tenant = tenant::storage_tenant(&tenant_meta);
+    response_handlers::get_response(
+        &state.context.response_storage,
+        tenant.as_deref(),
+        &response_id,
+    )
+    .await
 }
 
 async fn v1_responses_cancel(
     State(state): State<Arc<AppState>>,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Path(response_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
     state
         .router
-        .cancel_response(Some(&headers), &response_id)
+        .cancel_response(Some(&headers), &tenant_meta, &response_id)
         .await
 }
 
 async fn v1_responses_delete(
     State(state): State<Arc<AppState>>,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Path(response_id): Path<String>,
 ) -> Response {
-    response_handlers::delete_response(&state.context.response_storage, &response_id).await
+    let tenant = tenant::storage_tenant(&tenant_meta);
+    response_handlers::delete_response(
+        &state.context.response_storage,
+        tenant.as_deref(),
+        &response_id,
+    )
+    .await
 }
 
 async fn v1_responses_list_input_items(
     State(state): State<Arc<AppState>>,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Path(response_id): Path<String>,
 ) -> Response {
-    response_handlers::list_response_input_items(&state.context.response_storage, &response_id)
-        .await
+    let tenant = tenant::storage_tenant(&tenant_meta);
+    response_handlers::list_response_input_items(
+        &state.context.response_storage,
+        tenant.as_deref(),
+        &response_id,
+    )
+    .await
 }
 
 async fn v1_conversations_create(
     State(state): State<Arc<AppState>>,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Json(body): Json<Value>,
 ) -> Response {
-    conversations::create_conversation(&state.context.conversation_storage, body).await
+    let tenant = tenant::storage_tenant(&tenant_meta);
+    conversations::create_conversation(&state.context.conversation_storage, tenant.as_deref(), body)
+        .await
 }
 
 async fn v1_conversations_get(
     State(state): State<Arc<AppState>>,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Path(conversation_id): Path<String>,
 ) -> Response {
-    conversations::get_conversation(&state.context.conversation_storage, &conversation_id).await
+    let tenant = tenant::storage_tenant(&tenant_meta);
+    conversations::get_conversation(
+        &state.context.conversation_storage,
+        tenant.as_deref(),
+        &conversation_id,
+    )
+    .await
 }
 
 async fn v1_conversations_update(
     State(state): State<Arc<AppState>>,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Path(conversation_id): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
-    conversations::update_conversation(&state.context.conversation_storage, &conversation_id, body)
-        .await
+    let tenant = tenant::storage_tenant(&tenant_meta);
+    conversations::update_conversation(
+        &state.context.conversation_storage,
+        tenant.as_deref(),
+        &conversation_id,
+        body,
+    )
+    .await
 }
 
 async fn v1_conversations_delete(
     State(state): State<Arc<AppState>>,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Path(conversation_id): Path<String>,
 ) -> Response {
-    conversations::delete_conversation(&state.context.conversation_storage, &conversation_id).await
+    let tenant = tenant::storage_tenant(&tenant_meta);
+    conversations::delete_conversation(
+        &state.context.conversation_storage,
+        tenant.as_deref(),
+        &conversation_id,
+    )
+    .await
 }
 
 #[derive(Deserialize, Default)]
@@ -460,6 +636,7 @@ struct ListItemsQuery {
 
 async fn v1_conversations_list_items(
     State(state): State<Arc<AppState>>,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Path(conversation_id): Path<String>,
     Query(ListItemsQuery {
         limit,
@@ -467,9 +644,11 @@ async fn v1_conversations_list_items(
         after,
     }): Query<ListItemsQuery>,
 ) -> Response {
+    let tenant = tenant::storage_tenant(&tenant_meta);
     conversations::list_conversation_items(
         &state.context.conversation_storage,
         &state.context.conversation_item_storage,
+        tenant.as_deref(),
         &conversation_id,
         limit,
         order.as_deref(),
@@ -478,20 +657,17 @@ async fn v1_conversations_list_items(
     .await
 }
 
-#[derive(Deserialize, Default)]
-struct GetItemQuery {
-    /// Additional fields to include in response (not yet implemented)
-    include: Option<Vec<String>>,
-}
-
 async fn v1_conversations_create_items(
     State(state): State<Arc<AppState>>,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Path(conversation_id): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
+    let tenant = tenant::storage_tenant(&tenant_meta);
     conversations::create_conversation_items(
         &state.context.conversation_storage,
         &state.context.conversation_item_storage,
+        tenant.as_deref(),
         &conversation_id,
         body,
     )
@@ -500,26 +676,38 @@ async fn v1_conversations_create_items(
 
 async fn v1_conversations_get_item(
     State(state): State<Arc<AppState>>,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Path((conversation_id, item_id)): Path<(String, String)>,
-    Query(query): Query<GetItemQuery>,
+    RawQuery(query): RawQuery,
 ) -> Response {
+    // `include` arrives as repeated `include[]=` / `include=` pairs; each value
+    // must name an includable field, as the public API requires.
+    let include = match conversations::parse_item_include_query(query.as_deref()) {
+        Ok(include) => include,
+        Err(response) => return response,
+    };
+    let tenant = tenant::storage_tenant(&tenant_meta);
     conversations::get_conversation_item(
         &state.context.conversation_storage,
         &state.context.conversation_item_storage,
+        tenant.as_deref(),
         &conversation_id,
         &item_id,
-        query.include,
+        include,
     )
     .await
 }
 
 async fn v1_conversations_delete_item(
     State(state): State<Arc<AppState>>,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Path((conversation_id, item_id)): Path<(String, String)>,
 ) -> Response {
+    let tenant = tenant::storage_tenant(&tenant_meta);
     conversations::delete_conversation_item(
         &state.context.conversation_storage,
         &state.context.conversation_item_storage,
+        tenant.as_deref(),
         &conversation_id,
         &item_id,
     )
@@ -618,6 +806,15 @@ async fn stop_profile(
         .into_response()
 }
 
+/// `POST /heap_profile`: a heap profile of this gateway process, written
+/// under `--jemalloc-prof-dir` by a `jemalloc-profiling` build (see
+/// [`heap_profile`]).
+async fn dump_heap_profile(State(state): State<Arc<AppState>>) -> Response {
+    heap_profile::dump_blocking(state.context.router_config.jemalloc_prof_dir.clone())
+        .await
+        .into_response()
+}
+
 async fn get_loads(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListWorkersQuery>,
@@ -638,7 +835,7 @@ async fn get_loads(
 
 async fn create_worker(
     State(state): State<Arc<AppState>>,
-    Json(config): Json<WorkerSpec>,
+    AdminJson(config): AdminJson<WorkerSpec>,
 ) -> Response {
     match state.context.worker_service.create_worker(config).await {
         Ok(result) => result.into_response(),
@@ -697,7 +894,7 @@ async fn delete_worker(
 async fn update_worker(
     State(state): State<Arc<AppState>>,
     Path(worker_id_raw): Path<String>,
-    Json(update): Json<WorkerUpdateRequest>,
+    AdminJson(update): AdminJson<WorkerUpdateRequest>,
 ) -> Response {
     match state
         .context
@@ -713,7 +910,7 @@ async fn update_worker(
 async fn replace_worker(
     State(state): State<Arc<AppState>>,
     Path(worker_id_raw): Path<String>,
-    Json(config): Json<WorkerSpec>,
+    AdminJson(config): AdminJson<WorkerSpec>,
 ) -> Response {
     match state
         .context
@@ -784,7 +981,9 @@ pub struct ServerConfig {
     /// main `port` regardless.
     pub health_check_port: Option<u16>,
     /// Explicit async runtime worker-thread count. `None` uses tokio's
-    /// container-aware default (`available_parallelism()`).
+    /// container-aware default (`available_parallelism()`). Only the CLI's
+    /// `main` sizes its runtime from it; `startup` runs on the caller's
+    /// runtime and logs the size it finds (and this setting, as `pinned`).
     pub runtime_worker_threads: Option<usize>,
     pub router_config: RouterConfig,
     pub max_payload_size: usize,
@@ -917,11 +1116,25 @@ pub fn build_app(
             .route("/v1/classify", post(v1_classify))
             .route("/v1/decisions", post(v1_decisions))
             .route("/v1/systemone", post(v1_systemone))
+            // Bound the buffered body read: inside admission, so a stalled
+            // upload releases its permit, and inside the stream-vs-buffer
+            // decision, since the streamed relay has its own watchdog.
+            .route_layer(axum::middleware::from_fn_with_state(
+                middleware::RequestBodyTimeouts::from_config(&app_state.context.router_config),
+                middleware::request_body_timeout_middleware,
+            ))
             // Per-request buffer-vs-stream decision for typed-JSON bodies;
             // declined requests pass to the handlers untouched.
             .route_layer(axum::middleware::from_fn_with_state(
                 StreamBodyState::new(app_state.router.clone(), app_state.context.clone()),
                 stream_eligible_request_bodies,
+            ))
+            // Every SSE stream of these routes carries a keep-alive through an
+            // upstream silence (a comment; the Messages API's ping event),
+            // written between frames, nothing while frames flow.
+            .route_layer(axum::middleware::from_fn_with_state(
+                middleware::SseKeepAlive::from_config(&app_state.context.router_config),
+                middleware::sse_keepalive_middleware,
             ))
             // Tokenize / Detokenize endpoints
             .route("/v1/tokenize", post(v1_tokenize))
@@ -950,6 +1163,11 @@ pub fn build_app(
     .route_layer(axum::middleware::from_fn_with_state(
         app_state.clone(),
         middleware::wasm_middleware,
+    ))
+    // Outermost on these routes: a refusal by any layer inside (authentication,
+    // admission, the body timeout) leaves in the Messages envelope as well.
+    .route_layer(axum::middleware::from_fn(
+        middleware::messages_error_envelope_middleware,
     ));
 
     // WebSocket and WebRTC routes: auth + concurrency but NO WASM middleware.
@@ -998,6 +1216,9 @@ pub fn build_app(
         .route("/engine_metrics", get(engine_metrics))
         .route("/loads", get(get_loads))
         .route("/v1/models", get(v1_models))
+        // The rest of the path: a self-hosted id usually carries a slash
+        // (an organisation and a name), raw or percent-encoded.
+        .route("/v1/models/{*id}", get(v1_model))
         .route("/get_model_info", get(get_model_info))
         .route("/get_server_info", get(get_server_info));
 
@@ -1006,6 +1227,7 @@ pub fn build_app(
         .route("/flush_cache", post(flush_cache))
         .route("/start_profile", post(start_profile))
         .route("/stop_profile", post(stop_profile))
+        .route("/heap_profile", post(dump_heap_profile))
         // Deprecated alias of the public `/loads`.
         .route("/get_loads", get(get_loads))
         .route("/parse/function_call", post(parse_function_call))
@@ -1095,8 +1317,8 @@ pub fn build_app(
     .with_state(app_state))
 }
 
-/// The middleware every request crosses, matched or not: body limits, access
-/// logging, HTTP metrics, request ids and CORS.
+/// The middleware every request crosses, matched or not: body limits, the
+/// trace-context echo, access logging, HTTP metrics, request ids and CORS.
 ///
 /// `Router::layer` wraps only what the router holds when it is called, so the
 /// not-found fallback goes in first. Registered after the layers, unknown
@@ -1113,14 +1335,39 @@ where
     S: Clone + Send + Sync + 'static,
 {
     app.fallback(sink_handler)
+        .method_not_allowed_fallback(method_not_allowed_handler)
+        // Marks every response that came back through the body-limit layer
+        // below, so the envelope pass outside it re-shapes only the limit
+        // layer's own refusal (a 413 minted inside, a handler's or a relayed
+        // upstream's, keeps its body).
+        .layer(axum::middleware::from_fn(
+            middleware::mark_passed_body_limit_middleware,
+        ))
         .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,
         ))
+        // The limit layer refuses a declared over-limit length with a plain
+        // text 413: the gateway's envelope and error code go on here, outside
+        // it, the same as the chunked refusal the extractor builds.
+        .layer(axum::middleware::from_fn(
+            middleware::payload_too_large_envelope_middleware,
+        ))
+        // The Messages envelope once more, outside the body-size limit: a
+        // declared over-limit length is refused by the limit layer before any
+        // route layer runs, and still leaves in the envelope.
+        .layer(axum::middleware::from_fn(
+            middleware::messages_error_envelope_middleware,
+        ))
+        .layer(axum::middleware::from_fn(
+            middleware::trace_context_response,
+        ))
         .layer(middleware::create_logging_layer())
         .layer(middleware::HttpMetricsLayer::new(inflight_tracker))
         .layer(middleware::RequestIdLayer::new(request_id_headers))
-        .layer(create_cors_layer(cors_allowed_origins))
+        .layer(tower::util::option_layer(create_cors_layer(
+            cors_allowed_origins,
+        )))
 }
 
 /// Discovery tasks owned by `startup`, aborted when this guard drops.
@@ -1163,6 +1410,8 @@ fn supervise_discovery(
 }
 
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+    crate::tls::install_crypto_provider();
+
     // Defense in depth: the CLI and Python bindings both validate via
     // `RouterConfigBuilder::build()` before reaching here, but `RouterConfig`
     // is public and `Deserialize`, so a Rust library caller can construct
@@ -1172,6 +1421,35 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // of construction path — a bypassed empty/duplicate tenant key would
     // otherwise silently reach `AuthConfig`.
     config.router_config.validate()?;
+    // The mesh listener's port against the others: the mesh configuration is
+    // not part of `RouterConfig`, so the validator cannot see it, and this is
+    // the one place the CLI, the Python binding and a library caller all pass.
+    if let Some(mesh_server_config) = &config.mesh_server_config {
+        crate::config::validate_mesh_listener_port(
+            mesh_server_config.bind_addr.port(),
+            config.port,
+            config
+                .prometheus_config
+                .as_ref()
+                .map(|prometheus_config| prometheus_config.port),
+            config.health_check_port,
+        )?;
+    }
+
+    // The TLS material is parsed before anything binds: a certificate or key
+    // file the gateway could read but not use used to fail at the HTTP bind,
+    // after the metrics listener was up.
+    let tls_config = match (
+        &config.router_config.server_cert,
+        &config.router_config.server_key,
+    ) {
+        (Some(cert), Some(key)) => Some(
+            axum_server::tls_rustls::RustlsConfig::from_pem(cert.clone(), key.clone())
+                .await
+                .map_err(|e| format!("Failed to create TLS config: {e}"))?,
+        ),
+        _ => None,
+    };
 
     static LOGGING_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
@@ -1208,6 +1486,33 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         ))
     };
 
+    // The runtime was built by the caller (the CLI's `main`, the Python
+    // binding, a library caller) before the subscriber existed: its size is
+    // logged here, where the line reaches the log. `pinned` is the
+    // configuration's say; only the CLI's `main` sizes its runtime from it.
+    info!(
+        worker_threads = tokio::runtime::Handle::current().metrics().num_workers(),
+        pinned = config.runtime_worker_threads.is_some(),
+        "Tokio runtime sized"
+    );
+
+    // Who else can read the private key files: checked here, once the
+    // subscriber exists, so the line reaches the log (the configuration is
+    // validated before logging starts).
+    if let Some(path) = &config.router_config.server_key_path {
+        crate::tls::warn_if_private_key_is_shared(std::path::Path::new(path), "--tls-key-path");
+    }
+    if let Some(path) = &config.router_config.client_key_path {
+        crate::tls::warn_if_private_key_is_shared(std::path::Path::new(path), "--client-key-path");
+    }
+    if let Some(mtls) = config
+        .mesh_server_config
+        .as_ref()
+        .and_then(|mesh| mesh.mtls_config.as_ref())
+    {
+        crate::tls::warn_if_private_key_is_shared(&mtls.server_key_path, "--mesh-tls-key");
+    }
+
     // Seed the process-wide multimodal tensor transport defaults from the
     // resolved router config; per-worker specs still override at request time.
     use crate::routers::grpc::multimodal::{
@@ -1224,21 +1529,16 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     llm_multimodal::init_log_video_decode_timing(mm_settings.log_mm_timing.value);
     init_mm_settings(mm_settings);
 
-    // Start the metrics server. It binds the port eagerly so we fail fast on
-    // port conflicts or bad addresses.
-    if let Some(prometheus_config) = &config.prometheus_config {
+    // The metrics recorder is installed now so start-up records land in it;
+    // its listener binds further down, once every configuration read that
+    // can still fail (storage hooks, policy files, store connections) has
+    // happened, right before the probe and HTTP listeners: nothing binds
+    // before a fatal configuration error.
+    let metrics_handle = config.prometheus_config.as_ref().map(|prometheus_config| {
         let handle = metrics::start_prometheus(prometheus_config.clone());
-        let (_metrics_addr, _server_handle) = metrics_server::start_metrics_server(
-            handle,
-            prometheus_config.host.clone(),
-            prometheus_config.port,
-        )
-        .await?;
-        // Tokio runtime self-observability (event-loop canary + sampler).
-        // `startup` runs on the main runtime, so the observer lands on —
-        // and therefore measures — the runtime that serves requests.
-        runtime_metrics::spawn_observer();
-    }
+        metrics::init_startup_series();
+        handle
+    });
 
     // Build the mesh server if configured. Starting gossip is deferred until
     // MeshAdapters has registered the `worker:`/`rl:` CRDT namespaces below —
@@ -1270,9 +1570,14 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         )
         .await?,
     );
+    // The history store's size on /metrics, from the stores that can count.
+    if config.prometheus_config.is_some() {
+        history_metrics::spawn_sampler(Arc::clone(&app_context));
+    }
 
-    // Register the CRDT namespaces and start the inbound sync adapters, then
-    // start gossip. Order matters: see the note at the mesh build above.
+    // Register the CRDT namespaces and start the inbound sync adapters now;
+    // gossip starts further down, after the metrics and probe listeners are
+    // bound. Order matters: see the note at the mesh build above.
     let mesh_adapters = mesh_handler.as_ref().map(|handler| {
         MeshAdapters::start(
             handler.mesh_kv(),
@@ -1282,17 +1587,6 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             app_context.policy_registry.clone(),
         )
     });
-    if let Some(mesh_server) = mesh_server {
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "mesh server runs for the lifetime of the process; shutdown is handled by the mesh handler"
-        )]
-        spawn(async move {
-            if let Err(e) = mesh_server.start().await {
-                tracing::error!("Mesh server failed: {}", e);
-            }
-        });
-    }
 
     if config.prometheus_config.is_some() {
         app_context.inflight_tracker.start_sampler(20);
@@ -1469,11 +1763,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         };
 
     if app_context.rate_limiter.is_none() {
-        info!("Rate limiting is disabled (max_concurrent_requests = -1)");
+        info!("Admission control is disabled (max_concurrent_requests = 0)");
     } else if admission_queue.is_none() {
         debug!(
-            "Rate limiting enabled (max_concurrent_requests = {}, queue disabled)",
-            config.router_config.max_concurrent_requests
+            "Admission queue disabled (queue_size = 0): requests past the in-flight bound are rejected at once"
         );
     }
 
@@ -1494,6 +1787,33 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         app_context.worker_registry.clone(),
         app_context.tokenizer_registry.clone(),
         config.router_config.clone(),
+    );
+
+    // The metrics listener: the recorder exists since the top of start-up,
+    // the port binds only now (see there). It still binds eagerly, so a port
+    // conflict or a bad address fails the start before the HTTP listener.
+    if let (Some(handle), Some(prometheus_config)) = (metrics_handle, &config.prometheus_config) {
+        let (_metrics_addr, _server_handle) = metrics_server::start_metrics_server(
+            handle,
+            prometheus_config.host.clone(),
+            prometheus_config.port,
+        )
+        .await?;
+        // Tokio runtime self-observability (event-loop canary + sampler).
+        // `startup` runs on the main runtime, so the observer lands on —
+        // and therefore measures — the runtime that serves requests.
+        runtime_metrics::spawn_observer();
+    }
+
+    // The records of unstored background responses whose polling window
+    // ended with no gateway there to retire them (a stop or a crash inside
+    // the window, with a store that outlives the process) are swept now,
+    // whatever this gateway's background setting (an earlier one may have had
+    // it on), and then once per window while background mode is on, where new
+    // unstored records can appear. Dropping the JoinHandle detaches the task.
+    let _unstored_sweeper = spawn_unstored_sweeper(
+        app_context.response_storage.clone(),
+        config.router_config.max_background_responses > 0,
     );
 
     // Optional isolated probe listener (additive): when `--health-check-port`
@@ -1592,6 +1912,16 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let control_plane_auth_state =
         smg_auth::ControlPlaneAuthState::try_init(config.control_plane_auth.as_ref()).await;
 
+    // Name what this start leaves open, once, before the listener opens:
+    // an unauthenticated gateway is a decision, not an omission.
+    crate::posture::log_open_posture(
+        &serving_auth_config,
+        &admin_auth_config,
+        control_plane_auth_state.is_some(),
+        config.prometheus_config.as_ref(),
+        config.mesh_server_config.as_ref(),
+    );
+
     let app = build_app(
         app_state,
         serving_auth_config,
@@ -1602,14 +1932,86 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.router_config.cors_allowed_origins.clone(),
     )?;
 
-    // TcpListener::bind accepts &str and handles IPv4/IPv6 via ToSocketAddrs
-    let bind_addr = format!("{}:{}", config.host, config.port);
-    info!("Starting server on {}", bind_addr);
-
-    // Parse address and set up graceful shutdown (common to both TLS and non-TLS)
-    let addr: std::net::SocketAddr = bind_addr
-        .parse()
+    // One bind-host rule for every listener: IPv6 with or without brackets.
+    let addr = crate::config::bind_socket_addr(&config.host, config.port)
         .map_err(|e| format!("Invalid address: {e}"))?;
+    // The mesh listener binds now too, eagerly, before the HTTP listener: a
+    // mesh port another process holds used to surface as one error line from
+    // the mesh server's task after the gateway was already serving, as a node
+    // outside the mesh, its rate limits and worker state shared with nobody.
+    // The bound socket is handed to the mesh server below.
+    let mesh_listener = match &config.mesh_server_config {
+        Some(mesh_server_config) => {
+            let mesh_addr = mesh_server_config.bind_addr;
+            Some(
+                tokio::net::TcpListener::bind(mesh_addr)
+                    .await
+                    .map_err(|e| {
+                        format!(
+                            "Failed to bind the mesh listener on {mesh_addr} (--mesh-port): {e}"
+                        )
+                    })?,
+            )
+        }
+        None => None,
+    };
+    // Everything the mesh server does before it serves happens now, before
+    // the HTTP listener binds: the listener against the configured address,
+    // the TLS configuration from the mesh TLS material, the gossip service
+    // and its controller. A failure here used to be one error line from the
+    // mesh server's task a second after the gateway was serving, as a node
+    // outside the mesh (`Mesh server failed: ...` once, `/readiness` ready);
+    // the mesh TLS flags check only that their files exist.
+    let mesh_server = match (mesh_server, mesh_listener) {
+        (Some(mesh_server), Some(mesh_listener)) => {
+            let with_tls = config
+                .mesh_server_config
+                .as_ref()
+                .is_some_and(|mesh| mesh.mtls_config.is_some());
+            let flags = if with_tls {
+                "--enable-mesh with --mesh-tls-ca-cert, --mesh-tls-cert and --mesh-tls-key"
+            } else {
+                "--enable-mesh"
+            };
+            Some(
+                mesh_server
+                    .prepare_with_listener(mesh_listener)
+                    .await
+                    .map_err(|e| format!("Failed to start the mesh server ({flags}): {e:#}"))?,
+            )
+        }
+        _ => None,
+    };
+    // The HTTP listener binds now, eagerly, the last of the listeners: a port
+    // another process holds fails the start here, before the mesh server
+    // below has joined the cluster. Bound through tokio, as axum-server
+    // binds (the same socket options and accept backlog; std's bind would
+    // queue 128 connections instead of 1024), and served from the socket at
+    // `serve` below.
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .and_then(tokio::net::TcpListener::into_std)
+        .map_err(|e| format!("Failed to bind the HTTP listener on {addr}: {e}"))?;
+    info!("Starting server on {addr}");
+
+    // The mesh server serves once every listener is bound: a member that
+    // joined the cluster and vanished with a failed bind is the partial start
+    // the checks above exist to prevent. The adapters registered their
+    // namespaces earlier, so gossip is safe to start. It serves from the
+    // socket bound and prepared above.
+    if let Some(mesh_server) = mesh_server {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "mesh server runs for the lifetime of the process; shutdown is handled by the mesh handler"
+        )]
+        spawn(async move {
+            if let Err(e) = mesh_server.serve().await {
+                tracing::error!("Mesh server failed: {e:#}");
+            }
+        });
+    }
+
+    // Set up graceful shutdown (common to both TLS and non-TLS)
 
     let handle = axum_server::Handle::new();
     let handle_clone = handle.clone();
@@ -1666,25 +2068,30 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         // Phase 3: Teardown proceeds after axum server stops (in the main task)
     });
 
-    let server_result = if let (Some(cert), Some(key)) = (
-        &config.router_config.server_cert,
-        &config.router_config.server_key,
-    ) {
+    // Bounds on connections that carry no request (a head that never
+    // arrives or stalls, an idle keep-alive connection); a request in flight,
+    // an open streaming response included, is never cut here.
+    let connection_timeouts = ConnectionTimeouts::from_secs(
+        config.router_config.header_read_timeout_secs,
+        config.router_config.idle_connection_timeout_secs,
+    );
+    info!(
+        header_read_timeout_secs = config.router_config.header_read_timeout_secs,
+        idle_connection_timeout_secs = config.router_config.idle_connection_timeout_secs,
+        "HTTP connection timeouts (0 = disabled)"
+    );
+
+    let server_result = if let Some(tls_config) = tls_config {
         info!("TLS enabled");
-        ring::default_provider()
-            .install_default()
-            .map_err(|e| format!("Failed to install rustls ring provider: {e:?}"))?;
 
-        let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem(cert.clone(), key.clone())
-            .await
-            .map_err(|e| format!("Failed to create TLS config: {e}"))?;
-
-        axum_server::bind_rustls(addr, tls_config)
+        axum_server::from_tcp_rustls(listener, tls_config)?
+            .map(|acceptor| ConnectionTimeoutAcceptor::new(acceptor, connection_timeouts))
             .handle(handle)
             .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
     } else {
-        bind_http_server(addr)
+        axum_server::from_tcp(listener)?
+            .acceptor(http_acceptor(connection_timeouts))
             .handle(handle)
             .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
@@ -1707,13 +2114,29 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     server_result.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
 }
 
-/// Disable Nagle buffering on accepted plain-HTTP sockets so small streaming
-/// writes need not wait for outstanding data to be acknowledged. This changes
-/// neither HTTP payloads nor the separately configured TLS listener.
+/// The plain-HTTP acceptor: Nagle buffering disabled on accepted sockets so
+/// small streaming writes need not wait for outstanding data to be
+/// acknowledged, and the connections that carry no request bounded (see
+/// [`connection_timeouts`]). This changes no HTTP payload; the separately
+/// configured TLS listener applies the same bounds around its handshake
+/// acceptor.
+fn http_acceptor(
+    timeouts: ConnectionTimeouts,
+) -> ConnectionTimeoutAcceptor<axum_server::accept::NoDelayAcceptor> {
+    ConnectionTimeoutAcceptor::new(axum_server::accept::NoDelayAcceptor::new(), timeouts)
+}
+
+/// A plain-HTTP server bound on `addr` with [`http_acceptor`]. Start-up
+/// serves a listener it bound earlier (see `startup`); the tests bind here.
+#[cfg(test)]
 fn bind_http_server(
     addr: std::net::SocketAddr,
-) -> axum_server::Server<std::net::SocketAddr, axum_server::accept::NoDelayAcceptor> {
-    axum_server::bind(addr).acceptor(axum_server::accept::NoDelayAcceptor::new())
+    timeouts: ConnectionTimeouts,
+) -> axum_server::Server<
+    std::net::SocketAddr,
+    ConnectionTimeoutAcceptor<axum_server::accept::NoDelayAcceptor>,
+> {
+    axum_server::bind(addr).acceptor(http_acceptor(timeouts))
 }
 
 #[expect(
@@ -1748,10 +2171,18 @@ async fn shutdown_signal() {
     }
 }
 
-fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLayer {
+/// The CORS policy for `--cors-allowed-origins`. Without the flag there is
+/// no layer: the gateway makes no cross-origin allowance, so a browser's
+/// preflight gets no `access-control-allow-*` headers and the browser
+/// refuses the cross-origin call (every other client is unaffected). A lone
+/// `*` is the open policy: any origin, method and header. A list allows
+/// exactly those origins with a fixed method and header set.
+fn create_cors_layer(allowed_origins: Vec<String>) -> Option<tower_http::cors::CorsLayer> {
     use tower_http::cors::Any;
 
     let cors = if allowed_origins.is_empty() {
+        return None;
+    } else if allowed_origins.iter().any(|origin| origin == "*") {
         tower_http::cors::CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)
@@ -1777,11 +2208,19 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
                 http::header::AUTHORIZATION,
                 http::header::HeaderName::from_static("anthropic-version"),
                 http::header::HeaderName::from_static("anthropic-beta"),
+                http::header::HeaderName::from_static("traceparent"),
+                http::header::HeaderName::from_static("tracestate"),
             ])
-            .expose_headers([http::header::HeaderName::from_static("x-request-id")])
+            // The request id and the echoed trace context, readable by
+            // browser clients.
+            .expose_headers([
+                http::header::HeaderName::from_static("x-request-id"),
+                http::header::HeaderName::from_static("traceparent"),
+                http::header::HeaderName::from_static("tracestate"),
+            ])
     };
 
-    cors.max_age(Duration::from_secs(3600))
+    Some(cors.max_age(Duration::from_secs(3600)))
 }
 
 #[cfg(test)]
@@ -1794,6 +2233,72 @@ mod tests {
 
     use super::*;
     use crate::config::TenantApiKeyEntry;
+
+    /// A request without `anthropic-version` is served (this gateway's own
+    /// SDK clients send none); a version that is not a real calendar date of
+    /// 2023 or later is refused, as the public API refuses it.
+    #[test]
+    fn messages_requests_take_a_missing_version_and_refuse_a_malformed_one() {
+        let with = |value: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("anthropic-version", http::HeaderValue::from_static(value));
+            headers
+        };
+        assert!(check_anthropic_version(&HeaderMap::new()).is_ok());
+        for ok in ["2023-06-01", "2023-01-01", "2024-02-29", "2026-12-31"] {
+            assert!(check_anthropic_version(&with(ok)).is_ok(), "{ok}");
+        }
+        for bad in [
+            "1999-01-01",
+            "latest",
+            "2023-6-1",
+            "2023-02-30",
+            "2023-13-01",
+            "2023-00-10",
+            "2023-02-29",
+        ] {
+            let refused = check_anthropic_version(&with(bad)).expect_err(bad);
+            assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "{bad}");
+            assert_eq!(
+                route_error::extract_error_code_from_response(&refused),
+                "invalid_anthropic_version",
+                "{bad}"
+            );
+        }
+    }
+
+    /// A thinking budget at or above `max_tokens` is refused as the public
+    /// API refuses it, except under the interleaved-thinking beta, where the
+    /// public API takes it.
+    #[test]
+    fn thinking_budget_must_stay_under_max_tokens_unless_interleaved() {
+        let request = |max_tokens: u32, budget: u32| -> CreateMessageRequest {
+            serde_json::from_value(serde_json::json!({
+                "model": "m", "max_tokens": max_tokens,
+                "thinking": {"type": "enabled", "budget_tokens": budget},
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap()
+        };
+        let plain = HeaderMap::new();
+        assert!(check_thinking_budget(&plain, &request(4096, 1024)).is_ok());
+        let refused = check_thinking_budget(&plain, &request(1024, 1024)).expect_err("refused");
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            route_error::extract_error_code_from_response(&refused),
+            "thinking_budget_exceeds_max_tokens"
+        );
+
+        let mut interleaved = HeaderMap::new();
+        interleaved.insert(
+            "anthropic-beta",
+            http::HeaderValue::from_static(
+                "fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14",
+            ),
+        );
+        assert!(check_thinking_budget(&interleaved, &request(1024, 1024)).is_ok());
+        assert!(check_thinking_budget(&interleaved, &request(1024, 8192)).is_ok());
+    }
 
     /// The not-found fallback sits inside the edge layers: an unknown route
     /// gets a request id (and a log line and a metric) like a known one.
@@ -1828,6 +2333,400 @@ mod tests {
         }
     }
 
+    /// An unknown URL and a wrong method answer a JSON envelope in the shape
+    /// of the API the request speaks: the Messages envelope on a Messages
+    /// route or with the `anthropic-version` header, the OpenAI-shaped one
+    /// otherwise; never an empty body.
+    #[tokio::test]
+    async fn unknown_routes_answer_the_envelope_of_the_api_spoken() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let app = attach_edge_layers(
+            Router::new().route("/v1/chat/completions", post(|| async { StatusCode::OK })),
+            1024,
+            InFlightRequestTracker::new(),
+            vec![],
+            vec![],
+        );
+        for (method, path, version, status, messages_shape) in [
+            (
+                "GET",
+                "/v1/models/claude-x",
+                None,
+                StatusCode::NOT_FOUND,
+                false,
+            ),
+            (
+                "GET",
+                "/v1/models/claude-x",
+                Some("2023-06-01"),
+                StatusCode::NOT_FOUND,
+                true,
+            ),
+            (
+                "GET",
+                "/v1/messages/batches",
+                None,
+                StatusCode::NOT_FOUND,
+                true,
+            ),
+            (
+                "GET",
+                "/v1/chat/completions",
+                None,
+                StatusCode::METHOD_NOT_ALLOWED,
+                false,
+            ),
+        ] {
+            let mut request = http::Request::builder().method(method).uri(path);
+            if let Some(version) = version {
+                request = request.header("anthropic-version", version);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{method} {path}");
+            let request_id = response.headers()["x-request-id"]
+                .to_str()
+                .unwrap()
+                .to_string();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: Value = serde_json::from_slice(&body)
+                .unwrap_or_else(|_| panic!("{method} {path}: not JSON: {body:?}"));
+            if messages_shape {
+                assert_eq!(json["type"], "error", "{json}");
+                let expected = if status == StatusCode::NOT_FOUND {
+                    "not_found_error"
+                } else {
+                    "invalid_request_error"
+                };
+                assert_eq!(json["error"]["type"], expected, "{json}");
+                assert_eq!(json["request_id"], request_id, "{json}");
+            } else {
+                assert!(json["error"].is_object(), "{json}");
+                assert!(
+                    json["error"]["message"]
+                        .as_str()
+                        .is_some_and(|m| m.contains(path)),
+                    "{json}"
+                );
+            }
+        }
+    }
+
+    /// An over-limit body answers 413 whatever its framing: a declared
+    /// Content-Length over the limit is refused by the limit layer before the
+    /// body, and a chunked upload is refused the moment it crosses the limit,
+    /// with the same status, the JSON error envelope (not 400
+    /// json_parse_error) and no further frame pulled from the client.
+    #[tokio::test]
+    async fn over_limit_bodies_answer_413_whatever_the_framing() {
+        use std::sync::atomic::AtomicUsize;
+
+        use axum::{
+            body::{to_bytes, Body},
+            http::header::{CONTENT_LENGTH, CONTENT_TYPE},
+        };
+        use bytes::Bytes;
+        use futures::StreamExt;
+        use tower::ServiceExt;
+
+        let app = attach_edge_layers(
+            Router::new()
+                .route(
+                    "/v1/chat/completions",
+                    post(
+                        |ValidatedJson(_): ValidatedJson<ChatCompletionRequest>| async {
+                            StatusCode::OK
+                        },
+                    ),
+                )
+                .route(
+                    "/v1/messages",
+                    post(
+                        |ValidatedJson(_): ValidatedJson<ChatCompletionRequest>| async {
+                            StatusCode::OK
+                        },
+                    ),
+                ),
+            1024,
+            InFlightRequestTracker::new(),
+            vec![],
+            vec![],
+        );
+        let oversized = format!(
+            r#"{{"model":"m","messages":[{{"role":"user","content":"{}"}}]}}"#,
+            "x".repeat(2048)
+        );
+
+        // Chunked: 256-byte frames and no Content-Length, so only the body
+        // read can discover the overrun; four frames fit, the fifth crosses.
+        let frames: Vec<Result<Bytes, Infallible>> = oversized
+            .as_bytes()
+            .chunks(256)
+            .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+            .collect();
+        let total_frames = frames.len();
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&pulled);
+        let body = Body::from_stream(futures::stream::iter(frames).inspect(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }));
+        let response = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"], "request_body_too_large");
+        let pulled = pulled.load(Ordering::SeqCst);
+        assert!(
+            pulled <= 5 && pulled < total_frames,
+            "reading must stop at the limit: {pulled} of {total_frames} frames pulled"
+        );
+
+        // Declared length on a Messages route: refused by the limit layer
+        // before the body, and still the Messages envelope.
+        let response = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header(CONTENT_TYPE, "application/json")
+                    .header(CONTENT_LENGTH, oversized.len())
+                    .body(Body::from(oversized.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let request_id = response.headers()["x-request-id"]
+            .to_str()
+            .unwrap()
+            .to_string();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["type"], "error", "{json}");
+        assert_eq!(json["error"]["type"], "request_too_large", "{json}");
+        assert_eq!(json["request_id"], request_id, "{json}");
+
+        // Declared length: refused by the limit layer before the body, and
+        // still the JSON envelope with the same code as the chunked refusal
+        // (the limit layer's own answer is plain text).
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(CONTENT_TYPE, "application/json")
+                    .header(CONTENT_LENGTH, oversized.len())
+                    .body(Body::from(oversized))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            route_error::extract_error_code_from_response(&response),
+            "request_body_too_large"
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"], "request_body_too_large", "{json}");
+        assert_eq!(json["error"]["type"], "invalid_request_error", "{json}");
+    }
+
+    /// The same answer survives the request-body watchdog the typed-JSON
+    /// routes add inside the edge layers: it wraps the body, which boxes the
+    /// limit error once more, past where the extractor looks for it. A
+    /// chunked upload over the limit is still 413 request_body_too_large
+    /// (not 400 json_parse_error) and no frame past the limit is pulled.
+    #[tokio::test]
+    async fn chunked_over_limit_body_is_413_behind_the_body_watchdog() {
+        use std::sync::atomic::AtomicUsize;
+
+        use axum::{
+            body::{to_bytes, Body},
+            http::header::CONTENT_TYPE,
+        };
+        use bytes::Bytes;
+        use futures::StreamExt;
+        use tower::ServiceExt;
+
+        let app = attach_edge_layers(
+            Router::new()
+                .route(
+                    "/v1/chat/completions",
+                    post(
+                        |ValidatedJson(_): ValidatedJson<ChatCompletionRequest>| async {
+                            StatusCode::OK
+                        },
+                    ),
+                )
+                .route_layer(axum::middleware::from_fn_with_state(
+                    middleware::RequestBodyTimeouts::from_config(&RouterConfig::default()),
+                    middleware::request_body_timeout_middleware,
+                )),
+            1024,
+            InFlightRequestTracker::new(),
+            vec![],
+            vec![],
+        );
+        let oversized = format!(
+            r#"{{"model":"m","messages":[{{"role":"user","content":"{}"}}]}}"#,
+            "x".repeat(2048)
+        );
+        let frames: Vec<Result<Bytes, Infallible>> = oversized
+            .as_bytes()
+            .chunks(256)
+            .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+            .collect();
+        let total_frames = frames.len();
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&pulled);
+        let body = Body::from_stream(futures::stream::iter(frames).inspect(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }));
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"], "request_body_too_large");
+        let pulled = pulled.load(Ordering::SeqCst);
+        assert!(
+            pulled <= 5 && pulled < total_frames,
+            "reading must stop at the limit: {pulled} of {total_frames} frames pulled"
+        );
+    }
+
+    /// The CORS policy per `--cors-allowed-origins`, through the edge stack
+    /// a request meets: nothing cross-origin without the flag, any origin
+    /// for a lone `*`, the listed origins otherwise; on a preflight and on a
+    /// plain request alike.
+    #[tokio::test]
+    async fn cors_is_off_without_the_flag_open_for_a_wildcard_and_listed_otherwise() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let allow_origin = |origins: Vec<String>, origin: &'static str, preflight: bool| async move {
+            let app = attach_edge_layers(
+                Router::new().route("/v1/models", get(|| async { StatusCode::OK })),
+                1 << 20,
+                InFlightRequestTracker::new(),
+                vec![],
+                origins,
+            );
+            let mut request = http::Request::builder()
+                .method(if preflight { "OPTIONS" } else { "GET" })
+                .uri("/v1/models")
+                .header("origin", origin);
+            if preflight {
+                request = request
+                    .header("access-control-request-method", "GET")
+                    .header(
+                        "access-control-request-headers",
+                        "authorization,content-type",
+                    );
+            }
+            let response = app
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let header = |name: &str| {
+                response
+                    .headers()
+                    .get(name)
+                    .map(|value| value.to_str().unwrap().to_owned())
+            };
+            (
+                response.status(),
+                header("access-control-allow-origin"),
+                header("access-control-allow-methods"),
+                header("access-control-allow-headers"),
+            )
+        };
+        let listed = || vec!["https://app.example".to_string()];
+        let star = || vec!["*".to_string()];
+
+        // Absent: no allowance for any origin, and a plain request still works.
+        let (_, origin, methods, headers) =
+            allow_origin(vec![], "https://evil.example", true).await;
+        assert_eq!(
+            (origin, methods, headers),
+            (None, None, None),
+            "preflight without the flag"
+        );
+        let (status, origin, _, _) = allow_origin(vec![], "https://evil.example", false).await;
+        assert_eq!(
+            (status, origin),
+            (StatusCode::OK, None),
+            "plain request without the flag"
+        );
+
+        // A lone `*`: the open policy.
+        let (status, origin, methods, headers) =
+            allow_origin(star(), "https://evil.example", true).await;
+        assert!(status.is_success());
+        assert_eq!(
+            (origin.as_deref(), methods.as_deref(), headers.as_deref()),
+            (Some("*"), Some("*"), Some("*")),
+            "preflight with '*'"
+        );
+        let (status, origin, _, _) = allow_origin(star(), "https://evil.example", false).await;
+        assert_eq!(
+            (status, origin.as_deref()),
+            (StatusCode::OK, Some("*")),
+            "plain request with '*'"
+        );
+
+        // A list: the listed origin is echoed, every other origin gets nothing.
+        let (status, origin, methods, _) =
+            allow_origin(listed(), "https://app.example", true).await;
+        assert!(status.is_success());
+        assert_eq!(
+            origin.as_deref(),
+            Some("https://app.example"),
+            "preflight from a listed origin"
+        );
+        assert!(
+            methods.is_some_and(|m| m.contains("POST")),
+            "the fixed method list"
+        );
+        let (_, origin, _, _) = allow_origin(listed(), "https://evil.example", true).await;
+        assert_eq!(origin, None, "preflight from an unlisted origin");
+        let (status, origin, _, _) = allow_origin(listed(), "https://app.example", false).await;
+        assert_eq!(
+            (status, origin.as_deref()),
+            (StatusCode::OK, Some("https://app.example")),
+            "plain request from a listed origin"
+        );
+    }
+
     #[tokio::test]
     async fn configured_cors_allows_anthropic_headers() {
         use axum::body::Body;
@@ -1838,7 +2737,10 @@ mod tests {
                 "/v1/messages/count_tokens",
                 post(|| async { StatusCode::OK }),
             )
-            .layer(create_cors_layer(vec!["https://client.example".into()]));
+            .layer(
+                create_cors_layer(vec!["https://client.example".into()])
+                    .expect("a configured origin list attaches the layer"),
+            );
         let response = app
             .oneshot(
                 http::Request::builder()
@@ -1887,14 +2789,14 @@ mod tests {
             socket.set_nodelay(false).unwrap();
             assert!(!socket.nodelay().unwrap());
             let service = Arc::new(());
-            let server = bind_http_server(addr);
+            let server = bind_http_server(addr, ConnectionTimeouts::disabled());
             let (socket, returned_service) = server
                 .get_ref()
                 .accept(socket, service.clone())
                 .await
                 .unwrap();
-            assert!(socket.nodelay().unwrap());
-            assert!(Arc::ptr_eq(&service, &returned_service));
+            assert!(socket.get_ref().nodelay().unwrap());
+            assert!(Arc::ptr_eq(&service, &returned_service.into_inner()));
         })
         .await
         .expect("plain HTTP acceptor test timed out");
@@ -1918,12 +2820,18 @@ mod tests {
                         ]))
                     }),
                 );
-            let serving = bind_http_server("127.0.0.1:0".parse().unwrap())
-                .handle(handle.clone())
-                .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>());
+            let serving = bind_http_server(
+                "127.0.0.1:0".parse().unwrap(),
+                ConnectionTimeouts::disabled(),
+            )
+            .handle(handle.clone())
+            .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>());
             let checking = async {
                 let addr = handle.listening().await.expect("HTTP server did not bind");
-                let client = reqwest::Client::builder().no_proxy().build().unwrap();
+                let client = crate::http_client::client_builder()
+                    .no_proxy()
+                    .build()
+                    .unwrap();
                 for (path, content_type, expected) in [
                     ("plain", "application/json", "{\"ok\":true}"),
                     (

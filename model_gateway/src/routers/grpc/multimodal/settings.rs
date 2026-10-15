@@ -4,7 +4,7 @@
 //! default, remembering which of the three supplied the value. An env-sourced
 //! value logs one deprecation line: env support ends after this release.
 
-use std::sync::OnceLock;
+use std::{str::FromStr, sync::OnceLock};
 
 use anyhow::{Context, Result};
 use openai_protocol::worker::MmProcessingMode;
@@ -53,6 +53,10 @@ const ENV_PIXEL_RDMA: &str = "SMG_MM_PIXEL_RDMA";
 const ENV_RDMA_LISTEN_IP: &str = "SMG_RDMA_LISTEN_IP";
 const ENV_RDMA_SLOT_TTL_S: &str = "SMG_RDMA_SLOT_TTL_S";
 const ENV_LOG_MM_TIMING: &str = "SMG_LOG_MM_TIMING";
+/// The opt-in for media origins on private, loopback or link-local addresses;
+/// not a legacy name: it is also how a worker's own media pipeline, which has
+/// no flags, is told (the worker reads it through [`mm_settings`]).
+const ENV_ALLOW_PRIVATE_MEDIA_HOSTS: &str = "SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MultimodalSettings {
@@ -69,6 +73,14 @@ pub(crate) struct MultimodalSettings {
     pub rdma_slot_ttl_s: Setting<Option<u64>>,
     /// Per-request multimodal timing at INFO.
     pub log_mm_timing: Setting<bool>,
+    /// Hosts the router's own media pipeline may fetch client-supplied media
+    /// URLs from, by name, every redirect hop included; `None` is any host
+    /// the address policy passes.
+    pub allowed_media_domains: Setting<Option<Vec<String>>>,
+    /// Whether a client-supplied media URL may name or resolve to a loopback,
+    /// link-local, private or otherwise non-public address; off, such URLs
+    /// are refused before anything is connected.
+    pub allow_private_media_hosts: Setting<bool>,
 }
 
 impl Default for MultimodalSettings {
@@ -80,6 +92,8 @@ impl Default for MultimodalSettings {
             rdma_listen_ip: Setting::from_default(None),
             rdma_slot_ttl_s: Setting::from_default(None),
             log_mm_timing: Setting::from_default(false),
+            allowed_media_domains: Setting::from_default(None),
+            allow_private_media_hosts: Setting::from_default(false),
         }
     }
 }
@@ -92,9 +106,9 @@ impl MultimodalSettings {
 
     /// Resolve with an explicit env reader, so tests never touch the process.
     ///
-    /// A `SMG_MM_PROCESSING` that cannot be read stops startup: carrying on
-    /// with the default would leave the router doing the opposite of what the
-    /// operator asked for, and a warning in the startup log is easy to miss.
+    /// Every setting is flag > env > default through [`resolve`]; the three
+    /// env switches share one spelling ([`switch`]); an unreadable
+    /// `SMG_MM_PROCESSING` stops startup ([`processing_mode`]).
     pub(crate) fn resolve_with(
         config: &RouterConfig,
         env: impl Fn(&str) -> Option<String>,
@@ -105,104 +119,153 @@ impl MultimodalSettings {
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
         };
-        let deprecated = |env_name: &str, flag: &str| {
-            warn!(
-                "{env_name} is deprecated in favour of {flag}; env support ends in the next \
-                 minor release"
-            );
-        };
 
-        let processing = match (config.mm_processing, env_nonempty(ENV_PROCESSING)) {
-            (Some(mode), _) => flag(mode),
-            (None, Some(raw)) => {
-                let mode = raw
-                    .parse::<MmProcessingMode>()
-                    .map_err(|message| anyhow::anyhow!("{message}"))
-                    .context(ENV_PROCESSING)?;
-                deprecated(ENV_PROCESSING, "--mm-processing");
-                from_env(mode)
-            }
-            (None, None) => defaults.processing,
-        };
-
-        let pixel_cache_mb = match (config.mm_pixel_cache_mb, env_nonempty(ENV_PIXEL_CACHE_MB)) {
-            (Some(mb), _) => flag(mb),
-            (None, Some(raw)) => match raw.parse::<usize>() {
-                Ok(mb) => {
-                    deprecated(ENV_PIXEL_CACHE_MB, "--mm-pixel-cache-mb");
-                    from_env(mb)
-                }
-                Err(_) => {
-                    warn!(value = %raw, "{ENV_PIXEL_CACHE_MB} is not a number; pixel cache stays off");
-                    defaults.pixel_cache_mb
-                }
-            },
-            (None, None) => defaults.pixel_cache_mb,
-        };
-
-        let pixel_rdma = if config.mm_pixel_rdma {
-            flag(true)
-        } else {
-            match env_nonempty(ENV_PIXEL_RDMA).as_deref() {
-                Some("1" | "true") => {
-                    deprecated(ENV_PIXEL_RDMA, "--mm-pixel-rdma");
-                    from_env(true)
-                }
-                _ => defaults.pixel_rdma,
-            }
-        };
-
-        let rdma_listen_ip = match (
-            config
-                .rdma_listen_ip
-                .clone()
-                .filter(|ip| !ip.trim().is_empty()),
-            env_nonempty(ENV_RDMA_LISTEN_IP),
-        ) {
-            (Some(ip), _) => flag(Some(ip)),
-            (None, Some(ip)) => {
-                deprecated(ENV_RDMA_LISTEN_IP, "--rdma-listen-ip");
-                from_env(Some(ip))
-            }
-            (None, None) => defaults.rdma_listen_ip,
-        };
-
-        let rdma_slot_ttl_s = match (config.rdma_slot_ttl_s, env_nonempty(ENV_RDMA_SLOT_TTL_S)) {
-            (Some(secs), _) => flag(Some(secs)),
-            (None, Some(raw)) => match raw.parse::<u64>() {
-                Ok(secs) => {
-                    deprecated(ENV_RDMA_SLOT_TTL_S, "--rdma-slot-ttl-s");
-                    from_env(Some(secs))
-                }
-                Err(_) => {
-                    warn!(value = %raw, "{ENV_RDMA_SLOT_TTL_S} is not a number; using the derived TTL");
-                    defaults.rdma_slot_ttl_s
-                }
-            },
-            (None, None) => defaults.rdma_slot_ttl_s,
-        };
-
-        let log_mm_timing = if config.log_mm_timing {
-            flag(true)
-        } else {
-            match env_nonempty(ENV_LOG_MM_TIMING).map(|value| value.to_ascii_lowercase()) {
-                Some(value) if matches!(value.as_str(), "1" | "true" | "yes" | "on") => {
-                    deprecated(ENV_LOG_MM_TIMING, "--log-mm-timing");
-                    from_env(true)
-                }
-                _ => defaults.log_mm_timing,
-            }
+        let switch_setting = |flag_value: bool, env_name: &str, flag_name: Option<&str>| {
+            resolve(
+                flag_value.then_some(true),
+                env_nonempty(env_name),
+                env_name,
+                flag_name,
+                Setting::from_default(false),
+                switch,
+            )
         };
 
         Ok(Self {
-            processing,
-            pixel_cache_mb,
-            pixel_rdma,
-            rdma_listen_ip,
-            rdma_slot_ttl_s,
-            log_mm_timing,
+            processing: processing_mode(config, env_nonempty(ENV_PROCESSING), defaults.processing)?,
+            pixel_cache_mb: resolve(
+                config.mm_pixel_cache_mb,
+                env_nonempty(ENV_PIXEL_CACHE_MB),
+                ENV_PIXEL_CACHE_MB,
+                Some("--mm-pixel-cache-mb"),
+                defaults.pixel_cache_mb,
+                |raw| number(raw, ENV_PIXEL_CACHE_MB, "pixel cache stays off"),
+            ),
+            pixel_rdma: switch_setting(
+                config.mm_pixel_rdma,
+                ENV_PIXEL_RDMA,
+                Some("--mm-pixel-rdma"),
+            ),
+            rdma_listen_ip: resolve(
+                config
+                    .rdma_listen_ip
+                    .clone()
+                    .filter(|ip| !ip.trim().is_empty())
+                    .map(Some),
+                env_nonempty(ENV_RDMA_LISTEN_IP),
+                ENV_RDMA_LISTEN_IP,
+                Some("--rdma-listen-ip"),
+                defaults.rdma_listen_ip,
+                |ip| Some(Some(ip.to_string())),
+            ),
+            rdma_slot_ttl_s: resolve(
+                config.rdma_slot_ttl_s.map(Some),
+                env_nonempty(ENV_RDMA_SLOT_TTL_S),
+                ENV_RDMA_SLOT_TTL_S,
+                Some("--rdma-slot-ttl-s"),
+                defaults.rdma_slot_ttl_s,
+                |raw| number(raw, ENV_RDMA_SLOT_TTL_S, "using the derived TTL").map(Some),
+            ),
+            log_mm_timing: switch_setting(
+                config.log_mm_timing,
+                ENV_LOG_MM_TIMING,
+                Some("--log-mm-timing"),
+            ),
+            // A flag only: nothing in the environment lists hosts.
+            allowed_media_domains: config
+                .mm_allowed_media_domains
+                .clone()
+                .filter(|domains| !domains.is_empty())
+                .map_or(defaults.allowed_media_domains, |domains| {
+                    flag(Some(domains))
+                }),
+            // Not a legacy name (the worker's own pipeline reads it too), so
+            // no deprecation line.
+            allow_private_media_hosts: switch_setting(
+                config.mm_allow_private_media_hosts,
+                ENV_ALLOW_PRIVATE_MEDIA_HOSTS,
+                None,
+            ),
         })
     }
+}
+
+/// The placement mode, flag > env > default like the rest, except that an
+/// env value that cannot be read stops startup: carrying on with the default
+/// would leave the router doing the opposite of what the operator asked for,
+/// and a warning in the startup log is easy to miss.
+fn processing_mode(
+    config: &RouterConfig,
+    env_value: Option<String>,
+    default: Setting<MmProcessingMode>,
+) -> Result<Setting<MmProcessingMode>> {
+    Ok(match (config.mm_processing, env_value) {
+        (Some(mode), _) => flag(mode),
+        (None, Some(raw)) => {
+            let mode = raw
+                .parse::<MmProcessingMode>()
+                .map_err(|message| anyhow::anyhow!("{message}"))
+                .context(ENV_PROCESSING)?;
+            deprecated(ENV_PROCESSING, "--mm-processing");
+            from_env(mode)
+        }
+        (None, None) => default,
+    })
+}
+
+/// One setting, flag > env > default: `flag_value` when the flag is set;
+/// else the env value `parse` can read (an unreadable one leaves the
+/// default, and `parse` says so itself where that deserves a line); else
+/// `default`. An env-sourced value logs the deprecation line when
+/// `flag_name` names the flag that replaces `env_name`.
+fn resolve<T>(
+    flag_value: Option<T>,
+    env_value: Option<String>,
+    env_name: &str,
+    flag_name: Option<&str>,
+    default: Setting<T>,
+    parse: impl FnOnce(&str) -> Option<T>,
+) -> Setting<T> {
+    if let Some(value) = flag_value {
+        return flag(value);
+    }
+    match env_value.as_deref().and_then(parse) {
+        Some(value) => {
+            if let Some(flag_name) = flag_name {
+                deprecated(env_name, flag_name);
+            }
+            from_env(value)
+        }
+        None => default,
+    }
+}
+
+/// An env switch is on with `1`, `true`, `yes` or `on`, in any case; any
+/// other spelling leaves it at its default without a word, as before (an
+/// operator's typo in a legacy switch is not an outage).
+fn switch(raw: &str) -> Option<bool> {
+    matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+    .then_some(true)
+}
+
+/// A numeric env value; one that is not a number is logged with its
+/// consequence and left unused.
+fn number<N: FromStr>(raw: &str, env_name: &str, consequence: &str) -> Option<N> {
+    let parsed = raw.parse::<N>().ok();
+    if parsed.is_none() {
+        warn!(value = %raw, "{env_name} is not a number; {consequence}");
+    }
+    parsed
+}
+
+fn deprecated(env_name: &str, flag_name: &str) {
+    warn!(
+        "{env_name} is deprecated in favour of {flag_name}; env support ends in the next minor \
+         release"
+    );
 }
 
 fn flag<T>(value: T) -> Setting<T> {
@@ -283,6 +346,7 @@ mod tests {
                 ("SMG_RDMA_LISTEN_IP", "10.0.0.7"),
                 ("SMG_RDMA_SLOT_TTL_S", "600"),
                 ("SMG_LOG_MM_TIMING", "YES"),
+                ("SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS", "True"),
             ]),
         )
         .unwrap();
@@ -295,6 +359,9 @@ mod tests {
         );
         assert_eq!(settings.rdma_slot_ttl_s, from_env(Some(600)));
         assert_eq!(settings.log_mm_timing, from_env(true));
+        assert_eq!(settings.allow_private_media_hosts, from_env(true));
+        // The allow-list is a flag only: nothing in the environment lists hosts.
+        assert_eq!(settings.allowed_media_domains, Setting::from_default(None));
     }
 
     #[test]
@@ -306,6 +373,8 @@ mod tests {
             rdma_listen_ip: Some("192.168.1.2".to_string()),
             rdma_slot_ttl_s: Some(900),
             log_mm_timing: true,
+            mm_allowed_media_domains: Some(vec!["media.example".to_string()]),
+            mm_allow_private_media_hosts: true,
             ..RouterConfig::default()
         };
         let settings = MultimodalSettings::resolve_with(
@@ -317,6 +386,7 @@ mod tests {
                 ("SMG_RDMA_LISTEN_IP", "10.0.0.7"),
                 ("SMG_RDMA_SLOT_TTL_S", "600"),
                 ("SMG_LOG_MM_TIMING", "false"),
+                ("SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS", "0"),
             ]),
         )
         .unwrap();
@@ -329,6 +399,43 @@ mod tests {
         );
         assert_eq!(settings.rdma_slot_ttl_s, flag(Some(900)));
         assert_eq!(settings.log_mm_timing, flag(true));
+        assert_eq!(
+            settings.allowed_media_domains,
+            flag(Some(vec!["media.example".to_string()]))
+        );
+        assert_eq!(settings.allow_private_media_hosts, flag(true));
+    }
+
+    /// The media fetch policy's defaults: any public host, no private ones;
+    /// an empty allow-list is no allow-list, and only a true-ish opt-in
+    /// opens private hosts.
+    #[test]
+    fn media_fetch_policy_defaults_and_opt_in_spellings() {
+        let config = RouterConfig {
+            mm_allowed_media_domains: Some(Vec::new()),
+            ..RouterConfig::default()
+        };
+        let settings = MultimodalSettings::resolve_with(&config, no_env).unwrap();
+        assert_eq!(settings.allowed_media_domains, Setting::from_default(None));
+        assert_eq!(
+            settings.allow_private_media_hosts,
+            Setting::from_default(false)
+        );
+        for (value, expected) in [
+            ("1", from_env(true)),
+            ("yes", from_env(true)),
+            ("ON", from_env(true)),
+            ("0", Setting::from_default(false)),
+            ("false", Setting::from_default(false)),
+            ("sometimes", Setting::from_default(false)),
+        ] {
+            let settings = MultimodalSettings::resolve_with(
+                &RouterConfig::default(),
+                env(&[("SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS", value)]),
+            )
+            .unwrap();
+            assert_eq!(settings.allow_private_media_hosts, expected, "{value}");
+        }
     }
 
     /// A mode that is nearly right would otherwise resolve to the default and
@@ -374,15 +481,15 @@ mod tests {
     }
 
     /// The numeric and boolean env knobs keep their lenient reading: an
-    /// unreadable value is ignored, and only the exact legacy spellings switch
-    /// the RDMA lane on.
+    /// unreadable value is ignored, and a switch spelling outside `1`, `true`,
+    /// `yes`, `on` leaves the switch off.
     #[test]
     fn unreadable_numeric_env_and_unknown_switch_values_fall_back() {
         let settings = MultimodalSettings::resolve_with(
             &RouterConfig::default(),
             env(&[
                 ("SMG_MM_PIXEL_CACHE_MB", "lots"),
-                ("SMG_MM_PIXEL_RDMA", "yes"),
+                ("SMG_MM_PIXEL_RDMA", "maybe"),
                 ("SMG_RDMA_SLOT_TTL_S", "soon"),
                 ("SMG_LOG_MM_TIMING", "0"),
                 ("SMG_RDMA_LISTEN_IP", "   "),
@@ -390,5 +497,55 @@ mod tests {
         )
         .unwrap();
         assert_eq!(settings, MultimodalSettings::default());
+    }
+
+    /// The three env switches read one set of spellings: `1`, `true`, `yes`
+    /// and `on` in any case turn them on, anything else leaves the default.
+    /// (`SMG_MM_PIXEL_RDMA` took `1` and `true` only before.)
+    #[test]
+    fn every_env_switch_reads_the_same_spellings() {
+        for name in [
+            "SMG_MM_PIXEL_RDMA",
+            "SMG_LOG_MM_TIMING",
+            "SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS",
+        ] {
+            for (value, on) in [
+                ("1", true),
+                ("true", true),
+                ("yes", true),
+                ("ON", true),
+                (" True ", true),
+                ("0", false),
+                ("false", false),
+                ("off", false),
+                ("sometimes", false),
+                ("", false),
+            ] {
+                let settings = MultimodalSettings::resolve_with(
+                    &RouterConfig::default(),
+                    env(&[(name, value)]),
+                )
+                .unwrap();
+                let [pixel_rdma, log_mm_timing, allow_private] = [
+                    settings.pixel_rdma,
+                    settings.log_mm_timing,
+                    settings.allow_private_media_hosts,
+                ];
+                let expected = if on {
+                    from_env(true)
+                } else {
+                    Setting::from_default(false)
+                };
+                let off = Setting::from_default(false);
+                let (actual, others) = match name {
+                    "SMG_MM_PIXEL_RDMA" => (pixel_rdma, [log_mm_timing, allow_private]),
+                    "SMG_LOG_MM_TIMING" => (log_mm_timing, [pixel_rdma, allow_private]),
+                    _ => (allow_private, [pixel_rdma, log_mm_timing]),
+                };
+                assert_eq!(actual, expected, "{name}={value:?}");
+                // Each switch reads its own name only.
+                assert_eq!(others, [off, off], "{name}={value:?}");
+            }
+        }
     }
 }

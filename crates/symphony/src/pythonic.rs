@@ -17,40 +17,55 @@
 //! the markers; this assembler reads what lies between them: one call or several, bare or in a
 //! list, and gives each its own index.
 //!
-//! What the syntax says, and what the assembler does with it:
-//!
-//! - **A call is a name, `(`, arguments, `)`.** The name's bytes and the `(` are `ToolCallStart`'s
-//!   source; the `)` is `ToolCallEnd`'s. A list's brackets, the commas between calls and the
-//!   whitespace around them are the template's and come back as `Dropped { Wrapper }`; any other
-//!   text where a call should begin is `Malformed`.
-//! - **Each argument is `key=value`.** The value is a Python expression the template wrote for a
-//!   JSON value: a string in either quote, a number, `True`, `False`, `None`, a list, a tuple, a
-//!   dict, or the JSON a template writes with `tojson` for a nested value. Its extent is known
-//!   when a `,` or the call's `)` arrives outside every string and bracket, so a value is held
-//!   until then and written whole, through the value module's literal reader; a value that is
-//!   not a literal is a string holding its text. Streaming a long string value as it arrives is
-//!   a later step: the templates that write Python write short values, and the extent rule is
-//!   what makes every chunking say the same.
-//! - **Every byte lands in exactly one event**, as in the other assemblers: the key, the `=`, the
-//!   value and the separator after it in the fragment they produce.
-//! - **Two endings.** [`Assembler::close`] is the region's closing marker (or the next opener):
-//!   a call still open is closed for the client, an open argument's bytes and a name that never
-//!   got its `(` come back as `Malformed`, and the list's wrapping before any call is dropped.
-//!   [`Assembler::finish`] is a stream that was cut: nothing is closed, what was held comes back
-//!   as `Malformed { UnterminatedRegion }`, and a call that started still ends, with no bytes of
-//!   its own, as every assembler ends one.
-//! - **Python's whitespace is allowed** between a name and its `(`, around the `=`, and around a
-//!   value, as the old parser's regular expression allowed it; a name or a key is the text less
-//!   that whitespace.
-//!
-//! Ported in spirit from the old crate's pythonic parser, which compiled a regular expression per
-//! call and read the arguments with a Python-literal evaluator at the end; here the arguments are
-//! read as the stream arrives, at the value's extent.
+//! Notes on what this module decides, and on what it leaves open: `docs/assemblers.md`.
 
 use crate::{
     event::{DropReason, Event, Events, MalformedReason, Text},
     tagged::value::{json, python_literal},
 };
+
+/// How a template frames the calls of one turn, which the grammar derived from the table writes
+/// and the assembler, which reads either, does not need: Olmo 3 writes them one per line between
+/// its markers, LFM2.5 as a Python list, `[` and `]` around calls joined by `, `.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Framing {
+    /// One call per line: `get_weather(city="Paris")\nget_stock_price()`.
+    OnePerLine,
+    /// A Python list: `[get_weather(city='Paris'), get_stock_price()]`.
+    List,
+}
+
+/// How a template writes a value, which the grammar derived from the table writes and the
+/// assembler, which reads both, does not need: LFM2.5's template writes Python (`True`, `None`,
+/// a string in either quote); Olmo 3's writes every value through `tojson`, so JSON (`true`,
+/// `null`, a string in double quotes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Values {
+    /// `True`, `False`, `None`, `'Paris'` or `"Paris"`.
+    Python,
+    /// `true`, `false`, `null`, `"Paris"`.
+    Json,
+}
+
+/// How a template spells its pythonic calls: how it frames them and how it writes a value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Dialect {
+    pub framing: Framing,
+    pub values: Values,
+}
+
+impl Dialect {
+    /// Olmo 3: one call per line, each value as `tojson` writes it.
+    pub const OLMO3: Self = Self {
+        framing: Framing::OnePerLine,
+        values: Values::Json,
+    };
+    /// LFM2.5: a Python list of calls with Python values.
+    pub const LFM2_5: Self = Self {
+        framing: Framing::List,
+        values: Values::Python,
+    };
+}
 
 const TEXT_BETWEEN_CALLS: &str = "text where a call should begin";
 const TEXT_WHERE_AN_ARGUMENT_SHOULD_BEGIN: &str = "text where an argument should begin";
@@ -354,6 +369,23 @@ impl Assembler {
             text: Text::uncounted(std::mem::take(&mut self.carried)),
             why: DropReason::Wrapper,
         });
+    }
+}
+
+impl crate::engine::CallAssembler for Assembler {
+    fn feed(&mut self, text: &str, _declared: &crate::tagged::Declared, out: &mut Events) -> usize {
+        self.feed(text, out);
+        text.len()
+    }
+
+    /// The region's marker belongs to the region, not to its last call.
+    fn close(self: Box<Self>, _terminal: &str, out: &mut Events) -> bool {
+        (*self).close(out);
+        false
+    }
+
+    fn finish(self: Box<Self>, out: &mut Events) {
+        (*self).finish(out);
     }
 }
 

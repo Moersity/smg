@@ -4,29 +4,39 @@
 
 use std::fmt::Write as _;
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
-// `DsEncodingError` now lives in `deepseek_common` (shared with V4.1) but is
-// re-exported here unchanged: it was already part of this module's public
-// API (returned from `encode_messages`), and `pub(super)` items are only
-// reachable within `encoders` on their own — this `pub use` is what makes it
-// visible to callers outside `encoders` (e.g. `huggingface.rs`) again.
+// `DsEncodingError` lives in `deepseek_common` (shared with V4.1) and is
+// re-exported here unchanged: it is part of this module's public API
+// (returned from `encode_messages`), and `pub(super)` items are only
+// reachable within `encoders` on their own.
 pub use super::deepseek_common::DsEncodingError;
-// Message-shape preprocessing, drop-thinking and DSML argument rendering are
-// identical to the upcoming V4.1 renderer except for the tag strings; see
-// `deepseek_common` for the shared implementation and its own doc comments.
-use super::deepseek_common::{
-    at_or_after_last_user, drop_thinking_messages, encode_arguments_to_dsml, find_last_user_index,
-    merge_tool_messages, sort_tool_results_by_call_order, DsmlTags,
-};
 // Reuse the public ThinkingMode enum from the V3.2 module to keep the
 // "thinking" / "chat" mode invariant identical across DeepSeek versions.
 pub use super::deepseek_v32::ThinkingMode;
+// Message-shape preprocessing, drop-thinking, DSML argument rendering and the
+// tools template are the V4.1 renderer's too, apart from the tag strings; see
+// `deepseek_common` for the shared implementation and its own doc comments.
+use super::{
+    deepseek_common::{
+        after_last_user, at_or_after_last_user, drop_thinking_messages, encode_arguments_to_dsml,
+        find_last_user_index, merge_tool_messages, render_v4_tools_template,
+        sort_tool_results_by_call_order, task_sp_token, to_json, tool_calls_from_openai_format,
+        tool_schemas, tools_from_openai_format, DsmlTags,
+    },
+    RendererProfile,
+};
+use crate::{
+    chat_template::{ThinkingKeyName, ThinkingToggle},
+    traits::RendererCapabilities,
+};
 
 /// Which reasoning-effort prompt revision the checkpoint was trained with.
 ///
 /// The 0731 refresh shifted the levels down one: the original's `max` text
-/// became 0731's `high`, and 0731's `max` is a new, stronger prompt.
+/// became 0731's `high`, and 0731's `max` is a new, stronger prompt. The engine's
+/// port of the encoder renders the refreshed table for every V4 checkpoint,
+/// so it is also what a checkpoint directory without its own encoder gets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EffortEncoding {
     /// `DeepSeek-V4-Flash` / `-DSpark` / `-Pro`.
@@ -42,6 +52,35 @@ impl EffortEncoding {
         match self {
             Self::Original => &["high", "max"],
             Self::V0731 => &["low", "high", "max"],
+        }
+    }
+
+    /// What this renderer answers around a render under this effort
+    /// encoding (see [`RendererProfile`]).
+    pub(crate) fn profile(self) -> RendererProfile {
+        RendererProfile {
+            // No opinion on content parts: the (usually absent) template's format.
+            content_format: None,
+            // Thinking defaults ON like the engine's own server: `thinking:
+            // false`, its `enable_thinking` alias or `reasoning_effort:
+            // "none"` turns it off.
+            thinking_toggle: ThinkingToggle::DefaultOn,
+            thinking_key_name: ThinkingKeyName::Thinking,
+            native_effort_values: self.valid_native_values(),
+            // `reasoning_effort` is read as the engine's own server reads it:
+            // `"none"` is chat mode, every other value (`"minimal"` included,
+            // which the engine maps to the low effort) keeps thinking on.
+            // Declaring the off word keeps the gateway's parser arming on
+            // that rule.
+            native_effort_off_values: &["none"],
+            // `<｜Assistant｜><think>` ends the prompt when thinking is on.
+            think_in_prefill: true,
+            // The shim reads the engine's `enable_thinking` alias too.
+            capabilities: RendererCapabilities {
+                enable_thinking_alias: true,
+                ..RendererProfile::NO_CAPABILITIES
+            },
+            thinking_mode: None,
         }
     }
 
@@ -119,30 +158,12 @@ const ASSISTANT_SP_TOKEN: &str = "<｜Assistant｜>";
 const LATEST_REMINDER_SP_TOKEN: &str = "<｜latest_reminder｜>";
 const TOOL_CALLS_BLOCK_NAME: &str = "tool_calls";
 /// V4's DSML tag strings: bare `invoke`/`parameter`, no leading space. The
-/// upcoming V4.1 renderer builds its own `DsmlTags` with a leading space on
-/// each and passes it to the same shared [`encode_arguments_to_dsml`].
+/// V4.1 renderer builds its own `DsmlTags` with a leading space on each and
+/// passes it to the same shared [`encode_arguments_to_dsml`].
 const DSML_TAGS: DsmlTags = DsmlTags {
     invoke: "invoke",
     parameter: "parameter",
 };
-// Quick-instruction "task" tokens (`<｜action｜>`, `<｜query｜>`, etc.)
-const TASK_ACTION: &str = "<｜action｜>";
-const TASK_QUERY: &str = "<｜query｜>";
-const TASK_AUTHORITY: &str = "<｜authority｜>";
-const TASK_DOMAIN: &str = "<｜domain｜>";
-const TASK_TITLE: &str = "<｜title｜>";
-const TASK_READ_URL: &str = "<｜read_url｜>";
-fn task_sp_token(task: &str) -> Option<&'static str> {
-    match task {
-        "action" => Some(TASK_ACTION),
-        "query" => Some(TASK_QUERY),
-        "authority" => Some(TASK_AUTHORITY),
-        "domain" => Some(TASK_DOMAIN),
-        "title" => Some(TASK_TITLE),
-        "read_url" => Some(TASK_READ_URL),
-        _ => None,
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Templates
@@ -151,80 +172,10 @@ fn task_sp_token(task: &str) -> Option<&'static str> {
 const REASONING_EFFORT_ABSOLUTE_MAXIMUM: &str = "Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n";
 const REASONING_EFFORT_BEYOND_MAXIMUM: &str = "Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\nYou MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\nDo not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n";
 
-/// Mirrors V4's `TOOLS_TEMPLATE`. The block name is `tool_calls` (not
-/// `function_calls` like V3.2) and the wording is updated.
-fn render_tools_template(tool_schemas: &str) -> String {
-    let dsml = DSML_TOKEN;
-    let tcb = TOOL_CALLS_BLOCK_NAME;
-    let tstart = THINKING_START_TOKEN;
-    let tend = THINKING_END_TOKEN;
-    format!(
-"## Tools
-
-You have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<{dsml}{tcb}>\" block like the following:
-
-<{dsml}{tcb}>
-<{dsml}invoke name=\"$TOOL_NAME\">
-<{dsml}parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</{dsml}parameter>
-...
-</{dsml}invoke>
-<{dsml}invoke name=\"$TOOL_NAME2\">
-...
-</{dsml}invoke>
-</{dsml}{tcb}>
-
-String parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.
-
-If thinking_mode is enabled (triggered by {tstart}), you MUST output your complete reasoning inside {tstart}...{tend} BEFORE any tool calls or final response.
-
-Otherwise, output directly after {tend} with tool calls or final response.
-
-### Available Tool Schemas
-
-{tool_schemas}
-
-You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.
-"
-    )
-}
-
-// ---------------------------------------------------------------------------
-// JSON helpers (mirror V3.2)
-// ---------------------------------------------------------------------------
-// Python's `to_json` is `json.dumps(value, ensure_ascii=False)`: spaced
-// separators, raw UTF-8. Compact `serde_json::to_string` would change the
-// prompt bytes vLLM trained on.
-fn to_json(value: &Value) -> String {
-    crate::json_dumps::to_string(value)
-}
-fn tools_from_openai_format(tools: &[Value]) -> Vec<Value> {
-    tools
-        .iter()
-        .filter_map(|t| t.get("function").cloned())
-        .collect()
-}
-fn tool_calls_from_openai_format(tool_calls: &[Value]) -> Vec<Value> {
-    tool_calls
-        .iter()
-        .filter_map(|tc| {
-            let f = tc.get("function")?;
-            Some(json!({
-                "name": f.get("name").cloned().unwrap_or(Value::Null),
-                "arguments": f.get("arguments").cloned().unwrap_or(Value::Null),
-            }))
-        })
-        .collect()
-}
-
+/// Mirrors V4's `TOOLS_TEMPLATE`: the V4 family's text with this dialect's
+/// block name (`tool_calls`, not `function_calls` like V3.2) and bare tags.
 fn render_tools(tools: &[Value]) -> String {
-    let schemas: Vec<String> = tools.iter().map(to_json).collect();
-    render_tools_template(&schemas.join("\n"))
-}
-fn after_last_user(index: usize, last_user_idx: Option<usize>) -> bool {
-    match last_user_idx {
-        Some(idx) => index > idx,
-        None => true,
-    }
+    render_v4_tools_template(TOOL_CALLS_BLOCK_NAME, &DSML_TAGS, &tool_schemas(tools))
 }
 
 // ---------------------------------------------------------------------------
@@ -533,6 +484,11 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    // The task tokens as the recorded prompts spell them, independent of
+    // `task_sp_token`.
+    const TASK_ACTION: &str = "<｜action｜>";
+    const TASK_QUERY: &str = "<｜query｜>";
     fn user(text: &str) -> Value {
         json!({ "role": "user", "content": text })
     }

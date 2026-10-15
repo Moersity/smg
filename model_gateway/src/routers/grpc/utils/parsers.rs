@@ -7,17 +7,18 @@ use llm_tokenizer::{
     traits::Tokenizer,
 };
 use openai_protocol::{
-    chat::{thinking_from_reasoning_effort, ChatCompletionRequest, ChatMessage},
+    chat::{thinking_from_reasoning_effort, ChatCompletionRequest},
     model_card::ModelCard,
+    profile::ProviderProfile,
 };
 use reasoning_parser::{ParserFactory as ReasoningParserFactory, ReasoningParser};
 use serde_json::Value;
 use tool_parser::{
-    ParserFactory as ToolParserFactory, PooledParser as ToolPooledParser, ToolParser,
+    GrammarStart, ParserFactory as ToolParserFactory, PooledParser as ToolPooledParser, ToolParser,
 };
 use tracing::warn;
 
-use crate::worker::WorkerRegistry;
+use crate::{routers::grpc::context::WorkerSelection, worker::WorkerRegistry};
 
 /// Per-request parser-name resolution.
 ///
@@ -72,6 +73,15 @@ impl ParserResolver {
             .or_else(|| self.configured_reasoning_parser.clone())
     }
 
+    /// Both names for `model`, as [`Self::tool_parser`] and [`Self::reasoning_parser`] resolve
+    /// them: Symphony reads them as a pair (`regular::symphony::reads`).
+    pub(crate) fn names(&self, model: &str) -> Names {
+        Names {
+            tool: self.tool_parser(model),
+            reasoning: self.reasoning_parser(model),
+        }
+    }
+
     fn card_parser(
         &self,
         model: &str,
@@ -112,17 +122,30 @@ impl ParserResolver {
     }
 }
 
+/// The parser names set for one model, resolved by [`ParserResolver`]: the tool-call parser's
+/// and the reasoning parser's, each `None` when nothing names one.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Names {
+    pub tool: Option<String>,
+    pub reasoning: Option<String>,
+}
+
 /// Determine if thinking is effectively ON based on the template's thinking
 /// toggle and the user's request.
 ///
 /// `user_thinking`: `Some(true)` = user enabled thinking, `Some(false)` = user
 /// disabled it, `None` = not specified (use template default).
+///
+/// A template without a switch cannot turn thinking off, whatever the request
+/// asks: when its generation prompt opens the think block (GLM-5.3), the
+/// completion starts inside it and the parser must start there too, or the
+/// reasoning streams as content.
 pub fn should_mark_reasoning_started(
     user_thinking: Option<bool>,
     tokenizer: &dyn Tokenizer,
 ) -> bool {
     match tokenizer.thinking_toggle() {
-        ThinkingToggle::None => false,
+        ThinkingToggle::None => tokenizer.prefill_opens_think_block(),
         ThinkingToggle::DefaultOn => user_thinking != Some(false),
         ThinkingToggle::DefaultOff => user_thinking == Some(true),
     }
@@ -134,20 +157,23 @@ pub fn should_mark_reasoning_started(
 /// for Qwen3, `thinking` for Kimi-K2.5), plus vLLM's `enable_thinking` alias
 /// for renderers that declare it (`RendererCapabilities::enable_thinking_alias`).
 /// This prevents mismatches where the user passes a key name the template
-/// ignores.
+/// ignores. A template keyed on `reasoning_effort` is read from the value it
+/// sees: the request-level field written over a kwargs entry, as the render's
+/// merge does.
 pub(crate) fn extract_thinking_from_kwargs(
     kwargs: Option<&std::collections::HashMap<String, Value>>,
+    reasoning_effort: Option<&str>,
     tokenizer: &dyn Tokenizer,
 ) -> Option<bool> {
-    let kwargs = kwargs?;
     match tokenizer.thinking_key_name() {
         Some(ThinkingKeyName::EnableThinking) => {
-            kwargs.get("enable_thinking").and_then(Value::as_bool)
+            kwargs?.get("enable_thinking").and_then(Value::as_bool)
         }
         // Renderers that honour vLLM's `enable_thinking` alias (DeepSeek-V4.1)
         // read it too; `thinking` wins when both are present (the renderer
         // rejects a disagreeing pair before anything is dispatched).
         Some(ThinkingKeyName::Thinking) => {
+            let kwargs = kwargs?;
             kwargs.get("thinking").and_then(Value::as_bool).or_else(|| {
                 tokenizer
                     .renderer_capabilities()
@@ -156,14 +182,15 @@ pub(crate) fn extract_thinking_from_kwargs(
                     .flatten()
             })
         }
-        // The template's own on/off words for `reasoning_effort`.
+        // The template's own on/off words for `reasoning_effort`, read from
+        // the value the template renders (`reasoning_effort_as_rendered`).
         Some(ThinkingKeyName::ReasoningEffort) => {
-            let effort = kwargs.get("reasoning_effort").and_then(Value::as_str)?;
+            let effort = reasoning_effort_as_rendered(kwargs, reasoning_effort)?;
             native_effort_thinking(effort, tokenizer)
         }
         // Tri-state string toggle: adaptive adds no reasoning prefix.
         Some(ThinkingKeyName::ThinkingMode) => {
-            match kwargs.get("thinking_mode").and_then(Value::as_str) {
+            match kwargs?.get("thinking_mode").and_then(Value::as_str) {
                 Some("enabled") => Some(true),
                 Some("disabled") => Some(false),
                 _ => None,
@@ -178,8 +205,8 @@ pub(crate) fn extract_thinking_from_kwargs(
 /// with the rendered prompt: `Some(true)` for one of its on words, `Some(false)`
 /// for one of its off words (which short-circuits the generic
 /// `reasoning_effort` fallback in `resolve_thinking_pref`), `None` otherwise.
-/// Mirrors the template-kwargs merge: an explicit kwargs entry wins over the
-/// top-level `reasoning_effort` field.
+/// Mirrors the template-kwargs merge: the request-level `reasoning_effort`
+/// is written over an explicit kwargs entry.
 fn extract_template_effort_thinking(
     kwargs: Option<&std::collections::HashMap<String, Value>>,
     reasoning_effort: Option<&str>,
@@ -190,11 +217,24 @@ fn extract_template_effort_thinking(
     {
         return None;
     }
-    let effort = kwargs
-        .and_then(|k| k.get("reasoning_effort"))
-        .and_then(Value::as_str)
-        .or(reasoning_effort)?;
+    let effort = reasoning_effort_as_rendered(kwargs, reasoning_effort)?;
     native_effort_thinking(effort, tokenizer)
+}
+
+/// The `reasoning_effort` the template sees: the request-level field
+/// (`thinking.effort`, else the top-level field), written over a
+/// `chat_template_kwargs` entry as the engine's own server renders it, else
+/// the entry (`build_chat_template_kwargs` in `chat_utils` merges them the
+/// same way).
+fn reasoning_effort_as_rendered<'a>(
+    kwargs: Option<&'a std::collections::HashMap<String, Value>>,
+    reasoning_effort: Option<&'a str>,
+) -> Option<&'a str> {
+    reasoning_effort.or_else(|| {
+        kwargs
+            .and_then(|k| k.get("reasoning_effort"))
+            .and_then(Value::as_str)
+    })
 }
 
 /// What a `reasoning_effort` value means to this renderer, wherever it
@@ -224,8 +264,10 @@ fn native_effort_thinking(effort: &str, tokenizer: &dyn Tokenizer) -> Option<boo
 
 /// Precedence for the effective thinking preference: an explicit template
 /// toggle always wins, then a native template effort for renderers that
-/// support it, then the typed `thinking.type` toggle, then the protocol-level
-/// OpenAI `reasoning_effort` mapping ([`thinking_from_reasoning_effort`]).
+/// support it, then the typed `thinking.type` toggle, then the provider
+/// profile's reading of `reasoning_effort`
+/// ([`ProviderProfile::thinking_from_reasoning_effort`]: the OpenAI mapping
+/// for every profile but MiniMax, which no effort value switches off).
 /// The typed rank matches where K3, V3.2 and V4.1 read `params.thinking`;
 /// V4 ranks it above its native effort, so a typed `disabled` plus a native
 /// effort disagrees there.
@@ -233,12 +275,9 @@ fn resolve_thinking_pref(
     explicit: Option<bool>,
     template_effort: Option<bool>,
     typed: Option<bool>,
-    reasoning_effort: Option<&str>,
+    effort_thinking: Option<bool>,
 ) -> Option<bool> {
-    explicit
-        .or(template_effort)
-        .or(typed)
-        .or_else(|| thinking_from_reasoning_effort(reasoning_effort))
+    explicit.or(template_effort).or(typed).or(effort_thinking)
 }
 
 /// Whether the reasoning parser must start in reasoning mode, i.e. whether
@@ -248,13 +287,18 @@ fn resolve_thinking_pref(
 /// that continues a trailing assistant message natively
 /// (`continue_final_message`, see `RendererCapabilities`) renders that
 /// message past its `</think>`, so the completion starts in content mode and
-/// the parser must not be armed.
+/// the parser must not be armed. `continues_final_assistant` says whether
+/// the prompt does that. Once the prompt is rendered it is the prompt's
+/// `continued_final_message`, not the request's ask: a template that cannot
+/// continue the message appends its text after the generation prompt, and
+/// the completion then starts wherever that prompt leaves it.
 pub fn reasoning_starts_in_prefill(
     kwargs: Option<&std::collections::HashMap<String, Value>>,
     reasoning_effort: Option<&str>,
     thinking: Option<bool>,
     continues_final_assistant: bool,
     tokenizer: &dyn Tokenizer,
+    provider: ProviderProfile,
 ) -> bool {
     if continues_final_assistant
         && tokenizer
@@ -264,78 +308,176 @@ pub fn reasoning_starts_in_prefill(
         return false;
     }
     should_mark_reasoning_started(
-        resolve_user_thinking(kwargs, reasoning_effort, thinking, tokenizer),
+        resolve_user_thinking(kwargs, reasoning_effort, thinking, tokenizer, provider),
         tokenizer,
     )
 }
 
-/// Whether `continue_final_message` applies to the request: it asks to
-/// continue the trailing assistant message, and the request ends with one.
-pub fn continues_final_assistant(request: &ChatCompletionRequest) -> bool {
-    request.continue_final_message
-        && matches!(request.messages.last(), Some(ChatMessage::Assistant { .. }))
-}
-
-/// [`reasoning_starts_in_prefill`] for a chat request.
+/// [`reasoning_starts_in_prefill`] for a chat request, without its rendered
+/// prompt (the Go binding): a trailing assistant message is taken to be
+/// continued whenever the request asks for it. The gateway decides from the
+/// rendered prompt with [`chat_reasoning_starts_in_rendered_prefill`].
 pub fn chat_reasoning_starts_in_prefill(
     request: &ChatCompletionRequest,
+    tokenizer: &dyn Tokenizer,
+) -> bool {
+    chat_reasoning_starts_in_rendered_prefill(
+        request,
+        request.continues_final_assistant(),
+        tokenizer,
+    )
+}
+
+/// [`reasoning_starts_in_prefill`] for a chat request whose prompt is
+/// rendered: `continued_final_message` is the rendered prompt's.
+pub fn chat_reasoning_starts_in_rendered_prefill(
+    request: &ChatCompletionRequest,
+    continued_final_message: bool,
     tokenizer: &dyn Tokenizer,
 ) -> bool {
     reasoning_starts_in_prefill(
         request.chat_template_kwargs.as_ref(),
         request.effective_reasoning_effort(),
-        request.thinking_toggle(),
-        continues_final_assistant(request),
+        request.effective_thinking_toggle(),
+        continued_final_message,
         tokenizer,
+        ProviderProfile::for_model(&request.model),
     )
 }
 
-/// [`should_mark_reasoning_started`] for a Messages API request: the
+/// [`reasoning_starts_in_prefill`] for a Messages API request: the
 /// `thinking` block is the user's preference (`enabled`/`adaptive` on,
-/// `disabled` off, absent → the template's default).
+/// `disabled` off, absent → the template's default), and
+/// `continued_final_message` is the rendered prompt's (a trailing assistant
+/// message with text and no tool call is continued where the template can).
+/// `output_config.effort` is the `reasoning_effort` the template renders, as
+/// a Chat request's effective effort is.
 pub fn messages_reasoning_starts_in_prefill(
     request: &openai_protocol::messages::CreateMessageRequest,
+    continued_final_message: bool,
     tokenizer: &dyn Tokenizer,
 ) -> bool {
-    use openai_protocol::messages::ThinkingConfig;
-    let user_thinking = match &request.thinking {
-        Some(ThinkingConfig::Enabled { .. }) | Some(ThinkingConfig::Adaptive { .. }) => Some(true),
-        Some(ThinkingConfig::Disabled) => Some(false),
-        None => None,
-    };
-    should_mark_reasoning_started(user_thinking, tokenizer)
+    reasoning_starts_in_prefill(
+        None,
+        request.reasoning_effort(),
+        request.thinking_toggle(),
+        continued_final_message,
+        tokenizer,
+        ProviderProfile::for_model(&request.model),
+    )
 }
 
-/// Whether a tool constraint already carries the model's reasoning block: a
-/// structural tag the registry wrapped in the parser's reasoning prefix
-/// (`ParserRegistry::register_reasoning_prefix`) because the prompt ends
-/// inside the thinking block. Such a grammar runs from the first generated
-/// token; the engine must not defer it past `</think>` on top (SGLang's
-/// `require_reasoning`), or the model would owe a second `</think>`.
-pub fn constraint_covers_reasoning(
+/// Where the selected worker's engine starts a request's grammar on a prompt
+/// that ends inside the model's thinking block, from its
+/// `constrained_decoding_start` label (the servicers advertise it off the
+/// engine's config); under PD the decode worker's, whose engine generates the
+/// tokens the grammar constrains. Unknown without a selection or a label.
+pub fn grammar_start_for(workers: Option<&WorkerSelection>) -> GrammarStart {
+    let worker = match workers {
+        Some(WorkerSelection::Single { worker }) => worker,
+        Some(WorkerSelection::Disaggregated { decode, .. }) => decode,
+        None => return GrammarStart::Unknown,
+    };
+    GrammarStart::from_label(
+        worker
+            .metadata()
+            .spec
+            .labels
+            .get(GrammarStart::LABEL)
+            .map(String::as_str),
+    )
+}
+
+/// The request's tool constraint, shaped for the worker that will run it. A
+/// forced call's structural tag built on a thinking prompt opens with free
+/// text that fits either kind of engine (`ParserRegistry::generate_tool_constraint`);
+/// once the worker is known it takes the one shape its engine needs
+/// (`ParserRegistry::structural_tag_for_grammar_start`): the bare calls for an
+/// engine that starts the grammar after its reasoning parser's gate, so the
+/// call is forced right there as the engine's own server does, the thought
+/// block and then the calls for an engine that starts it at the first token.
+/// A worker that does not say, a JSON-schema constraint and a tag without the
+/// prefix pass through unchanged.
+pub fn tool_constraints_for_worker(
     tool_parser_factory: &ToolParserFactory,
     configured_parser: Option<&str>,
-    tool_constraints: Option<&(String, String)>,
-) -> bool {
-    tool_constraints.is_some_and(|(kind, _)| kind == "structural_tag")
-        && tool_parser_factory
-            .registry()
-            .has_reasoning_prefix(configured_parser)
+    tool_constraints: Option<(String, String)>,
+    workers: Option<&WorkerSelection>,
+) -> Result<Option<(String, String)>, String> {
+    let Some((kind, value)) = tool_constraints else {
+        return Ok(None);
+    };
+    if kind != "structural_tag" {
+        return Ok(Some((kind, value)));
+    }
+    let shaped = tool_parser_factory
+        .registry()
+        .structural_tag_for_grammar_start(configured_parser, &value, grammar_start_for(workers))?;
+    Ok(Some((kind, shaped.unwrap_or(value))))
 }
 
-/// Resolve the user's effective thinking preference.
+/// Resolve the user's effective thinking preference: the answer of a
+/// renderer that resolves the mode by its own rule, else the generic
+/// precedence of [`resolve_thinking_pref`]. `provider` reads the protocol's
+/// `reasoning_effort` by its contract, both halves of it: the effort's own
+/// reading, and whether an explicit effort outranks a typed `disabled`
+/// toggle, applied here to `thinking` so a caller passing the raw
+/// `thinking.type` arms the parser the way the prompt was rendered
+/// (`ChatCompletionRequest::effective_thinking_toggle` applies the same
+/// rule, so an already-effective toggle passes through unchanged).
 pub fn resolve_user_thinking(
     kwargs: Option<&std::collections::HashMap<String, Value>>,
     reasoning_effort: Option<&str>,
     thinking: Option<bool>,
     tokenizer: &dyn Tokenizer,
+    provider: ProviderProfile,
 ) -> Option<bool> {
+    let thinking = thinking.filter(|&on| {
+        on || reasoning_effort.is_none() || !provider.effort_outranks_thinking_disabled()
+    });
+    let effort_thinking = provider.thinking_from_reasoning_effort(reasoning_effort);
+    if let Some(mode) = rendered_thinking_mode(
+        kwargs,
+        reasoning_effort,
+        thinking.or(effort_thinking),
+        tokenizer,
+    ) {
+        return Some(mode);
+    }
     resolve_thinking_pref(
-        extract_thinking_from_kwargs(kwargs, tokenizer),
+        extract_thinking_from_kwargs(kwargs, reasoning_effort, tokenizer),
         extract_template_effort_thinking(kwargs, reasoning_effort, tokenizer),
         thinking,
-        reasoning_effort,
+        effort_thinking,
     )
+}
+
+/// The mode a renderer with its own thinking rule renders for the request,
+/// asked with the inputs the render receives (`build_chat_template_kwargs`
+/// and `resolve_template_thinking` in `chat_utils` build the same for the
+/// render): the request's template kwargs with the effective `reasoning_effort`
+/// written over their entry under that key, whatever its type (the render's
+/// merge writes the request-level field over any kwargs entry), the kwargs as
+/// they are when the request carries no field, and `template_thinking`: the
+/// typed toggle or the profile's reading of the effort, as the render
+/// resolves it. `None` for every other renderer.
+fn rendered_thinking_mode(
+    kwargs: Option<&std::collections::HashMap<String, Value>>,
+    reasoning_effort: Option<&str>,
+    template_thinking: Option<bool>,
+    tokenizer: &dyn Tokenizer,
+) -> Option<bool> {
+    match reasoning_effort {
+        Some(effort) => {
+            let mut as_rendered = kwargs.cloned().unwrap_or_default();
+            as_rendered.insert(
+                "reasoning_effort".to_string(),
+                Value::String(effort.to_string()),
+            );
+            tokenizer.native_thinking_mode(Some(&as_rendered), template_thinking)
+        }
+        None => tokenizer.native_thinking_mode(kwargs, template_thinking),
+    }
 }
 
 /// Check if a reasoning parser is available for the given model
@@ -344,13 +486,7 @@ pub(crate) fn check_reasoning_parser_availability(
     configured_parser: Option<&str>,
     model: &str,
 ) -> bool {
-    if let Some(parser_name) = configured_parser {
-        reasoning_parser_factory.registry().has_parser(parser_name)
-    } else {
-        reasoning_parser_factory
-            .registry()
-            .has_parser_for_model(model)
-    }
+    create_reasoning_parser(reasoning_parser_factory, configured_parser, model).is_some()
 }
 
 /// Check if a tool parser is available for the given model
@@ -391,6 +527,19 @@ pub(crate) fn create_reasoning_parser(
         // Auto-detect based on model
         reasoning_parser_factory.registry().create_for_model(model)
     }
+}
+
+/// Native Gemma4 channels derive their initial state from the rendered prompt,
+/// using the same explicit, automatic or fallback parser selection as responses.
+pub(crate) fn rendered_prompt_reasoning_in_prefill(
+    reasoning_parser_factory: &ReasoningParserFactory,
+    configured_parser: Option<&str>,
+    model: &str,
+    prompt: &str,
+) -> Option<bool> {
+    create_reasoning_parser(reasoning_parser_factory, configured_parser, model)
+        .filter(|parser| parser.model_type() == "gemma4")
+        .map(|_| reasoning_parser::parsers::Gemma4Parser::prompt_ends_in_reasoning(prompt))
 }
 
 /// Whether the selected reasoning parser needs tokenizer special tokens to be
@@ -462,32 +611,208 @@ pub(crate) fn create_tool_parser(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use llm_multimodal::MediaPartOrder;
+    use openai_protocol::common::{Tool, ToolChoice, ToolChoiceValue};
+    use tool_parser::ToolConstraint;
+
     use super::*;
+    use crate::{
+        routers::grpc::utils::{chat_utils, message_utils},
+        worker::{BasicWorkerBuilder, WorkerType},
+    };
+
+    fn worker(labels: &[(&str, &str)]) -> WorkerSelection {
+        let mut builder =
+            BasicWorkerBuilder::new("grpc://engine:50051").worker_type(WorkerType::Regular);
+        for (key, value) in labels {
+            builder = builder.label(*key, *value);
+        }
+        WorkerSelection::Single {
+            worker: Arc::new(builder.build()),
+        }
+    }
+
+    fn forced_call_on_a_thinking_prompt(factory: &ToolParserFactory) -> (String, String) {
+        let tools: Vec<Tool> = serde_json::from_value(serde_json::json!([{
+            "type": "function",
+            "function": {"name": "get_weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}
+        }]))
+        .unwrap();
+        let required = ToolChoice::Value(ToolChoiceValue::Required);
+        match factory
+            .registry()
+            .generate_tool_constraint(Some("glm47_moe"), &tools, &required, true)
+            .unwrap()
+        {
+            Some(ToolConstraint::StructuralTag(tag)) => ("structural_tag".to_string(), tag),
+            other => panic!("expected a structural tag, got {other:?}"),
+        }
+    }
+
+    /// The worker's `constrained_decoding_start` label names where its engine
+    /// starts the grammar; no selection, no label or another value is unknown.
+    #[test]
+    fn grammar_start_comes_from_the_workers_label() {
+        assert_eq!(grammar_start_for(None), GrammarStart::Unknown);
+        assert_eq!(grammar_start_for(Some(&worker(&[]))), GrammarStart::Unknown);
+        assert_eq!(
+            grammar_start_for(Some(&worker(&[(
+                "constrained_decoding_start",
+                "after_reasoning"
+            )]))),
+            GrammarStart::AfterReasoning
+        );
+        assert_eq!(
+            grammar_start_for(Some(&worker(&[(
+                "constrained_decoding_start",
+                "first_token"
+            )]))),
+            GrammarStart::FirstToken
+        );
+        assert_eq!(
+            grammar_start_for(Some(&worker(&[("constrained_decoding_start", "later")]))),
+            GrammarStart::Unknown
+        );
+    }
+
+    /// A forced call's tag on a thinking prompt takes the shape the selected
+    /// worker's engine needs: the bare calls behind a reasoning parser's gate,
+    /// the thought block then the calls from the first token, and the
+    /// free-text prefix it was built with where the worker does not say.
+    #[test]
+    fn tool_constraints_take_the_shape_the_workers_engine_needs() {
+        let factory = ToolParserFactory::new();
+        let parser = Some("glm47_moe");
+        let built = forced_call_on_a_thinking_prompt(&factory);
+        let built_tag: Value = serde_json::from_str(&built.1).unwrap();
+        assert_eq!(built_tag["format"]["type"], "sequence");
+
+        let shape = |labels: &[(&str, &str)]| -> Value {
+            let (kind, value) = tool_constraints_for_worker(
+                &factory,
+                parser,
+                Some(built.clone()),
+                Some(&worker(labels)),
+            )
+            .unwrap()
+            .expect("the constraint stays");
+            assert_eq!(kind, "structural_tag");
+            serde_json::from_str(&value).unwrap()
+        };
+        let deferred = shape(&[("constrained_decoding_start", "after_reasoning")]);
+        assert_eq!(
+            deferred["format"]["type"], "triggered_tags",
+            "nothing precedes the calls: {deferred}"
+        );
+        assert_eq!(deferred["format"]["at_least_one"], true);
+        let first_token = shape(&[("constrained_decoding_start", "first_token")]);
+        assert_eq!(first_token["format"]["type"], "sequence");
+        assert_eq!(first_token["format"]["elements"][0]["type"], "tag");
+        assert_eq!(first_token["format"]["elements"][0]["end"], "</think>");
+        assert_eq!(
+            first_token["format"]["elements"][1],
+            built_tag["format"]["elements"][1]
+        );
+        assert_eq!(
+            shape(&[]),
+            built_tag,
+            "a worker that does not say keeps the shape that fits both"
+        );
+
+        // Nothing else is touched: no selection, a JSON-schema constraint, no constraint.
+        assert_eq!(
+            tool_constraints_for_worker(&factory, parser, Some(built.clone()), None).unwrap(),
+            Some(built.clone())
+        );
+        let schema = ("json_schema".to_string(), "{}".to_string());
+        assert_eq!(
+            tool_constraints_for_worker(
+                &factory,
+                parser,
+                Some(schema.clone()),
+                Some(&worker(&[(
+                    "constrained_decoding_start",
+                    "after_reasoning"
+                )]))
+            )
+            .unwrap(),
+            Some(schema)
+        );
+        assert_eq!(
+            tool_constraints_for_worker(&factory, parser, None, Some(&worker(&[]))).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn template_without_a_switch_starts_in_reasoning_when_its_prompt_opens_the_think_block() {
+        use llm_tokenizer::MockTokenizer;
+        // GLM-5.3: no thinking switch, the generation prompt ends in `<think>`.
+        // No request field can switch thinking off, so none may disarm the parser.
+        let always_thinks = MockTokenizer::new()
+            .with_thinking_toggle(ThinkingToggle::None)
+            .with_think_in_prefill(true);
+        for user_thinking in [None, Some(true), Some(false)] {
+            assert!(
+                should_mark_reasoning_started(user_thinking, &always_thinks),
+                "{user_thinking:?}"
+            );
+        }
+        // A non-thinking template without a switch writes an empty, closed
+        // think block: the tag is in the prefill, nothing is open.
+        let closed_block = MockTokenizer::new()
+            .with_thinking_toggle(ThinkingToggle::None)
+            .with_think_in_prefill(true)
+            .with_prefill_opens_think_block(false);
+        for user_thinking in [None, Some(true), Some(false)] {
+            assert!(
+                !should_mark_reasoning_started(user_thinking, &closed_block),
+                "{user_thinking:?}"
+            );
+        }
+        // A template without a switch that leaves the think block to the model
+        // starts in content mode, as before.
+        let never_prefills = MockTokenizer::new().with_thinking_toggle(ThinkingToggle::None);
+        for user_thinking in [None, Some(true), Some(false)] {
+            assert!(!should_mark_reasoning_started(
+                user_thinking,
+                &never_prefills
+            ));
+        }
+    }
 
     #[test]
     fn resolve_thinking_pref_precedence() {
-        // Explicit toggle > native template effort > typed toggle > reasoning_effort mapping.
+        // Explicit toggle > native template effort > typed toggle > the profile's
+        // reading of reasoning_effort (here the OpenAI one: none off, high none).
+        let effort =
+            |value: &str| ProviderProfile::Generic.thinking_from_reasoning_effort(Some(value));
         assert_eq!(
-            resolve_thinking_pref(Some(false), Some(true), Some(true), Some("high")),
+            resolve_thinking_pref(Some(false), Some(true), Some(true), effort("high")),
             Some(false)
         );
         assert_eq!(
-            resolve_thinking_pref(None, Some(true), Some(false), Some("none")),
+            resolve_thinking_pref(None, Some(true), Some(false), effort("none")),
             Some(true)
         );
         assert_eq!(
-            resolve_thinking_pref(None, None, Some(false), Some("high")),
+            resolve_thinking_pref(None, None, Some(false), effort("high")),
             Some(false)
         );
         assert_eq!(
-            resolve_thinking_pref(None, None, Some(true), Some("none")),
+            resolve_thinking_pref(None, None, Some(true), effort("none")),
             Some(true)
         );
         assert_eq!(
-            resolve_thinking_pref(None, None, None, Some("none")),
+            resolve_thinking_pref(None, None, None, effort("none")),
             Some(false)
         );
-        assert_eq!(resolve_thinking_pref(None, None, None, Some("high")), None);
+        assert_eq!(
+            resolve_thinking_pref(None, None, None, effort("high")),
+            None
+        );
         assert_eq!(resolve_thinking_pref(None, None, None, None), None);
     }
 
@@ -502,16 +827,32 @@ mod tests {
             Value::String("none".to_string()),
         )]);
         assert_eq!(
+            extract_template_effort_thinking(Some(&none_kw), None, &tok),
+            Some(false)
+        );
+        assert_eq!(
+            resolve_user_thinking(Some(&none_kw), None, None, &tok, ProviderProfile::Generic),
+            Some(false)
+        );
+        assert_eq!(
+            resolve_user_thinking(None, Some("none"), None, &tok, ProviderProfile::Generic),
+            Some(false)
+        );
+        // The request-level field is written over the kwargs entry, as the
+        // engine renders it: a top-level `high` arms against a kwargs `none`.
+        assert_eq!(
             extract_template_effort_thinking(Some(&none_kw), Some("high"), &tok),
-            Some(false)
+            Some(true)
         );
         assert_eq!(
-            resolve_user_thinking(Some(&none_kw), Some("high"), None, &tok),
-            Some(false)
-        );
-        assert_eq!(
-            resolve_user_thinking(None, Some("none"), None, &tok),
-            Some(false)
+            resolve_user_thinking(
+                Some(&none_kw),
+                Some("high"),
+                None,
+                &tok,
+                ProviderProfile::Generic
+            ),
+            Some(true)
         );
         // `minimal` is the switch's other spelling and disarms the same way.
         let minimal_kw = std::collections::HashMap::from([(
@@ -519,7 +860,7 @@ mod tests {
             Value::String("minimal".to_string()),
         )]);
         assert_eq!(
-            extract_template_effort_thinking(Some(&minimal_kw), Some("high"), &tok),
+            extract_template_effort_thinking(Some(&minimal_kw), None, &tok),
             Some(false)
         );
     }
@@ -575,6 +916,7 @@ mod tests {
                 enable_thinking_alias: true,
                 native_assistant_continuation: true,
                 raw_tool_call_arguments: true,
+                declares_tools_under_tool_choice_none: false,
             })
     }
 
@@ -588,11 +930,17 @@ mod tests {
         let alias_off =
             std::collections::HashMap::from([("enable_thinking".to_string(), Value::Bool(false))]);
         assert_eq!(
-            extract_thinking_from_kwargs(Some(&alias_off), &tok),
+            extract_thinking_from_kwargs(Some(&alias_off), None, &tok),
             Some(false)
         );
         assert_eq!(
-            resolve_user_thinking(Some(&alias_off), Some("high"), None, &tok),
+            resolve_user_thinking(
+                Some(&alias_off),
+                Some("high"),
+                None,
+                &tok,
+                ProviderProfile::Generic
+            ),
             Some(false)
         );
         // `thinking` wins when both keys are present.
@@ -600,31 +948,48 @@ mod tests {
             ("thinking".to_string(), Value::Bool(true)),
             ("enable_thinking".to_string(), Value::Bool(false)),
         ]);
-        assert_eq!(extract_thinking_from_kwargs(Some(&both), &tok), Some(true));
+        assert_eq!(
+            extract_thinking_from_kwargs(Some(&both), None, &tok),
+            Some(true)
+        );
         // Tokenizers that do not declare the alias keep reading their own key only.
         let other = T(llm_tokenizer::MockTokenizer::new());
-        assert_eq!(extract_thinking_from_kwargs(Some(&alias_off), &other), None);
+        assert_eq!(
+            extract_thinking_from_kwargs(Some(&alias_off), None, &other),
+            None
+        );
 
-        // A kwargs `"none"` disarms even when the top-level field is a native level.
+        // A kwargs `"none"` disarms; a top-level native level is written over
+        // it, as the engine renders the request-level field.
         let none_kw = std::collections::HashMap::from([(
             "reasoning_effort".to_string(),
             Value::String("none".to_string()),
         )]);
         assert_eq!(
-            extract_template_effort_thinking(Some(&none_kw), Some("high"), &tok),
+            extract_template_effort_thinking(Some(&none_kw), None, &tok),
             Some(false)
         );
         assert_eq!(
-            resolve_user_thinking(Some(&none_kw), Some("high"), None, &tok),
+            resolve_user_thinking(Some(&none_kw), None, None, &tok, ProviderProfile::Generic),
             Some(false)
+        );
+        assert_eq!(
+            resolve_user_thinking(
+                Some(&none_kw),
+                Some("high"),
+                None,
+                &tok,
+                ProviderProfile::Generic
+            ),
+            Some(true)
         );
         // Native names arm; a top-level "none" disarms; an explicit toggle beats "none".
         assert_eq!(
-            resolve_user_thinking(None, Some("xhigh"), None, &tok),
+            resolve_user_thinking(None, Some("xhigh"), None, &tok, ProviderProfile::Generic),
             Some(true)
         );
         assert_eq!(
-            resolve_user_thinking(None, Some("none"), None, &tok),
+            resolve_user_thinking(None, Some("none"), None, &tok, ProviderProfile::Generic),
             Some(false)
         );
         let explicit_on = std::collections::HashMap::from([
@@ -635,11 +1000,23 @@ mod tests {
             ),
         ]);
         assert_eq!(
-            resolve_user_thinking(Some(&explicit_on), None, None, &tok),
+            resolve_user_thinking(
+                Some(&explicit_on),
+                None,
+                None,
+                &tok,
+                ProviderProfile::Generic
+            ),
             Some(true)
         );
         assert!(should_mark_reasoning_started(
-            resolve_user_thinking(Some(&explicit_on), None, None, &tok),
+            resolve_user_thinking(
+                Some(&explicit_on),
+                None,
+                None,
+                &tok,
+                ProviderProfile::Generic
+            ),
             &tok
         ));
 
@@ -669,10 +1046,181 @@ mod tests {
             &request(true, "user"),
             &tok
         ));
-        assert!(!should_mark_reasoning_started(
-            resolve_user_thinking(Some(&none_kw), Some("high"), None, &tok),
+        // The request-level `high` is written over the kwargs `none`.
+        assert!(should_mark_reasoning_started(
+            resolve_user_thinking(
+                Some(&none_kw),
+                Some("high"),
+                None,
+                &tok,
+                ProviderProfile::Generic
+            ),
             &tok
         ));
+    }
+
+    /// A Messages prefill (trailing assistant text) continued natively is
+    /// rendered past the turn's reasoning, so the parser is not armed; a
+    /// trailing tool call, with or without text, opens a new turn and a
+    /// popped prefill follows the generation prompt, and both arm as before.
+    #[test]
+    fn messages_prefill_continued_natively_does_not_arm() {
+        let request = |last: Value| -> openai_protocol::messages::CreateMessageRequest {
+            serde_json::from_value(serde_json::json!({
+                "model": "m",
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": "q"}, last]
+            }))
+            .expect("messages request")
+        };
+        let prefill = request(serde_json::json!({"role": "assistant", "content": "a"}));
+        let tool_use = request(serde_json::json!({"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "f", "input": {}}
+        ]}));
+        let text_and_tool_use = request(serde_json::json!({"role": "assistant", "content": [
+            {"type": "text", "text": "a"},
+            {"type": "tool_use", "id": "toolu_1", "name": "f", "input": {}}
+        ]}));
+        let thinking_on =
+            || llm_tokenizer::MockTokenizer::new().with_thinking_toggle(ThinkingToggle::DefaultOn);
+        let native =
+            thinking_on().with_renderer_capabilities(llm_tokenizer::traits::RendererCapabilities {
+                native_assistant_continuation: true,
+                ..Default::default()
+            });
+        // Armed from the rendered prompt, as request building arms it.
+        let armed = |request: &openai_protocol::messages::CreateMessageRequest,
+                     tokenizer: &dyn Tokenizer| {
+            let (processed, _) = message_utils::process_messages(
+                request,
+                tokenizer,
+                None,
+                None,
+                MediaPartOrder::MediaFirst,
+            )
+            .expect("rendered");
+            messages_reasoning_starts_in_prefill(
+                request,
+                processed.continued_final_message,
+                tokenizer,
+            )
+        };
+
+        assert!(!armed(&prefill, &native));
+        assert!(armed(&tool_use, &native));
+        assert!(armed(&text_and_tool_use, &native));
+        assert!(armed(&prefill, &thinking_on()));
+    }
+
+    /// A generation prompt that opens `<think>` (thinking on by default) and
+    /// no rendered assistant turn: a continued final message cannot be cut
+    /// from the template's own rendering, so its text follows that prompt.
+    const THINKING_PROMPT_NO_ASSISTANT_TURNS: &str = r"
+{%- for m in messages -%}
+{%- if m.role != 'assistant' -%}{{- '<|im_start|>' + m.role + '\n' + m.content + '<|im_end|>\n' -}}{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}{{- '<|im_start|>assistant\n' -}}
+{%- if enable_thinking is not defined or enable_thinking -%}{{- '<think>\n' -}}{%- endif -%}
+{%- endif -%}";
+
+    /// The prompt both APIs render for a `Let me` prefill on that template.
+    const PREFILL_AFTER_THINKING_PROMPT: &str =
+        "<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\n<think>\nLet me";
+
+    fn thinking_prompt_tokenizer() -> llm_tokenizer::TiktokenTokenizer {
+        let mut tokenizer =
+            llm_tokenizer::TiktokenTokenizer::new(llm_tokenizer::TiktokenModel::Cl100kBase)
+                .expect("tokenizer");
+        tokenizer
+            .set_chat_template(THINKING_PROMPT_NO_ASSISTANT_TURNS.to_string())
+            .expect("template");
+        tokenizer
+    }
+
+    /// The reasoning and the answer a fresh qwen3 parser, armed or not, finds
+    /// in a completion that closes its reasoning and then answers.
+    fn reasoning_and_answer(armed: bool) -> (String, String) {
+        let factory = ReasoningParserFactory::new();
+        let mut parser =
+            create_reasoning_parser(&factory, Some("qwen3"), "m").expect("qwen3 parser");
+        if armed {
+            parser.mark_reasoning_started();
+        }
+        let parsed = parser
+            .detect_and_parse_reasoning(" check.</think>Done")
+            .expect("parsed");
+        (parsed.reasoning_text, parsed.normal_text)
+    }
+
+    /// Where the template cannot continue a Messages prefill, the prompt ends
+    /// inside the `<think>` its generation prompt opens. The parser is armed
+    /// from the rendered prompt, not from the request asking to continue, so
+    /// the completion's reasoning is parsed as reasoning.
+    #[test]
+    fn messages_continuation_after_a_thinking_generation_prompt_arms() {
+        let tokenizer = thinking_prompt_tokenizer();
+        let request: openai_protocol::messages::CreateMessageRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": "m",
+                "max_tokens": 8,
+                "messages": [
+                    {"role": "user", "content": "q"},
+                    {"role": "assistant", "content": "Let me"}
+                ]
+            }))
+            .expect("messages request");
+        let (processed, _) = message_utils::process_messages(
+            &request,
+            &tokenizer,
+            None,
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .expect("rendered");
+        assert_eq!(processed.text, PREFILL_AFTER_THINKING_PROMPT);
+        assert!(!processed.continued_final_message);
+        let armed = messages_reasoning_starts_in_prefill(
+            &request,
+            processed.continued_final_message,
+            &tokenizer,
+        );
+        assert_eq!(
+            reasoning_and_answer(armed),
+            (" check.".to_string(), "Done".to_string())
+        );
+    }
+
+    /// The same for a chat `continue_final_message`.
+    #[test]
+    fn chat_continuation_after_a_thinking_generation_prompt_arms() {
+        let tokenizer = thinking_prompt_tokenizer();
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": "Let me"}
+            ],
+            "continue_final_message": true
+        }))
+        .expect("chat request");
+        let (processed, _) = chat_utils::process_chat_messages_with_placeholders(
+            &request,
+            &tokenizer,
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .expect("rendered");
+        assert_eq!(processed.text, PREFILL_AFTER_THINKING_PROMPT);
+        assert!(!processed.continued_final_message);
+        let armed = chat_reasoning_starts_in_rendered_prefill(
+            &request,
+            processed.continued_final_message,
+            &tokenizer,
+        );
+        assert_eq!(
+            reasoning_and_answer(armed),
+            (" check.".to_string(), "Done".to_string())
+        );
     }
 
     /// Typed toggle: below an explicit kwargs toggle and a native effort, above the OpenAI mapping.
@@ -684,42 +1232,78 @@ mod tests {
 
         // KVV `thinking:{type:"disabled"}`: chat mode, parser not armed.
         assert_eq!(
-            resolve_user_thinking(None, Some("max"), Some(false), &k3),
+            resolve_user_thinking(
+                None,
+                Some("max"),
+                Some(false),
+                &k3,
+                ProviderProfile::Generic
+            ),
             Some(false)
         );
         assert!(!should_mark_reasoning_started(
-            resolve_user_thinking(None, Some("max"), Some(false), &k3),
+            resolve_user_thinking(
+                None,
+                Some("max"),
+                Some(false),
+                &k3,
+                ProviderProfile::Generic
+            ),
             &k3
         ));
         // Absent `thinking`, K3 stays thinking-on by default.
         assert!(should_mark_reasoning_started(
-            resolve_user_thinking(None, None, None, &k3),
+            resolve_user_thinking(None, None, None, &k3, ProviderProfile::Generic),
             &k3
         ));
         // An explicit kwargs toggle outranks the typed one.
         let kw_on = std::collections::HashMap::from([("thinking".to_string(), Value::Bool(true))]);
         assert_eq!(
-            resolve_user_thinking(Some(&kw_on), None, Some(false), &k3),
+            resolve_user_thinking(
+                Some(&kw_on),
+                None,
+                Some(false),
+                &k3,
+                ProviderProfile::Generic
+            ),
             Some(true)
         );
         // The typed toggle outranks the OpenAI mapping; absent it, the mapping applies.
         assert_eq!(
-            resolve_user_thinking(None, Some("none"), Some(true), &k3),
+            resolve_user_thinking(
+                None,
+                Some("none"),
+                Some(true),
+                &k3,
+                ProviderProfile::Generic
+            ),
             Some(true)
         );
         assert_eq!(
-            resolve_user_thinking(None, Some("none"), None, &k3),
+            resolve_user_thinking(None, Some("none"), None, &k3, ProviderProfile::Generic),
             Some(false)
         );
 
         // A native template effort outranks the typed toggle (DeepSeek-V4.1).
         let v41 = v41_like();
         assert_eq!(
-            resolve_user_thinking(None, Some("high"), Some(false), &v41),
+            resolve_user_thinking(
+                None,
+                Some("high"),
+                Some(false),
+                &v41,
+                ProviderProfile::Generic
+            ),
             Some(true)
         );
         assert_eq!(
-            resolve_user_thinking(None, Some("medium"), Some(false), &v41),
+            resolve_user_thinking(
+                None,
+                Some("medium"),
+                Some(false),
+                &v41,
+                ProviderProfile::Generic
+            ),
             Some(false)
         );
 
@@ -747,6 +1331,97 @@ mod tests {
         ));
     }
 
+    /// A K3 directory with a byte-complete stub vocabulary (every byte one
+    /// token, no merges) and the real renderer: prompts render and encode
+    /// without the checkpoint's files.
+    fn k3_stub() -> (tempfile::TempDir, llm_tokenizer::TiktokenTokenizer) {
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+        let dir = tempfile::TempDir::new().unwrap();
+        let vocabulary: String = (0..=255u8)
+            .map(|byte| format!("{} {byte}\n", BASE64.encode([byte])))
+            .collect();
+        std::fs::write(dir.path().join("tiktoken.model"), vocabulary).unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"architectures": ["KimiK3ForConditionalGeneration"]}"#,
+        )
+        .unwrap();
+        let tokenizer = llm_tokenizer::TiktokenTokenizer::from_dir(dir.path()).unwrap();
+        (dir, tokenizer)
+    }
+
+    /// The K3 parser is armed from the decision the prompt was rendered
+    /// with, whatever the request's mix of typed toggle, top-level effort and
+    /// kwargs: the renderer's own rule decides both (an effort word other
+    /// than `none` leaves the mode to the typed toggle, `none` switches it
+    /// off, a kwargs `minimal` keeps the default on).
+    #[test]
+    fn k3_parser_is_armed_the_way_the_prompt_was_rendered() {
+        use crate::routers::grpc::utils::process_chat_messages;
+
+        let (_dir, tokenizer) = k3_stub();
+        let request = |fields: Value| -> ChatCompletionRequest {
+            let mut body = serde_json::json!({
+                "model": "kimi-k3",
+                "messages": [{"role": "user", "content": "q"}],
+            });
+            body.as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            serde_json::from_value(body).expect("chat request")
+        };
+        let armed_like_the_prompt = |fields: Value| -> bool {
+            let request = request(fields.clone());
+            let prompt = process_chat_messages(&request, &tokenizer, None)
+                .expect("render")
+                .text;
+            let opens_think = prompt.ends_with("<|open|>think<|sep|>");
+            assert!(
+                opens_think || prompt.ends_with("<|open|>response<|sep|>"),
+                "{prompt}"
+            );
+            assert_eq!(
+                chat_reasoning_starts_in_prefill(&request, &tokenizer),
+                opens_think,
+                "{fields}: prompt {prompt:?}"
+            );
+            opens_think
+        };
+        // Typed disabled plus an effort word: chat mode on both sides.
+        assert!(!armed_like_the_prompt(serde_json::json!({
+            "thinking": {"type": "disabled"}, "reasoning_effort": "high"
+        })));
+        // A kwargs `minimal` is not the renderer's off word: thinking stays on.
+        assert!(armed_like_the_prompt(serde_json::json!({
+            "chat_template_kwargs": {"reasoning_effort": "minimal"}
+        })));
+        // `none` switches thinking off, even against a typed enabled.
+        assert!(!armed_like_the_prompt(serde_json::json!({
+            "chat_template_kwargs": {"reasoning_effort": "none"}, "thinking": {"type": "enabled"}
+        })));
+        assert!(!armed_like_the_prompt(
+            serde_json::json!({"reasoning_effort": "none"})
+        ));
+        // The top-level `minimal` reaches the renderer as the protocol's off toggle.
+        assert!(!armed_like_the_prompt(
+            serde_json::json!({"reasoning_effort": "minimal"})
+        ));
+        assert!(armed_like_the_prompt(
+            serde_json::json!({"reasoning_effort": "high"})
+        ));
+        assert!(!armed_like_the_prompt(serde_json::json!({
+            "chat_template_kwargs": {"thinking": false, "reasoning_effort": "high"}
+        })));
+        // The request-level effort is written over a kwargs entry of any type
+        // (the render's merge does the same): the top-level `none` replaces
+        // the null entry, so the response channel opens on both sides.
+        assert!(!armed_like_the_prompt(serde_json::json!({
+            "thinking": {"type": "enabled"}, "reasoning_effort": "none",
+            "chat_template_kwargs": {"reasoning_effort": null}
+        })));
+        assert!(armed_like_the_prompt(serde_json::json!({})));
+    }
+
     #[test]
     fn template_effort_thinking_covers_kwargs_and_top_level_field() {
         let tok = T(llm_tokenizer::MockTokenizer::new());
@@ -761,13 +1436,17 @@ mod tests {
             extract_template_effort_thinking(None, Some("medium"), &tok),
             None
         );
-        // A kwargs entry wins over the top-level field, matching the merge.
+        // The top-level field wins over a kwargs entry, matching the merge.
         let kwargs = std::collections::HashMap::from([(
             "reasoning_effort".to_string(),
             Value::String("max".to_string()),
         )]);
         assert_eq!(
             extract_template_effort_thinking(Some(&kwargs), Some("medium"), &tok),
+            None
+        );
+        assert_eq!(
+            extract_template_effort_thinking(Some(&kwargs), None, &tok),
             Some(true)
         );
         // Renderers without native efforts never arm.
@@ -781,29 +1460,106 @@ mod tests {
         );
     }
 
+    /// The MiniMax profile reads `reasoning_effort` by its contract: no value
+    /// switches thinking off, so the parser's arming follows the template's
+    /// default as the render does; the OpenAI reading stays for every other
+    /// profile.
+    #[test]
+    fn minimax_effort_never_switches_the_arming_off() {
+        // A tokenizer like the MiniMax M3 template's: the tri-state key, off by
+        // default, and no native `reasoning_effort` words of its own.
+        let tok = llm_tokenizer::MockTokenizer::new()
+            .with_thinking_toggle(ThinkingToggle::DefaultOff)
+            .with_thinking_key_name(ThinkingKeyName::ThinkingMode);
+        for effort in ["none", "minimal", "low", "high"] {
+            assert_eq!(
+                resolve_user_thinking(None, Some(effort), None, &tok, ProviderProfile::Minimax),
+                None,
+                "MiniMax {effort}"
+            );
+        }
+        assert_eq!(
+            resolve_user_thinking(None, Some("none"), None, &tok, ProviderProfile::Generic),
+            Some(false)
+        );
+        assert_eq!(
+            resolve_user_thinking(None, Some("none"), None, &tok, ProviderProfile::Kimi),
+            Some(false)
+        );
+        // The typed toggle, as the profile read it, still ranks above the effort.
+        assert_eq!(
+            resolve_user_thinking(
+                None,
+                Some("none"),
+                Some(true),
+                &tok,
+                ProviderProfile::Minimax
+            ),
+            Some(true)
+        );
+        // The profile's other half applies here too: a raw `disabled` next to
+        // an explicit effort is demoted under MiniMax, honoured elsewhere.
+        assert_eq!(
+            resolve_user_thinking(
+                None,
+                Some("high"),
+                Some(false),
+                &tok,
+                ProviderProfile::Minimax
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_user_thinking(None, None, Some(false), &tok, ProviderProfile::Minimax),
+            Some(false)
+        );
+        assert_eq!(
+            resolve_user_thinking(
+                None,
+                Some("high"),
+                Some(false),
+                &tok,
+                ProviderProfile::Generic
+            ),
+            Some(false)
+        );
+    }
+
     #[test]
     fn thinking_mode_kwargs_map_to_tristate_pref() {
         let tok = T(llm_tokenizer::MockTokenizer::new());
         let kw = |v: Value| std::collections::HashMap::from([("thinking_mode".to_string(), v)]);
 
         assert_eq!(
-            extract_thinking_from_kwargs(Some(&kw(Value::String("enabled".to_string()))), &tok),
+            extract_thinking_from_kwargs(
+                Some(&kw(Value::String("enabled".to_string()))),
+                None,
+                &tok
+            ),
             Some(true)
         );
         assert_eq!(
-            extract_thinking_from_kwargs(Some(&kw(Value::String("disabled".to_string()))), &tok),
+            extract_thinking_from_kwargs(
+                Some(&kw(Value::String("disabled".to_string()))),
+                None,
+                &tok
+            ),
             Some(false)
         );
         assert_eq!(
-            extract_thinking_from_kwargs(Some(&kw(Value::String("adaptive".to_string()))), &tok),
+            extract_thinking_from_kwargs(
+                Some(&kw(Value::String("adaptive".to_string()))),
+                None,
+                &tok
+            ),
             None
         );
         // Non-string values are not a preference for the tri-state key.
         assert_eq!(
-            extract_thinking_from_kwargs(Some(&kw(Value::Bool(true))), &tok),
+            extract_thinking_from_kwargs(Some(&kw(Value::Bool(true))), None, &tok),
             None
         );
-        assert_eq!(extract_thinking_from_kwargs(None, &tok), None);
+        assert_eq!(extract_thinking_from_kwargs(None, None, &tok), None);
     }
 
     #[test]
@@ -838,6 +1594,58 @@ mod tests {
         let parser = create_reasoning_parser(&factory, Some("qwen3"), "unknown-model")
             .expect("configured qwen3 parser exists");
         assert_eq!(parser.model_type(), "qwen3");
+        assert!(check_reasoning_parser_availability(
+            &factory,
+            Some("qwen3"),
+            "unknown-model",
+        ));
+        for configured in [None, Some("unknown-parser")] {
+            assert!(!check_reasoning_parser_availability(
+                &factory,
+                configured,
+                "unknown-model",
+            ));
+        }
+    }
+
+    #[test]
+    fn gemma4_rendered_prompt_state_follows_actual_parser_selection() {
+        let factory = ReasoningParserFactory::new();
+        for configured in [Some("gemma4"), None, Some("unknown-parser")] {
+            assert!(check_reasoning_parser_availability(
+                &factory,
+                configured,
+                "google/gemma-4-serve",
+            ));
+            for (prompt, expected) in [
+                ("<|im_start|>model\n", false),
+                ("<|im_start|>model<|channel>thought\n", true),
+                ("<|im_start|>model<|channel>thought\nplan<channel|>", false),
+            ] {
+                assert_eq!(
+                    rendered_prompt_reasoning_in_prefill(
+                        &factory,
+                        configured,
+                        "google/gemma-4-serve",
+                        prompt,
+                    ),
+                    Some(expected),
+                    "configured={configured:?}, prompt={prompt:?}"
+                );
+            }
+        }
+        // A valid override wins over the model; other models keep their defaults.
+        for (configured, model) in [(Some("qwen3"), "gemma-4"), (None, "qwen3")] {
+            assert_eq!(
+                rendered_prompt_reasoning_in_prefill(
+                    &factory,
+                    configured,
+                    model,
+                    "<|channel>thought\n",
+                ),
+                None
+            );
+        }
     }
 
     #[test]
@@ -960,17 +1768,43 @@ mod hy_v4_tests {
             serde_json::json!("high"),
         )]);
         assert_eq!(
-            extract_thinking_from_kwargs(Some(&kwargs), &tok),
+            extract_thinking_from_kwargs(Some(&kwargs), None, &tok),
             Some(true)
         );
         assert_eq!(
+            extract_template_effort_thinking(Some(&kwargs), None, &tok),
+            Some(true)
+        );
+        // The request-level off word is written over the kwargs entry.
+        assert_eq!(
             extract_template_effort_thinking(Some(&kwargs), Some("no_think"), &tok),
+            Some(false)
+        );
+        // The parser follows the value the template sees: the request-level
+        // off word over the kwargs `high` disarms it, as the prompt renders
+        // thinking off; the kwargs entry alone arms it.
+        assert_eq!(
+            extract_thinking_from_kwargs(Some(&kwargs), Some("no_think"), &tok),
+            Some(false)
+        );
+        assert_eq!(
+            resolve_user_thinking(
+                Some(&kwargs),
+                Some("no_think"),
+                None,
+                &tok,
+                ProviderProfile::Generic
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            resolve_user_thinking(Some(&kwargs), None, None, &tok, ProviderProfile::Generic),
             Some(true)
         );
         // The template renders its default for a value it does not know, so
         // the protocol's `none` must not disarm the parser here.
         assert_eq!(
-            resolve_user_thinking(None, Some("none"), None, &tok),
+            resolve_user_thinking(None, Some("none"), None, &tok, ProviderProfile::Generic),
             Some(true)
         );
         let unknown = std::collections::HashMap::from([(
@@ -978,7 +1812,7 @@ mod hy_v4_tests {
             serde_json::json!("none"),
         )]);
         assert_eq!(
-            resolve_user_thinking(Some(&unknown), None, None, &tok),
+            resolve_user_thinking(Some(&unknown), None, None, &tok, ProviderProfile::Generic),
             Some(true)
         );
     }

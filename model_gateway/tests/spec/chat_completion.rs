@@ -12,7 +12,7 @@ use validator::Validate;
 // Deprecated fields normalization tests
 
 #[test]
-fn test_max_tokens_normalizes_to_max_completion_tokens() {
+fn test_max_tokens_stays_as_the_client_wrote_it() {
     #[expect(deprecated)]
     let mut req = ChatCompletionRequest {
         model: "test-model".to_string(),
@@ -27,18 +27,23 @@ fn test_max_tokens_normalizes_to_max_completion_tokens() {
     };
 
     req.normalize();
-    assert_eq!(
-        req.max_completion_tokens,
-        Some(100),
-        "max_tokens should be copied to max_completion_tokens"
-    );
     #[expect(deprecated)]
     {
-        assert!(
-            req.max_tokens.is_none(),
-            "Deprecated field should be cleared"
+        assert_eq!(
+            req.max_tokens,
+            Some(100),
+            "the field the client wrote is kept for the upstream"
         );
     }
+    assert_eq!(
+        req.max_completion_tokens, None,
+        "nothing is migrated into the field the client did not write"
+    );
+    assert_eq!(
+        req.output_token_cap(),
+        Some(100),
+        "the cap is read from the deprecated field"
+    );
     assert!(
         req.validate().is_ok(),
         "Should be valid after normalization"
@@ -66,9 +71,20 @@ fn test_max_completion_tokens_takes_precedence() {
         Some(200),
         "max_completion_tokens should take precedence"
     );
+    assert_eq!(req.output_token_cap(), Some(200));
+    #[expect(deprecated)]
+    {
+        assert_eq!(
+            req.max_tokens,
+            Some(100),
+            "the field the client wrote is kept for the upstream"
+        );
+    }
+    // A self-hosted model takes the pair, as the serving engines do; only
+    // OpenAI's own contract refuses it (pinned by the profile's unit tests).
     assert!(
         req.validate().is_ok(),
-        "Should be valid after normalization"
+        "both token limits at once are accepted; max_completion_tokens wins"
     );
 }
 
@@ -87,6 +103,7 @@ fn test_functions_normalizes_to_tools() {
             description: Some("Test function".to_string()),
             parameters: json!({}),
             strict: None,
+            extra: Default::default(),
         }]),
         tools: None,
         ..Default::default()
@@ -167,6 +184,7 @@ fn test_function_call_function_variant_normalizes() {
                 description: None,
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         }]),
         ..Default::default()
@@ -350,6 +368,7 @@ fn test_tool_choice_function_not_found() {
                 description: Some("Get weather".to_string()),
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         }]),
         tool_choice: Some(ToolChoice::Function {
@@ -386,6 +405,7 @@ fn test_tool_choice_function_exists_valid() {
                 description: Some("Get weather".to_string()),
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         }]),
         tool_choice: Some(ToolChoice::Function {
@@ -417,6 +437,7 @@ fn test_tool_choice_allowed_tools_invalid_mode() {
                 description: Some("Get weather".to_string()),
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         }]),
         tool_choice: Some(ToolChoice::AllowedTools {
@@ -454,6 +475,7 @@ fn test_tool_choice_allowed_tools_valid_mode_auto() {
                 description: Some("Get weather".to_string()),
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         }]),
         tool_choice: Some(ToolChoice::AllowedTools {
@@ -486,6 +508,7 @@ fn test_tool_choice_allowed_tools_valid_mode_required() {
                 description: Some("Get weather".to_string()),
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         }]),
         tool_choice: Some(ToolChoice::AllowedTools {
@@ -518,6 +541,7 @@ fn test_tool_choice_allowed_tools_tool_not_found() {
                 description: Some("Get weather".to_string()),
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         }]),
         tool_choice: Some(ToolChoice::AllowedTools {
@@ -556,6 +580,7 @@ fn test_tool_choice_allowed_tools_multiple_tools_valid() {
                     description: Some("Get weather".to_string()),
                     parameters: json!({}),
                     strict: None,
+                    extra: Default::default(),
                 },
             },
             Tool {
@@ -565,6 +590,7 @@ fn test_tool_choice_allowed_tools_multiple_tools_valid() {
                     description: Some("Get time".to_string()),
                     parameters: json!({}),
                     strict: None,
+                    extra: Default::default(),
                 },
             },
         ]),
@@ -604,6 +630,7 @@ fn test_tool_choice_allowed_tools_one_invalid_among_valid() {
                     description: Some("Get weather".to_string()),
                     parameters: json!({}),
                     strict: None,
+                    extra: Default::default(),
                 },
             },
             Tool {
@@ -613,6 +640,7 @@ fn test_tool_choice_allowed_tools_one_invalid_among_valid() {
                     description: Some("Get time".to_string()),
                     parameters: json!({}),
                     strict: None,
+                    extra: Default::default(),
                 },
             },
         ]),

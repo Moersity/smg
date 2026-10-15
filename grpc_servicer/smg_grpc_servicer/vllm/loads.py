@@ -31,6 +31,11 @@ import time
 from collections import deque
 from typing import NamedTuple
 
+from smg_grpc_proto import vllm_engine_pb2
+from smg_grpc_proto.generated import common_pb2
+
+from smg_grpc_servicer.load_record import engine_load_from
+
 THROUGHPUT_WINDOW = 2.0
 HIT_RATE_SAMPLES = 64
 
@@ -139,26 +144,30 @@ def scheduler_load_fields(
     num_running: int,
     num_waiting: int,
     kv_usage: float,
-    estimate: LoadEstimate,
+    estimate: LoadEstimate | None,
     *,
+    dp_rank: int = 0,
     max_total_num_tokens: int = 0,
     max_running_requests: int = 0,
 ) -> dict:
     """The ``SchedulerLoad`` fields for one rank: vLLM's own counts plus the
     tracker's estimate, with ``num_used_tokens`` and ``utilization`` derived
-    from the KV usage as the SGLang servicer derives them."""
+    from the KV usage as the SGLang servicer derives them. The estimate must
+    belong to this rank; pass ``None`` when no rank-local estimate is available
+    to omit queued token-work, throughput and hit rate."""
     kv_usage = max(0.0, float(kv_usage or 0.0))
     fields = {
-        "dp_rank": 0,
+        "dp_rank": int(dp_rank),
         "num_running_reqs": int(num_running),
         "num_waiting_reqs": int(num_waiting),
-        "num_waiting_uncached_tokens": int(estimate.queued_token_work),
         "num_total_reqs": int(num_running) + int(num_waiting),
         "token_usage": kv_usage,
         "utilization": kv_usage,
-        "gen_throughput": float(estimate.gen_throughput),
-        "cache_hit_rate": float(estimate.cache_hit_rate),
     }
+    if estimate is not None:
+        fields["num_waiting_uncached_tokens"] = int(estimate.queued_token_work)
+        fields["gen_throughput"] = float(estimate.gen_throughput)
+        fields["cache_hit_rate"] = float(estimate.cache_hit_rate)
     if max_total_num_tokens > 0:
         fields["max_total_num_tokens"] = int(max_total_num_tokens)
         fields["num_used_tokens"] = int(round(kv_usage * max_total_num_tokens))
@@ -175,9 +184,39 @@ class RankLoadTrackers:
     """
 
     def __init__(self, ranks, *, clock=time.monotonic):
+        """Create independent request trackers for the managed global ranks."""
         self._trackers = {rank: LoadTracker(clock=clock) for rank in ranks}
 
     def for_rank(self, rank: int | None) -> LoadTracker | None:
+        """Resolve an explicit rank, or an unnamed request on a single rank."""
         if rank is None and len(self._trackers) == 1:
             return next(iter(self._trackers.values()))
         return self._trackers.get(rank)
+
+
+def load_record(
+    num_running: int,
+    num_waiting: int,
+    kv_usage: float,
+    estimate: LoadEstimate | None,
+    *,
+    dp_rank: int = 0,
+    max_total_num_tokens: int = 0,
+    max_running_requests: int = 0,
+) -> common_pb2.EngineLoad:
+    """The load record the KV-event stream carries for one rank, from the
+    figures :func:`scheduler_load_fields` reports on ``GetLoads``: the two
+    agree field for field. The estimate must belong to this rank; when it is
+    ``None``, the record leaves queued token-work unset."""
+    load = vllm_engine_pb2.SchedulerLoad(
+        **scheduler_load_fields(
+            num_running,
+            num_waiting,
+            kv_usage,
+            estimate,
+            dp_rank=dp_rank,
+            max_total_num_tokens=max_total_num_tokens,
+            max_running_requests=max_running_requests,
+        )
+    )
+    return engine_load_from(load, queued_token_work=estimate is not None)

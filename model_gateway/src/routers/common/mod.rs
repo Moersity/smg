@@ -25,6 +25,9 @@
 //!   HTTP and gRPC families used to each carry a copy of
 //! - [`worker_selection`] — per-request worker-selection helpers used
 //!   by every routing path (regular, PD, fallback, external provider)
+//! - [`attempt_ledger`] — one request's bookkeeping across its retry
+//!   attempts: the circuit breaker charged once per request per worker,
+//!   and a worker's definitive answer never replayed on it
 //! - [`request_lease`] — dispatch-phase owner of a request's parsed
 //!   body, routing derivatives and serialized upstream bytes, with a
 //!   retry-aware release point
@@ -32,11 +35,12 @@
 //!   used by every router for transport-level retries. Has zero
 //!   coupling to the `Worker` trait — it lived in `worker/` for
 //!   historical reasons before this extraction.
-//! - [`sglang_fields`] — the SGLang-only request fields the HTTP proxy
+//! - [`sglang_fields`] — the engine-specific request fields the HTTP proxy
 //!   strips at their defaults and the provider transformers drop outright
 //! - [`sse`] — shared SSE codec (encoder + decoder) for streaming
 //!   responses to clients and parsing upstream SSE byte streams
 
+pub(crate) mod attempt_ledger;
 pub mod body_policy;
 pub(crate) mod decisions;
 pub use smg_external_router::header_utils;

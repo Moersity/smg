@@ -17,11 +17,14 @@
 
 use std::{collections::HashSet, sync::Arc};
 
+use axum::response::Response;
 use llm_multimodal::{
-    AudioClip, EncoderFieldLayouts, ImageFrame, Modality, PlaceholderRange,
+    AudioClip, EncoderFieldLayouts, EncoderInputFormat, ImageFrame, Modality, PlaceholderRange,
     PreprocessedEncoderInputs, VideoClip,
 };
 use llm_tokenizer::{Encoding, TokenizerTrait};
+
+use crate::routers::{error, grpc::proto_wrapper::VLLM_MROPE_GRID_KEYS};
 
 /// Bridges the gateway's tokenizer to the model registry's local tokenizer
 /// seam: `llm-multimodal` deliberately depends on no tokenizer crate, so the
@@ -50,12 +53,14 @@ mod capability;
 mod config;
 mod detect;
 mod inflight;
+mod item_limits;
 mod pixel_cache;
 mod plan;
 mod process;
 mod refs;
 mod serialize;
 mod settings;
+mod transparency;
 mod transport;
 pub mod worker;
 
@@ -64,29 +69,56 @@ pub(crate) use assemble::{
     assemble_tokenspeed_for_encode, encode_routing_hashes,
 };
 pub(crate) use capability::{
-    ensure_backend_supports_modalities, worker_language_model_only, SUPPORTS_VISION_LABEL,
+    ensure_backend_supports_modalities, ensure_model_accepts_media, fleet_reads_format,
+    request_needs_vision, worker_language_model_only, SUPPORTS_VISION_LABEL,
 };
 pub(crate) use config::{
     load_image_preprocessor_config, load_video_preprocessor_config, MultimodalComponents,
     MultimodalConfigRegistry, MultimodalModelConfig,
 };
 pub(crate) use detect::{media_plan_chat, media_plan_messages};
-pub(crate) use inflight::{reserve_multimodal_inflight, InflightPermit};
+pub(crate) use inflight::{
+    reserve_multimodal_inflight, InflightPermit, UNIT_BYTES as INFLIGHT_UNIT_BYTES,
+};
+pub(crate) use item_limits::engine_item_limits;
 pub(crate) use plan::{
-    prepare_placeholder_tokens, resolve_media_part_order, validate_rendered_media_anchors,
-    MediaPlan, PlaceholderTokens,
+    anchor_rendered_markers, prepare_placeholder_tokens, resolve_media_part_order,
+    validate_rendered_media_anchors, MediaPlan, PlaceholderTokens,
 };
 pub(crate) use process::process_multimodal_plan;
 pub(crate) use refs::{
     assemble_media_refs, ensure_selection_supports_media_refs, resolve_mm_processing,
     worker_accepts_media_refs, MmProcessing, MmRefsError,
 };
+pub(crate) use serialize::WireMismatch;
 pub(crate) use settings::{init_mm_settings, mm_settings, MultimodalSettings};
-pub(crate) use transport::{init_mm_transport_defaults, mm_rdma_exporter};
+pub(crate) use transparency::engine_transparency_policy;
+pub(crate) use transport::{
+    init_mm_transport_defaults, mm_rdma_exporter, mm_shared_image_wire_dtype_over,
+};
+
+/// The response for an error of assembling or planning a request's
+/// multimodal data: the typed wire mismatch is the gateway's own transient
+/// state (the model's workers changed between preparation and selection),
+/// answered with a retryable status; anything else is the request's.
+pub(crate) fn assembly_error_response(error: &anyhow::Error) -> Response {
+    if WireMismatch::is(error) {
+        error::service_unavailable("multimodal_wire_changed", format!("{error}"))
+    } else {
+        error::bad_request("multimodal_not_supported", format!("{error}"))
+    }
+}
 
 /// Whether verbose multimodal timing logs are enabled (`--log-mm-timing` /
 /// `SMG_LOG_MM_TIMING`). Resolved once at startup; called on every multimodal
 /// request.
+/// The client-facing message for a media pipeline failure: the whole error
+/// chain, so the cause (the URL whose fetch ran out of its budget, the clip
+/// the decoder refused) reaches the caller, not only the outermost context.
+pub(crate) fn processing_failed_message(error: &anyhow::Error) -> String {
+    format!("Multimodal processing failed: {error:#}")
+}
+
 pub(crate) fn log_mm_timing_enabled() -> bool {
     mm_settings().log_mm_timing.value
 }
@@ -110,6 +142,9 @@ pub(crate) struct MultimodalIntermediate {
     /// Independently preprocessed modality batches sharing one expanded prompt.
     /// A single-modality request is represented by a one-element vector.
     batches: Vec<PrecomputedMultimodalIntermediate>,
+    /// The format the spec's processors emitted the batches in
+    /// (`ModelProcessorSpec::encoder_input_format`).
+    encoder_input_format: EncoderInputFormat,
 }
 
 impl MultimodalIntermediate {
@@ -130,11 +165,36 @@ impl MultimodalIntermediate {
                 "multimodal intermediate contains an empty {modality} batch"
             );
         }
-        Ok(Self { batches })
+        Ok(Self {
+            batches,
+            encoder_input_format: EncoderInputFormat::Reference,
+        })
+    }
+
+    pub(crate) fn with_encoder_input_format(mut self, format: EncoderInputFormat) -> Self {
+        self.encoder_input_format = format;
+        self
+    }
+
+    pub(crate) fn encoder_input_format(&self) -> EncoderInputFormat {
+        self.encoder_input_format
     }
 
     pub(crate) fn batches(&self) -> &[PrecomputedMultimodalIntermediate] {
         &self.batches
+    }
+
+    /// Whether a batch carries the grid tensors a disaggregated decode leg
+    /// derives its positions from ([`VLLM_MROPE_GRID_KEYS`]): such a leg
+    /// cannot be served by a decode worker without a vision encoder.
+    pub(crate) fn has_mrope_grids(&self) -> bool {
+        self.batches.iter().any(|batch| {
+            batch
+                .preprocessed
+                .model_specific
+                .keys()
+                .any(|key| VLLM_MROPE_GRID_KEYS.contains(&key.as_str()))
+        })
     }
 
     pub(crate) fn into_batches(self) -> Vec<PrecomputedMultimodalIntermediate> {
@@ -205,9 +265,10 @@ pub(crate) struct PrecomputedMultimodalIntermediate {
     pub encoder_input_key: Option<String>,
 }
 
-/// Say once which JPEG decoder this process has, and publish it: without
-/// libjpeg-turbo the pure-Rust decoder's pixels differ from PIL's by a few
-/// levels, an embedding shift against an engine that decodes with PIL.
+/// Say once which JPEG and WebP decoders this process has, and publish them:
+/// without libjpeg-turbo the pure-Rust decoder's pixels differ from PIL's by a
+/// few levels, an embedding shift against an engine that decodes with PIL;
+/// without libwebp the WebP fallback is correct but several times slower.
 pub(crate) fn report_jpeg_decoder() {
     use crate::observability::metrics::Metrics;
     static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
@@ -223,5 +284,39 @@ pub(crate) fn report_jpeg_decoder() {
                  an engine that decodes with PIL"
             );
         }
+        let webp = llm_multimodal::webp_native::webp_available();
+        Metrics::set_mm_webp_available(webp);
+        match llm_multimodal::webp_native::webp_version() {
+            Some(version) => tracing::info!(%version, "WebP decode uses libwebp"),
+            None => tracing::info!(
+                "libwebp not found: WebP files decode with the pure-Rust decoder (the same \
+                 pixels, several times the cost); install libwebp for the faster decode"
+            ),
+        }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use llm_multimodal::{MediaConnectorError, MultiModalError};
+
+    use super::processing_failed_message;
+
+    /// A fetch that ran out of its budget is reported with its URL and the
+    /// budget, not as the bare "failed to finalize" context around it.
+    #[test]
+    fn a_processing_failure_names_its_cause() {
+        let error = anyhow::Error::new(MultiModalError::Media(MediaConnectorError::Timeout {
+            url: "https://media.example/clip.mp4".to_string(),
+            budget: Duration::from_secs(30),
+        }))
+        .context("Failed to finalize multimodal tracker");
+        assert_eq!(
+            processing_failed_message(&error),
+            "Multimodal processing failed: Failed to finalize multimodal tracker: media fetch of \
+             https://media.example/clip.mp4 timed out after 30s"
+        );
+    }
 }

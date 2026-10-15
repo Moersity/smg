@@ -28,16 +28,16 @@ use tracing_appender::{
 use tracing_log::{AsLog, LogTracer};
 use tracing_subscriber::{
     filter::{LevelFilter, Targets},
-    fmt::time::ChronoUtc,
     layer::SubscriberExt,
     util::SubscriberInitExt,
     EnvFilter, Layer, Registry,
 };
 
-use super::otel_trace::get_otel_layer;
+use super::{
+    log_format::{JsonLine, SpanFields, UtcSeconds},
+    otel_trace::get_otel_layer,
+};
 use crate::{config::TraceConfig, observability::metrics::Metrics};
-
-const TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
 
 /// All workspace crate names (hyphens → underscores to match tracing targets).
 /// When no explicit log targets are configured, these crates get the configured
@@ -370,50 +370,75 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
         .with_ansi(config.colorize)
         .with_file(true)
         .with_line_number(true)
-        .with_timer(ChronoUtc::new(TIME_FORMAT.to_string()))
+        .with_timer(UtcSeconds)
         .with_writer(stdout_writer);
 
+    // The JSON lines are the stock format's, written by `log_format` (the
+    // span's fields appended to, never re-parsed per record or per line).
     let stdout_layer = if config.json_format {
-        stdout_layer.json().flatten_event(true).boxed()
+        stdout_layer
+            .fmt_fields(SpanFields)
+            .event_format(JsonLine::new())
+            .boxed()
     } else {
         stdout_layer.boxed()
     };
 
     layers.push(stdout_layer);
 
+    // A start through the CLI or the bindings validated this path before
+    // anything bound (`ConfigValidator::validate_log_dir`, over the
+    // `RouterConfig` field both fill from the same flag as this one): an
+    // existing path is a writable directory, a missing one sits under a
+    // writable directory and is created here. A caller that set only this
+    // `ServerConfig` field, or bypassed the validation, keeps the console
+    // logging on either failure here, reported on stderr, instead of a panic
+    // in the appender or a start without any log output.
     if let Some(log_dir) = &config.log_dir {
         let log_dir = PathBuf::from(log_dir);
 
-        if !log_dir.exists() {
-            if let Err(e) = std::fs::create_dir_all(&log_dir) {
+        let file_appender = std::fs::create_dir_all(&log_dir)
+            .map_err(|e| format!("Failed to create log directory {}: {e}", log_dir.display()))
+            .and_then(|()| {
+                RollingFileAppender::builder()
+                    .rotation(Rotation::DAILY)
+                    .filename_prefix(&config.log_file_name)
+                    .build(&log_dir)
+                    .map_err(|e| {
+                        format!("Failed to open the log file in {}: {e}", log_dir.display())
+                    })
+            });
+
+        match file_appender {
+            Ok(file_appender) => {
+                let file_writer = install(file_appender, "smg-log-file");
+
+                let file_layer = tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_file(true)
+                    .with_line_number(true)
+                    .with_timer(UtcSeconds)
+                    .with_writer(file_writer);
+
+                let file_layer = if config.json_format {
+                    file_layer
+                        .fmt_fields(SpanFields)
+                        .event_format(JsonLine::new())
+                        .boxed()
+                } else {
+                    file_layer.boxed()
+                };
+
+                layers.push(file_layer);
+            }
+            Err(message) => {
                 // Logger is not yet initialized; stderr is the only output channel
                 #[expect(clippy::print_stderr)]
                 {
-                    eprintln!("Failed to create log directory: {e}");
+                    eprintln!("{message}");
                 }
-                return LogGuard(());
             }
         }
-
-        let file_appender =
-            RollingFileAppender::new(Rotation::DAILY, log_dir, &config.log_file_name);
-
-        let file_writer = install(file_appender, "smg-log-file");
-
-        let file_layer = tracing_subscriber::fmt::layer()
-            .with_ansi(false)
-            .with_file(true)
-            .with_line_number(true)
-            .with_timer(ChronoUtc::new(TIME_FORMAT.to_string()))
-            .with_writer(file_writer);
-
-        let file_layer = if config.json_format {
-            file_layer.json().flatten_event(true).boxed()
-        } else {
-            file_layer.boxed()
-        };
-
-        layers.push(file_layer);
     }
 
     if let Some(otel_layer_config) = &otel_layer_config {

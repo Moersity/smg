@@ -37,6 +37,8 @@ class TestRouterArgs:
         assert args.service_discovery is False
         assert args.discovery_provider is None
         assert args.selected_discovery_provider() is None
+        assert args.discovery_file is None
+        assert args.discovery_check_interval_secs is None
         assert args.selector == {}
         assert args.service_discovery_port == 80
         assert args.service_discovery_namespace is None
@@ -587,6 +589,9 @@ class TestParseRouterArgs:
                 "--rdma-slot-ttl-s",
                 "600",
                 "--log-mm-timing",
+                "--mm-allowed-media-domains",
+                "media.example, cdn.example",
+                "--mm-allow-private-media-hosts",
             ]
         )
         assert router_args.mm_processing == "worker"
@@ -595,6 +600,8 @@ class TestParseRouterArgs:
         assert router_args.rdma_listen_ip == "10.0.0.7"
         assert router_args.rdma_slot_ttl_s == 600
         assert router_args.log_mm_timing is True
+        assert router_args.mm_allowed_media_domains == ["media.example", "cdn.example"]
+        assert router_args.mm_allow_private_media_hosts is True
 
         defaults = parse_router_args([])
         assert defaults.mm_processing is None
@@ -603,6 +610,8 @@ class TestParseRouterArgs:
         assert defaults.rdma_listen_ip is None
         assert defaults.rdma_slot_ttl_s is None
         assert defaults.log_mm_timing is False
+        assert defaults.mm_allowed_media_domains is None
+        assert defaults.mm_allow_private_media_hosts is False
 
         with pytest.raises(SystemExit):
             parse_router_args(["--mm-processing", "routers"])
@@ -717,6 +726,8 @@ class TestParseRouterArgs:
                 "5",
                 "--worker-wedge-secs",
                 "7",
+                "--worker-stale-secs",
+                "9",
                 "--worker-warmup-secs",
                 "30",
                 "--worker-warmup-share",
@@ -737,6 +748,7 @@ class TestParseRouterArgs:
         assert router_args.kv_index == "chain"
         assert router_args.worker_stall_secs == 5
         assert router_args.worker_wedge_secs == 7
+        assert router_args.worker_stale_secs == 9
         assert router_args.worker_warmup_secs == 30
         assert router_args.worker_warmup_share == pytest.approx(0.5)
         assert router_args.worker_warmup_blocks == 256
@@ -750,6 +762,7 @@ class TestParseRouterArgs:
         assert defaults.kv_index == "positional"
         assert defaults.worker_stall_secs == 2
         assert defaults.worker_wedge_secs == 3
+        assert defaults.worker_stale_secs == 15
         assert defaults.worker_warmup_secs == 60
         assert defaults.worker_warmup_share == pytest.approx(0.25)
         assert defaults.worker_warmup_blocks == 1024
@@ -757,6 +770,84 @@ class TestParseRouterArgs:
         assert defaults.worker_warmup_divert_every == 8
         assert defaults.selection_policy == "cache-aware-default"
         assert defaults.selection_accounting_ttl_ms == 0
+
+    def test_parse_tenancy_flags(self):
+        """The tenancy flags of the Rust CLI reach RouterArgs: tenant header
+        trust, per-tenant data-plane keys, the priority scheduler and the
+        tenant rate limit, with the CLI's defaults when the flags are absent."""
+        router_args = parse_router_args(
+            [
+                "--trust-tenant-header",
+                "--tenant-header-name",
+                "x-acme-tenant",
+                "--tenant-api-key",
+                "team-red:secret-red",
+                "--tenant-api-key",
+                " team-blue : secret:with:colons ",
+                "--priority-scheduler-enabled",
+                "--priority-scheduler-default-max-class",
+                "interactive",
+                "--priority-scheduler-config",
+                "/etc/smg/scheduler.yaml",
+                "--priority-scheduler-tenant-metric-top-n",
+                "8",
+                "--tenant-rate-limit-enabled",
+                "--tenant-rate-limit-config",
+                "/etc/smg/rate-limit.yaml",
+            ]
+        )
+        assert router_args.trust_tenant_header is True
+        assert router_args.tenant_header_name == "x-acme-tenant"
+        assert router_args.tenant_api_keys == [
+            ("team-red", "secret-red"),
+            ("team-blue", "secret:with:colons"),
+        ]
+        assert router_args.priority_scheduler_enabled is True
+        assert router_args.priority_scheduler_default_max_class == "interactive"
+        assert router_args.priority_scheduler_config == "/etc/smg/scheduler.yaml"
+        assert router_args.priority_scheduler_tenant_metric_top_n == 8
+        assert router_args.tenant_rate_limit_enabled is True
+        assert router_args.tenant_rate_limit_config == "/etc/smg/rate-limit.yaml"
+
+        defaults = parse_router_args([])
+        assert defaults.trust_tenant_header is False
+        assert defaults.tenant_header_name == "x-smg-tenant-id"
+        assert defaults.tenant_api_keys == []
+        assert defaults.priority_scheduler_enabled is False
+        assert defaults.priority_scheduler_default_max_class == "default"
+        assert defaults.priority_scheduler_config is None
+        assert defaults.priority_scheduler_tenant_metric_top_n == 32
+        assert defaults.tenant_rate_limit_enabled is False
+        assert defaults.tenant_rate_limit_config is None
+
+    def test_tenant_api_key_without_separator_is_rejected(self):
+        """A key without the ':' separator fails to parse, and the error does
+        not echo the value (it may be the plaintext credential)."""
+        with pytest.raises(ValueError, match="missing ':' separator") as excinfo:
+            parse_router_args(["--tenant-api-key", "no-separator-secret"])
+        assert "no-separator-secret" not in str(excinfo.value)
+
+    def test_prefixed_tenancy_flags(self):
+        """The --router-prefixed tenancy flags reach the same fields."""
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=True)
+        namespace = parser.parse_args(
+            [
+                "--router-trust-tenant-header",
+                "--router-tenant-api-key",
+                "team-red:secret-red",
+                "--router-tenant-rate-limit-enabled",
+                "--router-tenant-rate-limit-config",
+                "/etc/smg/rate-limit.yaml",
+            ]
+        )
+
+        router_args = RouterArgs.from_cli_args(namespace, use_router_prefix=True)
+
+        assert router_args.trust_tenant_header is True
+        assert router_args.tenant_api_keys == [("team-red", "secret-red")]
+        assert router_args.tenant_rate_limit_enabled is True
+        assert router_args.tenant_rate_limit_config == "/etc/smg/rate-limit.yaml"
 
     def test_prefixed_disable_overload_protection_flag(self):
         """The --router-prefixed disable flag reaches the same field."""
@@ -940,6 +1031,23 @@ class TestParseRouterArgs:
         assert router_args.service_discovery is False
         assert router_args.selected_discovery_provider() == "kubernetes"
         assert router_args.selector == {"app": "worker"}
+
+    def test_parse_discovery_provider_file(self):
+        """The file provider's flags parse into RouterArgs."""
+        router_args = parse_router_args(
+            [
+                "--discovery-provider",
+                "file",
+                "--discovery-file",
+                "/run/smg/workers.json",
+                "--discovery-check-interval-secs",
+                "5",
+            ]
+        )
+
+        assert router_args.selected_discovery_provider() == "file"
+        assert router_args.discovery_file == "/run/smg/workers.json"
+        assert router_args.discovery_check_interval_secs == 5
 
     def test_service_discovery_and_discovery_provider_are_exclusive(self):
         """Both spellings of one choice is a usage error, not a precedence rule."""
@@ -1278,6 +1386,35 @@ class TestParseRouterArgs:
         assert router_args.mesh_advertise_host == "10.0.0.42"
         assert router_args.mesh_port == 39527
         assert router_args.mesh_peer_urls == ["10.0.0.43:39527"]
+
+    def test_parse_mesh_tls_args(self):
+        """The mesh TLS flags land in the dataclass; absent, they stay None."""
+        router_args = parse_router_args(
+            [
+                "--enable-mesh",
+                "--mesh-host",
+                "::",
+                "--mesh-advertise-host",
+                "fd00::7",
+                "--mesh-tls-ca-cert",
+                "/etc/smg/mesh/ca.pem",
+                "--mesh-tls-cert",
+                "/etc/smg/mesh/node.pem",
+                "--mesh-tls-key",
+                "/etc/smg/mesh/node-key.pem",
+            ]
+        )
+
+        assert router_args.mesh_tls_ca_cert == "/etc/smg/mesh/ca.pem"
+        assert router_args.mesh_tls_cert == "/etc/smg/mesh/node.pem"
+        assert router_args.mesh_tls_key == "/etc/smg/mesh/node-key.pem"
+
+        plain = parse_router_args(["--enable-mesh", "--mesh-host", "127.0.0.1"])
+        assert (plain.mesh_tls_ca_cert, plain.mesh_tls_cert, plain.mesh_tls_key) == (
+            None,
+            None,
+            None,
+        )
 
     def test_parse_cors_args(self):
         """Test parsing CORS arguments."""
@@ -1649,6 +1786,7 @@ class TestRouterArgsFieldOrder:
         "kv_index",
         "worker_stall_secs",
         "worker_wedge_secs",
+        "worker_stale_secs",
         "worker_warmup_secs",
         "worker_warmup_share",
         "worker_warmup_blocks",
@@ -1656,6 +1794,35 @@ class TestRouterArgsFieldOrder:
         "worker_warmup_divert_every",
         "selection_policy",
         "selection_accounting_ttl_ms",
+        "trust_tenant_header",
+        "tenant_header_name",
+        "tenant_api_keys",
+        "priority_scheduler_enabled",
+        "priority_scheduler_default_max_class",
+        "priority_scheduler_config",
+        "priority_scheduler_tenant_metric_top_n",
+        "tenant_rate_limit_enabled",
+        "tenant_rate_limit_config",
+        "jemalloc_prof_dir",
+        "mesh_tls_ca_cert",
+        "mesh_tls_cert",
+        "mesh_tls_key",
+        "tokenizer_cache_l0_max_memory",
+        "discovery_file",
+        "discovery_check_interval_secs",
+        "max_background_responses",
+        "power_of_two_load_metric",
+        "header_read_timeout_secs",
+        "idle_connection_timeout_secs",
+        "mm_allowed_media_domains",
+        "mm_allow_private_media_hosts",
+        "sse_keepalive_secs",
+        "postgres_op_timeout_secs",
+        "redis_op_timeout_secs",
+        "history_memory_max_responses",
+        "history_memory_max_items",
+        "history_memory_retention_secs",
+        "parser",
     ]
 
     def test_complete_field_sequence_is_frozen(self):
@@ -1698,6 +1865,7 @@ class TestRouterArgsFieldOrder:
             "kv_index",
             "worker_stall_secs",
             "worker_wedge_secs",
+            "worker_stale_secs",
             "worker_warmup_secs",
             "worker_warmup_share",
             "worker_warmup_blocks",
@@ -1705,8 +1873,110 @@ class TestRouterArgsFieldOrder:
             "worker_warmup_divert_every",
             "selection_policy",
             "selection_accounting_ttl_ms",
+            "trust_tenant_header",
+            "tenant_header_name",
+            "tenant_api_keys",
+            "priority_scheduler_enabled",
+            "priority_scheduler_default_max_class",
+            "priority_scheduler_config",
+            "priority_scheduler_tenant_metric_top_n",
+            "tenant_rate_limit_enabled",
+            "tenant_rate_limit_config",
+            "tokenizer_cache_l0_max_memory",
+            "max_background_responses",
+            "power_of_two_load_metric",
+            "header_read_timeout_secs",
+            "idle_connection_timeout_secs",
+            "sse_keepalive_secs",
+            "postgres_op_timeout_secs",
+            "redis_op_timeout_secs",
+            "history_memory_max_responses",
+            "history_memory_max_items",
+            "history_memory_retention_secs",
         ):
             assert names.index(appended) > marker, (
                 f"{appended} must be appended after worker_startup_delay to "
                 "preserve positional callers"
             )
+
+
+class TestConnectionTimeouts:
+    """The HTTP edge's connection-level timeouts: their defaults and the
+    disabling zero."""
+
+    def test_defaults(self):
+        args = parse_router_args([])
+        assert args.header_read_timeout_secs == 30
+        assert args.idle_connection_timeout_secs == 90
+
+    def test_flags_parse_and_zero_disables(self):
+        args = parse_router_args(
+            [
+                "--header-read-timeout-secs",
+                "5",
+                "--idle-connection-timeout-secs",
+                "0",
+            ]
+        )
+        assert args.header_read_timeout_secs == 5
+        assert args.idle_connection_timeout_secs == 0
+
+
+class TestPrometheusHostDefault:
+    """--prometheus-host is unset by default: the router derives the metrics
+    bind address from --host's family (:: for an IPv6 host, 0.0.0.0 otherwise)
+    instead of the launcher pinning an IPv4-only 0.0.0.0."""
+
+    def _parse(self, argv):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser)
+        return RouterArgs.from_cli_args(parser.parse_args(argv))
+
+    def test_unset_by_default(self):
+        assert self._parse([]).prometheus_host is None
+        assert self._parse(["--host", "[::]"]).prometheus_host is None
+        assert self._parse(["--host", "127.0.0.1"]).prometheus_host is None
+
+    def test_explicit_value_is_kept(self):
+        assert self._parse(["--prometheus-host", "::"]).prometheus_host == "::"
+        assert self._parse(["--prometheus-host", "[::]"]).prometheus_host == "[::]"
+        assert self._parse(["--prometheus-host", "127.0.0.1"]).prometheus_host == "127.0.0.1"
+        assert self._parse(["--prometheus-host", "0.0.0.0"]).prometheus_host == "0.0.0.0"
+
+    def test_router_prefix_unset_by_default(self):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=True)
+        args = RouterArgs.from_cli_args(parser.parse_args([]), use_router_prefix=True)
+        assert args.prometheus_host is None
+
+
+class TestControlPlaneApiKeyEntryErrors:
+    """A malformed entry is refused without the entry in the message: it carries the credential."""
+
+    @pytest.mark.parametrize(
+        "entry", ["bad", "i:n:bogus:s3cr3t", "ops:Ops Key:sk-live-abc123:admin"]
+    )
+    def test_the_error_does_not_echo_the_entry(self, entry):
+        with pytest.raises(ValueError) as excinfo:
+            RouterArgs._parse_control_plane_api_keys([entry])
+        text = str(excinfo.value)
+        assert "s3cr3t" not in text
+        assert "sk-live-abc123" not in text
+        assert "'bad'" not in text
+
+
+class TestParserFlag:
+    """--parser picks the gateway's chat parser: legacy by default, or symphony."""
+
+    def test_defaults_to_legacy_and_takes_symphony(self):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser)
+        assert RouterArgs.from_cli_args(parser.parse_args([])).parser == "legacy"
+        chosen = RouterArgs.from_cli_args(parser.parse_args(["--parser", "symphony"]))
+        assert chosen.parser == "symphony"
+
+    def test_refuses_an_unknown_parser(self):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser)
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--parser", "fast"])

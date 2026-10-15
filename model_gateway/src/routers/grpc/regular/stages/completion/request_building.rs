@@ -52,11 +52,13 @@ impl CompletionRequestBuildingStage {
         sampling_mask: Option<helpers::SamplingDefaultsMask>,
         workers: Option<&WorkerSelection>,
     ) -> Result<(ProtoGenerateRequest, Option<helpers::SamplingBaseline>), Response> {
+        // A completion carries no media: the ids are the prompt and the text
+        // stays off the wire (see `helpers::wire_prompt_text`).
         let mut proto_request = builder_client
             .build_completion_request(
                 request_id,
                 completion_request,
-                item.text.clone(),
+                String::new(),
                 item.token_ids.clone(),
             )
             .map_err(|e| {
@@ -220,6 +222,7 @@ impl BuildStage for CompletionRequestBuildingStage {
                 sampling_mask,
                 sampling_baseline,
                 inject_pd_metadata: self.inject_pd_metadata,
+                tool_constraint: None,
             },
         })
     }

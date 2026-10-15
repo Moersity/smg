@@ -31,7 +31,7 @@ use uuid::Uuid;
 
 use crate::{
     config::types::RetryConfig,
-    observability::metrics::Metrics,
+    observability::metrics::{metrics_labels, Metrics},
     worker::{
         circuit_breaker::CircuitState,
         event::{WorkerConnected, WorkerEvent},
@@ -1067,6 +1067,23 @@ impl WorkerRegistry {
             .is_some_and(|workers| !workers.is_empty())
     }
 
+    /// The value of the `model` label on the request metric families for a
+    /// request that names `model_id`: the id itself while a worker serves it
+    /// (an alias included), else [`metrics_labels::MODEL_OTHER`], so a client
+    /// cannot mint label values with names the gateway does not serve.
+    /// [`UNKNOWN_MODEL_ID`], the gateway's own wildcard for a request that
+    /// names no model and is routed to every worker, keeps its own value: it
+    /// is one fixed label, and the recorders of that traffic that run after
+    /// routing write it as it is. Routing keeps the request's own id; only
+    /// the label is bounded.
+    pub fn metric_model_label<'a>(&self, model_id: &'a str) -> &'a str {
+        if model_id == UNKNOWN_MODEL_ID || self.contains_model(model_id) {
+            model_id
+        } else {
+            metrics_labels::MODEL_OTHER
+        }
+    }
+
     /// Return the number of registered workers.
     pub fn len(&self) -> usize {
         self.workers.len()
@@ -1562,6 +1579,7 @@ impl WorkerRegistry {
         let transition = match candidate_status {
             Some(new_status) if new_status != old_status => {
                 worker.set_status(new_status);
+                Self::on_status_changed(&worker, new_status);
                 let _ = self.event_tx.send(WorkerEvent::StatusChanged {
                     worker_id: worker_id.clone(),
                     worker: worker.clone(),
@@ -1687,6 +1705,10 @@ impl WorkerRegistry {
             removed
         };
         if let Some((_, worker)) = removed {
+            // Retire the URL's series while the URL still maps to this id: a
+            // registration of the same URL cannot slip in between and have its
+            // fresh series retired under it.
+            Metrics::remove_worker_metrics(worker.url());
             self.url_to_id.remove(worker.url());
             // We hold _guard; drop the DashMap entry but the Mutex stays alive via Arc.
             self.worker_mutation_locks.remove(worker_id);
@@ -1714,8 +1736,6 @@ impl WorkerRegistry {
             {
                 conn_workers.retain(|id| id != worker_id);
             }
-
-            Metrics::remove_worker_metrics(worker.url());
 
             // Release background work owned by this instance — notably the ZMQ
             // handshake driver, whose bound sockets would otherwise block a
@@ -1921,6 +1941,20 @@ impl WorkerRegistry {
             self.workers.insert(worker_id.clone(), worker.clone());
             self.bump_global_routing_epoch();
         }
+
+        // The worker's series are kept for the time its address is
+        // registered (see `observability::worker_metrics`). The builder's
+        // writes for health, HTTP/2 and breaker state preceded this
+        // registration and were dropped if the address was retired by an
+        // earlier removal, so they are repeated here.
+        Metrics::worker_registered(worker.url());
+        Metrics::set_worker_health(worker.url(), worker.is_healthy());
+        Metrics::set_worker_http2(worker.url(), worker.http2());
+        Metrics::set_worker_cb_state(worker.url(), worker.circuit_breaker_state().as_int());
+
+        // The worker's request counter starts at zero with its registration,
+        // so a worker that gets no traffic shows as such.
+        Metrics::init_worker_requests(worker.url(), worker.model_id());
 
         // Update model index for O(1) lookups using copy-on-write.
         for model_id in Self::worker_model_ids(&worker) {
@@ -2341,6 +2375,31 @@ impl WorkerRegistry {
         })
     }
 
+    /// What goes with a status change besides the status. Shared by
+    /// [`Self::transition_status_inner`] (connect signals, admin paths) and
+    /// [`Self::apply_if_revision`] (the health probes), so a worker comes
+    /// back the same way whichever of the two promoted it.
+    fn on_status_changed(worker: &Arc<dyn Worker>, new_status: WorkerStatus) {
+        if new_status != WorkerStatus::Ready {
+            return;
+        }
+        // The warm-up slice (cache_aware) counts from here.
+        worker.note_admitted();
+        // A worker promoted to Ready does not wait out its circuit breaker's
+        // timeout: the failures that opened the breaker belong to the outage
+        // its probes just saw end. An open breaker goes half-open now, so
+        // the worker takes traffic at once, closes on the usual success
+        // threshold and reopens on the first failure if the engine is not
+        // back after all; a breaker the outage left closed forgets the
+        // failure streak it banked, so the first failure after the return
+        // does not open it on the outage's account. A flapping engine gets
+        // one trial per promotion, and the next promotion costs it a full
+        // demotion first. The breaker logs the transition itself.
+        if worker.readmit_circuit_breaker() {
+            Metrics::record_worker_cb_health_readmission(worker.url());
+        }
+    }
+
     /// Shared backend for [`Self::transition_status`] and
     /// [`Self::transition_status_if_revision`]. Holds the per-worker
     /// mutation lock for the full read-modify-emit sequence.
@@ -2368,16 +2427,7 @@ impl WorkerRegistry {
         }
 
         worker.set_status(new_status);
-        if new_status == WorkerStatus::Ready {
-            // The warm-up slice (cache_aware) counts from here.
-            worker.note_admitted();
-            // A worker promoted back from a demotion returns with a closed
-            // circuit breaker: the failures that opened it belong to the
-            // outage its probes just ended.
-            if matches!(old_status, WorkerStatus::NotReady | WorkerStatus::Failed) {
-                worker.reset_circuit_breaker();
-            }
-        }
+        Self::on_status_changed(&worker, new_status);
 
         let _ = self.event_tx.send(WorkerEvent::StatusChanged {
             worker_id: worker_id.clone(),
@@ -2595,6 +2645,147 @@ mod tests {
             disable_health_check: true,
             ..Default::default()
         }
+    }
+
+    /// A worker whose breaker opens on one failed request and would stay
+    /// open for an hour on its own.
+    fn worker_with_a_hair_trigger_breaker() -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new("http://worker:8080")
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .circuit_breaker_config(CircuitBreakerConfig {
+                    failure_threshold: 1,
+                    success_threshold: 1,
+                    timeout_duration: std::time::Duration::from_secs(3600),
+                    window_duration: std::time::Duration::from_secs(3600),
+                })
+                .build(),
+        )
+    }
+
+    /// The outage ended before the breaker opened (fewer failures than the
+    /// threshold): the promotion forgets that streak, on either path, so the
+    /// first failure after the return does not open the breaker on the
+    /// outage's account.
+    #[test]
+    fn a_promotion_to_ready_forgets_the_failure_streak_of_a_closed_breaker() {
+        for by_probe in [true, false] {
+            let registry = WorkerRegistry::new();
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new("http://worker:8080")
+                    .worker_type(WorkerType::Regular)
+                    .health_config(no_health_check())
+                    .circuit_breaker_config(CircuitBreakerConfig {
+                        failure_threshold: 5,
+                        success_threshold: 1,
+                        timeout_duration: std::time::Duration::from_secs(3600),
+                        window_duration: std::time::Duration::from_secs(3600),
+                    })
+                    .build(),
+            );
+            let worker_id = registry.register(worker.clone()).unwrap();
+            for _ in 0..4 {
+                worker.record_outcome(503);
+            }
+            assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+            registry.transition_status(&worker_id, WorkerStatus::NotReady);
+
+            if by_probe {
+                registry.apply_if_revision(&worker_id, worker.revision(), |_| {
+                    ((), Some(WorkerStatus::Ready))
+                });
+            } else {
+                registry.transition_status(&worker_id, WorkerStatus::Ready);
+            }
+            worker.record_outcome(503);
+            assert_eq!(
+                worker.circuit_breaker_state(),
+                CircuitState::Closed,
+                "by_probe={by_probe}: the outage's four failures are forgotten"
+            );
+            assert!(worker.is_available(), "by_probe={by_probe}");
+        }
+    }
+
+    /// The two promotion paths, `apply_if_revision` (the health probes) and
+    /// `transition_status` (connect signals), both put a promoted worker's
+    /// open circuit breaker on trial: a worker whose health returned is
+    /// routable at once, not at the breaker's timeout.
+    #[test]
+    fn a_promotion_to_ready_puts_an_open_circuit_breaker_on_trial() {
+        for by_probe in [true, false] {
+            let registry = WorkerRegistry::new();
+            let worker = worker_with_a_hair_trigger_breaker();
+            let worker_id = registry.register(worker.clone()).unwrap();
+
+            // The outage: a request fails, the breaker opens, the probes demote.
+            worker.record_outcome(503);
+            assert_eq!(worker.circuit_breaker_state(), CircuitState::Open);
+            assert_eq!(
+                registry.transition_status(&worker_id, WorkerStatus::NotReady),
+                Some((WorkerStatus::Ready, WorkerStatus::NotReady))
+            );
+            assert!(!worker.is_available());
+
+            // The return, by either path.
+            let transition = if by_probe {
+                registry
+                    .apply_if_revision(&worker_id, worker.revision(), |_| {
+                        ((), Some(WorkerStatus::Ready))
+                    })
+                    .and_then(|((), transition)| transition)
+            } else {
+                registry.transition_status(&worker_id, WorkerStatus::Ready)
+            };
+            assert_eq!(
+                transition,
+                Some((WorkerStatus::NotReady, WorkerStatus::Ready)),
+                "by_probe={by_probe}"
+            );
+            assert_eq!(
+                worker.circuit_breaker_state(),
+                CircuitState::HalfOpen,
+                "by_probe={by_probe}: the promotion puts the open breaker on trial"
+            );
+            assert!(worker.is_available(), "by_probe={by_probe}");
+        }
+    }
+
+    /// A flapping engine: its probes pass, so it is promoted and its breaker
+    /// goes on trial; the first failed request reopens the breaker, and
+    /// nothing short of another demotion and promotion (or the breaker's own
+    /// timeout) starts another trial.
+    #[test]
+    fn a_breaker_reopened_during_the_trial_waits_for_the_next_promotion() {
+        let registry = WorkerRegistry::new();
+        let worker = worker_with_a_hair_trigger_breaker();
+        let worker_id = registry.register(worker.clone()).unwrap();
+        worker.record_outcome(503);
+        registry.transition_status(&worker_id, WorkerStatus::NotReady);
+        registry.transition_status(&worker_id, WorkerStatus::Ready);
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::HalfOpen);
+
+        // The trial fails.
+        worker.record_outcome(503);
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Open);
+        assert!(!worker.is_available());
+
+        // Passing probes on a Ready worker are no promotion: no new trial.
+        assert_eq!(
+            registry.apply_if_revision(&worker_id, worker.revision(), |_| {
+                ((), Some(WorkerStatus::Ready))
+            }),
+            Some(((), None))
+        );
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Open);
+        assert!(!worker.is_available());
+
+        // The next demotion and promotion earn the next trial.
+        registry.transition_status(&worker_id, WorkerStatus::NotReady);
+        registry.transition_status(&worker_id, WorkerStatus::Ready);
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::HalfOpen);
+        assert!(worker.is_available());
     }
 
     fn worker_with_sampling_defaults(
@@ -2823,6 +3014,7 @@ mod tests {
             load: 0.0,
             version: 1,
             spec: vec![],
+            owner: "peer".to_string(),
         });
         let mesh_id = registry.get_id_by_url("http://remote:8080").unwrap();
         assert_eq!(registry.origin_of(&mesh_id), Some(WorkerOrigin::Mesh));
@@ -2842,6 +3034,7 @@ mod tests {
             load: 0.0,
             version: 1,
             spec,
+            owner: "peer".to_string(),
         }
     }
 
@@ -3997,6 +4190,39 @@ mod tests {
         assert!(registry.remove(&worker_id).is_some());
         assert!(!registry.contains_model("GLM-5.2"));
         assert!(!registry.contains_model("GLM-5.2-Coding"));
+    }
+
+    /// smg-lab #288: the request metric families take the served model's id,
+    /// or `other` for a name no worker serves, as their `model` label.
+    #[test]
+    fn metric_model_label_is_the_served_id_or_other() {
+        let registry = WorkerRegistry::new();
+        assert_eq!(registry.metric_model_label("ghost-1"), "other");
+
+        let worker = worker_with_model_aliases(
+            "http://worker:8080",
+            "GLM-5.2",
+            &["GLM-5.2-Coding"],
+            WorkerType::Regular,
+        );
+        let worker_id = registry.register(worker).unwrap();
+        assert_eq!(registry.metric_model_label("GLM-5.2"), "GLM-5.2");
+        assert_eq!(
+            registry.metric_model_label("GLM-5.2-Coding"),
+            "GLM-5.2-Coding"
+        );
+        assert_eq!(
+            registry.metric_model_label("ghost-1"),
+            metrics_labels::MODEL_OTHER
+        );
+        // The gateway's own wildcard is one fixed value, kept as it is.
+        assert_eq!(
+            registry.metric_model_label(UNKNOWN_MODEL_ID),
+            UNKNOWN_MODEL_ID
+        );
+
+        assert!(registry.remove(&worker_id).is_some());
+        assert_eq!(registry.metric_model_label("GLM-5.2"), "other");
     }
 
     #[test]

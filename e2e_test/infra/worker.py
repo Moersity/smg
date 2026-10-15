@@ -34,6 +34,7 @@ from .constants import (
     get_vllm_mm_processor,
     get_vllm_servicer_impl,
     get_zmq_engine_count,
+    host_port,
     sglang_transfer_backend,
     vllm_kv_backend,
 )
@@ -95,8 +96,8 @@ class Worker:
 
             return _zmq_ipc_url(self.port)
         if self.mode == ConnectionMode.GRPC:
-            return f"grpc://{DEFAULT_HOST}:{self.port}"
-        return f"http://{DEFAULT_HOST}:{self.port}"
+            return f"grpc://{host_port(DEFAULT_HOST, self.port)}"
+        return f"http://{host_port(DEFAULT_HOST, self.port)}"
 
     @property
     def worker_url(self) -> str:
@@ -106,7 +107,7 @@ class Worker:
     @property
     def http_url(self) -> str:
         """HTTP URL (used for health checks even on gRPC workers)."""
-        return f"http://{DEFAULT_HOST}:{self.port}"
+        return f"http://{host_port(DEFAULT_HOST, self.port)}"
 
     def start(
         self,
@@ -782,7 +783,7 @@ class Worker:
             )
 
         start = time.perf_counter()
-        channel = grpc.insecure_channel(f"{DEFAULT_HOST}:{self.port}")
+        channel = grpc.insecure_channel(host_port(DEFAULT_HOST, self.port))
         try:
             while time.perf_counter() - start < timeout:
                 if not self.is_alive():
@@ -852,10 +853,10 @@ def start_workers(
         mode: Connection mode (HTTP or GRPC).
         count: Number of workers to start.
         worker_type: Worker specialization (regular, prefill, decode).
-        timeout: Seconds to wait for each worker to become healthy.
+        timeout: Shared startup bound for all workers to become healthy.
         log_dir: Directory to store worker log files.
         gpu_offset: Starting GPU index for worker assignment.
-        wait_ready: If True (default), block until each worker is healthy.
+        wait_ready: If True (default), spawn all workers before waiting for health.
             If False, spawn processes and return immediately.
         gpus: GPUs per worker; defaults to the model spec's tp (e.g. DP needs dp*tp).
         extra_engine_args: Extra CLI args appended to the engine launch command.
@@ -912,7 +913,7 @@ def start_workers(
                 WorkerType.DECODE,
             )
             dist_init_port = get_open_port() if is_ts_disagg else None
-            dist_init_addr = f"{DEFAULT_HOST}:{dist_init_port}" if dist_init_port else None
+            dist_init_addr = host_port(DEFAULT_HOST, dist_init_port) if dist_init_port else None
 
             worker = Worker(
                 model_id=model_id,
@@ -938,7 +939,19 @@ def start_workers(
                 time.sleep(LAUNCH_STAGGER_DELAY)
 
             workers.append(worker)
-            worker.start(timeout=timeout, wait_ready=wait_ready)
+            # Each worker has its own GPU slice. Let model loading overlap
+            # instead of holding later workers' GPUs idle during this wait.
+            worker.start(timeout=timeout, wait_ready=False)
+        if wait_ready:
+            # Launch staggering must not shorten the last worker's load budget.
+            deadline = time.monotonic() + timeout
+            for worker in workers:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"Workers for {model_id} did not become healthy within {timeout}s"
+                    )
+                worker.wait_ready(max(1, int(remaining)))
     except Exception:
         stop_workers(workers)
         raise

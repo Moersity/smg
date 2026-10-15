@@ -1,4 +1,4 @@
-//! Load balancing policies for SGLang router
+//! Load balancing policies for the router
 //!
 //! This module provides a unified abstraction for routing policies that work
 //! across both regular and prefill-decode (PD) routing modes.
@@ -150,7 +150,11 @@ pub struct CacheAwareConfig {
     /// mean by this many requests AND by `balance_rel_threshold`. Requiring
     /// both keeps the gate quiet on steady-state variance at low means
     /// (absolute) without going blind to a deep queue at high means
-    /// (relative).
+    /// (relative). The margin is capped at the in-flight count's natural
+    /// swing at the pool's current mean (two standard deviations, never
+    /// under four requests unless this value is lower), so a pool whose
+    /// per-worker in-flight count
+    /// stays below this value can still spill.
     pub balance_abs_threshold: usize,
     /// Relative load margin (multiple of the healthy-fleet mean) for the
     /// per-request candidate gate; fires only together with
@@ -160,7 +164,7 @@ pub struct CacheAwareConfig {
     pub max_tree_size: usize,
     /// Backend KV cache block size (tokens per block) for event-driven routing.
     /// Used by `compute_request_content_hashes` to chunk request tokens into blocks.
-    /// Must match the backend's block size. Default: 16 (SGLang page size).
+    /// Must match the backend's block size. Default: 16 (one engine's page size).
     pub block_size: usize,
     /// KV-usage **spread** (hottest minus coldest backend, 0.0–1.0) above which
     /// the pool is treated as imbalanced and cache affinity is abandoned for

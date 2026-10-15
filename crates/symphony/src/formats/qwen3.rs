@@ -2,23 +2,15 @@
 //! `</tool_call>`, everything else content. Inside the call markers the family writes one of two
 //! syntaxes ([`CallSyntax`]): Qwen3 a JSON object, `{"name": …, "arguments": {…}}`; Qwen 3.5
 //! and later and Qwen3-Coder the tags `<function=NAME>` and `<parameter=KEY>` around each value's
-//! text, which the request's tools type, an object or a list written as JSON.
+//! text, which the request's tools type, an object or a list written as JSON. Qwen 3.5 puts the
+//! value on a line of its own and MiMo writes it between the tags directly, which the syntax's
+//! [`Placement`](crate::tagged::Placement) says.
 //!
-//! The definition is the table below; the [`Engine`](crate::Engine) runs it, and decides
-//! everything the module doc of [`engine`](crate::engine) lists. Two things are Qwen3's own:
-//!
-//! - `calls + call_open = calls`: a new `<tool_call>` before the previous block closed ends the
-//!   call that was open and starts the next.
-//! - No row leaves reasoning on a call marker: Qwen3 closes its thought with `</think>` before a
-//!   call, so a `<tool_call>` inside the thought is reasoning text.
-//! - The turn opener is ChatML's `<|im_start|>assistant`.
-//!
-//! The tests here are the engine's as much as this format's: they were written against the
-//! hand-written parser this table replaced, and hold the table to the same events.
+//! Notes on this table, and on what it leaves open: `docs/tables.md`.
 
 use crate::format::{CallSyntax, Emits, Format};
 #[cfg(test)]
-use crate::tagged::Spelling;
+use crate::tagged::{Placement, Spelling};
 
 /// The Qwen3 table, with the call syntax the checkpoint writes.
 pub fn qwen3(syntax: CallSyntax) -> Format {
@@ -762,6 +754,7 @@ mod tests {
                     "days": {"type": "integer"},
                 }}),
                 strict: None,
+                extra: Default::default(),
             },
         }])
     }
@@ -772,7 +765,10 @@ mod tests {
     );
 
     fn run_tagged(pieces: &[&str], finish: EngineFinish) -> Vec<Event> {
-        let mut parser = Engine::new(qwen3(CallSyntax::Tagged(Spelling::Json)), declared());
+        let mut parser = Engine::new(
+            qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine)),
+            declared(),
+        );
         let mut out = Events::new();
         for piece in pieces {
             parser.feed(delta(piece), &mut out).expect("delta");
@@ -942,7 +938,10 @@ mod tests {
 
     /// The prompt, then the whole output in one delta, then the engine's stop.
     fn after_prompt(prompt: &str, output: &str) -> Vec<Event> {
-        let mut parser = Engine::new(qwen3(CallSyntax::Tagged(Spelling::Json)), declared());
+        let mut parser = Engine::new(
+            qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine)),
+            declared(),
+        );
         let mut out = Events::new();
         parser
             .feed(
@@ -1159,6 +1158,112 @@ mod tests {
         let events = out.drain();
         assert_eq!(events[0], Event::ReasoningStart);
         assert_eq!(reasoning_of(&events), "The user asks about the marker.\n");
+    }
+
+    /// The table with the tagged syntax at `placement`, for a `submit_patch` tool whose `patch`
+    /// is a declared string, as bellwether's swebench call cases declare it.
+    fn submit_patch(placement: Placement) -> Engine {
+        use openai_protocol::common::{Function, Tool};
+        use serde_json::json as value;
+        Engine::new(
+            qwen3(CallSyntax::Tagged(Spelling::Json, placement)),
+            Declared::of(&[Tool {
+                tool_type: "function".to_string(),
+                function: Function {
+                    name: "submit_patch".to_string(),
+                    description: None,
+                    parameters: value!({
+                        "type": "object",
+                        "properties": {"patch": {"type": "string"}},
+                    }),
+                    strict: None,
+                    extra: Default::default(),
+                },
+            }]),
+        )
+    }
+
+    #[test]
+    fn a_value_written_between_the_tags_directly_keeps_the_newline_it_ends_with() {
+        // MiMo writes `<parameter=KEY>`, the value and `</parameter>` with no newline between
+        // them, where Qwen 3.5 puts the value on a line of its own: bellwether's
+        // mimo-v2.5/parse/swebench-*-call-* cases, whose patch ends in a newline, came back a byte
+        // short under the Qwen 3.5 reading (smg-lab #110). Each template's own shape gives the
+        // value back whole under its placement, at every cut.
+        let patch = "diff --git a/f b/f\n-x\n+y\n";
+        let expected = format!(
+            "{{\"patch\": {}}}",
+            serde_json::Value::String(patch.to_string())
+        );
+        let shapes = [
+            (
+                Placement::Direct,
+                format!(
+                    "<think></think><tool_call>\n<function=submit_patch>\n\
+                     <parameter=patch>{patch}</parameter>\n</function>\n</tool_call>"
+                ),
+            ),
+            (
+                Placement::OwnLine,
+                format!(
+                    "<tool_call>\n<function=submit_patch>\n\
+                     <parameter=patch>\n{patch}\n</parameter>\n</function>\n</tool_call>"
+                ),
+            ),
+        ];
+        for (placement, output) in &shapes {
+            for cut in 0..output.len() {
+                let pieces: Vec<&str> = if cut == 0 {
+                    vec![output]
+                } else {
+                    vec![&output[..cut], &output[cut..]]
+                };
+                let mut parser = submit_patch(*placement);
+                let mut out = Events::new();
+                for piece in &pieces {
+                    parser.feed(delta(piece), &mut out).expect("delta");
+                }
+                parser
+                    .feed(
+                        Input::End {
+                            finish: EngineFinish::Stop,
+                        },
+                        &mut out,
+                    )
+                    .expect("end");
+                let events = out.drain();
+                assert_eq!(
+                    arguments_of(&events, 0),
+                    expected,
+                    "{placement:?} cut at {cut}"
+                );
+                assert_eq!(bytes(&events), *output, "{placement:?} cut at {cut}");
+            }
+        }
+        // Under the direct placement a value of one newline is one newline, spaces are spaces,
+        // and nothing is nothing.
+        for (value, expected) in [("\n", "\"\\n\""), ("  ", "\"  \""), ("", "\"\"")] {
+            let output = format!(
+                "<tool_call>\n<function=submit_patch>\n<parameter=patch>{value}</parameter>\n\
+                 </function>\n</tool_call>"
+            );
+            let mut parser = submit_patch(Placement::Direct);
+            let mut out = Events::new();
+            parser.feed(delta(&output), &mut out).expect("delta");
+            parser
+                .feed(
+                    Input::End {
+                        finish: EngineFinish::Stop,
+                    },
+                    &mut out,
+                )
+                .expect("end");
+            assert_eq!(
+                arguments_of(&out.drain(), 0),
+                format!("{{\"patch\": {expected}}}"),
+                "{value:?}"
+            );
+        }
     }
 
     #[test]

@@ -330,7 +330,7 @@ impl MlxEngineClient {
             frequency_penalty: request.frequency_penalty.unwrap_or(0.0),
             presence_penalty: request.presence_penalty.unwrap_or(0.0),
             repetition_penalty: request.repetition_penalty.unwrap_or(1.0),
-            max_tokens: request.max_completion_tokens,
+            max_tokens: request.output_token_cap(),
             stop_token_ids: request.stop_token_ids.clone().unwrap_or_default(),
             ignore_eos: request.ignore_eos,
             logprobs,
@@ -340,7 +340,7 @@ impl MlxEngineClient {
     }
 
     fn build_sampling_params_from_completion(request: &CompletionRequest) -> proto::SamplingParams {
-        let logprobs = request.logprobs.map(|v| v.min(5) as i32);
+        let logprobs = request.logprobs.map(|v| v.min(20) as i32);
 
         proto::SamplingParams {
             temperature: request.temperature,

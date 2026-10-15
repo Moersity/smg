@@ -1000,9 +1000,10 @@ fn minimax_profile_rejects_a_second_answer_to_an_answered_call() {
 }
 
 #[test]
-fn kimi_and_openai_tolerate_loose_tool_history() {
-    // KVV requires invalid-JSON history arguments to be ACCEPTED for Kimi
-    for model in ["kimi-k3", "gpt-4o-mini"] {
+fn kimi_and_the_default_profile_tolerate_loose_tool_history() {
+    // KVV requires invalid-JSON history arguments to be ACCEPTED for Kimi;
+    // a self-hosted model (no vendor profile) leaves the history to the engine.
+    for model in ["kimi-k3", "qwen3-8b"] {
         assert!(
             tool_history_request(model, "call_1", "{invalid json}")
                 .validate()
@@ -1023,7 +1024,32 @@ fn kimi_and_openai_tolerate_loose_tool_history() {
 }
 
 #[test]
-fn minimax_normalizes_root_to_leading_system() {
+fn openai_tolerates_loose_arguments_but_pairs_tool_messages() {
+    // The public API takes any string as historical arguments ...
+    assert!(
+        tool_history_request("gpt-4o-mini", "call_1", "{invalid json}")
+            .validate()
+            .is_ok(),
+        "gpt-4o-mini must tolerate loose arguments"
+    );
+    // ... and rejects a tool message that answers no issued call, and a
+    // tool_calls turn left unanswered (the recorded public-API behaviour).
+    let mismatch = tool_history_request("gpt-4o-mini", "call_999", "{}");
+    assert!(
+        has_code(&mismatch, "tool_call_id_not_found"),
+        "{:?}",
+        error_codes(&mismatch)
+    );
+    let unanswered = unanswered_request("gpt-4o-mini");
+    assert!(
+        has_code(&unanswered, "tool_calls_without_tool_messages"),
+        "{:?}",
+        error_codes(&unanswered)
+    );
+}
+
+#[test]
+fn minimax_keeps_a_leading_root_message() {
     let mut req: ChatCompletionRequest = serde_json::from_value(json!({
         "model": "MiniMax-M3",
         "messages": [
@@ -1036,8 +1062,44 @@ fn minimax_normalizes_root_to_leading_system() {
     assert!(req.validate().is_ok());
 
     let out = serde_json::to_value(&req).expect("serializes");
-    assert_eq!(out["messages"][0]["role"], json!("system"));
+    assert_eq!(out["messages"][0]["role"], json!("root"));
     assert_eq!(out["messages"][0]["content"], json!("top priority"));
+    assert_eq!(out["messages"][1]["role"], json!("user"));
+}
+
+#[test]
+fn minimax_keeps_the_system_message_that_follows_a_root() {
+    let mut req: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "MiniMax-M3",
+        "messages": [
+            {"role": "root", "content": "Top priority: always answer in French."},
+            {"role": "system", "content": "You are a terse assistant."},
+            {"role": "user", "content": "hi"}
+        ]
+    }))
+    .expect("root role deserializes");
+    req.normalize();
+    assert!(req.validate().is_ok());
+
+    let out = serde_json::to_value(&req).expect("serializes");
+    let roles: Vec<&Value> = out["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .map(|m| &m["role"])
+        .collect();
+    assert_eq!(
+        roles,
+        vec![&json!("root"), &json!("system"), &json!("user")]
+    );
+    assert_eq!(
+        out["messages"][0]["content"],
+        json!("Top priority: always answer in French.")
+    );
+    assert_eq!(
+        out["messages"][1]["content"],
+        json!("You are a terse assistant.")
+    );
 }
 
 #[test]
@@ -1063,7 +1125,7 @@ fn minimax_hoists_a_non_leading_root_above_system() {
         .collect();
     assert_eq!(
         roles,
-        vec![&json!("system"), &json!("system"), &json!("user")]
+        vec![&json!("root"), &json!("system"), &json!("user")]
     );
     assert_eq!(
         out["messages"][0]["content"],
@@ -1090,13 +1152,38 @@ fn root_requires_content() {
 }
 
 #[test]
-fn minimax_hoists_every_root_in_order() {
+fn minimax_merges_every_root_into_one_leading_root() {
     let mut req: ChatCompletionRequest = serde_json::from_value(json!({
         "model": "MiniMax-M3",
         "messages": [
             {"role": "user", "content": "hi"},
-            {"role": "root", "content": "Answer in French"},
+            {"role": "root", "content": "Answer in French", "name": "boss"},
             {"role": "root", "content": "Answer in German"}
+        ]
+    }))
+    .expect("root roles deserialize");
+    req.normalize();
+    assert!(req.validate().is_ok());
+    let out = serde_json::to_value(&req).expect("serializes");
+    let messages = out["messages"].as_array().expect("messages");
+    let roles: Vec<&Value> = messages.iter().map(|m| &m["role"]).collect();
+    assert_eq!(roles, vec![&json!("root"), &json!("user")]);
+    assert_eq!(
+        messages[0]["content"],
+        json!("Answer in French\n\nAnswer in German")
+    );
+    assert_eq!(messages[0]["name"], json!("boss"));
+}
+
+#[test]
+fn minimax_merges_root_parts_and_text_into_one_parts_list() {
+    let mut req: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "MiniMax-M3",
+        "messages": [
+            {"role": "root", "content": [{"type": "text", "text": "Answer in French"}]},
+            {"role": "root", "content": "Answer in German"},
+            {"role": "system", "content": "Be terse"},
+            {"role": "user", "content": "hi"}
         ]
     }))
     .expect("root roles deserialize");
@@ -1106,10 +1193,16 @@ fn minimax_hoists_every_root_in_order() {
     let roles: Vec<&Value> = messages.iter().map(|m| &m["role"]).collect();
     assert_eq!(
         roles,
-        vec![&json!("system"), &json!("system"), &json!("user")]
+        vec![&json!("root"), &json!("system"), &json!("user")]
     );
-    assert_eq!(messages[0]["content"], json!("Answer in French"));
-    assert_eq!(messages[1]["content"], json!("Answer in German"));
+    assert_eq!(
+        messages[0]["content"],
+        json!([
+            {"type": "text", "text": "Answer in French"},
+            {"type": "text", "text": "Answer in German"}
+        ])
+    );
+    assert_eq!(messages[1]["content"], json!("Be terse"));
 }
 
 #[test]
@@ -1229,11 +1322,53 @@ fn kimi_profile_stream_usage_default_is_kimi_wide() {
 }
 
 #[test]
-fn non_kimi_models_get_no_stream_usage_default() {
-    for model in ["gpt-4o-mini", "MiniMax-M3"] {
+fn models_without_a_stream_usage_default_get_none() {
+    for model in ["gpt-4o-mini", "self-hosted-model"] {
         let mut req = sampling_request(model, json!({"stream": true}));
         req.normalize();
         assert!(req.stream_options.is_none(), "{model}");
+    }
+}
+
+#[test]
+fn minimax_profile_defaults_stream_usage_on() {
+    for model in ["MiniMax-M3", "MiniMax-M2"] {
+        let mut req = sampling_request(model, json!({"stream": true}));
+        req.normalize();
+        assert_eq!(include_usage(&req), Some(true), "{model}");
+        assert!(req.validate().is_ok(), "{model}");
+    }
+}
+
+#[test]
+fn minimax_profile_keeps_explicit_stream_usage_opt_out() {
+    let mut req = sampling_request(
+        "MiniMax-M3",
+        json!({"stream": true, "stream_options": {"include_usage": false}}),
+    );
+    req.normalize();
+    assert_eq!(include_usage(&req), Some(false));
+}
+
+#[test]
+fn minimax_profile_stream_usage_default_preserves_other_stream_options() {
+    let mut req = sampling_request(
+        "MiniMax-M3",
+        json!({"stream": true, "stream_options": {"continuous_usage_stats": true}}),
+    );
+    req.normalize();
+    let opts = req.stream_options.as_ref().unwrap();
+    assert_eq!(opts.include_usage, Some(true));
+    assert_eq!(opts.continuous_usage_stats, Some(true));
+}
+
+#[test]
+fn minimax_profile_adds_no_stream_options_when_not_streaming() {
+    for fields in [json!({}), json!({"stream": false})] {
+        let mut req = sampling_request("MiniMax-M3", fields);
+        req.normalize();
+        assert!(req.stream_options.is_none());
+        assert!(!has_code(&req, "stream_options_requires_stream"));
     }
 }
 

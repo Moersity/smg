@@ -10,7 +10,9 @@ use wfaas::{
 
 use crate::{
     observability::metrics::Metrics,
+    routers::common::pd_admission,
     worker::{
+        bootstrap_probe,
         registry::WorkerId,
         worker::{ConnectionModeExt, WorkerTypeExt},
         Worker, WorkerRegistry,
@@ -139,7 +141,20 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
                 worker.model_id(),
                 worker_id
             );
+            // A decode worker's running window is the PD admission bound; one
+            // that reports none leaves the gate off for it, which is said here
+            // rather than inferred later from absent series.
+            pd_admission::announce_decode_window(worker.as_ref());
             worker_ids.push(worker_id);
+        }
+
+        // The rendezvous port a disaggregated leg advertises is probed once
+        // the leg is in the registry (DP ranks share the port), off the
+        // registration path: a registration refused above, or a workflow
+        // that failed before this step, is never reported as a registered
+        // leg with a dead port.
+        if let Some(worker) = workers.first() {
+            bootstrap_probe::spawn_bootstrap_port_probe(worker.as_ref());
         }
 
         // Update per-model retry config (last write wins).

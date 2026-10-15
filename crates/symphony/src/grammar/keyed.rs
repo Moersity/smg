@@ -1,8 +1,10 @@
 //! Keyed arguments written from the table's own tags, for the spellings the engines' `glm_xml`
 //! style does not write: Ling's, with the template's newline after the call's name, after each
-//! `</arg_key>` and before `</tool_call>`, and Hy4's, every tag suffixed `:opensource` and the
-//! calls in a block. GLM's and IQuest's compact spelling keeps the `glm_xml` style, the shape the
-//! gateway writes for it today.
+//! `</arg_key>` and before `</tool_call>`; GLM 4.5 and 4.6's, with it after the name, after each
+//! `</arg_key>` and after each `</arg_value>`; K2-Horizon's, the same under `ifm|`-prefixed tags
+//! with the block's newline before each call and before its close; and Hy4's, every tag suffixed
+//! `:opensource` and the calls in a block. GLM 4.7's and IQuest's compact spelling keeps the
+//! `glm_xml` style, the shape the gateway writes for it today.
 //!
 //! A call is the call's opener and the tool's name, then one `<arg_key>` and `<arg_value>` pair per
 //! property of the tool's schema, in the schema's order, each optional unless the schema requires
@@ -18,18 +20,18 @@ use serde_json::Value;
 use super::{
     block_of,
     schema::{self, shape, Definitions},
-    CallMarkers, Grammar, Tag, WayIn,
+    CallMarkers, Count, Grammar, Tag, WayIn,
 };
 use crate::tagged::keyed::Tags;
 
-/// The calls for `tools`: in a block, the block's ways in around one or more calls; without one,
-/// one tag per tool, triggered by the call's opener.
+/// The calls for `tools`: in a block, the block's ways in around one or more calls (one, when
+/// `count` asks for one); without one, one tag per tool, triggered by the call's opener.
 pub(super) fn calls(
     markers: &CallMarkers<'_>,
     ways_in: &[WayIn<'_>],
     tags: &Tags,
     tools: &[&Tool],
-    at_least_one: bool,
+    count: Count<'_>,
 ) -> Grammar {
     let ends = Ends {
         value_close: tags.value_close,
@@ -57,20 +59,28 @@ pub(super) fn calls(
                     })
                     .collect(),
             );
-            block_of(
-                ways_in,
-                Grammar::Plus(Box::new(one_call)),
-                block.close,
-                at_least_one,
-            )
+            // The block's own newlines, where the template writes them: before each call and
+            // before the block's close (K2-Horizon); Hy4's block writes none.
+            let newlines = &tags.newlines;
+            let each = match newlines.block_before_call {
+                "" => one_call,
+                before => {
+                    Grammar::Sequence(vec![Grammar::ConstString(before.to_string()), one_call])
+                }
+            };
+            let all = count.calls(each);
+            let inside = match newlines.block_before_close {
+                "" => all,
+                before => Grammar::Sequence(vec![all, Grammar::ConstString(before.to_string())]),
+            };
+            block_of(ways_in, inside, block.close, count)
         }
-        None => Grammar::TriggeredTags {
-            triggers: vec![markers.call_open.to_string()],
-            tags: calls
+        None => count.triggered(
+            vec![markers.call_open.to_string()],
+            calls
                 .map(|(begin, content, end)| Tag::new(begin, content, end))
                 .collect(),
-            at_least_one,
-        },
+        ),
     }
 }
 
@@ -92,8 +102,8 @@ impl Ends<'_> {
     }
 }
 
-/// One call as its three parts: the opener with the name and the spelling's newline, the
-/// arguments, and the newline with the close.
+/// One call as its three parts: the opener with the name and the newline the spelling writes after
+/// it, the arguments, and the newline the spelling writes before the close with the close.
 fn call(
     markers: &CallMarkers<'_>,
     tags: &Tags,
@@ -102,9 +112,9 @@ fn call(
     parameters: &Value,
 ) -> (String, Grammar, String) {
     (
-        format!("{}{name}{}", markers.call_open, tags.between),
+        format!("{}{name}{}", markers.call_open, tags.newlines.after_name),
         arguments(tags, ends, parameters),
-        format!("{}{}", tags.between, markers.call_close),
+        format!("{}{}", tags.newlines.before_close, markers.call_close),
     )
 }
 
@@ -121,17 +131,19 @@ fn arguments(tags: &Tags, ends: &Ends<'_>, parameters: &Value) -> Grammar {
     })
 }
 
-/// One pair: the key between its tags, the spelling's newline, the value between its tags.
+/// One pair: the key between its tags, the newline the spelling writes after the key, the value
+/// between its tags, and the newline the spelling writes after the value.
 fn argument(tags: &Tags, key: Grammar, value: Grammar) -> Grammar {
+    let newlines = &tags.newlines;
     Grammar::Sequence(vec![
         Grammar::ConstString(tags.key_open.to_string()),
         key,
         Grammar::ConstString(format!(
             "{}{}{}",
-            tags.key_close, tags.between, tags.value_open
+            tags.key_close, newlines.after_key, tags.value_open
         )),
         value,
-        Grammar::ConstString(tags.value_close.to_string()),
+        Grammar::ConstString(format!("{}{}", tags.value_close, newlines.after_value)),
     ])
 }
 
@@ -159,6 +171,7 @@ mod tests {
                 description: None,
                 parameters,
                 strict: None,
+                extra: Default::default(),
             },
         }
     }
@@ -256,8 +269,9 @@ mod tests {
     #[test]
     fn a_ling_call_without_arguments_writes_both_newlines() {
         // The template writes the newline after the name and the one before `</tool_call>`
-        // whether or not an argument comes between: every one of the 259 zero-argument calls in
-        // ling-3.0-flash's recorded parse sets reads `<tool_call>NAME\n\n</tool_call>`.
+        // whether or not an argument comes between, and nothing between two pairs: every one of
+        // the 259 zero-argument calls in ling-3.0-flash's recorded parse sets reads
+        // `<tool_call>NAME\n\n</tool_call>`, and its pairs read `</arg_value><arg_key>`.
         let payload = formats::ling()
             .grammar(&[tool("ping", value!({"type": "object"}))], true, false)
             .expect("a grammar")
@@ -272,22 +286,123 @@ mod tests {
     }
 
     #[test]
+    fn glm4_ends_each_pair_with_its_newline_and_closes_right_after() {
+        // GLM 4.6's template writes the newline after each `</arg_value>` and none of its own
+        // before `</tool_call>`: in glm-4.6's recorded parse sets, 280 of 280 zero-argument calls
+        // read `<tool_call>NAME\n</tool_call>`, 23,167 of 23,167 pairs are followed by
+        // `\n<arg_key>`, and 19,254 of 19,254 last pairs by `\n</tool_call>`.
+        let payload = formats::glm4()
+            .grammar(&weather_tools(), true, false)
+            .expect("a grammar")
+            .payload();
+        let tags = payload["format"]["tags"].as_array().expect("two tags");
+        assert_eq!(tags[0]["begin"], "<tool_call>get_weather\n");
+        assert_eq!(tags[0]["end"], "</tool_call>");
+        let pairs = tags[0]["content"]["elements"]
+            .as_array()
+            .expect("three pairs");
+        let city = pairs[0]["elements"].as_array().expect("a pair's parts");
+        assert_eq!(city[2]["value"], "</arg_key>\n<arg_value>");
+        assert_eq!(city[4]["value"], "</arg_value>\n");
+        let units = pairs[2]["content"]["elements"]
+            .as_array()
+            .expect("the optional pair's parts");
+        assert_eq!(units[4]["value"], "</arg_value>\n");
+        // A call without arguments: the name's newline, then the close.
+        let written = format!(
+            "{}{}",
+            tags[1]["begin"].as_str().expect("begin"),
+            tags[1]["end"].as_str().expect("end")
+        );
+        assert_eq!(written, "<tool_call>ping\n</tool_call>");
+    }
+
+    #[test]
+    fn k2_horizon_writes_its_block_with_a_newline_before_each_call_and_before_the_close() {
+        // K2-Horizon's template writes `<ifm|tool_calls>`, then each call after a newline, then a
+        // newline and `</ifm|tool_calls>`; every one of the recorded sets' 1,935 block openings,
+        // 1,250 call-to-call joins and 1,935 block closings reads so. The block holds one call or
+        // more, each GLM 4.6's pair spelling under the `ifm|` tags, and a zero-argument call is its
+        // name and a newline.
+        let payload = formats::k2_horizon()
+            .grammar(&weather_tools(), true, false)
+            .expect("a grammar")
+            .payload();
+        let block = &payload["format"]["tags"][0];
+        assert_eq!(block["begin"], "<ifm|tool_calls>");
+        assert_eq!(block["end"], "</ifm|tool_calls>");
+        let inside = block["content"]["elements"]
+            .as_array()
+            .expect("calls, then the newline");
+        assert_eq!(inside[1], value!({"type": "const_string", "value": "\n"}));
+        assert_eq!(inside[0]["type"], "plus");
+        let each = inside[0]["content"]["elements"]
+            .as_array()
+            .expect("the newline, then one of the calls");
+        assert_eq!(each[0], value!({"type": "const_string", "value": "\n"}));
+        let calls = each[1]["elements"].as_array().expect("two tools");
+        let weather = calls[0]["elements"].as_array().expect("a call's parts");
+        assert_eq!(weather[0]["value"], "<ifm|tool_call>get_weather\n");
+        assert_eq!(weather[2]["value"], "</ifm|tool_call>");
+        let city = weather[1]["elements"][0]["elements"]
+            .as_array()
+            .expect("the first pair's parts");
+        assert_eq!(city[2]["value"], "</ifm|arg_key>\n<ifm|arg_value>");
+        assert_eq!(city[4]["value"], "</ifm|arg_value>\n");
+        let ping = calls[1]["elements"]
+            .as_array()
+            .expect("the zero-argument call's parts");
+        assert_eq!(ping[0]["value"], "<ifm|tool_call>ping\n");
+        assert_eq!(ping[1]["type"], "star");
+        assert_eq!(ping[2]["value"], "</ifm|tool_call>");
+        // With the thought open, the same block follows a prefix that excludes the call tags.
+        let with_prefix = formats::k2_horizon()
+            .grammar(&weather_tools(), true, true)
+            .expect("a grammar")
+            .payload();
+        let parts = with_prefix["format"]["elements"]
+            .as_array()
+            .expect("prefix, then the block");
+        let excludes = parts[0]["excludes"].as_array().expect("the excluded tags");
+        for tag in [
+            "<ifm|tool_calls>",
+            "</ifm|tool_calls>",
+            "<ifm|tool_call>",
+            "</ifm|tool_call>",
+            "<ifm|arg_key>",
+            "</ifm|arg_key>",
+            "<ifm|arg_value>",
+            "</ifm|arg_value>",
+        ] {
+            assert!(
+                excludes.contains(&value!(tag)),
+                "{tag} is excluded from the prefix"
+            );
+        }
+        assert_eq!(parts[1]["tags"][0]["begin"], "<ifm|tool_calls>");
+    }
+
+    #[test]
     fn hy4_with_the_reasoning_open_takes_the_prefix_and_its_one_way_in() {
-        // Hy4's prompt opens the thought, so this is the path it takes most: the prefix closes the
-        // thought and can write none of the six terminals nor the four suffixed tags; the block
-        // behind it has its one way in, from content, with no close of its own before the opener.
+        // Hy4's prompt opens the thought, so this is the path it takes most: the prefix is free
+        // text that can write none of the four call terminals nor the four suffixed tags, the
+        // thought's own two allowed so the model may close it where the engine runs the grammar
+        // from the first token, and nothing owed at its end; the block behind it has its one way
+        // in, from content, with no close of its own before the opener.
         let payload = formats::hy4()
             .grammar(&weather_tools(), true, true)
             .expect("a grammar")
             .payload();
         assert_eq!(payload["format"]["type"], "sequence");
         let prefix = &payload["format"]["elements"][0];
-        assert_eq!(prefix["end"], "</think:opensource>");
+        assert_eq!(prefix["type"], "any_text");
+        assert!(
+            prefix.get("end").is_none(),
+            "nothing owed at the prefix's end: {prefix}"
+        );
         assert_eq!(
-            prefix["content"]["excludes"],
+            prefix["excludes"],
             value!([
-                "<think:opensource>",
-                "</think:opensource>",
                 "<tool_calls:opensource>",
                 "</tool_calls:opensource>",
                 "<tool_call:opensource>",
@@ -311,12 +426,10 @@ mod tests {
             .expect("a grammar")
             .payload();
         assert_eq!(payload["format"]["type"], "sequence");
-        assert_eq!(payload["format"]["elements"][0]["end"], "</think>");
+        assert_eq!(payload["format"]["elements"][0]["type"], "any_text");
         assert_eq!(
-            payload["format"]["elements"][0]["content"]["excludes"],
+            payload["format"]["elements"][0]["excludes"],
             value!([
-                "<think>",
-                "</think>",
                 "<tool_call>",
                 "</tool_call>",
                 "<arg_key>",

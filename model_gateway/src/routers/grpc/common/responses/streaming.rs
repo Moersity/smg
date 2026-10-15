@@ -6,14 +6,14 @@ use futures::Stream;
 use http::header::{HeaderValue, CONTENT_TYPE};
 use openai_protocol::{
     chat::ChatCompletionStreamResponse,
-    common::{Usage, UsageInfo},
+    common::Usage,
     event_types::{
         ContentPartEvent, FunctionCallEvent, McpEvent, OutputItemEvent, OutputTextEvent,
         ResponseEvent,
     },
     responses::{
-        IncludeField, IncompleteDetails, IncompleteReason, ResponseOutputItem, ResponseStatus,
-        ResponsesRequest, ResponsesResponse, ResponsesUsage,
+        IncludeField, ResponseOutputItem, ResponseStatus, ResponseUsage, ResponsesRequest,
+        ResponsesResponse, ResponsesUsage,
     },
 };
 use serde_json::json;
@@ -31,7 +31,7 @@ use crate::{
     routers::{
         common::{
             openai_bridge::{self, descriptor, ResponseFormat},
-            sse::{SseReceiver, SseSender},
+            sse::{SseEncodeError, SseEncoder, SseReceiver, SseSender},
         },
         error,
         grpc::harmony::responses::ToolResult,
@@ -94,10 +94,11 @@ struct ToolCallStreamItem {
 /// reported a failed generation (also the case when the finish reason alone
 /// says so and no error object was built). Anything else counts as `other`
 /// so a client-visible code can never widen the label set.
-fn failure_reason(error: Option<&serde_json::Value>) -> &'static str {
+pub(crate) fn failure_reason(error: Option<&serde_json::Value>) -> &'static str {
     match error.and_then(|e| e.get("code")).and_then(|c| c.as_str()) {
         Some("stream_error") => "stream_error",
         Some("server_error") | None => "server_error",
+        Some("storage_unavailable") => "storage_unavailable",
         Some(_) => "other",
     }
 }
@@ -149,6 +150,14 @@ pub(crate) struct ResponseStreamEventEmitter {
     /// Chat `finish_reason` of the final chunk, e.g. `"length"` for a
     /// `max_output_tokens` truncation. Drives the terminal event's status.
     finish_reason: Option<String>,
+    /// The response runs in the background: `response.created` reports it
+    /// `queued`, `response.queued` follows, and the objects echo the flag.
+    background: bool,
+    /// The error of the last `error` event sent, for the runner of a
+    /// background stream that ends without a terminal object.
+    last_error: Option<serde_json::Value>,
+    /// Frames every event of the stream through one reusable buffer.
+    encoder: SseEncoder,
 }
 
 /// Streaming state for the reasoning output item of the current turn.
@@ -179,11 +188,15 @@ impl ResponseStreamEventEmitter {
             tool_call_items: Vec::new(),
             reasoning_item: None,
             finish_reason: None,
+            background: false,
+            last_error: None,
+            encoder: SseEncoder::new(),
         }
     }
 
     /// Set the original request for including all fields in response.completed
     pub fn set_original_request(&mut self, request: ResponsesRequest) {
+        self.background = request.background.unwrap_or(false);
         self.original_request = Some(request);
     }
 
@@ -225,6 +238,12 @@ impl ResponseStreamEventEmitter {
         }
     }
 
+    /// Whether a streamed output item is a call cut short: a `function_call` whose status says
+    /// its arguments are not complete JSON.
+    fn is_cut_call(item: &serde_json::Value) -> bool {
+        item["type"] == "function_call" && item["status"] == "incomplete"
+    }
+
     fn next_sequence(&mut self) -> u64 {
         let seq = self.sequence_number;
         self.sequence_number += 1;
@@ -239,9 +258,25 @@ impl ResponseStreamEventEmitter {
                 "id": self.response_id,
                 "object": "response",
                 "created_at": self.created_at,
-                "status": "in_progress",
+                "status": if self.background { "queued" } else { "in_progress" },
+                "background": self.background,
                 "model": self.model,
                 "output": []
+            }
+        })
+    }
+
+    /// The event after `response.created` on a background stream: the
+    /// response is accepted and waits for its turn.
+    pub fn emit_queued(&mut self) -> serde_json::Value {
+        json!({
+            "type": ResponseEvent::QUEUED,
+            "sequence_number": self.next_sequence(),
+            "response": {
+                "id": self.response_id,
+                "object": "response",
+                "status": "queued",
+                "background": true
             }
         })
     }
@@ -366,7 +401,8 @@ impl ResponseStreamEventEmitter {
         // the Responses contract reports that as status=incomplete with
         // incomplete_details and terminates the stream with
         // response.incomplete, mirroring the non-streaming conversion.
-        let truncated = self.finish_reason.as_deref() == Some("length");
+        let length = self.finish_reason.as_deref() == Some("length");
+        let truncated = length || output.iter().any(Self::is_cut_call);
         let failed = matches!(self.finish_reason.as_deref(), Some("failed" | "error"));
 
         // Build base response object
@@ -375,13 +411,14 @@ impl ResponseStreamEventEmitter {
             "object": "response",
             "created_at": self.created_at,
             "status": if failed { "failed" } else if truncated { "incomplete" } else { "completed" },
+            "background": self.background,
             "model": self.model,
             "output": output
         });
         if let Some(error) = generation_failure_error(self.finish_reason.as_deref()) {
             response_obj["error"] = error;
         }
-        if truncated {
+        if length {
             response_obj["incomplete_details"] = json!({ "reason": "max_output_tokens" });
         }
 
@@ -442,6 +479,26 @@ impl ResponseStreamEventEmitter {
         })
     }
 
+    /// The `response.failed` terminal event of a response that ended with
+    /// `error` after its items were emitted (a record that could not be
+    /// written, for one); terminal like [`Self::emit_completed`], which it is
+    /// built on. The paths that emit their terminal themselves use it.
+    pub fn emit_failed(
+        &mut self,
+        usage: Option<&serde_json::Value>,
+        error: &serde_json::Value,
+    ) -> serde_json::Value {
+        self.finish_reason = Some("failed".into());
+        let mut event = self.emit_completed(usage);
+        event["type"] = json!(ResponseEvent::FAILED);
+        event["response"]["status"] = json!("failed");
+        event["response"]["error"] = error.clone();
+        if let Some(response) = event["response"].as_object_mut() {
+            response.remove("incomplete_details");
+        }
+        event
+    }
+
     /// Close remaining item event sequences, retaining unfinished wire statuses,
     /// and emit exactly one terminal event.
     pub async fn emit_terminal(
@@ -456,15 +513,10 @@ impl ResponseStreamEventEmitter {
         self.close_reasoning_item(tx).await?;
         self.close_message_item(tx).await?;
         self.close_tool_call_items(tx).await?;
-        let mut event = self.emit_completed(usage);
-        if let Some(error) = error {
-            event["type"] = json!(ResponseEvent::FAILED);
-            event["response"]["status"] = json!("failed");
-            event["response"]["error"] = error.clone();
-            if let Some(response) = event["response"].as_object_mut() {
-                response.remove("incomplete_details");
-            }
-        }
+        let event = match error {
+            Some(error) => self.emit_failed(usage, error),
+            None => self.emit_completed(usage),
+        };
         let failed = event["type"] == ResponseEvent::FAILED;
         self.send_event(&event, tx).await?;
         if failed {
@@ -825,33 +877,16 @@ impl ResponseStreamEventEmitter {
             })
             .collect();
 
-        // Convert Usage to ResponsesUsage
-        let responses_usage = usage.map(|u| {
-            let usage_info = UsageInfo {
-                prompt_tokens: u.prompt_tokens,
-                completion_tokens: u.completion_tokens,
-                total_tokens: u.total_tokens,
-                reasoning_tokens: u
-                    .completion_tokens_details
-                    .as_ref()
-                    .and_then(|d| d.reasoning_tokens),
-                prompt_tokens_details: u.prompt_tokens_details.clone(),
-            };
-            ResponsesUsage::Modern(usage_info.to_response_usage())
-        });
+        // The usage the terminal event carries, through the one conversion.
+        let responses_usage = usage.map(|u| ResponsesUsage::Modern(ResponseUsage::from(&u)));
 
         // Match the streamed terminal event: a `length` finish reports
-        // status=incomplete with the truncation reason.
-        let (status, incomplete_details) = match self.finish_reason.as_deref() {
-            Some("failed" | "error") => (ResponseStatus::Failed, None),
-            Some("length") => (
-                ResponseStatus::Incomplete,
-                Some(IncompleteDetails {
-                    reason: IncompleteReason::MaxOutputTokens,
-                }),
-            ),
-            _ => (ResponseStatus::Completed, None),
-        };
+        // status=incomplete with the truncation reason, a cut call without one.
+        let cut_call = output.iter().any(|item| {
+            matches!(item, ResponseOutputItem::FunctionToolCall { status, .. } if status == "incomplete")
+        });
+        let (status, incomplete_details) =
+            super::utils::response_status(self.finish_reason.as_deref(), cut_call);
 
         // Build response using builder
         let mut builder = ResponsesResponse::builder(&self.response_id, &self.model)
@@ -867,6 +902,22 @@ impl ResponseStreamEventEmitter {
             builder = builder.error(error);
         }
         builder.build()
+    }
+
+    /// The final object of a run that ends as `failed` before its terminal
+    /// event (the tool-call limit): [`finalize`](Self::finalize)'s object
+    /// with the status and the error the terminal will carry. Read before
+    /// the terminal, which drains the items: the stored object keeps them.
+    pub fn finalize_failed(
+        &self,
+        usage: Option<Usage>,
+        error: serde_json::Value,
+    ) -> ResponsesResponse {
+        let mut response = self.finalize(usage);
+        response.status = ResponseStatus::Failed;
+        response.error = Some(error);
+        response.incomplete_details = None;
+        response
     }
 
     /// Emit reasoning item wrapper events (added + done)
@@ -1284,24 +1335,29 @@ impl ResponseStreamEventEmitter {
         Ok(())
     }
 
+    /// Send `event` as one frame: its `type` on the `event:` line (`message`
+    /// when it has none), its JSON on the `data:` line, serialized straight
+    /// into the encoder's buffer.
     pub async fn send_event(
-        &self,
+        &mut self,
         event: &serde_json::Value,
         tx: &SseSender,
     ) -> Result<(), String> {
-        let event_json =
-            serde_json::to_string(event).map_err(|e| format!("Failed to serialize event: {e}"))?;
-
-        // Extract event type from the JSON for SSE event field
         let event_type = event
             .get("type")
             .and_then(|v| v.as_str())
             .unwrap_or("message");
+        let frame = self
+            .encoder
+            .encode_event(event_type, event)
+            .map_err(|e| match e {
+                SseEncodeError::Json(e) => format!("Failed to serialize event: {e}"),
+                SseEncodeError::InvalidEventType => {
+                    "Failed to serialize event: its type breaks the frame".to_string()
+                }
+            })?;
 
-        // Format as SSE with event: field
-        let sse_message = format!("event: {event_type}\ndata: {event_json}\n\n");
-
-        if tx.send(Ok(Bytes::from(sse_message))).await.is_err() {
+        if tx.send(Ok(frame)).await.is_err() {
             return Err("Client disconnected".to_string());
         }
 
@@ -1313,7 +1369,11 @@ impl ResponseStreamEventEmitter {
     /// This is a convenience method for streaming scenarios where client
     /// disconnection is expected and should be logged but not fail the operation.
     /// Returns true if sent successfully, false if client disconnected.
-    pub async fn send_event_best_effort(&self, event: &serde_json::Value, tx: &SseSender) -> bool {
+    pub async fn send_event_best_effort(
+        &mut self,
+        event: &serde_json::Value,
+        tx: &SseSender,
+    ) -> bool {
         match self.send_event(event, tx).await {
             Ok(()) => true,
             Err(e) => {
@@ -1329,18 +1389,25 @@ impl ResponseStreamEventEmitter {
     /// Uses OpenAI's error event format.
     /// Use this for terminal errors that should abort the streaming response.
     pub async fn emit_error(&mut self, error_msg: &str, error_code: Option<&str>, tx: &SseSender) {
+        let code = error_code.unwrap_or("internal_error");
+        self.last_error = Some(json!({ "code": code, "message": error_msg }));
         let event = json!({
             "type": "error",
-            "code": error_code.unwrap_or("internal_error"),
+            "code": code,
             "message": error_msg,
             "param": null,
             "sequence_number": self.next_sequence()
         });
-        let sse_data = match serde_json::to_string(&event) {
-            Ok(json) => format!("data: {json}\n\n"),
-            Err(_) => "data: {\"type\":\"error\",\"code\":\"internal_error\",\"message\":\"serialization failed\",\"param\":null}\n\n".to_string(),
-        };
-        let _ = tx.send(Ok(Bytes::from(sse_data))).await;
+        // The error event goes out on a `data:` line alone, as it always has.
+        let frame = self.encoder.encode_data(&event).unwrap_or_else(|_| {
+            Bytes::from_static(b"data: {\"type\":\"error\",\"code\":\"internal_error\",\"message\":\"serialization failed\",\"param\":null}\n\n")
+        });
+        let _ = tx.send(Ok(frame)).await;
+    }
+
+    /// The error of the last `error` event this emitter sent, if any.
+    pub fn take_error(&mut self) -> Option<serde_json::Value> {
+        self.last_error.take()
     }
 
     /// Emit the full mcp_list_tools output-item sequence.
@@ -1487,6 +1554,87 @@ pub(crate) fn attach_mcp_server_label(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The frame of an event: its `type` on the `event:` line and the JSON on
+    /// the `data:` line, the text escaped as JSON; an error frame has no
+    /// `event:` line.
+    #[tokio::test]
+    async fn an_event_frame_names_its_type_and_an_error_frame_does_not() {
+        let mut emitter =
+            ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
+        let (tx, mut rx) = sse_channel();
+        let event = emitter.emit_text_delta("héllo \"there\"\n", 1, "msg_1", 0);
+        emitter.send_event(&event, &tx).await.unwrap();
+        emitter
+            .emit_error("engine unavailable", Some("server_error"), &tx)
+            .await;
+        drop(tx);
+        let mut frames = Vec::new();
+        while let Some(Ok(bytes)) = rx.recv().await {
+            frames.push(String::from_utf8(bytes.to_vec()).unwrap());
+        }
+        let delta = OutputTextEvent::DELTA;
+        assert_eq!(
+            frames,
+            [
+                format!(
+                    "event: {delta}\ndata: {{\"type\":\"{delta}\",\"sequence_number\":0,\
+                     \"output_index\":1,\"item_id\":\"msg_1\",\"content_index\":0,\
+                     \"delta\":\"héllo \\\"there\\\"\\n\"}}\n\n"
+                ),
+                "data: {\"type\":\"error\",\"code\":\"server_error\",\"message\":\"engine \
+                 unavailable\",\"param\":null,\"sequence_number\":1}\n\n"
+                    .to_string(),
+            ]
+        );
+    }
+
+    /// A run that ends as failed before its terminal (the tool-call limit)
+    /// stores what the stream carries: `failed`, the error, the items still
+    /// held by the emitter, the usage; the terminal drains them afterwards.
+    #[test]
+    fn the_failed_final_object_keeps_the_items_the_error_and_the_usage() {
+        let mut emitter =
+            ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
+        let (index, id) = emitter.allocate_output_index(OutputItemKind::FunctionCall);
+        let item = json!({"id": id, "type": "function_call", "call_id": "call_test", "name": "lookup", "arguments": "{}", "status": "completed"});
+        emitter.emit_output_item_added(index, &item);
+        emitter.emit_output_item_done(index, &item);
+        emitter.complete_output_item(index);
+        let error = json!({
+            "code": "max_tool_calls_exceeded",
+            "message": "Reached the max_tool_calls limit (1) before executing the remaining tool calls.",
+        });
+
+        let response = emitter.finalize_failed(Some(Usage::from_counts(3, 2)), error.clone());
+
+        assert_eq!(response.status, ResponseStatus::Failed);
+        assert_eq!(response.error, Some(error.clone()));
+        assert!(response.incomplete_details.is_none());
+        let stored = serde_json::to_value(&response).unwrap();
+        assert_eq!(stored["output"][0]["name"], "lookup", "{stored}");
+        assert_eq!(stored["usage"]["total_tokens"], 5, "{stored}");
+        // The terminal built afterwards still carries the item.
+        let terminal = emitter.emit_completed(None);
+        assert_eq!(terminal["response"]["output"][0]["name"], "lookup");
+    }
+
+    #[tokio::test]
+    async fn the_error_event_is_remembered_for_the_stream_runner() {
+        let mut emitter =
+            ResponseStreamEventEmitter::new("resp_test".to_string(), "test-model".to_string(), 1);
+        assert!(emitter.take_error().is_none());
+        let (tx, mut rx) = sse_channel();
+        emitter
+            .emit_error("Pipeline execution failed", Some("pipeline_error"), &tx)
+            .await;
+        let frame = rx.recv().await.expect("the error frame").expect("a frame");
+        assert!(frame.starts_with(b"data: "), "{frame:?}");
+        let error = emitter.take_error().expect("remembered");
+        assert_eq!(error["code"], "pipeline_error");
+        assert_eq!(error["message"], "Pipeline execution failed");
+        assert!(emitter.take_error().is_none(), "taken once");
+    }
 
     #[test]
     fn finalized_streaming_response_serializes_responses_api_usage() {

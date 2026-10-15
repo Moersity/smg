@@ -79,6 +79,7 @@ ENV_MM_PROCESSING = (
     "E2E_MM_PROCESSING"  # Per-lane multimodal processing location — see get_mm_processing
 )
 ENV_VLLM_MM_PROCESSOR = "E2E_VLLM_MM_PROCESSOR"  # Worker-lane processor — see get_vllm_mm_processor
+ENV_PARSER = "E2E_PARSER"  # The gateway's --parser for a lane — see get_parser
 ENV_STARTUP_TIMEOUT = (
     "E2E_STARTUP_TIMEOUT"  # Floor on every startup wait — see effective_startup_timeout
 )
@@ -199,6 +200,21 @@ def get_mm_processing() -> str | None:
 
 VLLM_SERVICER_IMPLS = ("python", "rust")
 VLLM_MM_PROCESSORS = ("inprocess", "smg")
+
+
+def get_parser() -> str | None:
+    """The parser a lane starts the gateway with, its ``--parser`` flag.
+
+    Set ``E2E_PARSER=symphony`` to read every chat completion with Symphony for
+    the models its registry knows; ``legacy`` names the per-model parsers.
+    Unset or blank leaves the gateway on its default, legacy.
+    """
+    value = os.environ.get(ENV_PARSER, "").strip().lower()
+    if not value:
+        return None
+    if value not in ("legacy", "symphony"):
+        raise ValueError(f"{ENV_PARSER}={value!r} is not a parser; use legacy or symphony")
+    return value
 
 
 def get_vllm_mm_processor() -> str:
@@ -369,10 +385,30 @@ ENV_SHOW_ROUTER_LOGS = "SHOW_ROUTER_LOGS"
 ENV_SHOW_WORKER_LOGS = "SHOW_WORKER_LOGS"
 
 # Network
-DEFAULT_HOST = "127.0.0.1"
+ENV_HOST = "E2E_HOST"  # The loopback the lane binds and dials — see default_host
+
+
+def default_host() -> str:
+    """The loopback the harness binds gateways and workers to and dials them at.
+
+    ``127.0.0.1`` unless ``E2E_HOST`` names another address; ``E2E_HOST=::1`` runs
+    a lane over IPv6 (bare literal, no brackets: it is passed to ``--host`` flags
+    as is, and every URL goes through :func:`host_port`).
+    """
+    return os.environ.get(ENV_HOST, "").strip() or "127.0.0.1"
+
+
+def host_port(host: str, port: int | str) -> str:
+    """``host:port`` for a URL or a dial string: an IPv6 literal goes in brackets."""
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]:{port}"
+    return f"{host}:{port}"
+
+
+DEFAULT_HOST = default_host()
 BRAVE_MCP_PORT = int(os.environ.get("BRAVE_MCP_PORT") or 8080)
 BRAVE_MCP_HOST = os.environ.get("BRAVE_MCP_HOST") or DEFAULT_HOST
-BRAVE_MCP_URL = f"http://{BRAVE_MCP_HOST}:{BRAVE_MCP_PORT}/mcp"
+BRAVE_MCP_URL = f"http://{host_port(BRAVE_MCP_HOST, BRAVE_MCP_PORT)}/mcp"
 
 # In-process mock MCP server (see infra/mock_mcp_server.py). Bound to localhost
 # on an auto-allocated port; host is exposed as a constant so tests and

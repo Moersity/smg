@@ -65,6 +65,9 @@ pub struct SglangModelInfo {
     /// The model's generation-config sampling defaults merged with the
     /// preferred ones, as JSON text, or empty.
     pub default_sampling_params_json: String,
+    /// Whether the model takes multimodal input, as the launcher reports it.
+    /// Not advertised until this servicer carries media to the scheduler
+    /// (see `info`): the wire refuses `mm_inputs` today.
     pub supports_vision: bool,
     /// Classification heads: `id2label` as JSON text and the label count.
     pub id2label_json: String,
@@ -114,9 +117,14 @@ pub struct SglangServicerConfig {
     /// `GetTokenizer`; the scheduler keeps its own tokenizer for stop strings.
     pub tokenizer_dir: Option<String>,
     pub model: SglangModelInfo,
-    /// Bound on the scheduler's startup handshake; see
-    /// [`crate::DEFAULT_ENGINE_STARTUP_TIMEOUT`].
+    /// Bound on silence during the scheduler's startup handshake: a handshake
+    /// message or a [`SglangServicerServer::note_engine_alive`] report resets
+    /// it; see [`crate::DEFAULT_ENGINE_STARTUP_TIMEOUT`].
     pub engine_startup_timeout: Duration,
+    /// Bound on the whole startup handshake however alive the scheduler is;
+    /// `None` leaves that to the silence bound and the lifecycle owner. See
+    /// [`crate::DEFAULT_ENGINE_STARTUP_CEILING`].
+    pub engine_startup_ceiling: Option<Duration>,
 }
 
 /// The servicer's `GetLoads` figures, read for the load record the relay
@@ -130,7 +138,11 @@ impl crate::kv_events::LoadSource for LoadFromState {
         let load = response.loads.first()?;
         // The engine reports no queued token-work on this wire yet: the
         // record's `waiting_uncached_tokens` stays unset.
-        Some(smg_grpc_client::common_proto::EngineLoad::from(load))
+        let mut record = smg_grpc_client::common_proto::EngineLoad::from(load);
+        record.engine_silence_ms = state.engine.output_silence_ms();
+        record.engine_reports_steps = state.engine.reports_steps();
+        record.prefill_pending_tokens = state.engine.prefill_pending_tokens();
+        Some(record)
     }
 }
 
@@ -216,6 +228,12 @@ impl SglangServicerServer {
         if config.engine_startup_timeout.is_zero() {
             return Err(invalid("engine_startup_timeout must be positive"));
         }
+        if config
+            .engine_startup_ceiling
+            .is_some_and(|ceiling| ceiling.is_zero())
+        {
+            return Err(invalid("engine_startup_ceiling must be positive when set"));
+        }
         if config.model.model_path.trim().is_empty() {
             return Err(invalid("model_path must not be empty"));
         }
@@ -228,6 +246,14 @@ impl SglangServicerServer {
             if !json.trim().is_empty() && !proto_json::is_json_object(json) {
                 return Err(invalid(&format!("{name} must be a JSON object")));
             }
+        }
+        if config.model.supports_vision {
+            info!(
+                served_model_name = %config.model.served_model_name,
+                "the model takes multimodal input, but this servicer does not carry media to \
+                 the scheduler yet: it advertises supports_vision=false, so the gateway refuses \
+                 image and video input at its gate instead of after fetching it"
+            );
         }
         let kv_relay = crate::kv_events::KvEventRelay::for_publisher(
             &config.model.kv_events_endpoint,
@@ -263,6 +289,7 @@ impl SglangServicerServer {
             handshake_address,
             engine_count,
             engine_startup_timeout,
+            engine_startup_ceiling,
             ..
         } = config;
         let thread = ServerThread::start(
@@ -285,6 +312,7 @@ impl SglangServicerServer {
                     handshake_address,
                     engine_count,
                     engine_startup_timeout,
+                    engine_startup_ceiling,
                     last_error,
                 ));
                 info!(address = %listener.local_addr().map(|a| a.to_string()).unwrap_or_default(), "SGLang gRPC servicer listening");
@@ -341,6 +369,18 @@ impl SglangServicerServer {
     /// Whether the engine handshake completed.
     pub fn engine_ready(&self) -> bool {
         self.state.engine.client.get().is_some()
+    }
+
+    /// Report a sign of life from the scheduler process while the handshake
+    /// runs: the lifecycle owner that launched it calls this each time it
+    /// polls the process and finds it alive. Each report resets the
+    /// handshake's silence bound (`engine_startup_timeout`); the ceiling
+    /// (`engine_startup_ceiling`) still holds. A no-op once the scheduler is
+    /// connected.
+    pub fn note_engine_alive(&self) {
+        if !self.engine_ready() {
+            self.state.engine.liveness.touch();
+        }
     }
 
     pub fn last_error(&self) -> Result<Option<String>, ServicerError> {

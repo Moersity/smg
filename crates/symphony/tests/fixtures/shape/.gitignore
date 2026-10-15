@@ -1,0 +1,2 @@
+# The recorded fixtures are line-delimited JSON, which the repository ignores elsewhere.
+!*.jsonl

@@ -3,7 +3,7 @@
 //! metadata reads.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::Path,
     sync::{Arc, OnceLock},
     time::Duration,
@@ -19,7 +19,7 @@ use engine_zmq_client::{
         vllm::{request::EngineCoreRequest, sampling::EngineCoreSamplingParams},
         EngineLoad,
     },
-    ConnectedEngine,
+    ConnectedEngine, StartupBudget,
 };
 use futures::{stream::SelectAll, StreamExt};
 use llm_tokenizer::traits::Tokenizer;
@@ -157,10 +157,11 @@ pub async fn connect_for_worker(
 /// data-plane sockets under `base_url`, clear stale socket files, and complete
 /// the handshake. For a frontend that already knows the model's EOS ids from
 /// the engine's own config (the Rust gRPC servicer) and has no model dir to
-/// read them from. `startup_timeout` bounds the handshake: the gateway's
-/// connector passes [`ZMQ_CONNECT_TIMEOUT`]; a servicer that launches its own
-/// engine passes what that engine's start may take. `handshake` is the
-/// endpoint the engine dials: a registered worker's is tcp-only
+/// read them from. `startup` bounds the handshake: the gateway's connector
+/// passes [`ZMQ_CONNECT_TIMEOUT`]; a servicer that launches its own engine
+/// passes a [`StartupBudget`] shaped by what that engine's start may take
+/// and by the signs of life it sees from the engine process. `handshake` is
+/// the endpoint the engine dials: a registered worker's is tcp-only
 /// ([`Handshake::registered`]); a servicer's own link may bind an `ipc://`
 /// socket ([`Handshake::TcpOrIpc`]).
 pub async fn connect_with_eos(
@@ -170,7 +171,7 @@ pub async fn connect_with_eos(
     handshake: Handshake<'_>,
     engine_count: usize,
     eos: EosTokenIds,
-    startup_timeout: Duration,
+    startup: impl Into<StartupBudget>,
 ) -> Result<ZmqEngineClient, String> {
     let (handshake, input, output) = zmq_socket_addresses(base_url, handshake)?;
     ensure_ipc_socket_dir(base_url).await?;
@@ -195,7 +196,7 @@ pub async fn connect_with_eos(
         model_id,
         eos,
         runtime,
-        startup_timeout,
+        startup,
     )
     .await
     .map_err(|e| format!("Failed to connect ZMQ engine: {e}"))
@@ -232,7 +233,9 @@ impl ZmqEngineClient {
     /// `input_address`/`output_address` are the `ipc://` data-plane endpoints the
     /// engines connect to (chosen by SMG). `engine_count` is the number of DP
     /// ranks to await. `runtime` selects the wire protocol spoken over the shared
-    /// transport (vLLM EngineCore vs TokenSpeed).
+    /// transport (vLLM EngineCore vs TokenSpeed). `startup` bounds the
+    /// handshake (see [`StartupBudget`]; a plain [`Duration`] is a per-message
+    /// timeout).
     #[expect(
         clippy::too_many_arguments,
         reason = "transport constructor: endpoints, engine count, and runtime are all irreducible connection inputs"
@@ -245,7 +248,7 @@ impl ZmqEngineClient {
         model_id: String,
         eos: EosTokenIds,
         runtime: RuntimeType,
-        timeout: Duration,
+        startup: impl Into<StartupBudget>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         // Resolve the dialect before the handshake: no silent fallback for a
         // runtime with no ZMQ engine adapter, and no such engine ever dials in,
@@ -270,7 +273,7 @@ impl ZmqEngineClient {
             engine_count,
             input_address,
             output_address,
-            timeout,
+            startup,
         )
         .await?;
         let backend = match dialect {
@@ -427,6 +430,25 @@ impl ZmqEngineClient {
         self.engines().first().map(|engine| &engine.ready_response)
     }
 
+    /// Capture identities from every connected replica, or none if any replica
+    /// has no identity. The first engine alone cannot identify a grouped worker.
+    pub fn cache_trace_epochs(&self) -> Vec<String> {
+        let engines = self.engines();
+        if engines
+            .iter()
+            .any(|engine| engine.ready_response.cache_trace_epochs.is_empty())
+        {
+            return Vec::new();
+        }
+        let mut epochs: Vec<String> = engines
+            .iter()
+            .flat_map(|engine| engine.ready_response.cache_trace_epochs.iter().cloned())
+            .collect();
+        epochs.sort_unstable();
+        epochs.dedup();
+        epochs
+    }
+
     /// The vLLM half of [`Self::generate`] as one stream per choice: the
     /// `n > 1` fan-out submitted to the engine, each sub tagged with its proto
     /// `index`, left unmerged so a caller can end one choice without the
@@ -436,17 +458,20 @@ impl ZmqEngineClient {
         &self,
         req: vllm::GenerateRequest,
     ) -> Result<Vec<VllmGenerateStream>, tonic::Status> {
-        self.generate_vllm_streams_with_media(req, None).await
+        self.generate_vllm_streams_with_media(req, None, None).await
     }
 
     /// [`generate_vllm_streams`](Self::generate_vllm_streams) for a request
     /// whose `media_refs` a worker-side processor already turned into engine
     /// features: `processed` is attached in place of the request's own
-    /// multimodal batches (it must carry none).
+    /// multimodal batches (it must carry none). `trace_headers` is the
+    /// caller's W3C trace context, set on every choice's engine request as
+    /// vLLM's own frontend does for its tracer.
     pub async fn generate_vllm_streams_with_media(
         &self,
         mut req: vllm::GenerateRequest,
         processed: Option<ProcessedMedia>,
+        trace_headers: Option<BTreeMap<String, String>>,
     ) -> Result<Vec<VllmGenerateStream>, tonic::Status> {
         let ZmqBackend::Vllm(client) = &self.backend else {
             return Err(tonic::Status::internal(
@@ -516,7 +541,7 @@ impl ZmqEngineClient {
             // Worker-processed tensors ride as aux frames; each choice's
             // message carries them (shared bytes, not copies).
             let aux_frames = sub_media.aux_frames.clone();
-            let request = translate_request_with_media(
+            let mut request = translate_request_with_media(
                 sub,
                 sub_media,
                 max_model_len,
@@ -524,6 +549,7 @@ impl ZmqEngineClient {
                 structured_backend,
             )
             .map_err(tonic::Status::invalid_argument)?;
+            request.trace_headers.clone_from(&trace_headers);
             // The engine returns the sampled/prompt token's logprob
             // plus the requested ranked candidates per position; carry
             // the counts so the stream can shape both `top_logprobs`
@@ -682,6 +708,19 @@ impl ZmqEngineClient {
         &self,
         req: sglang_proto::GenerateRequest,
     ) -> Result<Vec<SglangGenerateStream>, tonic::Status> {
+        self.generate_sglang_streams_with_trace(req, None).await
+    }
+
+    /// [`generate_sglang_streams`](Self::generate_sglang_streams) with the
+    /// caller's W3C trace context: `trace_headers` ride beside every choice's
+    /// request (the scheduler's struct has no slot for them; the plugin in
+    /// the scheduler starts the request's trace from them), so the engine's
+    /// spans join the caller's trace as they do behind SGLang's own frontend.
+    pub async fn generate_sglang_streams_with_trace(
+        &self,
+        req: sglang_proto::GenerateRequest,
+        trace_headers: Option<BTreeMap<String, String>>,
+    ) -> Result<Vec<SglangGenerateStream>, tonic::Status> {
         let ZmqBackend::Sglang(client) = &self.backend else {
             return Err(tonic::Status::internal(
                 "this ZMQ backend is not an SGLang scheduler",
@@ -689,7 +728,9 @@ impl ZmqEngineClient {
         };
         let mut streams = Vec::new();
         for (index, sub) in fan_out_sglang_requests(req).into_iter().enumerate() {
-            let request = translate_request_sglang(sub).map_err(tonic::Status::invalid_argument)?;
+            let mut request =
+                translate_request_sglang(sub).map_err(tonic::Status::invalid_argument)?;
+            request.trace_headers.clone_from(&trace_headers);
             let stream = client
                 .submit(SglangRequest::Generate(request))
                 .await
@@ -867,6 +908,50 @@ impl ZmqEngineClient {
         }
     }
 
+    /// The engine's silence on the requests in flight on it (the ZMQ client's
+    /// `output_silence`): the time since its last output of any kind, `None`
+    /// while nothing is in flight.
+    pub fn output_silence(&self) -> Option<Duration> {
+        match &self.backend {
+            ZmqBackend::Vllm(client) => client.output_silence(),
+            ZmqBackend::TokenSpeed(client) => client.output_silence(),
+            ZmqBackend::Sglang(client) => client.output_silence(),
+        }
+    }
+
+    /// Whether the engine's wire has shown a scheduler step without any
+    /// token, so its silence is the scheduler's own (the ZMQ client's
+    /// `reports_steps`).
+    pub fn reports_steps(&self) -> bool {
+        match &self.backend {
+            ZmqBackend::Vllm(client) => client.reports_steps(),
+            ZmqBackend::TokenSpeed(client) => client.reports_steps(),
+            ZmqBackend::Sglang(client) => client.reports_steps(),
+        }
+    }
+
+    /// The engine's wire reports every scheduler step, as the launcher that
+    /// started the engine knows: `reports_steps` holds from now rather than
+    /// from the first stats-only step batch (see the client's own
+    /// `note_reports_steps`).
+    pub fn note_reports_steps(&self) {
+        match &self.backend {
+            ZmqBackend::Vllm(client) => client.note_reports_steps(),
+            ZmqBackend::TokenSpeed(client) => client.note_reports_steps(),
+            ZmqBackend::Sglang(client) => client.note_reports_steps(),
+        }
+    }
+
+    /// Prompt tokens of the in-flight requests without a first output yet
+    /// (the ZMQ client's `prefill_pending_tokens`).
+    pub fn prefill_pending_tokens(&self) -> u64 {
+        match &self.backend {
+            ZmqBackend::Vllm(client) => client.prefill_pending_tokens(),
+            ZmqBackend::TokenSpeed(client) => client.prefill_pending_tokens(),
+            ZmqBackend::Sglang(client) => client.prefill_pending_tokens(),
+        }
+    }
+
     /// Per-rank load from the piggybacked scheduler stats (SMG's DP routing
     /// signal), in the same shape as the gRPC `GetLoads` response. A rank that
     /// has not reported yet has no entry.
@@ -984,7 +1069,13 @@ impl ZmqEngineClient {
 
 pub(crate) fn zmq_status(error: engine_zmq_client::Error) -> tonic::Status {
     match error {
-        engine_zmq_client::Error::EngineCoreDead => tonic::Status::unavailable(error.to_string()),
+        // The engine is gone, or is not taking input right now: either way
+        // this request is better served elsewhere.
+        engine_zmq_client::Error::EngineCoreDead
+        | engine_zmq_client::Error::EngineInputBlocked { .. }
+        | engine_zmq_client::Error::EngineInputFull { .. } => {
+            tonic::Status::unavailable(error.to_string())
+        }
         other => tonic::Status::internal(other.to_string()),
     }
 }
@@ -1103,7 +1194,10 @@ mod tests {
             connect_to_frontend(
                 &handshake,
                 EngineId::from_engine_index(rank),
-                default_ready_response(),
+                EngineCoreReadyResponse {
+                    cache_trace_epochs: vec![format!("capture-{rank}")],
+                    ..default_ready_response()
+                },
             )
         });
         let (client, engines) = tokio::join!(
@@ -1124,6 +1218,13 @@ mod tests {
             .map(|engine| engine.expect("mock engine"))
             .collect();
         (client.expect("adapter connect"), engines)
+    }
+
+    #[tokio::test]
+    async fn cache_trace_epochs_include_all_connected_replicas() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, _engines) = connected_ranks(dir.path(), 2).await;
+        assert_eq!(client.cache_trace_epochs(), vec!["capture-0", "capture-1"]);
     }
 
     /// Answer each rank's next utility call with its entry in `answers`,

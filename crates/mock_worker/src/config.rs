@@ -1,6 +1,6 @@
 //! Runtime configuration for the mock worker fleet, parsed from CLI flags.
 
-use std::{path::PathBuf, time::Duration};
+use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
 use crate::engine::{Calibration, EngineParams, LoadsLike, TimingModel};
 
@@ -38,12 +38,27 @@ pub struct Config {
     pub realistic: bool,
     /// Engine-simulator parameters (only used when `realistic`).
     pub engine: EngineParams,
+    /// Extra `server_args` entries the gRPC `GetServerInfo` advertises, as
+    /// string values (e.g. `rl.control_url`). Empty leaves `server_args` unset.
+    pub server_args: BTreeMap<String, String>,
+    /// Weight version stamped on every gRPC generate chunk and completion;
+    /// `None` leaves the field unset, like an engine that predates it.
+    pub weight_version: Option<String>,
     /// Port of the process-wide admin API (fleet, request records, cache
     /// dumps, resets); off when `None`.
     pub admin_port: Option<u16>,
+    /// How long a termination signal (SIGTERM or SIGINT) lets the requests
+    /// in flight finish before the process exits regardless; no worker
+    /// accepts new work from the signal on.
+    pub drain_timeout: Duration,
     /// Context length advertised to the gateway (`max_context_length`,
     /// `max_req_input_len`, `max_model_len`).
     pub context_length: u32,
+    /// Largest gRPC message a worker decodes or encodes, in bytes. A gateway
+    /// sends a prompt's token ids as one `Generate`, and a million of them are
+    /// a few megabytes; tonic's own default (4 MiB) refuses that, while the
+    /// engine servicers run without a limit, so none is the default.
+    pub grpc_max_message_bytes: usize,
     /// vLLM-wire ZMQ KV-event publishers (realistic engines only): the first
     /// PUB port; worker `i` publishes on `base + 2i` and answers replay on
     /// `base + 2i + 1`. Off when `None`.
@@ -58,6 +73,11 @@ pub struct Config {
     pub kv_events_wire: crate::kv_zmq::Wire,
     /// Which backend's load report the workers imitate (`GetLoads`, `/v1/loads`).
     pub loads_like: LoadsLike,
+    /// What the load record says of the mock's wire: `true` imitates an
+    /// engine that reports every scheduler step (vLLM's stats-only step
+    /// batches), `false` (the default) a wire that carries token batches
+    /// only, whose silence the gateway judges against its prefill bound.
+    pub step_reports: bool,
     /// Settings for replay testing (gRPC workers only).
     pub replay: ReplayConfig,
 }
@@ -151,14 +171,19 @@ impl Default for Config {
             output_tokens: 8,
             realistic: false,
             engine: EngineParams::default(),
+            server_args: BTreeMap::new(),
+            weight_version: None,
             admin_port: None,
+            drain_timeout: Duration::from_secs(5),
             context_length: 32768,
+            grpc_max_message_bytes: usize::MAX,
             kv_events_zmq_base_port: None,
             kv_events_replay: true,
             kv_events_topic: String::new(),
             kv_events_buffer_steps: 10_000,
             kv_events_wire: crate::kv_zmq::Wire::Vllm,
             loads_like: LoadsLike::Mock,
+            step_reports: false,
             replay: ReplayConfig::default(),
         }
     }
@@ -245,6 +270,9 @@ impl Config {
                 "--context-length" => {
                     cfg.context_length = parse(value(&mut args, &flag)?, &flag)?;
                 }
+                "--grpc-max-message-bytes" => {
+                    cfg.grpc_max_message_bytes = parse(value(&mut args, &flag)?, &flag)?;
+                }
                 "--kv-events-zmq-base-port" => {
                     cfg.kv_events_zmq_base_port = Some(parse(value(&mut args, &flag)?, &flag)?);
                 }
@@ -257,11 +285,17 @@ impl Config {
                 }
                 "--kv-events-wire" => cfg.kv_events_wire = value(&mut args, &flag)?.parse()?,
                 "--loads-like" => cfg.loads_like = value(&mut args, &flag)?.parse()?,
+                "--step-reports" => cfg.step_reports = parse(value(&mut args, &flag)?, &flag)?,
                 "--block-size" => {
                     cfg.engine.block_size = parse(value(&mut args, &flag)?, &flag)?;
                     block_size_given = true;
                 }
                 "--admin-port" => cfg.admin_port = Some(parse(value(&mut args, &flag)?, &flag)?),
+                "--drain-timeout-secs" => {
+                    let secs: f64 = parse(value(&mut args, &flag)?, &flag)?;
+                    cfg.drain_timeout =
+                        Duration::try_from_secs_f64(secs).map_err(|e| format!("{flag}: {e}"))?;
+                }
                 "--prefix-cache" => {
                     cfg.engine.prefix_cache = parse(value(&mut args, &flag)?, &flag)?
                 }
@@ -361,6 +395,8 @@ fn usage() -> String {
        --http-count <n>         number of HTTP workers (default 0)\n\
        --grpc-base-port <port>  first gRPC port (required if --grpc-count > 0)\n\
        --grpc-count <n>         number of gRPC workers (default 0)\n\
+       --grpc-max-message-bytes <n>  largest gRPC message a worker decodes or encodes, in bytes\n\
+                                (default none, as the engine servicers; tonic's own default is 4 MiB)\n\
        --zmq-handshake <addr>   frontend ipc:// handshake addr (required if --zmq-count > 0)\n\
        --zmq-count <n>          number of ZMQ mock EngineCore ranks (default 0)\n\
        --zmq-start-index <n>    engine index of the first ZMQ rank (default 0)\n\
@@ -401,8 +437,14 @@ fn usage() -> String {
        --kv-events-wire <vllm|sglang>  which engine's publisher to imitate (default vllm)\n\
        --loads-like <mock|vllm>  load report: everything the simulator knows, or only what the\n\
                                 vLLM servicer reports (running, waiting, token_usage, maxima)\n\
+       --step-reports <bool>    the load record says the wire reports every scheduler step (as\n\
+                                vLLM's stats-only step batches do) instead of token batches only\n\
+                                (default false): decides which bound the gateway judges the\n\
+                                engine's silence against\n\
        --admin-port <port>      process-wide admin API: fleet, request records with the\n\
-                                arrival-time oracle, cache dumps, resets (default off)"
+                                arrival-time oracle, cache dumps, resets (default off)\n\
+       --drain-timeout-secs <s> on SIGTERM or SIGINT, how long the requests in flight may\n\
+                                finish before the process exits regardless (default 5)"
         .to_string()
 }
 
@@ -436,6 +478,26 @@ mod tests {
     }
 
     #[test]
+    fn drain_timeout_flag_is_seconds_and_must_be_a_duration() {
+        let grpc = ["--grpc-base-port", "19000", "--grpc-count", "1"];
+        let cfg = parse(&grpc).expect("gRPC flags parse");
+        assert_eq!(
+            cfg.drain_timeout,
+            Duration::from_secs(5),
+            "the default drain"
+        );
+
+        let cfg = parse(&[&grpc[..], &["--drain-timeout-secs", "0.5"]].concat())
+            .expect("fractional seconds parse");
+        assert_eq!(cfg.drain_timeout, Duration::from_millis(500));
+        assert!(
+            parse(&[&grpc[..], &["--drain-timeout-secs", "-1"]].concat()).is_err(),
+            "a negative drain is refused"
+        );
+        assert!(parse(&[&grpc[..], &["--drain-timeout-secs", "soon"]].concat()).is_err());
+    }
+
+    #[test]
     fn capture_flag_sets_the_capture_path() {
         let grpc = ["--grpc-base-port", "19000", "--grpc-count", "1"];
         let cfg = parse(&grpc).expect("gRPC flags parse");
@@ -447,5 +509,20 @@ mod tests {
             cfg.replay.capture,
             Some(PathBuf::from("/tmp/generate.jsonl"))
         );
+    }
+
+    #[test]
+    fn grpc_message_limit_is_off_by_default_and_settable() {
+        let grpc = ["--grpc-base-port", "19000", "--grpc-count", "1"];
+        let cfg = parse(&grpc).expect("gRPC flags parse");
+        assert_eq!(
+            cfg.grpc_max_message_bytes,
+            usize::MAX,
+            "no limit by default"
+        );
+
+        let cfg = parse(&[&grpc[..], &["--grpc-max-message-bytes", "4194304"]].concat())
+            .expect("--grpc-max-message-bytes parses");
+        assert_eq!(cfg.grpc_max_message_bytes, 4_194_304);
     }
 }

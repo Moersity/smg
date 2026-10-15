@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import enum
 import functools
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -45,15 +47,18 @@ from tokenspeed.runtime.pd.kv_events import KVEventBatch
 from smg_grpc_servicer.kv_events import endpoint_for_rank, stream_kv_events
 from smg_grpc_servicer.mm_rdma import RdmaPixelPuller
 from smg_grpc_servicer.tokenizer_bundle import CHUNK_SIZE, build_tokenizer_zip
+from smg_grpc_servicer.tokenspeed.config_view import EngineConfigView
 from smg_grpc_servicer.tokenspeed.health_servicer import TokenSpeedHealthServicer
 from smg_grpc_servicer.tokenspeed.kv_events import resolve_kv_events_config
 from smg_grpc_servicer.tokenspeed.loads import (
     convert_load_to_protobuf,
     convert_snapshot_to_protobuf,
+    load_record,
     running_window,
 )
 from smg_grpc_servicer.tokenspeed.redact import redact_secrets
 
+from ..constrained_decoding import grammar_start_labels, tokenspeed_constrained_decoding_start
 from ..pd_pairing import pairing_protocol_from_env
 
 if TYPE_CHECKING:
@@ -70,6 +75,18 @@ HEALTH_CHECK_TIMEOUT = int(os.getenv("TOKENSPEED_HEALTH_CHECK_TIMEOUT", "20"))
 PAUSE_PROBE_TIMEOUT = float(os.getenv("TOKENSPEED_PAUSE_PROBE_TIMEOUT", "2"))
 # Profile round-trips include trace serialization, which can take minutes.
 PROFILE_TIMEOUT = 600.0
+# The engine refuses a flush while any request still pins cached blocks, and
+# it retires a finished request a scheduler round after its last token was
+# streamed: a flush issued right after a completion returns lands in that gap.
+# FlushCache repeats the non-mutating attempt this often, for at least this
+# long, before it reports the refusal.
+FLUSH_RETRY_INTERVAL_S = 0.05
+FLUSH_RETIRE_GRACE_S = 2.0
+# The bound of the whole FlushCache RPC, attempts included: the scheduler's
+# round-trip floor, or the request's own wait plus a margin; the gateway's
+# client deadline is sized on it.
+FLUSH_SCHEDULER_TIMEOUT_S = 30.0
+FLUSH_SCHEDULER_MARGIN_S = 10.0
 LOG_MM_TENSOR_DATA = os.getenv("TOKENSPEED_LOG_MM_TENSOR_DATA", "").lower() in (
     "1",
     "true",
@@ -195,6 +212,21 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
     # ------------------------------------------------------------------
     # Generate (server-streaming)
     # ------------------------------------------------------------------
+
+    @functools.cached_property
+    def _config(self) -> EngineConfigView:
+        """The launcher's server args and the engine's model config, read once:
+        the load record reads them on every KV-event batch. One field of the
+        args does change for the servicer's life, ``weight_version`` (an RL
+        weight update writes the new version back onto the args), so
+        ``GetModelInfo`` reads it live through a fresh view, not from here."""
+        return EngineConfigView(self.server_args, getattr(self.async_llm, "model_config", None))
+
+    @functools.cached_property
+    def _engine_config(self) -> EngineConfigView:
+        """The engine's own copy of the server args (the knobs it resolved:
+        the page size, the token budget), read once."""
+        return EngineConfigView(self.async_llm.server_args)
 
     async def Generate(
         self,
@@ -361,7 +393,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         # bootstrap-less probe. So skip the deep probe and report shallow liveness
         # for any disaggregated role; the deep generate probe is meaningful only
         # for aggregated (null) workers.
-        if getattr(self.server_args, "disaggregation_mode", "null") != "null":
+        if self._config.server_args.disaggregation_mode != "null":
             return tokenspeed_scheduler_pb2.HealthCheckResponse(
                 healthy=True,
                 message="Health check passed (disaggregation worker; shallow probe)",
@@ -466,48 +498,31 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         _context: grpc.aio.ServicerContext,
     ) -> tokenspeed_scheduler_pb2.GetModelInfoResponse:
         model_config = self.async_llm.model_config
-        hf_config = getattr(model_config, "hf_config", None)
-
-        eos = getattr(hf_config, "eos_token_id", None) if hf_config else None
-        if isinstance(eos, int):
-            eos_token_ids = [eos]
-        elif isinstance(eos, list):
-            eos_token_ids = list(eos)
-        else:
-            eos_token_ids = []
+        args, model = self._config.server_args, self._config.model
 
         max_req_input_len = self.scheduler_info.get("max_req_input_len") or (
             self.async_llm.max_req_input_len or 0
         )
-
-        # Upstream renamed ``model_path`` → ``model`` and
-        # ``tokenizer_path`` → ``tokenizer``; accept either so the servicer
-        # works against both old and new builds.
-        model_path = getattr(self.server_args, "model", None) or getattr(
-            self.server_args, "model_path", ""
-        )
-        tokenizer_path = getattr(self.server_args, "tokenizer", None) or getattr(
-            self.server_args, "tokenizer_path", ""
-        )
-        supported_modalities = self._static_supported_modalities(model_config, hf_config)
+        supported_modalities = self._static_supported_modalities(model_config, model.hf_config)
         supports_vision = any(
             modality in (common_pb2.IMAGE, common_pb2.VIDEO) for modality in supported_modalities
         )
         supports_multimodal = bool(supported_modalities)
 
         response_kwargs = dict(
-            model_path=model_path,
-            tokenizer_path=tokenizer_path or "",
-            default_sampling_params_json=self.server_args.preferred_sampling_params or "",
-            weight_version=str(getattr(self.server_args, "weight_version", "") or ""),
-            served_model_name=(self.server_args.served_model_name or model_path),
+            model_path=args.model,
+            tokenizer_path=args.tokenizer,
+            default_sampling_params_json=args.preferred_sampling_params or "",
+            # Live, not from the cached view: an RL weight update rewrites it.
+            weight_version=EngineConfigView(self.server_args).server_args.weight_version,
+            served_model_name=(args.served_model_name or args.model),
             max_context_length=int(self.async_llm.context_len),
-            vocab_size=int(model_config.vocab_size),
-            model_type=(getattr(hf_config, "model_type", "") or "") if hf_config else "",
-            architectures=(getattr(hf_config, "architectures", []) or []) if hf_config else [],
-            eos_token_ids=eos_token_ids,
-            pad_token_id=(getattr(hf_config, "pad_token_id", 0) or 0) if hf_config else 0,
-            bos_token_id=(getattr(hf_config, "bos_token_id", 0) or 0) if hf_config else 0,
+            vocab_size=model.vocab_size,
+            model_type=model.model_type,
+            architectures=model.architectures,
+            eos_token_ids=model.eos_token_ids,
+            pad_token_id=model.pad_token_id,
+            bos_token_id=model.bos_token_id,
             max_req_input_len=int(max_req_input_len),
             supports_vision=supports_vision,
         )
@@ -516,7 +531,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             response_kwargs["supports_multimodal"] = supports_multimodal
         if "supported_modalities" in fields:
             response_kwargs["supported_modalities"] = supported_modalities
-        dtype = self._torch_dtype_to_proto(getattr(model_config, "dtype", None))
+        dtype = self._torch_dtype_to_proto(model.dtype)
         if "model_dtype" in fields:
             response_kwargs["model_dtype"] = dtype
         if "multimodal_encoder_dtype" in fields:
@@ -571,6 +586,12 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             supported.append(image_modality)
             if hf_config is not None and config_value(hf_config, "video_token_id") is not None:
                 supported.append(video_modality)
+        if (
+            bool(getattr(model_config, "is_audio_model", False))
+            and hf_config is not None
+            and config_value(hf_config, "audio_token_id") is not None
+        ):
+            supported.append(audio_modality)
         return supported
 
     # ------------------------------------------------------------------
@@ -592,16 +613,12 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         # gateway's label extraction reads) only when the engine can honor a
         # rank pin — the label doubles as the capability handshake.
         if _engine_supports_dp_rank_pin():
-            dp_size = getattr(
-                getattr(getattr(self.server_args, "mapping", None), "attn", None),
-                "dp_size",
-                None,
-            )
+            dp_size = self._config.server_args.attention_dp_size
             # > 1 only: a width-1 pin has no placement to choose, yet an
             # explicit pin still changes engine-side scheduling. Dp-aware
             # gateways degrade a missing label to a plain worker, so
             # single-rank engines simply stay label-free.
-            if isinstance(dp_size, int) and dp_size > 1:
+            if dp_size is not None and dp_size > 1:
                 server_args_dict["dp_size"] = dp_size
 
         # The operator's PD pairing protocol rides with the server args, so
@@ -609,6 +626,13 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         pairing_protocol = pairing_protocol_from_env()
         if pairing_protocol:
             server_args_dict["pairing_protocol"] = pairing_protocol
+        # The engine's reasoning parser and where it starts a grammar on a
+        # thinking prompt (the first token: this engine has no reasoning gate
+        # in front of a grammar), for the gateway to shape a forced tool
+        # call's grammar by.
+        server_args_dict.update(
+            grammar_start_labels(self.server_args, tokenspeed_constrained_decoding_start())
+        )
 
         # Control endpoint and capabilities for a fronting gateway (SMG reads
         # the `rl.*` keys straight into worker labels). Older engines have no
@@ -680,7 +704,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         is well under the gateway's 10 s metadata step, so a silent scheduler
         costs this one field, not the worker's registration.
         """
-        if getattr(self.server_args, "disaggregation_mode", "null") == "encode":
+        if self._config.server_args.disaggregation_mode == "encode":
             return False
         query = getattr(self.async_llm, "is_scheduler_paused", None)
         if not callable(query):
@@ -720,7 +744,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         # response so a frontend polling loads on an encode worker reads "no
         # scheduler load" instead of crashing the engine. Prefill/decode loops
         # dispatch GetLoadReqInput correctly and keep reporting real loads.
-        if getattr(self.server_args, "disaggregation_mode", "null") == "encode":
+        if self._config.server_args.disaggregation_mode == "encode":
             return tokenspeed_scheduler_pb2.GetLoadsResponse(
                 timestamp=datetime.now(timezone.utc).isoformat(),
                 version="tokenspeed",
@@ -768,16 +792,11 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
 
         # Only legacy token pages have a page size. Native snapshots count
         # LCM allocator blocks, whose packing is independent of launch grain.
-        page_size = int(getattr(self.async_llm.server_args, "page_size", 0) or 0)
+        page_size = self._engine_config.server_args.page_size
         if load_outputs and snapshots is None and page_size <= 0:
             await context.abort(grpc.StatusCode.UNAVAILABLE, "KV page geometry is unavailable")
             return
-        # Fall back to ``server_args.max_total_num_tokens`` for SimpleNamespace test stubs.
-        max_total_num_tokens = int(
-            (self.scheduler_info.get("max_total_num_tokens") if self.scheduler_info else None)
-            or getattr(self.async_llm.server_args, "max_total_num_tokens", 0)
-            or 0
-        )
+        max_total_num_tokens = self._max_total_num_tokens()
         max_running_requests = running_window(self.async_llm.server_args)
 
         scheduler_loads = [
@@ -818,6 +837,32 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
     # SubscribeKvEvents (server-streaming) — feeds the gateway's
     # cache-aware router the scheduler's actual KV-cache state.
     # ------------------------------------------------------------------
+
+    def _max_total_num_tokens(self) -> int:
+        # Fall back to ``server_args.max_total_num_tokens`` for SimpleNamespace test stubs.
+        return int(
+            (self.scheduler_info.get("max_total_num_tokens") if self.scheduler_info else None)
+            or self._engine_config.server_args.max_total_num_tokens
+        )
+
+    def _load_record(self, dp_rank: int | None) -> common_pb2.EngineLoad | None:
+        """The load record the KV-event stream carries for ``dp_rank``: the
+        scheduler's fresh snapshot from the engine's replica, converted as
+        ``GetLoads`` converts it, read for every batch and heartbeat. An
+        encode worker has no scheduler load, and an older engine without the
+        replica would need a scheduler round trip per record: both push none
+        and stay polled. A read that raises is the recorder's to report."""
+        if self._config.server_args.disaggregation_mode == "encode":
+            return None
+        store = getattr(self.async_llm, "load_snapshot_store", None)
+        if store is None:
+            return None
+        return load_record(
+            store.fresh_snapshots(),
+            dp_rank,
+            max_total_num_tokens=self._max_total_num_tokens(),
+            max_running_requests=running_window(self.async_llm.server_args),
+        )
 
     async def SubscribeKvEvents(
         self,
@@ -866,6 +911,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                 decoder.decode,
                 lambda: context.send_initial_metadata(()),
                 context.cancelled,
+                load_source=self._load_record,
             ):
                 yield proto_batch
         except asyncio.CancelledError:
@@ -886,14 +932,39 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
     ) -> common_pb2.FlushCacheResponse:
         """Flush the KV cache on the scheduler.
 
-        TokenSpeed's ``FlushCacheReqInput`` carries no wait-for-idle knob, so
-        ``timeout_s`` only widens the gRPC-side wait for the scheduler reply;
-        the flush itself is immediate (fails if requests are in flight).
+        TokenSpeed's ``FlushCacheReqInput`` carries no wait-for-idle knob: each
+        attempt is immediate, and the scheduler refuses it while any request
+        still pins cached blocks. A finished request is retired a scheduler
+        round after its last token was streamed, so an attempt made right
+        after a completion returns is refused although nothing is in flight.
+        The attempt is non-mutating and is repeated every
+        ``FLUSH_RETRY_INTERVAL_S`` until the engine accepts it, for the
+        request's ``timeout_s`` and never less than ``FLUSH_RETIRE_GRACE_S``;
+        a request that is really in flight still fails the flush, at the end
+        of that wait instead of at once. The attempts share one deadline,
+        ``comm_timeout``, so the RPC as a whole stays bounded as before.
         """
-        logger.debug("Receive flush cache request")
-        comm_timeout = max(30.0, request.timeout_s + 10.0)
+        logger.debug("Receive flush cache request (timeout_s=%.1f)", request.timeout_s)
+        timeout_s = request.timeout_s
+        if not math.isfinite(timeout_s) or timeout_s < 0:
+            await context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT, "timeout_s must be finite and non-negative"
+            )
+            return
+        comm_timeout = max(FLUSH_SCHEDULER_TIMEOUT_S, timeout_s + FLUSH_SCHEDULER_MARGIN_S)
+        loop = asyncio.get_running_loop()
+        rpc_deadline = loop.time() + comm_timeout
+        retry_deadline = loop.time() + max(timeout_s, FLUSH_RETIRE_GRACE_S)
+        attempts = 0
         try:
-            result = await asyncio.wait_for(self.async_llm.flush_cache(), timeout=comm_timeout)
+            while True:
+                attempts += 1
+                result = await asyncio.wait_for(
+                    self.async_llm.flush_cache(), timeout=max(0.0, rpc_deadline - loop.time())
+                )
+                if result.success or loop.time() >= retry_deadline:
+                    break
+                await asyncio.sleep(FLUSH_RETRY_INTERVAL_S)
         # asyncio.TimeoutError is a separate exception on Python 3.10.
         except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041
             await context.abort(
@@ -906,10 +977,18 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             await context.abort(grpc.StatusCode.INTERNAL, f"Flush cache failed: {e}")
             return
 
+        if attempts > 1:
+            logger.debug(
+                "Flush cache %s after %d attempts",
+                "accepted" if result.success else "refused",
+                attempts,
+            )
         # TokenSpeed's FlushCacheReqOutput only carries `success` (no message
         # field); tolerate one appearing upstream later.
         message = getattr(result, "message", "") or (
-            "Cache flushed successfully" if result.success else "Cache flush failed"
+            "Cache flushed successfully"
+            if result.success
+            else f"Cache flush refused: requests still in flight after {attempts} attempts"
         )
         return common_pb2.FlushCacheResponse(success=bool(result.success), message=message)
 
@@ -993,9 +1072,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
 
         # Upstream renamed ``tokenizer_path`` → ``tokenizer``; accept either so
         # the servicer works against both old and new builds (see GetModelInfo).
-        tokenizer_path = getattr(self.server_args, "tokenizer", None) or getattr(
-            self.server_args, "tokenizer_path", ""
-        )
+        tokenizer_path = self._config.server_args.tokenizer
         if not tokenizer_path:
             await context.abort(
                 grpc.StatusCode.FAILED_PRECONDITION,
@@ -1093,7 +1170,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
 
         sampling = self._sampling_params_from_proto(
             request.sampling_params,
-            reasoning_parser=getattr(self.server_args, "reasoning_parser", None),
+            reasoning_parser=self._config.server_args.reasoning_parser,
         )
 
         # Decode the precomputed multimodal payload, if the request carries one.
@@ -1104,7 +1181,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         if request.HasField("mm_inputs"):
             precomputed_mm = self._mm_inputs_from_proto(
                 request.mm_inputs,
-                model_dtype=getattr(self.async_llm.model_config, "dtype", None),
+                model_dtype=self._config.model_dtype,
             )
 
         # EPD: per-item encode->prefill bootstrap info. Each entry tells the prefill
@@ -1791,14 +1868,39 @@ def _version_str(version: Any) -> str | None:
     return None if version is None else str(version)
 
 
-def _make_json_serializable(obj: Any) -> Any:
-    """Flatten an arbitrary dataclass/config graph into JSON-safe primitives."""
+def _make_json_serializable(obj: Any, _path: frozenset[int] = frozenset()) -> Any:
+    """Flatten an arbitrary dataclass/config graph into JSON-safe primitives.
+
+    Anything that carries attributes (a nested dataclass, a plain config
+    object) becomes a dict, so :func:`redact_secrets` sees its keys instead of
+    a ``str`` rendering that could carry a credential past it. Enums, paths,
+    dtypes and the like still render with ``str``. ``_path`` holds the ids of
+    the containers on the current descent: a back-reference (a sub-config
+    pointing at its parent) becomes a ``<cycle: Type>`` placeholder instead of
+    recursing forever (never ``str(obj)``, whose repr could carry a credential),
+    while the same object reached twice by different paths is expanded twice.
+    """
     if obj is None or isinstance(obj, str | int | float | bool):
         return obj
+    if id(obj) in _path:
+        return f"<cycle: {type(obj).__name__}>"
+    path = _path | {id(obj)}
     if isinstance(obj, list | tuple | set):
-        return [_make_json_serializable(x) for x in obj]
+        return [_make_json_serializable(x, path) for x in obj]
     if isinstance(obj, dict):
-        return {str(k): _make_json_serializable(v) for k, v in obj.items()}
+        return {str(k): _make_json_serializable(v, path) for k, v in obj.items()}
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        return {
+            f.name: _make_json_serializable(getattr(obj, f.name), path)
+            for f in dataclasses.fields(obj)
+        }
+    attrs = getattr(obj, "__dict__", None)
+    if attrs and not isinstance(obj, enum.Enum | type):
+        return {
+            str(k): _make_json_serializable(v, path)
+            for k, v in attrs.items()
+            if not str(k).startswith("_")
+        }
     return str(obj)
 
 

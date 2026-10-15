@@ -11,38 +11,16 @@
 //! </tool_call>
 //! ```
 //!
-//! each with its own spellings of the four tags ([`Tags`]) and its own newlines between them (Ling
-//! writes one after the name and one after `</arg_key>`, Hy4 and IQuest none). The engine's table
+//! each with its own spellings of the four tags ([`Tags`]) and its own newlines around them (Ling
+//! writes one after the name, after each `</arg_key>` and before the close, GLM 4.5 and 4.6 one
+//! after the name, after each `</arg_key>` and after each `</arg_value>`, K2-Horizon the same under
+//! `ifm|`-prefixed tags with the block's own around its calls, Hy4 and IQuest none;
+//! [`Newlines`]). The engine's table
 //! owns the call markers: it enters this assembler after the opening marker and leaves it at the
 //! closing one, which it hands over as the call's end. Between the two the assembler reads the
 //! name and the tags itself.
 //!
-//! What the syntax says, and what the assembler does with it:
-//!
-//! - **The name is the text before the first `<arg_key>`**, or before the call's end when the call
-//!   has no arguments, less the whitespace around it, which is the template's and goes into the
-//!   next event's source. The name is known only when that tag arrives, so `ToolCallStart` waits
-//!   for it; names are short. A name holds no whitespace, quote, brace or angle bracket: any
-//!   other text there (the JSON of a `<tool_call>` block quoted inside a code fence, prose) is
-//!   reported, and no call starts, so a block that names no call writes no arguments either.
-//! - **A value's type comes from the request's tools**, as in the Qwen assembler: a declared string
-//!   is its text, streamed as it arrives; every other value is written whole at `</arg_value>`
-//!   through [`json`], which reads the JSON the templates write for a number, a boolean, a list,
-//!   an object or null, and infers the rest. Nothing is taken from a value: the templates write it
-//!   directly between its tags.
-//! - **Inside a value only `</arg_value>` is a tag**; the other three there are the value's text.
-//! - **Two endings.** [`Assembler::close`] is the call's closing marker, or the block's end before
-//!   it: after the last value it names the call if it has not, closes the object and pushes
-//!   `ToolCallEnd` with the marker's bytes; inside a value it closes an open string and the object
-//!   and reports what was held. [`Assembler::finish`] is a stream that was cut: nothing is closed.
-//! - **Every byte of the call lands in exactly one event**, with the Qwen assembler's accounting:
-//!   the name's bytes in `ToolCallStart`, each tag's and value's bytes in the fragments they
-//!   produce, text where the syntax has tags as `Malformed` run by run with the whitespace before
-//!   it as `Dropped { Wrapper }`.
-//!
-//! This is the third tagged assembler, beside the Qwen one and DSML's; the three share the value
-//! module and the escaping, and the seams for one core are now visible: the tag spellings, how a
-//! name ends, where the template's newlines are, and what types a value.
+//! Notes on what this module decides, and on what it leaves open: `docs/assemblers.md`.
 
 use crate::{
     event::{DropReason, Event, Events, MalformedReason, Text},
@@ -71,18 +49,87 @@ fn is_name(text: &str) -> bool {
         .any(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '{' | '}' | '<' | '>'))
 }
 
-/// The four tags a family spells its keyed arguments with, and `between`: the template's newline,
-/// written after the call's name, after each key's closing tag and before the call's close (Ling,
-/// GLM 4.5 and 4.6), or nothing anywhere (GLM 4.7 and later, IQuest, Hy4). The field tells the two
-/// spellings apart; the places are the spelling's. The assembler reads a call either way; the
-/// grammar derived from a table spells the one its template writes.
+/// The four tags a family spells its keyed arguments with, and where its template writes a newline
+/// around them ([`Newlines`]). The assembler reads a call whatever the newlines, as the template's
+/// whitespace between tags; the grammar derived from a table spells the ones its template writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tags {
     pub key_open: &'static str,
     pub key_close: &'static str,
     pub value_open: &'static str,
     pub value_close: &'static str,
-    pub between: &'static str,
+    pub newlines: Newlines,
+}
+
+/// Where a template writes a newline around a call's keyed arguments: each field is the text it
+/// writes at that place, a newline or nothing. What the recorded calls show, place by place, is
+/// in the constants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Newlines {
+    /// After the call's name.
+    pub after_name: &'static str,
+    /// Between `</arg_key>` and `<arg_value>`.
+    pub after_key: &'static str,
+    /// After `</arg_value>`, whether or not a pair follows.
+    pub after_value: &'static str,
+    /// Before the call's close, whether or not a pair came.
+    pub before_close: &'static str,
+    /// Inside a block of calls, before each call's opener. The block's two places are the
+    /// grammar's alone: the table owns the block's markers, and the assembler never sees the
+    /// bytes between them.
+    pub block_before_call: &'static str,
+    /// Inside a block of calls, before the block's close.
+    pub block_before_close: &'static str,
+}
+
+impl Newlines {
+    /// Nothing anywhere: GLM 4.7 and later, IQuest, Hy4.
+    pub const NONE: Self = Self {
+        after_name: "",
+        after_key: "",
+        after_value: "",
+        before_close: "",
+        block_before_call: "",
+        block_before_close: "",
+    };
+
+    /// Ling's: after the name, after each `</arg_key>` and before the close, nothing between
+    /// pairs, so a call without arguments reads `<tool_call>NAME\n\n</tool_call>` (every one of
+    /// the 259 in ling-3.0-flash's recorded parse sets) and two pairs read
+    /// `</arg_value><arg_key>`.
+    pub const LING: Self = Self {
+        after_name: "\n",
+        after_key: "\n",
+        after_value: "",
+        before_close: "\n",
+        block_before_call: "",
+        block_before_close: "",
+    };
+
+    /// GLM 4.5 and 4.6's: after the name, after each `</arg_key>` and after each `</arg_value>`,
+    /// nothing of its own before the close, so a call without arguments reads
+    /// `<tool_call>NAME\n</tool_call>` (280 of 280 in glm-4.6's recorded parse sets), two pairs
+    /// read `</arg_value>\n<arg_key>` (23,167 of 23,167) and the close follows the last pair's
+    /// newline (19,254 of 19,254).
+    pub const GLM4: Self = Self {
+        after_name: "\n",
+        after_key: "\n",
+        after_value: "\n",
+        before_close: "",
+        block_before_call: "",
+        block_before_close: "",
+    };
+
+    /// K2-Horizon's: GLM 4.5 and 4.6's places, and the block's own newline before each call and
+    /// before the block's close, so a turn's calls read
+    /// `<ifm|tool_calls>\n<ifm|tool_call>NAME\n…</ifm|tool_call>\n</ifm|tool_calls>` (in
+    /// k2-horizon-36b's recorded shapes set: 4 of 4 zero-argument calls `NAME\n</ifm|tool_call>`,
+    /// 2,667 pairs followed by `\n<ifm|arg_key>`, 1,588 last pairs by `\n</ifm|tool_call>`).
+    pub const K2_HORIZON: Self = Self {
+        block_before_call: "\n",
+        block_before_close: "\n",
+        ..Self::GLM4
+    };
 }
 
 impl Tags {
@@ -92,14 +139,28 @@ impl Tags {
         key_close: "</arg_key>",
         value_open: "<arg_value>",
         value_close: "</arg_value>",
-        between: "",
+        newlines: Newlines::NONE,
     };
 
-    /// The plain tags with the template's newline after the call's name, after each `</arg_key>`
-    /// and before `</tool_call>`: Ling, GLM 4.5 and 4.6.
+    /// The plain tags with Ling's newlines.
     pub const LING: Self = Self {
-        between: "\n",
+        newlines: Newlines::LING,
         ..Self::PLAIN
+    };
+
+    /// The plain tags with GLM 4.5 and 4.6's newlines.
+    pub const GLM4: Self = Self {
+        newlines: Newlines::GLM4,
+        ..Self::PLAIN
+    };
+
+    /// K2-Horizon's spelling, every tag prefixed `ifm|`, with its newlines.
+    pub const K2_HORIZON: Self = Self {
+        key_open: "<ifm|arg_key>",
+        key_close: "</ifm|arg_key>",
+        value_open: "<ifm|arg_value>",
+        value_close: "</ifm|arg_value>",
+        newlines: Newlines::K2_HORIZON,
     };
 
     /// Hy4's spelling, every tag suffixed `:opensource`, nothing between them.
@@ -108,7 +169,7 @@ impl Tags {
         key_close: "</arg_key:opensource>",
         value_open: "<arg_value:opensource>",
         value_close: "</arg_value:opensource>",
-        between: "",
+        newlines: Newlines::NONE,
     };
 
     fn text(&self, tag: usize) -> &'static str {
@@ -558,6 +619,23 @@ impl Assembler {
     }
 }
 
+impl crate::engine::CallAssembler for Assembler {
+    fn feed(&mut self, text: &str, declared: &Declared, out: &mut Events) -> usize {
+        self.feed(text, declared, out);
+        text.len()
+    }
+
+    /// The call's closing marker is the call's own: its bytes are the call's end.
+    fn close(self: Box<Self>, terminal: &str, out: &mut Events) -> bool {
+        (*self).close(terminal, out);
+        true
+    }
+
+    fn finish(self: Box<Self>, out: &mut Events) {
+        (*self).finish(out);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use openai_protocol::common::{Function, Tool};
@@ -579,6 +657,7 @@ mod tests {
                     "ns": {"type": ["string", "null"]},
                 }}),
                 strict: None,
+                extra: Default::default(),
             },
         }])
     }

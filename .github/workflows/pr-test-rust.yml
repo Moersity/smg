@@ -9,9 +9,6 @@ on:
   pull_request:
     branches: [ main ]
     types: [opened, synchronize, reopened]
-    paths-ignore:
-      - "docs/**"
-      - "*.md"
   workflow_dispatch:
 
 permissions:
@@ -267,7 +264,7 @@ jobs:
           pytest -q grpc_servicer/tests -rs
 
       - name: Run CI tooling unit tests
-        run: pytest -q scripts/tests/test_ci_node_health.py
+        run: pytest -q scripts/tests/test_ci_node_health.py scripts/tests/test_ci_prepared_backend_env.py scripts/tests/test_ci_tokenspeed_scheduler_pin.py scripts/tests/test_ci_gpu_runner_image.py
 
       # CPU-only unit tests for the e2e harness itself (connection-mode parsing,
       # ZMQ/EPD command builders, ZMQ-lane collection filter). --noconftest keeps
@@ -302,8 +299,15 @@ jobs:
         with:
           python-version: "3.13"
 
+      # Its own cache key: this job's target directory is the workspace's test
+      # profile, which the Rust Cache Warmer workflow builds on main under the
+      # same key (and the same action inputs and environment, which the key
+      # hashes), so a pull request restores a complete, current entry and
+      # compiles only what it changed. The other jobs keep the default key.
       - name: Setup Rust
         uses: ./.github/actions/setup-rust
+        with:
+          cache-key: unit-tests
 
       - name: Verify default multimodal build does not require OpenCV
         run: |
@@ -375,11 +379,29 @@ jobs:
           $sudo apt-get update
           $sudo apt-get install -y --no-install-recommends ffmpeg
 
+      # The test targets are built in a step of their own: when the Rust cache
+      # has nothing to restore (the usual case on this runner pool, see
+      # smg-project/smg-lab#157), the whole workspace compiles in the test
+      # profile here, 11 minutes on a quiet runner and 28 on a busy one, and a
+      # single step would spend the test budget below on compiling. The
+      # second step finds everything fresh and only runs the tests, so its
+      # timeout bounds the tests, which is what a timeout here is for.
+      - name: Build the Rust tests
+        timeout-minutes: 45
+        run: |
+          source "$HOME/.cargo/env"
+          cargo test --no-run
+          cargo test -p llm-tokenizer --features tokenizers-v1 --no-run
+          cargo test -p smg-response-template --features symphony --no-run
+          cargo test -p data-connector --test postgres_integration --no-run
+
       - name: Run Rust tests
         timeout-minutes: 30
         run: |
           source "$HOME/.cargo/env"
           cargo test
+          cargo test -p llm-tokenizer --features tokenizers-v1
+          cargo test -p smg-response-template --features symphony
           cargo test -p data-connector --test postgres_integration -- --ignored --test-threads=1
 
       - name: Fail if vision golden fixtures did not generate
@@ -396,6 +418,43 @@ jobs:
         if: always()
         run: sccache --show-stats
 
+  # --- Dependency audit ---
+
+  # cargo audit of Cargo.lock against the RustSec advisory database. A pull
+  # request that changes the dependency graph (the lockfile, a manifest, the
+  # audit's ignore list) fails here on an advisory that .cargo/audit.toml
+  # does not ignore; cargo-audit-nightly.yml runs the same script on main
+  # every day, for advisories published after the last lockfile change.
+  cargo-audit:
+    needs: [detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && needs.detect-changes.result == 'success'
+      && (
+        github.event_name != 'pull_request'
+        || needs.detect-changes.outputs.dependencies == 'true'
+      )
+    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      # The advisory database is a git clone from github.com; see pre-commit
+      # for why the workflow token rides on every github.com git operation.
+      - name: Authenticate git for github.com
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          git config --global \
+            url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf \
+            "https://github.com/"
+
+      - name: cargo audit
+        run: bash scripts/ci_cargo_audit.sh
+
   # --- Benchmarks (standalone) ---
 
   # Advisory: the thresholds in e2e_test/benchmarks are absolute latencies on
@@ -405,7 +464,9 @@ jobs:
   # uploaded and summarized.
   benchmarks:
     needs: [build-wheel, detect-changes]
-    if: needs.detect-changes.outputs.symphony-only != 'true'
+    if: >-
+      needs.detect-changes.outputs.docs-only != 'true'
+      && needs.detect-changes.outputs.symphony-only != 'true'
     runs-on: ${{ vars.SMG_RUNNER_GPU_4 || '4-gpu-h100' }}
     container: ${{ vars.SMG_CI_GPU_CONTAINER_IMAGE }}
     continue-on-error: true
@@ -486,6 +547,8 @@ jobs:
       pull-requests: read
       packages: read
     outputs:
+      # Only PRs use this shortcut; main pushes keep their existing test coverage.
+      docs-only: ${{ github.event_name == 'pull_request' && steps.filter.outputs.docs == 'true' && steps.filter.outputs.non-docs == 'false' && steps.filter.outputs.tests == 'false' }}
       common: ${{ steps.filter.outputs.common }}
       chat-completions: ${{ steps.filter.outputs.chat-completions }}
       completions: ${{ steps.filter.outputs.completions }}
@@ -494,6 +557,7 @@ jobs:
       realtime: ${{ steps.filter.outputs.realtime }}
       go-bindings: ${{ steps.filter.outputs.go-bindings }}
       rust-ci: ${{ steps.filter.outputs.rust-ci }}
+      dependencies: ${{ steps.filter.outputs.dependencies }}
       # Symphony is not wired into the gateway yet: a change confined to its crate and the
       # lock file runs the CPU checks only, and every GPU lane below skips on this flag.
       symphony-only: ${{ steps.filter.outputs.symphony == 'true' && steps.filter.outputs.outside-symphony == 'false' }}
@@ -534,6 +598,15 @@ jobs:
           # behave exactly as before: any changed file matching any pattern.
           predicate-quantifier: 'some-with-excludes'
           filters: |
+            docs:
+              - '**/*.md'
+            non-docs:
+              - '**'
+              - '!**/*.md'
+            tests:
+              - 'e2e_test/**'
+              - '**/tests/**'
+              - '**/fixtures/**'
             common:
               - 'model_gateway/**'
               - 'crates/protocols/**'
@@ -570,6 +643,7 @@ jobs:
               - 'crates/workflow/**'
             chat-completions:
               - 'crates/reasoning_parser/**'
+              - 'crates/response_template/**'
               - 'crates/multimodal/**'
               - 'crates/grpc_client/**'
               # The ZMQ wire crates drive the e2e-*-chat-zmq* lanes and the
@@ -638,6 +712,15 @@ jobs:
               - '.github/workflows/pr-test-rust.yml'
               - 'examples/wasm/wasm-guest-storage-hook/**'
               - 'examples/wasm/wasm-guest-storage-hook-passthrough/**'
+            # The dependency graph: the cargo-audit job runs on a pull request
+            # that changes it (or the audit's ignore list and script).
+            dependencies:
+              - 'Cargo.lock'
+              - 'Cargo.toml'
+              - '**/Cargo.toml'
+              - '.cargo/audit.toml'
+              - 'scripts/ci_cargo_audit.sh'
+              - '.github/workflows/pr-test-rust.yml'
 
   # --- GPU E2E: organized by GPU tier + API, engine as matrix axis ---
 
@@ -649,6 +732,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.docs-only != 'true'
       && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
@@ -700,14 +784,61 @@ jobs:
       servicer_unit_tests: ${{ matrix.engine == 'vllm' }}
     secrets: inherit
 
-  # The SGLang chat and admin-op cases against the Rust gRPC servicer
-  # (SMG_SGLANG_SERVICER_IMPL=rust): the same workers, the Rust request path.
+  # The chat cases with the gateway reading through Symphony (--parser symphony):
+  # the same workers and suite as e2e-1gpu-chat, the Symphony path for every
+  # model its registry knows. Runs for a chat or common change as the chat lane
+  # does, and for a Symphony-only change too, since this is the one lane that
+  # exercises a table against a real engine.
+  e2e-1gpu-chat-symphony:
+    name: e2e-1gpu-chat-symphony (${{ matrix.engine }})
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && needs.detect-changes.outputs.docs-only != 'true'
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (needs.detect-changes.result == 'success'
+              && (needs.detect-changes.outputs.common == 'true'
+                  || needs.detect-changes.outputs.chat-completions == 'true'
+                  || needs.detect-changes.outputs.symphony-only == 'true')))
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - engine: sglang
+            timeout: 36
+            test_timeout: 28
+            min_selected: 204
+          - engine: vllm
+            timeout: 32
+            test_timeout: 24
+            min_selected: 202
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: ${{ matrix.engine }}
+      gpu_tier: "1"
+      runner: ${{ vars.SMG_RUNNER_GPU_1 || '1-gpu-h100' }}
+      timeout: ${{ matrix.timeout }}
+      test_timeout: ${{ matrix.test_timeout }}
+      test_dirs: e2e_test/chat_completions
+      min_selected: ${{ matrix.min_selected }}
+      parser: symphony
+    secrets: inherit
+
+  # The chat cases against the Rust gRPC servicer (SMG_SGLANG_SERVICER_IMPL=rust,
+  # SMG_VLLM_SERVICER_IMPL=rust): the same workers, the Rust request path. A
+  # row for SGLang and one for vLLM (the TokenSpeed Rust servicer has no
+  # PR-time row yet, so this lane says nothing about it): every other lane of
+  # those engines runs the Python servicer, so a launcher or binding change
+  # that breaks the Rust servicer's start fails here and nowhere else.
   e2e-1gpu-chat-rust-servicer:
     name: e2e-1gpu-chat-rust-servicer (${{ matrix.engine }})
     needs: [build-wheel, detect-changes]
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.docs-only != 'true'
       && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
@@ -727,6 +858,22 @@ jobs:
             # the wire's control calls.
             test_dirs: e2e_test/chat_completions e2e_test/router/test_admin_ops.py e2e_test/router/test_decisions.py
             min_selected: 204 # floor ≈ 95% of the chat lane's measured effective (215 of 223 ran on the Rust servicer; audit 2026-10-04)
+          # The vLLM chat suite on the Rust servicer: the suite, floor and
+          # budgets of e2e-1gpu-chat's vllm row (the harness deselects nothing
+          # for this servicer), so the two rows differ by the servicer only.
+          - engine: vllm
+            timeout: 32
+            test_timeout: 24
+            min_selected: 202 # the vllm chat row's floor: the same selection
+          # The TokenSpeed chat suite on the Rust servicer: the suite, floor
+          # and budgets of e2e-1gpu-chat's tokenspeed row (its prebuilt engine
+          # image, or the source build on a cold path, hence the budget), so
+          # the two rows differ by the servicer only. The admin-op and loads
+          # cases of that row stay on the Python servicer's row.
+          - engine: tokenspeed
+            timeout: 56
+            test_timeout: 26
+            min_selected: 114 # the tokenspeed chat row's floor: the same selection
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: ${{ matrix.engine }}
@@ -749,6 +896,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.docs-only != 'true'
       && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
@@ -773,6 +921,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.docs-only != 'true'
       && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
@@ -824,6 +973,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.docs-only != 'true'
       && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
@@ -873,6 +1023,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.docs-only != 'true'
       && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
@@ -905,6 +1056,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.docs-only != 'true'
       && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
@@ -937,6 +1089,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.docs-only != 'true'
       && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
@@ -960,6 +1113,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.docs-only != 'true'
       && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
@@ -985,7 +1139,6 @@ jobs:
       runner: ${{ vars.SMG_RUNNER_GPU_1 || '1-gpu-h100' }}
       timeout: ${{ matrix.timeout }}
       test_dirs: e2e_test/router
-      test_filter: "--ignore=e2e_test/router/test_pd_mmlu.py"
       min_selected: ${{ matrix.min_selected }}
     secrets: inherit
 
@@ -999,6 +1152,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.docs-only != 'true'
       && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
@@ -1036,12 +1190,19 @@ jobs:
           - engine: sglang
             timeout: 40
             min_selected: 15 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
+          # The vLLM rows' job budget sits above the sum of their steps: the
+          # engine setup takes 3 to 9 minutes (its packages come from the
+          # network), the test step has 34, checkout, downloads, diagnostics
+          # and the log upload about 4. At 40 the job budget cancelled a long
+          # test step minutes before the step's own timeout would have failed
+          # it, and the leg ended "cancelled" with its cases passing instead
+          # of failing in the step that ran long (smg-project/smg-lab#170).
           - engine: vllm
-            timeout: 40
+            timeout: 50
             min_selected: 15 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
           - engine: vllm
             kv_backend: mooncake
-            timeout: 40
+            timeout: 50
             min_selected: 15 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
           # TokenSpeed prefill/decode over its Mooncake transfer, on the model
           # its disaggregation path is proven on (Qwen3.5-9B, fetched by id).
@@ -1395,6 +1556,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.docs-only != 'true'
       && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
@@ -1538,7 +1700,7 @@ jobs:
           path: benchmark_go_bindings/
 
   finish:
-    needs: [pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, unit-tests, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-rust-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-vendor, go-unit-tests, go-bindings-e2e]
+    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, unit-tests, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-symphony, e2e-1gpu-chat-rust-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-vendor, go-unit-tests, go-bindings-e2e]
     if: always()
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
@@ -1589,32 +1751,44 @@ jobs:
 
       - name: Check CI result
         run: |
-          if [[ "${{ needs.pre-commit.result }}" == "failure" || \
-                "${{ needs.python-lint.result }}" == "failure" || \
-                "${{ needs.grpc-proto-build-check.result }}" == "failure" || \
-                "${{ needs.build-wheel.result }}" == "failure" || \
-                "${{ needs.python-unit-tests.result }}" == "failure" || \
-                "${{ needs.unit-tests.result }}" == "failure" || \
-                "${{ needs.e2e-1gpu-chat.result }}" == "failure" || \
-                "${{ needs.e2e-1gpu-chat-rust-servicer.result }}" == "failure" || \
-                "${{ needs.e2e-1gpu-chat-mm-worker.result }}" == "failure" || \
-                "${{ needs.e2e-1gpu-chat-zmq.result }}" == "failure" || \
-                "${{ needs.e2e-2gpu-chat-zmq-dp.result }}" == "failure" || \
-                "${{ needs.e2e-1gpu-completions.result }}" == "failure" || \
-                "${{ needs.e2e-1gpu-embeddings.result }}" == "failure" || \
-                "${{ needs.e2e-1gpu-realtime.result }}" == "failure" || \
-                "${{ needs.e2e-1gpu-gateway.result }}" == "failure" || \
-                "${{ needs.e2e-1gpu-responses.result }}" == "failure" || \
-                "${{ needs.e2e-2gpu-pd.result }}" == "failure" || \
-                "${{ needs.e2e-2gpu-pd-mm-worker.result }}" == "failure" || \
-                "${{ needs.e2e-4gpu-chat.result }}" == "failure" || \
-                "${{ needs.e2e-4gpu-gateway.result }}" == "failure" || \
-                "${{ needs.e2e-4gpu-epd.result }}" == "failure" || \
-                "${{ needs.e2e-4gpu-pd.result }}" == "failure" || \
-                "${{ needs.e2e-vendor.result }}" == "failure" || \
-                "${{ needs.go-unit-tests.result }}" == "failure" || \
-                "${{ needs.go-bindings-e2e.result }}" == "failure" ]]; then
-            echo "One or more jobs failed"
+          # A job that runs into its timeout-minutes ends "cancelled", not
+          # "failure", and fails this gate the same way (smg-project/smg-lab#171).
+          # A run cancelled as a whole ends with this gate failed too: it did
+          # not pass, and finish stays a verdict on every head.
+          bad='^(failure|cancelled)$'
+          # detect-changes selects the lanes: when it fails or is cancelled, the
+          # Rust unit tests, the benchmarks and the EPD lane skip on every event
+          # (and, on a pull request, every e2e lane); a skipped job passes this
+          # check, so its own result gates here (smg-project/smg-lab#172).
+          if [[ "${{ needs.detect-changes.result }}" =~ $bad || \
+                "${{ needs.pre-commit.result }}" =~ $bad || \
+                "${{ needs.python-lint.result }}" =~ $bad || \
+                "${{ needs.grpc-proto-build-check.result }}" =~ $bad || \
+                "${{ needs.build-wheel.result }}" =~ $bad || \
+                "${{ needs.python-unit-tests.result }}" =~ $bad || \
+                "${{ needs.unit-tests.result }}" =~ $bad || \
+                "${{ needs.cargo-audit.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-chat.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-chat-symphony.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-chat-rust-servicer.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-chat-mm-worker.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-chat-zmq.result }}" =~ $bad || \
+                "${{ needs.e2e-2gpu-chat-zmq-dp.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-completions.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-embeddings.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-realtime.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-gateway.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-responses.result }}" =~ $bad || \
+                "${{ needs.e2e-2gpu-pd.result }}" =~ $bad || \
+                "${{ needs.e2e-2gpu-pd-mm-worker.result }}" =~ $bad || \
+                "${{ needs.e2e-4gpu-chat.result }}" =~ $bad || \
+                "${{ needs.e2e-4gpu-gateway.result }}" =~ $bad || \
+                "${{ needs.e2e-4gpu-epd.result }}" =~ $bad || \
+                "${{ needs.e2e-4gpu-pd.result }}" =~ $bad || \
+                "${{ needs.e2e-vendor.result }}" =~ $bad || \
+                "${{ needs.go-unit-tests.result }}" =~ $bad || \
+                "${{ needs.go-bindings-e2e.result }}" =~ $bad ]]; then
+            echo "One or more jobs failed or were cancelled"
             exit 1
           else
             echo "All jobs completed successfully"
