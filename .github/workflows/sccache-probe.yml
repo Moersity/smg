@@ -22,23 +22,10 @@ jobs:
         uses: ./.github/actions/setup-rust
         with:
           cache-key: sccache-probe
-      - name: Compile a tiny crate through Cargo
-        shell: bash
+      - name: Compile the CI test targets
         run: |
-          set -euxo pipefail
-          probe_dir="$RUNNER_TEMP/sccache-probe"
-          mkdir -p "$probe_dir/src"
-          cat > "$probe_dir/Cargo.toml" <<'EOF'
-          [package]
-          name = "sccache-probe"
-          version = "0.1.0"
-          edition = "2021"
-          EOF
-          cat > "$probe_dir/src/lib.rs" <<'EOF'
-          pub fn answer() -> u32 { 42 }
-          EOF
           source "$HOME/.cargo/env"
-          cargo -vv check --manifest-path "$probe_dir/Cargo.toml"
-          cargo -vv check -p llm-multimodal
-          cargo -vv test -p llm-multimodal --no-run
+          cargo -vv test --no-run
+          cargo -vv test -p llm-tokenizer --features tokenizers-v1 --no-run
+          cargo -vv test -p data-connector --test postgres_integration --no-run
           sccache --show-stats
