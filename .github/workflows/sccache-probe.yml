@@ -1,0 +1,39 @@
+name: sccache Wrapper Probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    if: github.repository == 'Moersity/smg'
+    runs-on: ubuntu-24.04
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: 'true'
+    steps:
+      - uses: actions/checkout@v7
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          cache-key: sccache-probe
+      - name: Compile a tiny crate through Cargo
+        shell: bash
+        run: |
+          set -euxo pipefail
+          probe_dir="$RUNNER_TEMP/sccache-probe"
+          mkdir -p "$probe_dir/src"
+          cat > "$probe_dir/Cargo.toml" <<'EOF'
+          [package]
+          name = "sccache-probe"
+          version = "0.1.0"
+          edition = "2021"
+          EOF
+          cat > "$probe_dir/src/lib.rs" <<'EOF'
+          pub fn answer() -> u32 { 42 }
+          EOF
+          source "$HOME/.cargo/env"
+          cargo -vv check --manifest-path "$probe_dir/Cargo.toml"
+          sccache --show-stats
