@@ -37,4 +37,5 @@ jobs:
           source "$HOME/.cargo/env"
           cargo -vv check --manifest-path "$probe_dir/Cargo.toml"
           cargo -vv check -p llm-multimodal
+          cargo -vv test -p llm-multimodal --no-run
           sccache --show-stats
