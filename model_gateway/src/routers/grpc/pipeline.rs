@@ -2216,6 +2216,8 @@ mod request_release_tests {
         })
     }
 
+    mod glm53;
+
     /// A worker whose servicer left `supports_vision` unset (the SGLang and
     /// TokenSpeed protos carry the field; only vLLM's servicer sets it on
     /// purpose) is not a language-model-only worker: its labels carry no

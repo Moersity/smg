@@ -981,6 +981,7 @@ mod tests {
             .with_thinking_key_name(ThinkingKeyName::Thinking)
             .with_native_reasoning_effort_values(&["low", "high", "xhigh", "max"])
             .with_renderer_capabilities(llm_tokenizer::traits::RendererCapabilities {
+                media_handling: llm_tokenizer::traits::MediaHandling::Preprocess,
                 enable_thinking_alias: true,
                 native_assistant_continuation: true,
                 raw_tool_call_arguments: true,

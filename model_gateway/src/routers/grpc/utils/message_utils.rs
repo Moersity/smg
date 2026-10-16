@@ -11,7 +11,7 @@ use axum::response::Response;
 use llm_multimodal::{MediaPartOrder, Modality};
 use llm_tokenizer::{
     chat_template::{ChatTemplateContentFormat, ChatTemplateParams},
-    traits::{PromptEncoding, RendererCapabilities, Tokenizer},
+    traits::{MediaHandling, PromptEncoding, RendererCapabilities, Tokenizer},
 };
 use openai_protocol::{
     common::{Tool as ChatTool, ToolChoice as ChatToolChoice},
@@ -314,6 +314,12 @@ pub(crate) async fn resolve_messages_media(
     tokenizer: &dyn Tokenizer,
     messages: &[InputMessage],
 ) -> Result<MessagesMedia, Response> {
+    if tokenizer.renderer_capabilities().media_handling == MediaHandling::TemplateText {
+        return Ok(MessagesMedia {
+            media_order: MediaPartOrder::Authored,
+            media: None,
+        });
+    }
     let tokenizer_entry = components
         .tokenizer_registry
         .get_by_name(model_id)

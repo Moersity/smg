@@ -40,10 +40,23 @@ impl std::fmt::Debug for EncodeJob {
     }
 }
 
+/// How the active renderer expects media content to reach its template.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MediaHandling {
+    /// Resolve and preprocess media using the model's multimodal configuration.
+    #[default]
+    Preprocess,
+    /// The template renders media as plain text. Preserve authored content order
+    /// and skip media processing; the resulting prompt needs only text tokenization.
+    TemplateText,
+}
+
 /// Renderer behaviours the gateway mirrors when it prepares a request, so
 /// the rendered prompt and the request handling never disagree.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RendererCapabilities {
+    /// Resolved when the renderer is loaded or its template is replaced.
+    pub media_handling: MediaHandling,
     /// The renderer reads `enable_thinking` as an alias of its thinking key.
     pub enable_thinking_alias: bool,
     /// With `add_generation_prompt` false and `continue_final_message` set

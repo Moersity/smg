@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use axum::response::Response;
+use llm_tokenizer::traits::MediaHandling;
 use openai_protocol::{
     chat::ChatCompletionRequest,
     common::{ToolChoice, ToolChoiceValue},
@@ -112,7 +113,11 @@ pub(crate) async fn prepare_chat_like(
             .tokenizer_registry
             .get_by_name(model_id)
             .or_else(|| ctx.components.tokenizer_registry.get_by_id(model_id));
+        let media_handling = tokenizer.renderer_capabilities().media_handling;
         let media_order = match (ctx.components.multimodal.as_ref(), tokenizer_entry.as_ref()) {
+            _ if media_handling == MediaHandling::TemplateText => {
+                llm_multimodal::MediaPartOrder::Authored
+            }
             (Some(mm_components), Some(entry)) => {
                 multimodal::resolve_media_part_order(
                     model_id,
@@ -128,7 +133,10 @@ pub(crate) async fn prepare_chat_like(
 
         // Normalize media once. The same plan drives placeholder resolution,
         // rendering, fetching, preprocessing, and final count validation.
-        let media_plan = multimodal::media_plan_chat(&request.messages);
+        let media_plan = match media_handling {
+            MediaHandling::TemplateText => multimodal::MediaPlan::default(),
+            MediaHandling::Preprocess => multimodal::media_plan_chat(&request.messages),
+        };
         // A pool whose every worker runs without a vision encoder takes no
         // images or video: the engine admits such a request and never
         // schedules it. Refuse it here, before any byte of media is decoded
