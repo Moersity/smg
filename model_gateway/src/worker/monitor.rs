@@ -166,6 +166,7 @@ impl WorkerLoadManager {
         }
     }
 
+    /// Replace cached rank loads for the supplied workers, preserving other workers.
     pub fn update_dp_loads(&self, loads: &HashMap<String, HashMap<isize, isize>>) {
         debug!("WorkerLoadManager update_dp_loads map:{:?}", loads);
         let mut cached = self.dp_cached_loads.write();
@@ -1757,6 +1758,7 @@ mod worker_monitor_tests {
         Arc::new(worker)
     }
 
+    /// Build an isolated monitor and registry with round-robin routing for tests.
     fn build_monitor() -> (Arc<WorkerRegistry>, Arc<WorkerMonitor>) {
         let registry = Arc::new(WorkerRegistry::new());
         let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
