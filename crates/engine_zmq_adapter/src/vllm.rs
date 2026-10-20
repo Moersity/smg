@@ -685,6 +685,7 @@ pub(crate) fn translate_request_with_backend(
 
 /// Translate a request whose media was already translated
 /// ([`translate_media`]), so the choices of one request share the work.
+/// Reject empty or full-context prompts before they can reach the engine.
 pub(crate) fn translate_request_with_media(
     req: vllm::GenerateRequest,
     media: TranslatedMedia,
@@ -695,7 +696,16 @@ pub(crate) fn translate_request_with_media(
     // Connector params ride `SamplingParams.extra_args`, where vLLM's own
     // frontend puts them, so a request carrying them always gets params.
     let kv_transfer_params = kv_transfer_params(&req)?;
-    prompt_token_ids(&req)?;
+    let prompt_len = prompt_token_ids(&req)?.len() as u64;
+    if prompt_len == 0 {
+        return Err("the decoder prompt cannot be empty".to_string());
+    }
+    if prompt_len >= max_model_len {
+        return Err(format!(
+            "the decoder prompt (length {prompt_len}) must be shorter than the maximum \
+             model length of {max_model_len} to leave room for at least one output token"
+        ));
+    }
     let prompt_token_ids = match req.input {
         Some(vllm::generate_request::Input::Tokenized(tokenized)) => Some(tokenized.input_ids),
         _ => None,
@@ -711,7 +721,6 @@ pub(crate) fn translate_request_with_media(
         .transpose()?;
     // vLLM's frontend defaults an unset `max_tokens` to the remaining context
     // (`max_model_len - prompt_len`).
-    let prompt_len = prompt_token_ids.as_ref().map_or(0, |ids| ids.len()) as u64;
     let default_max_tokens =
         u32::try_from(max_model_len.saturating_sub(prompt_len)).unwrap_or(u32::MAX);
     if let Some(sp) = req.sampling_params.as_ref() {
@@ -2023,6 +2032,51 @@ mod tests {
         assert_eq!(ranked_candidate_count(Some(3)), 3);
         // -1 asks for every candidate the engine returned.
         assert_eq!(ranked_candidate_count(Some(-1)), usize::MAX);
+    }
+
+    /// Prompt bounds apply before engine admission, with or without an output limit.
+    #[test]
+    fn vllm_validates_prompt_length_even_with_explicit_max_tokens() {
+        for sampling in [
+            None,
+            Some(vllm::SamplingParams::default()),
+            Some(vllm::SamplingParams {
+                max_tokens: Some(16_384),
+                ..Default::default()
+            }),
+        ] {
+            for (prompt_len, max_model_len, accepted) in [
+                (0, 4, false),
+                (3, 4, true),
+                (4, 4, false),
+                (5, 4, false),
+                (1_049_692, 1_048_576, false),
+            ] {
+                let mut req = tokenized_req(vllm::SamplingParams::default());
+                req.sampling_params = sampling.clone();
+                req.input = Some(vllm::generate_request::Input::Tokenized(
+                    vllm::TokenizedInput {
+                        input_ids: vec![1; prompt_len],
+                        ..Default::default()
+                    },
+                ));
+                let result = translate_request(
+                    req,
+                    max_model_len,
+                    ModelDtype::BFloat16,
+                    &EosTokenIds::default(),
+                );
+                assert_eq!(
+                    result.is_ok(),
+                    accepted,
+                    "prompt_len={prompt_len}, max_tokens={:?}",
+                    sampling.as_ref().and_then(|sp| sp.max_tokens)
+                );
+                if let Err(error) = result {
+                    assert!(error.contains("prompt"), "{error}");
+                }
+            }
+        }
     }
 
     #[test]

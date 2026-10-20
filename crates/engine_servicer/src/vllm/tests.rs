@@ -3794,3 +3794,54 @@ async fn a_shutdown_after_the_engines_completion_ends_the_stream_cleanly() {
     );
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
+
+/// Expanded media must be refused before normal engine admission; a PD leg
+/// still releases its remote prefill through the abort-only notice.
+#[tokio::test]
+async fn expanded_context_rejection_preserves_pd_cleanup() {
+    for remote_prefill in [false, true] {
+        let mut media = processed_media();
+        media.prompt_token_ids = vec![7; 1_049_692];
+        let processor = MockMediaProcessor::answering(Ok(media));
+        let mut h = harness_with(model_info(), None, Some(processor.clone())).await;
+        let mut request = media_request("oversized");
+        request.sampling_params.as_mut().unwrap().max_tokens = Some(16_384);
+        if remote_prefill {
+            request.kv_transfer_params_json =
+                Some(r#"{"do_remote_prefill":true,"remote_block_ids":[3]}"#.to_string());
+        }
+        let status = h
+            .client
+            .generate(request)
+            .await
+            .expect_err("expanded input refused");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(status.message().contains("1049692"));
+        assert!(status.message().contains("1048576"));
+        if remote_prefill {
+            let notice = recv_add(&mut h.engine_in).await;
+            assert_eq!(notice.request_id, "oversized");
+            assert!(notice.abort_immediately);
+            assert_eq!(notice.prompt_token_ids.as_deref(), Some(&[0][..]));
+            assert_eq!(
+                recv_abort(&mut h.engine_in).await,
+                vec!["oversized".to_string()]
+            );
+        }
+        assert_engine_idle(&mut h.engine_in).await;
+        assert!(h.server.engine_ready());
+        // Reusing the rejected id proves registration and media permits were
+        // released, and a healthy request can still reach the engine.
+        *processor.outcome.lock().unwrap() = Ok(processed_media());
+        let _stream = h
+            .client
+            .generate(media_request("oversized"))
+            .await
+            .expect("healthy request after refusal")
+            .into_inner();
+        let accepted = recv_add(&mut h.engine_in).await;
+        assert!(!accepted.abort_immediately);
+        assert_eq!(accepted.prompt_token_ids, Some(vec![7, 8, 9, 10]));
+        h.server.stop(Duration::from_secs(5)).expect("clean stop");
+    }
+}
