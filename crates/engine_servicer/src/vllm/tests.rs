@@ -1471,7 +1471,9 @@ async fn remote_kv_waiting_load_is_reported_per_rank() {
     model.data_parallel_size = 2;
     let (mut h, _rank1_in, mut rank1_out) = two_rank_harness(model).await;
     let source = LoadFromState(Arc::downgrade(&h.server.state));
-    for (runnable, deferred) in [(0, 4), (3, 4), (0, 0)] {
+    for (runnable, deferred) in [(0_u64, 4_u64), (3, 4), (0, 0)] {
+        let expected_total = i32::try_from(runnable + deferred).unwrap();
+        let expected_record_total = u32::try_from(expected_total).unwrap();
         rank1_out
             .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
                 engine_index: 1,
@@ -1486,9 +1488,11 @@ async fn remote_kv_waiting_load_is_reported_per_rank() {
             .unwrap();
         wait_until(|| {
             h.server.state.engine().is_ok_and(|client| {
-                client.get_loads().loads.iter().any(|load| {
-                    load.dp_rank == 1 && load.num_waiting_reqs == (runnable + deferred) as i32
-                })
+                client
+                    .get_loads()
+                    .loads
+                    .iter()
+                    .any(|load| load.dp_rank == 1 && load.num_waiting_reqs == expected_total)
             })
         })
         .await;
@@ -1501,9 +1505,9 @@ async fn remote_kv_waiting_load_is_reported_per_rank() {
         assert_eq!(loads.loads.len(), 1);
         let load = &loads.loads[0];
         assert_eq!(load.dp_rank, 1);
-        assert_eq!(load.num_waiting_reqs, (runnable + deferred) as i32);
+        assert_eq!(load.num_waiting_reqs, expected_total);
         let record = kv_events::LoadSource::load(&source, Some(1)).unwrap();
-        assert_eq!(record.waiting_requests, (runnable + deferred) as u32);
+        assert_eq!(record.waiting_requests, expected_record_total);
         assert!(kv_events::LoadSource::load(&source, Some(0)).is_none());
     }
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
