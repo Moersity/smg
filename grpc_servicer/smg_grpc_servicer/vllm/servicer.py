@@ -6,8 +6,8 @@ Implements the VllmEngine gRPC service on top of vLLM's EngineClient.
 """
 
 import asyncio
-import hashlib
 import itertools
+import os
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from pathlib import Path
@@ -33,11 +33,11 @@ from vllm.sampling_params import RequestOutputKind, StructuredOutputsParams
 
 from smg_grpc_servicer.kv_relay import Engine, relay
 from smg_grpc_servicer.load_record import engine_load_from
-from smg_grpc_servicer.tokenizer_bundle import CHUNK_SIZE, build_tokenizer_zip
+from smg_grpc_servicer.tokenizer_bundle import tokenizer_bundle, tokenizer_chunks
 from smg_grpc_servicer.trace_context import trace_headers
-from smg_grpc_servicer.vllm import attach_vllm_logging
+from smg_grpc_servicer.vllm import attach_vllm_logging, settle_logging
 from smg_grpc_servicer.vllm.admin import flush_cache
-from smg_grpc_servicer.vllm.config_view import uses_mrope
+from smg_grpc_servicer.vllm.config_view import EngineConfigView, uses_mrope
 from smg_grpc_servicer.vllm.errors import grpc_code_for
 from smg_grpc_servicer.vllm.kv_events import (
     rank_sources_for,
@@ -51,7 +51,7 @@ from smg_grpc_servicer.vllm.kv_transfer import (
 # The launcher imports this module before it defines serve_grpc: the moment
 # the servicer switch has to be in place (see launcher_switch).
 from smg_grpc_servicer.vllm.launcher_switch import install_launcher_switch
-from smg_grpc_servicer.vllm.loads import RankLoadTrackers
+from smg_grpc_servicer.vllm.loads import LoadTracker
 from smg_grpc_servicer.vllm.media_identity import build_media_identity, media_identity_supported
 from smg_grpc_servicer.vllm.media_refs import parse_media_refs, validate_schemes
 from smg_grpc_servicer.vllm.mm_processor import (
@@ -72,11 +72,13 @@ from smg_grpc_servicer.vllm.model_info import (
     constrained_decoding_start,
     engine_reasoning_parser,
     mm_device_do_normalize,
+    mm_encoder_budget,
     mm_item_limits,
     model_facts,
     server_facts,
 )
 from smg_grpc_servicer.vllm.scheduler_loads import build_loads_response, managed_ranks
+from smg_grpc_servicer.vllm.warmup import WARMUP_ENV, start_engine_warmup
 
 from .mm_keys import (
     batches_missing_pixels,
@@ -104,6 +106,87 @@ def _prompt_length(prompt) -> int:
         ids = prompt.get("prompt_token_ids")
         return len(ids) if ids is not None else 0
     return 0
+
+
+def _managed_ranks(engine) -> list[int]:
+    """The data-parallel ranks this servicer serves, in order: the engine
+    client's managed ranks (a slice of all the ranks under external or
+    hybrid load balancing, from ``data_parallel_rank`` on), else that start
+    rank from the config alone, else rank 0, for request tracking."""
+    managed = getattr(getattr(engine, "engine_core", None), "engine_ranks_managed", None)
+    if isinstance(managed, (list, tuple, range)):
+        ranks = sorted({rank for rank in managed if isinstance(rank, int)})
+        if ranks:
+            return ranks
+    return [EngineConfigView(getattr(engine, "vllm_config", None)).parallel.data_parallel_rank]
+
+
+def _first_rank(engine) -> int:
+    """The lowest data-parallel rank this servicer serves (the first of
+    :func:`_managed_ranks`), used by the request tracker when no route
+    or explicit pin is available."""
+    return _managed_ranks(engine)[0]
+
+
+def _rank_in_flight(engine, request_id: str, choice: int = 0) -> int | None:
+    """The data-parallel rank vLLM's load-balancing engine client routed
+    ``request_id`` to, while the request is in flight: for an ``n > 1``
+    request the rank of its ``choice``, each choice being a request of its
+    own to the engine. The client keeps the engine of every request it
+    routed, to route its abort (``reqs_in_flight``, keyed by the engine's
+    internal request id, valued with the engine's two-byte identity, which
+    is its rank), and the output processor keeps the internal ids under the
+    id the caller gave (``external_req_ids``; a choice's id starts with its
+    index). ``None`` when the client keeps no such table (one engine), the
+    request is not routed yet, or it has finished."""
+    table = getattr(getattr(engine, "engine_core", None), "reqs_in_flight", None)
+    names = getattr(getattr(engine, "output_processor", None), "external_req_ids", None)
+    if not isinstance(table, dict) or not isinstance(names, dict):
+        return None
+    internal_ids = list(names.get(request_id) or ())
+    own = [internal_id for internal_id in internal_ids if internal_id.startswith(f"{choice}_")]
+    for internal_id in own + [
+        internal_id for internal_id in internal_ids if internal_id not in own
+    ]:
+        identity = table.get(internal_id)
+        if isinstance(identity, (bytes, bytearray)) and len(identity) == 2:
+            return int.from_bytes(identity, "little")
+    return None
+
+
+def _routed_rank(engine, request_id: str, choice: int = 0) -> int | None:
+    """The rank an unpinned request (its ``choice``) went to, for its queued
+    prompt: the one the engine's load-balancing client routed it to (see
+    :func:`_rank_in_flight`), this servicer's first rank when the client
+    keeps no routing table (one engine: every request is its), ``None``
+    while the request is not routed yet."""
+    if not isinstance(getattr(getattr(engine, "engine_core", None), "reqs_in_flight", None), dict):
+        return _first_rank(engine)
+    return _rank_in_flight(engine, request_id, choice)
+
+
+def _request_rank(
+    engine,
+    request_id: str,
+    pinned: int | None,
+    choice: int = 0,
+    remembered: int | None = None,
+) -> int:
+    """The rank serving ``request_id`` (its ``choice``) from its first output
+    on, for the load tracker: the one the engine's client routed it to while
+    it is in flight (a pinned request is in that table too); else the rank
+    the tracker learned for it while it was queued (``remembered``: a
+    request the engine has already retired, whose only output was its last,
+    is in neither table any more); else the rank the request named; else
+    this servicer's first rank."""
+    rank = _routed_rank(engine, request_id, choice)
+    if rank is not None:
+        return rank
+    if remembered is not None:
+        return remembered
+    if pinned is not None:
+        return int(pinned)
+    return _first_rank(engine)
 
 
 class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
@@ -144,18 +227,26 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         from smg_grpc_servicer.vllm.rust import require_python_impl
 
         require_python_impl()
-        # vLLM 0.31+ configures logging after this module is imported; attach again.
-        attach_vllm_logging()
+        # vLLM 0.31+ configures logging after this module is imported: attach
+        # again, and end the hold of what was logged before (the launcher
+        # configured logging by now, if it was going to).
+        settle_logging()
         self.engine = async_llm
         self.start_time = start_time
         # Resolve KV-event publishing config from the engine. Non-None only when
         # vLLM was started with --kv-events-config enabling the ZMQ publisher.
         self._kv_events_config = resolve_kv_events_config(async_llm)
         # Queued token-work, generation throughput and hit rate for GetLoads,
-        # from the requests this servicer forwards (vLLM's stats carry none).
-        self._loads = RankLoadTrackers(managed_ranks(async_llm))
+        # per rank, from the requests this servicer forwards (vLLM's stats
+        # carry none); an unpinned request's queued prompt counts on the rank
+        # the engine routes it to, read once it has.
+        self._loads = LoadTracker(rank_of=lambda request_id: _routed_rank(async_llm, request_id))
         # Flag > env > default, resolved once so each value names its source.
         self._mm_settings = (mm_settings or launcher_settings() or MmSettings()).resolve()
+        # The engine's encoder budget, derived once (vLLM's helper builds the
+        # largest item the model's processor can produce) and advertised so
+        # the Router's media pipeline refuses a larger item before the engine.
+        self._mm_encoder_budget = mm_encoder_budget(getattr(async_llm, "vllm_config", None))
         # Worker-side media processing (media_refs); None keeps refs rejected.
         self._mm_processor = build_mm_processor(async_llm, settings=self._mm_settings)
         # One cap over all the multimodal work this servicer runs off the event
@@ -175,6 +266,14 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             self._mm_processor.name if self._mm_processor is not None else "off",
             self._mm_settings.source,
         )
+        # The planned warm-up (:mod:`smg_grpc_servicer.vllm.warmup`): in a
+        # launcher's process (the plugin kept its parse, the serving coroutine
+        # runs) the plan runs over the engine on the event loop and the health
+        # service holds NOT_SERVING until it is over; a servicer built
+        # elsewhere (a test, a harness) warms nothing.
+        self._warmup = None
+        if launcher_settings() is not None:
+            self._warmup = start_engine_warmup(async_llm, setting_text=os.environ.get(WARMUP_ENV))
 
     async def _acquire_mm_slot(self) -> None:
         """Take one multimodal slot, shedding load instead of queueing forever.
@@ -249,7 +348,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         input_type = request.WhichOneof("input")
         # One batch per modality: `mm_inputs`, then `extra_mm_inputs` for a
         # request that mixes image and video. A pixel-less mm payload with
-        # grid tensors is the PD decode leg's form: enough to rebuild mm
+        # grid tensors is the PD decode side's form: enough to rebuild mm
         # features (positions + block hashing).
         preprocessed_batches = [
             batch for batch in mm_batches(request) if has_preprocessed_mm_payload(batch)
@@ -268,12 +367,9 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         )
 
         kv_transfer_params: dict | None = None
-        # What a PD prefill leg learned about its media, for the decode leg.
+        # What a PD prefill side learned about its media, for the decode side.
         media_identity = None
         engine_started = False
-        load_tracker = self._loads.for_rank(
-            request.data_parallel_rank if request.HasField("data_parallel_rank") else None
-        )
         try:
             arrival_time = time.time()
             kv_transfer_params = params_from_request(request)
@@ -305,7 +401,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     )
                 finally:
                     self._mm_inflight.release()
-                # A PD prefill leg answers with the identity so decode is
+                # A PD prefill side answers with the identity so decode is
                 # served without pixels or references. The identity is an
                 # optimisation with a fallback (decode reprocesses), so a
                 # shape it cannot read must not fail a served request.
@@ -315,7 +411,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                             media_identity = build_media_identity(prompt)
                         except Exception as e:  # noqa: BLE001 - any failure falls back
                             logger.warning(
-                                "Request %s: media identity not built (%s); the decode leg "
+                                "Request %s: media identity not built (%s); the decode side "
                                 "will reprocess the media",
                                 request_id,
                                 e,
@@ -324,11 +420,11 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     else:
                         logger.warning(
                             "Request %s: the installed smg-grpc-proto has no media_identity; "
-                            "the decode leg will reprocess the media",
+                            "the decode side will reprocess the media",
                             request_id,
                         )
             elif has_preprocessed_mm and input_type == "tokenized":
-                # A pixel-less payload (PD decode leg) is only decodable with
+                # A pixel-less payload (PD decode side) is only decodable with
                 # remote KV: a local recompute would schedule the vision
                 # encoder with no pixels and crash the engine.
                 # Every batch needs its own, not just one of them: a batch left
@@ -358,9 +454,9 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 prompt: TokensPrompt = {"prompt_token_ids": list(request.tokenized.input_ids)}
                 if request.tokenized.original_text:
                     prompt["prompt"] = request.tokenized.original_text
-                # Tensor-less mm payload (grid-less PD decode leg): fold the
+                # Tensor-less mm payload (grid-less PD decode side): fold the
                 # kept mm hashes into cache_salt so different images cannot
-                # alias. Grid-carrying legs took the preprocessed path above.
+                # alias. Grid-carrying sides took the preprocessed path above.
                 batches = mm_batches(request)
                 if batches:
                     cache_salt = mm_identity_cache_salt(mm_identity_hashes(batches))
@@ -391,27 +487,54 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             # Track which indices have sent their first chunk
             seen_indices: set[int] = set()
 
-            if load_tracker is not None:
-                load_tracker.submitted(request_id, _prompt_length(prompt))
+            pinned_rank = (
+                request.data_parallel_rank if request.HasField("data_parallel_rank") else None
+            )
+            # The rank the request goes to: the pin, else the engine's choice,
+            # which the tracker reads once the engine has routed it (at every
+            # load read while the request is queued) and this loop reads when
+            # a choice first shows up (each choice of an n > 1 request is
+            # routed on its own); a non-streamed request's only output comes
+            # once the engine has retired it, so the tracker's reading is
+            # what names its rank then.
+            self._loads.submitted(request_id, _prompt_length(prompt), rank=pinned_rank)
+            ranks: dict[int, int] = {}
+            remembered: int | None = None
+
+            def rank_of(choice: int) -> int:
+                nonlocal remembered
+                if choice not in ranks:
+                    if not ranks:
+                        # Read once, at the first choice: the first output
+                        # takes the request out of the tracker's queue, and
+                        # the other choices of a retired request need it too.
+                        remembered = self._loads.pending_rank(request_id)
+                    ranks[choice] = _request_rank(
+                        self.engine, request_id, pinned_rank, choice, remembered=remembered
+                    )
+                return ranks[choice]
+
             async for output in self.engine.generate(
                 prompt=prompt,
                 sampling_params=sampling_params,
                 request_id=request_id,
                 tokenization_kwargs=tokenization_kwargs,
                 trace_headers=trace_headers(context.invocation_metadata()),
-                data_parallel_rank=(
-                    request.data_parallel_rank if request.HasField("data_parallel_rank") else None
-                ),
+                data_parallel_rank=pinned_rank,
             ):
-                if not engine_started and load_tracker is not None:
-                    load_tracker.first_output(
+                if not engine_started:
+                    # The prompt's cached count is the reporting choice's
+                    # (the first output of an n > 1 request is whichever
+                    # choice stepped first).
+                    self._loads.first_output(
                         request_id,
                         len(output.prompt_token_ids or ()),
                         getattr(output, "num_cached_tokens", 0) or 0,
+                        rank=rank_of(output.outputs[0].index if output.outputs else 0),
                     )
                 engine_started = True
-                if load_tracker is not None:
-                    load_tracker.generated(sum(len(c.token_ids) for c in output.outputs))
+                for completion in output.outputs:
+                    self._loads.generated(len(completion.token_ids), rank=rank_of(completion.index))
                 # For streaming, send chunks for EACH completion output (n outputs)
                 if request.stream:
                     for completion in output.outputs:
@@ -471,8 +594,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             await self._notify_kv_transfer_rejected(request_id, kv_transfer_params, engine_started)
             await context.abort(code, str(e))
         finally:
-            if load_tracker is not None:
-                load_tracker.finished(request_id)
+            self._loads.finished(request_id)
 
     async def _notify_kv_transfer_rejected(
         self,
@@ -702,6 +824,11 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         # pipeline to hold requests to; likewise absent from an older package.
         if "mm_item_limits" in info.DESCRIPTOR.fields_by_name:
             info.mm_item_limits = mm_item_limits(self.engine.vllm_config)
+        # The engine's encoder budget, for the Router's media pipeline to
+        # refuse an item the engine could never place; likewise absent from
+        # an older package.
+        if self._mm_encoder_budget and "mm_encoder_budget" in info.DESCRIPTOR.fields_by_name:
+            info.mm_encoder_budget = self._mm_encoder_budget
         # The engine's reasoning parser and where it starts a grammar on a
         # thinking prompt, for the Router to shape a forced tool call's
         # grammar by; likewise absent from an older package.
@@ -739,9 +866,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         )
         if not response.loads:
             return None
-        return engine_load_from(
-            response.loads[0], queued_token_work=self._loads.for_rank(dp_rank) is not None
-        )
+        return engine_load_from(response.loads[0], queued_token_work=self._loads is not None)
 
     async def GetTokenizer(
         self,
@@ -768,15 +893,13 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         tokenizer_dir = Path(tokenizer_path)
 
         # Reading and compressing the tokenizer directory is file I/O and CPU
-        # measured in hundreds of milliseconds, so it stays off the event loop
-        # and the engine keeps answering everything else meanwhile.
+        # measured in hundreds of milliseconds: the shared bundle builds it in
+        # a worker thread, once, and the engine keeps answering everything else.
         try:
-            zip_buffer, sha256 = await asyncio.to_thread(self._tokenizer_bundle, tokenizer_dir)
+            zip_data, sha256 = await tokenizer_bundle(tokenizer_dir)
         except Exception as e:
             logger.exception("Failed to build tokenizer ZIP")
             await context.abort(grpc.StatusCode.INTERNAL, str(e))
-
-        zip_data = zip_buffer.getbuffer()
 
         logger.info(
             "Streaming tokenizer bundle: %d bytes, sha256=%s",
@@ -784,25 +907,10 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             sha256,
         )
 
-        # Stream chunks; SHA-256 only on the final chunk
-        offset = 0
-        total = len(zip_data)
-        while offset < total:
-            end = min(offset + CHUNK_SIZE, total)
-            is_last = end == total
-            yield common_pb2.GetTokenizerChunk(
-                data=bytes(zip_data[offset:end]),
-                sha256=sha256 if is_last else "",
-            )
-            offset = end
+        for chunk in tokenizer_chunks(zip_data, sha256):
+            yield chunk
 
     # ========== Helper methods ==========
-
-    @staticmethod
-    def _tokenizer_bundle(tokenizer_dir: Path):
-        """The tokenizer archive and its fingerprint, built in one pass."""
-        zip_buffer = build_tokenizer_zip(tokenizer_dir)
-        return zip_buffer, hashlib.sha256(zip_buffer.getbuffer()).hexdigest()
 
     def _build_preprocessed_mm_inputs(
         self,
@@ -812,7 +920,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         """Build vLLM MultiModalInput from preprocessed proto data.
 
         Bypasses HF processor entirely — the tensors were already computed by
-        the Rust router. Pixel values are optional: the PD decode leg carries
+        the Rust router. Pixel values are optional: the PD decode side carries
         only the grid tensors (positions + block hashing need no pixels).
         Field layouts (batched / flat / shared) are also determined by the
         router via ``batched_keys`` and ``flat_keys`` proto fields.
@@ -847,7 +955,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
 
             num_items = len(mm_proto.mm_placeholders)
 
-            # Deserialize all tensors from proto. The PD decode leg carries no
+            # Deserialize all tensors from proto. The PD decode side carries no
             # pixel_values (KV arrives via the P/D transfer), only grid tensors.
             # The primary tensor is registered under the model's forward kwarg
             # (``encoder_input_key``; DeepSeek-V4.1 takes ``patches``), the same
@@ -1186,7 +1294,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                        If None, uses output.outputs[0] for backwards compatibility.
             num_logprobs: Number of top logprobs for output tokens
             num_prompt_logprobs: Number of top logprobs for prompt tokens
-            media_identity: A PD prefill leg's processed media, for the decode leg
+            media_identity: A PD prefill side's processed media, for the decode side
 
         Returns:
             GenerateResponse with complete field set
@@ -1222,7 +1330,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             num_prompt_logprobs,
         )
 
-        # Connector KV-transfer params returned by the engine (PD prefill leg)
+        # Connector KV-transfer params returned by the engine (PD prefill side)
         kv_transfer_params, kv_transfer_params_json = params_to_response_fields(
             output.kv_transfer_params
         )

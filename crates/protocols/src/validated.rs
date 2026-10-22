@@ -13,11 +13,12 @@ pub trait Normalizable {
 
 #[cfg(feature = "axum")]
 use axum::{
+    body::Bytes,
     extract::{
         rejection::{BytesRejection, FailedToBufferBody, JsonRejection},
         FromRequest, Request,
     },
-    http::StatusCode,
+    http::{header::CONTENT_TYPE, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -61,7 +62,12 @@ pub struct RejectionCode(pub String);
 /// `param` the offending field when one is known; the code also rides on the
 /// response as a [`RejectionCode`] extension.
 #[cfg(feature = "axum")]
-fn rejection(status: StatusCode, code: &str, param: Option<String>, message: String) -> Response {
+pub(crate) fn rejection(
+    status: StatusCode,
+    code: &str,
+    param: Option<String>,
+    message: String,
+) -> Response {
     let mut response = (
         status,
         Json(json!({
@@ -314,6 +320,88 @@ fn length_code(error: &ValidationError) -> String {
     }
 }
 
+/// Whether the request declares the plain `application/json` content type,
+/// bare or with well-formed `name=value` parameters (a token name; a token
+/// or a non-empty quoted string as the value; a parameter may follow its `;`
+/// after spaces, nothing else): a strict subset of what axum's extractor
+/// accepts, parsed directly. A `+json` suffix, a parameter the check doubts,
+/// whitespace where the MIME grammar has none, or anything else is left to
+/// axum's extractor, which decides as before.
+#[cfg(feature = "axum")]
+fn has_plain_json_content_type(req: &Request) -> bool {
+    let Some(value) = req
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let mut parts = value.split(';');
+    let mime = parts.next().unwrap_or("");
+    mime.eq_ignore_ascii_case("application/json") && parts.all(is_mime_parameter)
+}
+
+/// `name=value` after the spaces that may follow the `;`: a token name and a
+/// token or non-empty quoted-string value, with no whitespace of its own.
+#[cfg(feature = "axum")]
+fn is_mime_parameter(part: &str) -> bool {
+    fn is_token(text: &str) -> bool {
+        !text.is_empty()
+            && text
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
+    }
+    let Some((name, value)) = part.trim_start_matches(' ').split_once('=') else {
+        return false;
+    };
+    // A quoted value: non-empty, printable ASCII and spaces only (no tab, no
+    // control character, no inner quote, no backslash escape), the part of
+    // the grammar axum's parser and this check read alike.
+    let quoted = value.len() >= 3
+        && value.starts_with('"')
+        && value.ends_with('"')
+        && value[1..value.len() - 1]
+            .bytes()
+            .all(|byte| (b' '..=b'~').contains(&byte) && byte != b'"' && byte != b'\\');
+    is_token(name) && (is_token(value) || quoted)
+}
+
+/// The gateway's answer to a body axum's extractor refused.
+#[cfg(feature = "axum")]
+fn json_rejection(err: JsonRejection) -> Response {
+    // A body that crosses the payload limit is a size error,
+    // not a client JSON error: a declared Content-Length over
+    // the limit is already refused with 413 before the body,
+    // and a chunked upload must get the same answer the moment
+    // it crosses the limit (reading stops there; the frames
+    // after it are never pulled in).
+    if let JsonRejection::BytesRejection(BytesRejection::FailedToBufferBody(
+        FailedToBufferBody::LengthLimitError(_),
+    )) = &err
+    {
+        return rejection(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_body_too_large",
+            None,
+            "Request body exceeded the payload limit (max_payload_size)".to_string(),
+        );
+    }
+    let (code, error_message) = match err {
+        JsonRejection::JsonDataError(e) => {
+            let message = format!("Invalid JSON data: {e}");
+            (deserialize_code(&message), message)
+        }
+        JsonRejection::JsonSyntaxError(e) => ("invalid_json", format!("JSON syntax error: {e}")),
+        JsonRejection::MissingJsonContentType(_) => (
+            "json_parse_error",
+            "Missing Content-Type: application/json header".to_string(),
+        ),
+        _ => ("json_parse_error", format!("Failed to parse JSON: {err}")),
+    };
+    let param = param_from_deserialize_message(&error_message);
+    rejection(StatusCode::BAD_REQUEST, code, param, error_message)
+}
+
 #[cfg(feature = "axum")]
 impl<S, T> FromRequest<S> for ValidatedJson<T>
 where
@@ -323,46 +411,27 @@ where
     type Rejection = Response;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        // First, extract and deserialize the JSON
-        let Json(mut data) =
+        // A body under the plain `application/json` content type is read and
+        // parsed once, directly; axum's extractor parses it a second time only
+        // when that fails, so that the rejection names the path of the failing
+        // field as before. (axum's extractor always parses with path tracking,
+        // a chain of allocations per nested value: 118 of a tool-heavy chat
+        // request's 2,652 allocation calls, measured 2026-10-21.) Any other
+        // content type goes to axum's extractor as a whole, which decides what
+        // it accepts and how it refuses.
+        let Json(mut data) = if has_plain_json_content_type(&req) {
+            let bytes = Bytes::from_request(req, state)
+                .await
+                .map_err(|err| json_rejection(JsonRejection::from(err)))?;
+            match serde_json::from_slice::<T>(&bytes) {
+                Ok(data) => Json(data),
+                Err(_) => Json::<T>::from_bytes(&bytes).map_err(json_rejection)?,
+            }
+        } else {
             Json::<T>::from_request(req, state)
                 .await
-                .map_err(|err: JsonRejection| {
-                    // A body that crosses the payload limit is a size error,
-                    // not a client JSON error: a declared Content-Length over
-                    // the limit is already refused with 413 before the body,
-                    // and a chunked upload must get the same answer the moment
-                    // it crosses the limit (reading stops there; the frames
-                    // after it are never pulled in).
-                    if let JsonRejection::BytesRejection(BytesRejection::FailedToBufferBody(
-                        FailedToBufferBody::LengthLimitError(_),
-                    )) = &err
-                    {
-                        return rejection(
-                            StatusCode::PAYLOAD_TOO_LARGE,
-                            "request_body_too_large",
-                            None,
-                            "Request body exceeded the payload limit (max_payload_size)"
-                                .to_string(),
-                        );
-                    }
-                    let (code, error_message) = match err {
-                        JsonRejection::JsonDataError(e) => {
-                            let message = format!("Invalid JSON data: {e}");
-                            (deserialize_code(&message), message)
-                        }
-                        JsonRejection::JsonSyntaxError(e) => {
-                            ("invalid_json", format!("JSON syntax error: {e}"))
-                        }
-                        JsonRejection::MissingJsonContentType(_) => (
-                            "json_parse_error",
-                            "Missing Content-Type: application/json header".to_string(),
-                        ),
-                        _ => ("json_parse_error", format!("Failed to parse JSON: {err}")),
-                    };
-                    let param = param_from_deserialize_message(&error_message);
-                    rejection(StatusCode::BAD_REQUEST, code, param, error_message)
-                })?;
+                .map_err(json_rejection)?
+        };
 
         // Normalize the request (apply defaults based on other fields)
         data.normalize();
@@ -544,6 +613,84 @@ mod tests {
         )
     }
 
+    /// The body of a request under `content_type`, through the extractor.
+    async fn extract(content_type: &str, body: &str) -> Result<BodyRequest, (StatusCode, Value)> {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("content-type", content_type)
+            .body(Body::from(body.to_string()))
+            .unwrap_or_default();
+        match ValidatedJson::<BodyRequest>::from_request(request, &()).await {
+            Ok(ValidatedJson(body)) => Ok(body),
+            Err(response) => {
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap_or_default();
+                Err((
+                    status,
+                    serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+                ))
+            }
+        }
+    }
+
+    /// A good body under `application/json` is parsed once, directly; one that
+    /// fails is parsed again by axum's extractor, whose rejection names the
+    /// failing field as before; a content type that is not the plain one goes
+    /// to axum's extractor as a whole.
+    #[tokio::test]
+    async fn bodies_parse_once_and_a_failure_keeps_its_named_path() {
+        let good = r#"{"value":0.5,"name":"x"}"#;
+        assert!(extract("application/json", good).await.is_ok());
+        assert!(
+            extract("application/json; charset=utf-8", good)
+                .await
+                .is_ok(),
+            "parameters do not change the content type"
+        );
+        for malformed in [
+            "application/json; charset",
+            "application/json;;",
+            "application/json; a=b=c\"",
+            "application/json ;charset=utf-8",
+            "application/json;\tcharset=utf-8",
+            "application/json; charset=utf-8 ; x=y",
+            "application/json; foo=\"\"",
+            "application/json; foo=\"a\tb\"",
+            "application/json; foo=\"a\\\"b\"",
+        ] {
+            let (status, body) = extract(malformed, good).await.unwrap_err();
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{malformed}");
+            assert!(
+                body.to_string().contains("Missing Content-Type"),
+                "a parameter the check doubts goes to axum's extractor, which refuses it as before: {malformed}: {body}"
+            );
+        }
+        assert!(
+            extract("application/vnd.api+json", good).await.is_ok(),
+            "a +json type is accepted through axum's extractor"
+        );
+        let (status, body) = extract("text/plain", good).await.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.to_string().contains("Missing Content-Type"), "{body}");
+        let (status, body) = extract("application/json", r#"{"value":"half","name":"x"}"#)
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let text = body.to_string();
+        assert!(
+            text.contains("value") && text.contains("invalid type"),
+            "the second parse names the failing field: {text}"
+        );
+        let (status, body) = extract("application/json", r#"{"value":0.5,"name":"#)
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.to_string().contains("syntax"), "{body}");
+    }
+
     /// A rejection carries its code as the `RejectionCode` extension (the
     /// gateway's metrics read it), the same code the envelope shows.
     #[tokio::test]
@@ -568,6 +715,57 @@ mod tests {
                 "{body}"
             );
         }
+    }
+
+    /// A Messages body whose `thinking.display` is outside the documented
+    /// set is refused in place: `code` `invalid_value`, `param` the path
+    /// serde recorded, a message that names the field and lists the set.
+    /// One with a documented value goes through.
+    #[tokio::test]
+    async fn a_thinking_display_outside_its_set_is_refused_by_name() {
+        use crate::messages::{CreateMessageRequest, ThinkingConfig, ThinkingDisplay};
+
+        let extract = |display: &str| {
+            let body = json!({
+                "model": "m", "max_tokens": 64,
+                "thinking": {"type": "adaptive", "display": display},
+                "messages": [{"role": "user", "content": "hi"}]
+            })
+            .to_string();
+            let request = Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap_or_default();
+            ValidatedJson::<CreateMessageRequest>::from_request(request, &())
+        };
+        let Ok(ValidatedJson(accepted)) = extract("updates").await else {
+            panic!("`updates` is refused");
+        };
+        assert!(matches!(
+            accepted.thinking,
+            Some(ThinkingConfig::Adaptive {
+                display: Some(ThinkingDisplay::Updates)
+            })
+        ));
+        let Err(refused) = extract("full").await else {
+            panic!("`full` is accepted");
+        };
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(refused.into_body(), usize::MAX)
+            .await
+            .unwrap_or_default();
+        let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        assert_eq!(json["error"]["code"], "invalid_value", "{json}");
+        assert_eq!(json["error"]["param"], "thinking", "{json}");
+        let message = json["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(
+                "thinking: unknown variant `full` for `thinking.display`, expected one of `summarized`, `omitted`, `updates`"
+            ),
+            "{message}"
+        );
     }
 
     /// (status, type, code, param) of a rejection; `code` must be a string
@@ -793,6 +991,12 @@ mod tests {
                 "Invalid JSON data: Failed to deserialize the JSON body into the target type: include[0]: unknown variant `bogus.field`, expected one of `code_interpreter_call.outputs` at line 1 column 60",
                 "invalid_value",
             ),
+            // A custom error that opens with serde's words takes their code:
+            // a `thinking.display` outside its set is refused as a value.
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: thinking: unknown variant `full` for `thinking.display`, expected one of `summarized`, `omitted`, `updates` at line 1 column 71",
+                "invalid_value",
+            ),
             (
                 "Invalid JSON data: Failed to deserialize the JSON body into the target type: max_output_tokens: invalid value: integer `-1`, expected u32 at line 1 column 49",
                 "integer_below_min_value",
@@ -898,6 +1102,12 @@ mod tests {
             (
                 "Failed to deserialize the JSON body into the target type: messages[0].content: data did not match any variant of untagged enum Content at line 1 column 60",
                 Some("messages[0].content"),
+            ),
+            // A field inside a tagged enum keeps the enum's path: the message
+            // names the field, the param is the path serde recorded.
+            (
+                "Failed to deserialize the JSON body into the target type: thinking: unknown variant `full` for `thinking.display`, expected one of `summarized`, `omitted`, `updates` at line 1 column 71",
+                Some("thinking"),
             ),
             (
                 "Failed to deserialize the JSON body into the target type: invalid type: integer `5`, expected a string at line 1 column 10",

@@ -11,8 +11,9 @@
 //! `ministral-3-14b-instruct-2512-bf16`, whose templates have no thought.
 //!
 //! The table is named after the tokenizer version that brought `[ARGS]`, and apart from the
-//! gateway's older `mistral` parser, which reads 7B v0.3's list: an operator naming `mistral` keeps
-//! that parser under `--parser symphony`, and the registry picks this table for the groups above.
+//! [`mistral`](super::mistral()) table, which reads 7B v0.3's list, the gateway's older `mistral`
+//! parser's format: an operator naming `mistral` reads with that table under `--parser symphony`,
+//! and the registry picks this one for the groups above.
 //!
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
 
@@ -34,7 +35,10 @@ pub fn mistral_v13() -> Format {
         .transition("reasoning", "think_close", "content")
         .transition("content", "call_open", "call")
         .transition("call", "call_open", "call")
-        .calls(CallSyntax::NamedArguments(ARGS))
+        .calls(CallSyntax::NamedArguments {
+            marker: ARGS,
+            between_calls: "",
+        })
         .opens_turn("[/INST]")
 }
 
@@ -43,80 +47,20 @@ mod tests {
     use super::*;
     use crate::{
         engine::Engine,
-        event::{DropReason, Event, Events, FinishReason},
-        input::{EngineFinish, Input},
-        parser::Parser,
-        tagged::Declared,
+        event::{DropReason, Event, FinishReason, MalformedReason, Text},
+        testing::{calls, content, drive, reasoning},
+        Declared,
     };
 
     /// The generation prompt's tail: the user turn's close, and nothing more.
     const PROMPT: &str = "[/INST]";
 
-    fn run(prompt: &str, output: &str) -> Vec<Event> {
-        let mut parser = Engine::new(mistral_v13(), Declared::default());
-        let mut out = Events::new();
-        parser
-            .feed(
-                Input::Prompt {
-                    token_ids: &[],
-                    text: prompt,
-                },
-                &mut out,
-            )
-            .expect("prompt");
-        parser
-            .feed(
-                Input::Delta {
-                    token_ids: &[],
-                    text: output,
-                    spans: &[],
-                },
-                &mut out,
-            )
-            .expect("delta");
-        parser
-            .feed(
-                Input::End {
-                    finish: EngineFinish::Stop,
-                },
-                &mut out,
-            )
-            .expect("end");
-        out.drain()
-    }
-
-    fn calls(events: &[Event]) -> Vec<(String, String)> {
-        let mut calls: Vec<(String, String)> = Vec::new();
-        for event in events {
-            match event {
-                Event::ToolCallStart { name, .. } => calls.push((name.clone(), String::new())),
-                Event::ToolCallArguments { json, .. } => {
-                    calls.last_mut().expect("a call started").1.push_str(json);
-                }
-                _ => {}
-            }
-        }
-        calls
-    }
-
-    fn content(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Content(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn reasoning(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Reasoning(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect()
+    fn run(prompt: &str, output: &str) -> Vec<Event<'static>> {
+        drive(
+            &mut Engine::new(mistral_v13(), Declared::default()),
+            prompt,
+            &[output],
+        )
     }
 
     /// The engine's finish: its reason as the engine gave it (the adapters refine it to
@@ -131,6 +75,47 @@ mod tests {
                 _ => None,
             })
             .expect("a finish")
+    }
+
+    /// A call whose arguments are not JSON carries them as the model wrote them and says once,
+    /// with no bytes, that they are no JSON; nothing leaks into content, whole and in pieces.
+    #[test]
+    fn arguments_that_are_not_json_stay_the_calls_own_and_are_said_to_be_no_json() {
+        let output = "[TOOL_CALLS]plot_sine_wave[ARGS]{\"start_range\": 0, \"end_range\": 2.0 * Math.PI, \"frequency\": 5}";
+        let per_char: Vec<&str> = output
+            .char_indices()
+            .map(|(i, c)| &output[i..i + c.len_utf8()])
+            .collect();
+        let whole = run(PROMPT, output);
+        let streamed = drive(
+            &mut Engine::new(mistral_v13(), Declared::default()),
+            PROMPT,
+            &per_char,
+        );
+        for (how, events) in [("whole", &whole), ("per character", &streamed)] {
+            assert_eq!(
+                calls(events),
+                [(
+                    "plot_sine_wave".to_string(),
+                    "{\"start_range\": 0, \"end_range\": 2.0 * Math.PI, \"frequency\": 5}"
+                        .to_string()
+                )],
+                "{how}"
+            );
+            assert_eq!(content(events), "", "{how}");
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, Event::Malformed { .. }))
+                    .collect::<Vec<_>>(),
+                [&Event::Malformed {
+                    text: Text::default(),
+                    why: MalformedReason::InvalidArguments,
+                }],
+                "{how}: the break is said once, with no bytes"
+            );
+            assert_eq!(finish(events), (FinishReason::Stop, 1), "{how}");
+        }
     }
 
     #[test]

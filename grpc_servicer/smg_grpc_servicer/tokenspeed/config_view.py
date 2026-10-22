@@ -20,12 +20,18 @@ import dataclasses
 from functools import cached_property
 from typing import Any
 
+from smg_grpc_servicer.config_view import attr_int, attr_list, attr_str, positive_int
 
-def _positive_int(value: Any) -> int | None:
-    """``value`` as a count above zero, else ``None`` (a bool is not a count)."""
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        return None
-    return value
+CONSTRAINED_DECODING_POLICIES = ("requested", "always")
+
+
+def constrained_decoding_policy(value: Any) -> str:
+    """The engine's declared constrained-decoding policy as the gateway spells
+    it: ``always`` for a grammar on every turn, ``requested`` for one only when
+    the request asks; ``""`` when the engine declares none, or something the
+    gateway would not read (it then treats the worker as ``requested``)."""
+    text = str(value or "").strip().lower()
+    return text if text in CONSTRAINED_DECODING_POLICIES else ""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -44,10 +50,18 @@ class ServerArgsSection:
     attention_dp_size: int | None
     # The admission window, under TokenSpeed's spelling or the frontend's; 0 when unset.
     running_window: int
+    # The scheduler's step budget in prompt tokens, when the args carry one as
+    # a count: the chunk size under chunked prefill, else the prefill budget.
+    chunked_prefill_size: int | None
+    max_prefill_tokens: int | None
+    # The operator's context length when the args carry one, else ``None``.
+    max_model_len: int | None
     page_size: int
     max_total_num_tokens: int
     kv_events_config: Any
     disaggregation_mode: str
+    # The engine's declared constrained-decoding policy, ``""`` when it declares none.
+    constrained_decoding: str
 
     @classmethod
     def read(cls, server_args: Any) -> ServerArgsSection:
@@ -66,7 +80,7 @@ class ServerArgsSection:
             weight_version=str(getattr(server_args, "weight_version", "") or ""),
             revision=getattr(server_args, "revision", None),
             reasoning_parser=getattr(server_args, "reasoning_parser", None),
-            attention_dp_size=_positive_int(
+            attention_dp_size=positive_int(
                 getattr(getattr(mapping, "attn", None), "dp_size", None)
             ),
             running_window=int(
@@ -74,10 +88,16 @@ class ServerArgsSection:
                 or getattr(server_args, "max_running_requests", 0)
                 or 0
             ),
+            chunked_prefill_size=positive_int(getattr(server_args, "chunked_prefill_size", None)),
+            max_prefill_tokens=positive_int(getattr(server_args, "max_prefill_tokens", None)),
+            max_model_len=positive_int(getattr(server_args, "max_model_len", None)),
             page_size=int(getattr(server_args, "page_size", 0) or 0),
             max_total_num_tokens=int(getattr(server_args, "max_total_num_tokens", 0) or 0),
             kv_events_config=getattr(server_args, "kv_events_config", None),
             disaggregation_mode=getattr(server_args, "disaggregation_mode", "null") or "null",
+            constrained_decoding=constrained_decoding_policy(
+                getattr(server_args, "constrained_decoding", None)
+            ),
         )
 
 
@@ -110,12 +130,10 @@ class ModelConfigSection:
         return cls(
             hf_config=hf_config,
             eos_token_ids=eos_token_ids,
-            model_type=str((getattr(hf_config, "model_type", "") or "") if hf_config else ""),
-            architectures=list(
-                (getattr(hf_config, "architectures", []) or []) if hf_config else []
-            ),
-            pad_token_id=int((getattr(hf_config, "pad_token_id", 0) or 0) if hf_config else 0),
-            bos_token_id=int((getattr(hf_config, "bos_token_id", 0) or 0) if hf_config else 0),
+            model_type=attr_str(hf_config, "model_type"),
+            architectures=attr_list(hf_config, "architectures"),
+            pad_token_id=attr_int(hf_config, "pad_token_id"),
+            bos_token_id=attr_int(hf_config, "bos_token_id"),
             context_len=int(getattr(model_config, "context_len", 0) or 0),
             vocab_size=int(model_config.vocab_size),
             dtype=getattr(model_config, "dtype", None),
@@ -137,6 +155,14 @@ class EngineConfigView:
     @cached_property
     def model(self) -> ModelConfigSection:
         return ModelConfigSection.read(self._model_config)
+
+    @cached_property
+    def constrained_decoding(self) -> str:
+        """The engine's declared policy (``constrained_decoding_policy``): the
+        server args' when they carry one, else the model config's."""
+        return self.server_args.constrained_decoding or constrained_decoding_policy(
+            getattr(self._model_config, "constrained_decoding", None)
+        )
 
     @cached_property
     def model_dtype(self) -> Any:

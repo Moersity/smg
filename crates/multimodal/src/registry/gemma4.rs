@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::{
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
@@ -225,7 +225,9 @@ impl ModelProcessorSpec for Gemma4Spec {
             || id.contains("gemma4")
     }
 
-    /// The template renders the parts in the order they were written.
+    /// The family's renderer is positional: a string template of it gets the
+    /// media parts where the request put them. Its own template takes the
+    /// parts and places them itself, whatever this says.
     fn media_part_order(&self) -> MediaPartOrder {
         MediaPartOrder::Authored
     }
@@ -323,10 +325,6 @@ impl ModelProcessorSpec for Gemma4Spec {
             limits.insert(Modality::Audio, usize::MAX);
         }
         Ok(limits)
-    }
-
-    fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
-        Ok(json!({}))
     }
 
     fn prompt_replacements(
@@ -789,7 +787,6 @@ mod tests {
             FrameSampling::UpTo { max_frames: 32 }
         );
         assert_eq!(spec.default_video_sample_fps(), None);
-        assert_eq!(spec.processor_kwargs(&metadata).unwrap(), json!({}));
 
         let image = spec.encoder_field_layouts_for(Modality::Image);
         assert_eq!(image.encoder_input, FieldLayout::Batched);

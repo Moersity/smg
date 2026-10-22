@@ -9,6 +9,7 @@ import signal
 import threading
 import time
 from concurrent import futures
+from typing import Any
 
 import grpc
 from grpc_health.v1 import health_pb2_grpc
@@ -18,12 +19,21 @@ from smg_grpc_proto.generated import tokenspeed_scheduler_pb2
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 from smg_grpc_servicer.hostport import host_port, loopback_target
-from smg_grpc_servicer.rust_lifecycle import EXIT_GRACE_SECS, guarded_exit
+from smg_grpc_servicer.rust_lifecycle import (
+    EXIT_GRACE_SECS,
+    ServicerConfigError,
+    announce_kv_events_default,
+    configuration_exit,
+    guarded_exit,
+)
 from smg_grpc_servicer.tokenspeed import engine_watchdog
 from smg_grpc_servicer.tokenspeed.engine_watchdog import EngineProcessWatch
 from smg_grpc_servicer.tokenspeed.health_servicer import TokenSpeedHealthServicer
+from smg_grpc_servicer.tokenspeed.rust import KV_EVENTS_ENV, default_kv_events_config
 from smg_grpc_servicer.tokenspeed.scheduler_launcher import launch_engine
 from smg_grpc_servicer.tokenspeed.servicer import TokenSpeedSchedulerServicer
+from smg_grpc_servicer.tokenspeed.warmup import WARMUP_ENV, warmup_inputs, warmup_wire
+from smg_grpc_servicer.warmup import parse_setting, plan_for, run_warmup
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +114,26 @@ class TokenSpeedEncodeDiscoveryServicer(TokenSpeedSchedulerServicer):
 async def serve_grpc(server_args: ServerArgs) -> None:
     """Run the TokenSpeed gRPC server until a shutdown signal is received, or
     until the engine dies: then the servicer exits with code 1."""
+
+    # The Python servicer gets the Rust path's KV-events default too: server
+    # args without --kv-events-config have TokenSpeed's ZMQ publisher on, at
+    # a port found free on this host, before the engine and the servicer are
+    # built from them, so SubscribeKvEvents relays the events a cache-aware
+    # router routes by (the rule, the opt-out and the log line of
+    # `RustLauncher.serve`), unless the engine cannot serve the publisher for
+    # this model (a hybrid model's State groups, which its KV-event drain
+    # aborts on: `kv_events_unpublishable`, read off the model config the
+    # engine builds, which costs one read of the checkpoint's config here);
+    # a host with no free block of ports is refused as on the Rust path: one
+    # named ERROR line and exit code 2, not a traceback. An encode worker runs
+    # the vision tower only, with no KV cache to publish from: its server args
+    # are left as given.
+    encode_worker = server_args.disaggregation_mode == "encode"
+    try:
+        if not encode_worker and default_kv_events_config(server_args) is not None:
+            announce_kv_events_default("TokenSpeed", KV_EVENTS_ENV, logger)
+    except ServicerConfigError as error:
+        raise configuration_exit(error, logger) from None
 
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
@@ -316,9 +346,10 @@ def _wait_and_warmup(
     # engine is alive.
     deadline = time.time() + 180
     connected = False
+    model_info = None
     while time.time() < deadline:
         try:
-            stub.GetModelInfo(
+            model_info = stub.GetModelInfo(
                 tokenspeed_scheduler_pb2.GetModelInfoRequest(),
                 timeout=5,
             )
@@ -361,6 +392,13 @@ def _wait_and_warmup(
             warmup_ok = True
     except Exception as e:  # noqa: BLE001
         logger.warning("TokenSpeed warmup failed: %s", e)
+    try:
+        # The one-token request reached the scheduler; the planned warm-up
+        # (every running-batch size and prefill token count the engine's
+        # configuration admits, :mod:`smg_grpc_servicer.warmup`) runs over
+        # the same channel before the health flips, under its budget.
+        if warmup_ok:
+            planned_warmup(server_args, model_info, channel)
     finally:
         channel.close()
 
@@ -370,3 +408,36 @@ def _wait_and_warmup(
     else:
         # Stays NOT_SERVING so K8s readiness keeps this worker out of rotation.
         logger.error("TokenSpeed gRPC warmup did not produce a complete frame")
+
+
+def planned_warmup(server_args: Any, model_info: Any, channel: Any) -> Any:
+    """The planned warm-up over ``channel`` (the servicer's own port):
+    the plan from the server arguments and the advertised model facts, the
+    level and budget from :data:`WARMUP_ENV`. The pass is an optimisation: a
+    failed request is a logged line, and a failure of the pass itself (a
+    thread the host refuses, an argument an engine release lacks) is one
+    ERROR line, never a reason to stay NOT_SERVING (the one-token request
+    already proved the path, and a raise would leave the caller before it
+    flips the health). Returns the report, or ``None`` when nothing ran or
+    the pass failed."""
+    try:
+        return _planned_warmup(server_args, model_info, channel)
+    except Exception:  # noqa: BLE001 -- the pass is an optimisation; the server serves without it
+        logger.exception("The planned warm-up failed; the server serves without it")
+        return None
+
+
+def _planned_warmup(server_args: Any, model_info: Any, channel: Any) -> Any:
+    try:
+        setting = parse_setting(os.environ.get(WARMUP_ENV), name=WARMUP_ENV)
+    except ValueError as error:
+        logger.warning("%s; the planned warm-up is skipped", error)
+        return None
+    facts = {
+        "max_context_length": getattr(model_info, "max_context_length", 0),
+        "vocab_size": getattr(model_info, "vocab_size", 0),
+    }
+    plan = plan_for(setting, warmup_inputs(server_args, facts), knob=WARMUP_ENV)
+    if plan is None:
+        return None
+    return run_warmup(plan, warmup_wire("", channel=channel), budget_secs=setting.budget_secs)

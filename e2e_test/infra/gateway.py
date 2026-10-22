@@ -112,7 +112,7 @@ class Gateway:
         self.log_path: str | None = None
         self._log_file: IO[Any] | None = None
         self._log_is_temporary = False
-        # The leg workers a PD/EPD gateway was started with (tests kill and restart them).
+        # The PD workers a PD/EPD gateway was started with (tests kill and restart them).
         self.encode_workers: list[Worker] = []
         self.prefill_workers: list[Worker] = []
         self.decode_workers: list[Worker] = []
@@ -582,15 +582,18 @@ class Gateway:
         labels: dict[str, str] | None = None,
         worker_type: str | None = None,
         bootstrap_port: int | None = None,
+        spec: dict | None = None,
     ) -> tuple[bool, str | None]:
         """Add a worker to the gateway. Returns (success, worker_id or error).
 
         ``labels`` are attached to the worker's ``WorkerSpec`` (e.g.
         ``{"realtime": "true"}`` to make it eligible for realtime routing).
         ``worker_type`` (``"prefill"``/``"decode"``/``"encode"``) and the
-        prefill ``bootstrap_port`` register a disaggregated leg at runtime.
+        prefill ``bootstrap_port`` register a disaggregated worker at runtime.
+        ``spec`` adds other ``WorkerSpec`` fields (``kv_connector``,
+        ``kv_role``, ``runtime_type``, ``connection_mode``).
         """
-        body: dict = {"url": worker_url}
+        body: dict = {"url": worker_url, **(spec or {})}
         if labels:
             body["labels"] = labels
         if worker_type:

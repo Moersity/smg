@@ -2115,3 +2115,607 @@ fn m3_number_fragments_carry_the_definitions_they_reference() {
         "a reference followed to its target needs no definitions"
     );
 }
+
+/// A schema of `k` properties per object over `d` levels, the leaves strings: k^d leaves.
+fn fan_out(k: usize, d: usize) -> serde_json::Value {
+    if d == 0 {
+        return json!({"type": "string"});
+    }
+    let properties: serde_json::Map<String, serde_json::Value> = (0..k)
+        .map(|i| (format!("p{i}"), fan_out(k, d - 1)))
+        .collect();
+    let required: Vec<String> = (0..k).map(|i| format!("p{i}")).collect();
+    json!({"type": "object", "properties": properties, "required": required})
+}
+
+/// The elements a tag writes: one per opening tag the writer spells.
+fn elements_written(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Object(object) => {
+            let opener = object.get("type").and_then(serde_json::Value::as_str)
+                == Some("const_string")
+                && object
+                    .get("value")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|text| {
+                        text.starts_with(&format!("{NS}<")) && !text.starts_with(&format!("{NS}</"))
+                    });
+            usize::from(opener) + object.values().map(elements_written).sum::<usize>()
+        }
+        serde_json::Value::Array(items) => items.iter().map(elements_written).sum(),
+        _ => 0,
+    }
+}
+
+/// The free-text runs a tag holds: any text whose excludes do not name the separator (a typed
+/// string's text excludes it; an untyped value's, a recurring reference's and the rest of an
+/// object past the budget do not).
+fn free_text_runs(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Object(object) => {
+            let free = object.get("type").and_then(serde_json::Value::as_str) == Some("any_text")
+                && object
+                    .get("excludes")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|excludes| !excludes.iter().any(|e| e == NS));
+            usize::from(free) + object.values().map(free_text_runs).sum::<usize>()
+        }
+        serde_json::Value::Array(items) => items.iter().map(free_text_runs).sum(),
+        _ => 0,
+    }
+}
+
+/// An acyclic schema with a wide fan-out unfolds as k^d elements; the invoke's element budget
+/// bounds it: 1024 elements are written, the rest of each object past the budget is free text,
+/// and the tag stays small. A schema just under the budget is written in full, nothing falling
+/// back.
+#[test]
+fn m3_a_wide_fan_out_stays_within_the_element_budget() {
+    let wide = schema_tool(fan_out(8, 4)); // 8 + 64 + 512 + 4096 = 4680 elements unbounded
+    let tag = MinimaxM3Parser::build_structural_tag(&[wide], true);
+    let text = serde_json::to_string(&tag).unwrap();
+    assert_eq!(elements_written(&tag), 1024, "the budget, not 4680");
+    assert!(text.len() < 320_000, "{} bytes", text.len());
+    assert!(
+        free_text_runs(&tag) >= 1,
+        "the rest of an object past the budget is free text"
+    );
+    let deep = schema_tool(fan_out(4, 5)); // 1364 elements unbounded
+    let tag = MinimaxM3Parser::build_structural_tag(&[deep], true);
+    assert_eq!(elements_written(&tag), 1024);
+
+    let under = schema_tool(fan_out(31, 2)); // 31 + 961 = 992 elements
+    let tag = MinimaxM3Parser::build_structural_tag(&[under], true);
+    assert_eq!(elements_written(&tag), 992, "written in full");
+    assert_eq!(free_text_runs(&tag), 0, "nothing fell back");
+}
+
+/// The budget is spent depth first, but a property written first cannot take the elements its
+/// later siblings need: each keeps one, so the top-level arguments stay typed and the nested
+/// object loses its structure from the inside out.
+#[test]
+fn m3_a_wide_property_leaves_each_later_sibling_its_element() {
+    let mut properties = serde_json::Map::new();
+    properties.insert("config".to_string(), fan_out(8, 4)); // 4680 elements unbounded
+    properties.insert("path".to_string(), json!({"type": "string"}));
+    properties.insert("count".to_string(), json!({"type": "integer"}));
+    let tool = schema_tool(json!({
+        "type": "object",
+        "properties": properties,
+        "required": ["config", "path", "count"],
+    }));
+    let tag = MinimaxM3Parser::build_structural_tag(&[tool], true);
+    assert_eq!(elements_written(&tag), 1024, "the budget, not 4682");
+    let members = first_invoke(&tag)["elements"].clone();
+    assert_eq!(
+        members.as_array().map(Vec::len),
+        Some(3),
+        "every top-level property has its element: {members}"
+    );
+    assert_eq!(members[1], expected_element("path", expected_text("path")));
+    assert_eq!(
+        members[2],
+        expected_element(
+            "count",
+            json!({"type": "json_schema", "json_schema": {"type": "integer"}})
+        )
+    );
+    assert!(
+        free_text_runs(&members[0]) >= 1,
+        "the wide object is where the budget ran out"
+    );
+
+    // An object whose budget is one element per property writes each property's tag and nothing
+    // inside the objects below: the structure goes from the inside out.
+    let mut thin = serde_json::Map::new();
+    for i in 0..1000 {
+        thin.insert(format!("s{i:04}"), json!({"type": "string"}));
+    }
+    thin.insert("znest".to_string(), fan_out(30, 2)); // 930 elements unbounded
+    thin.insert("zlast".to_string(), json!({"type": "boolean"}));
+    let required: Vec<String> = thin.keys().cloned().collect();
+    let tool = schema_tool(json!({"type": "object", "properties": thin, "required": required}));
+    let tag = MinimaxM3Parser::build_structural_tag(&[tool], true);
+    let members = first_invoke(&tag)["elements"].clone();
+    assert_eq!(members.as_array().map(Vec::len), Some(1002));
+    assert_eq!(
+        members[1001],
+        expected_element(
+            "zlast",
+            json!({"type": "or", "elements": [
+                {"type": "const_string", "value": "true"},
+                {"type": "const_string", "value": "false"},
+                {"type": "const_string", "value": "True"},
+                {"type": "const_string", "value": "False"},
+            ]})
+        ),
+        "the last sibling keeps its element and its type"
+    );
+    assert_eq!(elements_written(&tag), 1024);
+}
+
+/// A property typed `null` writes nothing and costs nothing: neither an element of its own nor one
+/// held for it as a later sibling, so the properties that do write still get the whole budget.
+#[test]
+fn m3_null_properties_cost_no_element() {
+    // 1,023 strings, a null, a required boolean: 1,024 elements written, the boolean typed.
+    let mut properties = serde_json::Map::new();
+    for i in 0..1023 {
+        properties.insert(format!("s{i:04}"), json!({"type": "string"}));
+    }
+    properties.insert("unull".to_string(), json!({"type": "null"}));
+    properties.insert("zflag".to_string(), json!({"type": "boolean"}));
+    let required: Vec<String> = properties.keys().cloned().collect();
+    let tool =
+        schema_tool(json!({"type": "object", "properties": properties, "required": required}));
+    let tag = MinimaxM3Parser::build_structural_tag(&[tool], true);
+    assert_eq!(elements_written(&tag), 1024);
+    assert_eq!(free_text_runs(&tag), 0, "nothing fell back");
+    let members = first_invoke(&tag)["elements"].clone();
+    assert_eq!(
+        members.as_array().map(Vec::len),
+        Some(1024),
+        "the null property is left out"
+    );
+    assert_eq!(
+        members[1023],
+        expected_element(
+            "zflag",
+            json!({"type": "or", "elements": [
+                {"type": "const_string", "value": "true"},
+                {"type": "const_string", "value": "false"},
+                {"type": "const_string", "value": "True"},
+                {"type": "const_string", "value": "False"},
+            ]})
+        ),
+        "the boolean keeps its grammar"
+    );
+
+    // A null among the later siblings of a wide property holds no element: the wide property's
+    // descent gets it, and the string after both still has its own.
+    let mut properties = serde_json::Map::new();
+    properties.insert("config".to_string(), fan_out(8, 4));
+    properties.insert("none".to_string(), json!({"type": "null"}));
+    properties.insert("path".to_string(), json!({"type": "string"}));
+    let tool = schema_tool(json!({
+        "type": "object",
+        "properties": properties,
+        "required": ["config", "none", "path"],
+    }));
+    let tag = MinimaxM3Parser::build_structural_tag(&[tool], true);
+    assert_eq!(
+        elements_written(&tag),
+        1024,
+        "no element is held for the null sibling"
+    );
+    let members = first_invoke(&tag)["elements"].clone();
+    assert_eq!(members.as_array().map(Vec::len), Some(2));
+    assert_eq!(members[1], expected_element("path", expected_text("path")));
+
+    // A null after the last writer of an object that spent the budget adds nothing: no free-text
+    // tail after the typed top-level arguments, whether the budget ran out below (the wide
+    // property) or exactly on the last writer (1,024 strings).
+    let mut properties = serde_json::Map::new();
+    properties.insert("config".to_string(), fan_out(8, 4));
+    properties.insert("path".to_string(), json!({"type": "string"}));
+    properties.insert("zz".to_string(), json!({"type": "null"}));
+    let tool = schema_tool(json!({
+        "type": "object",
+        "properties": properties,
+        "required": ["config", "path", "zz"],
+    }));
+    let tag = MinimaxM3Parser::build_structural_tag(&[tool], true);
+    let members = first_invoke(&tag)["elements"].clone();
+    assert_eq!(members.as_array().map(Vec::len), Some(2), "{members}");
+    assert_eq!(members[1], expected_element("path", expected_text("path")));
+    assert_eq!(elements_written(&tag), 1024);
+    let mut properties = serde_json::Map::new();
+    for i in 0..1024 {
+        properties.insert(format!("s{i:04}"), json!({"type": "string"}));
+    }
+    properties.insert("zz".to_string(), json!({"type": "null"}));
+    let required: Vec<String> = properties.keys().cloned().collect();
+    let tool =
+        schema_tool(json!({"type": "object", "properties": properties, "required": required}));
+    let tag = MinimaxM3Parser::build_structural_tag(&[tool], true);
+    assert_eq!(elements_written(&tag), 1024);
+    assert_eq!(free_text_runs(&tag), 0, "no tail after the last string");
+}
+
+/// The keys of an object's elements, in order: the key each opening tag spells, an optional
+/// element unwrapped.
+fn element_keys(members: &serde_json::Value) -> Vec<String> {
+    members["elements"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|element| {
+            let element = if element["type"] == "optional" {
+                &element["content"]
+            } else {
+                element
+            };
+            let opener = element["elements"][0]["value"].as_str()?;
+            Some(
+                opener
+                    .trim_start_matches(NS)
+                    .trim_start_matches('<')
+                    .trim_end_matches('>')
+                    .to_string(),
+            )
+        })
+        .collect()
+}
+
+/// Exactly the properties that are not `null` have elements, whatever shape the schema takes: a
+/// reference chain, a pointer at nothing, a reference that recurs, `null` written out or behind
+/// a reference; and a nest past the depth cap keeps an element at every level, the innermost
+/// free text. One classification decides both the count the budget holds and the writing, so no
+/// property is dropped and none is charged without an element.
+#[test]
+fn m3_every_property_but_a_null_one_has_its_element() {
+    let tool = schema_tool(json!({
+        "type": "object",
+        "$defs": {
+            "S": {"type": "string"},
+            "N": {"type": "null"},
+            "Chain1": {"$ref": "#/$defs/Chain2"},
+            "Chain2": {"$ref": "#/$defs/S"},
+            "Loop": {"$ref": "#/$defs/Loop"},
+        },
+        "properties": {
+            "a_string": {"type": "string"},
+            "b_chain": {"$ref": "#/$defs/Chain1"},
+            "c_missing": {"$ref": "#/$defs/Missing"},
+            "d_loop": {"$ref": "#/$defs/Loop"},
+            "e_null": {"type": "null"},
+            "f_null_ref": {"$ref": "#/$defs/N"},
+            "g_last": {"type": "boolean"},
+        },
+        "required": ["a_string", "b_chain", "c_missing", "d_loop", "e_null", "f_null_ref", "g_last"],
+    }));
+    let tag = MinimaxM3Parser::build_structural_tag(&[tool], true);
+    let members = first_invoke(&tag);
+    assert_eq!(
+        element_keys(&members),
+        ["a_string", "b_chain", "c_missing", "d_loop", "g_last"]
+    );
+    assert_eq!(elements_written(&tag), 5, "each writer costs one element");
+    assert_eq!(
+        members["elements"][1],
+        expected_element("b_chain", expected_text("b_chain"))
+    );
+    assert_eq!(
+        free_text_runs(&tag),
+        2,
+        "the pointer at nothing and the reference that recurs are free text"
+    );
+
+    // Seventeen objects, each the one property of the one above: an element at every level, the
+    // innermost past the depth cap written as free text.
+    let tag = MinimaxM3Parser::build_structural_tag(&[schema_tool(fan_out(1, 17))], true);
+    assert_eq!(elements_written(&tag), 17);
+    assert_eq!(free_text_runs(&tag), 1);
+}
+
+/// The `json_schema` leaves a tag holds, in order.
+fn fragments(value: &serde_json::Value) -> Vec<serde_json::Value> {
+    match value {
+        serde_json::Value::Object(object) => {
+            if object.get("type").and_then(serde_json::Value::as_str) == Some("json_schema") {
+                return vec![object["json_schema"].clone()];
+            }
+            object.values().flat_map(fragments).collect()
+        }
+        serde_json::Value::Array(items) => items.iter().flat_map(fragments).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// How many `or` nodes of `width` alternatives a tag holds: the enums spelled out.
+fn enums_spelled(value: &serde_json::Value, width: usize) -> usize {
+    match value {
+        serde_json::Value::Object(object) => {
+            let spelled = object.get("type").and_then(serde_json::Value::as_str) == Some("or")
+                && object
+                    .get("elements")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|elements| elements.len() == width);
+            usize::from(spelled)
+                + object
+                    .values()
+                    .map(|v| enums_spelled(v, width))
+                    .sum::<usize>()
+        }
+        serde_json::Value::Array(items) => items.iter().map(|v| enums_spelled(v, width)).sum(),
+        _ => 0,
+    }
+}
+
+/// A number's fragment carries the definitions its pointers reach, directly or through one
+/// another, and no other: a large definition elsewhere under `$defs` does not travel with it, as
+/// in the symphony crate's writer.
+#[test]
+fn m3_a_fragment_carries_only_the_definitions_it_reaches() {
+    let words: Vec<String> = (0..2000).map(|i| format!("word_{i:04}")).collect();
+    let tool = schema_tool(json!({
+        "type": "object",
+        "$defs": {
+            "Count": {"$ref": "#/$defs/Positive"},
+            "Positive": {"type": "integer", "minimum": 1},
+            "Big": {"type": "string", "enum": words},
+        },
+        "properties": {"n": {"type": "integer", "anyOf": [{"$ref": "#/$defs/Count"}, {"type": "integer", "maximum": 0}]}},
+        "required": ["n"],
+    }));
+    let tag = MinimaxM3Parser::build_structural_tag(&[tool], true);
+    let leaves = fragments(&tag);
+    assert_eq!(leaves.len(), 1);
+    let defs = leaves[0]["$defs"]
+        .as_object()
+        .expect("the reached definitions");
+    let mut names: Vec<&str> = defs.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        ["Count", "Positive"],
+        "reached through one another; Big is not"
+    );
+    assert!(
+        serde_json::to_string(&tag).unwrap().len() < 4_000,
+        "the 2,000 words stay home"
+    );
+}
+
+/// The leaves' byte budget: a 5,000-word enum reached by 32 x 32 number leaves through `not`
+/// travelled with every fragment (about 110 MB of grammar from a 113 KB request); now it travels
+/// while the budget lasts, and the leaves after that are free text, the tag well under a megabyte.
+#[test]
+fn m3_number_fragments_past_the_byte_budget_are_free_text() {
+    let words: Vec<String> = (0..5000).map(|i| format!("option_number_{i:05}")).collect();
+    let row: serde_json::Map<String, serde_json::Value> = (0..32)
+        .map(|i| {
+            (
+                format!("n{i:02}"),
+                json!({"type": "number", "not": {"$ref": "#/$defs/Big"}}),
+            )
+        })
+        .collect();
+    let row_required: Vec<String> = row.keys().cloned().collect();
+    let root: serde_json::Map<String, serde_json::Value> = (0..32)
+        .map(|i| (format!("r{i:02}"), json!({"$ref": "#/$defs/Row"})))
+        .collect();
+    let required: Vec<String> = root.keys().cloned().collect();
+    let tool = schema_tool(json!({
+        "type": "object",
+        "$defs": {
+            "Big": {"type": "string", "enum": words},
+            "Row": {"type": "object", "properties": row, "required": row_required},
+        },
+        "properties": root,
+        "required": required,
+    }));
+    let tag = MinimaxM3Parser::build_structural_tag(&[tool], true);
+    let text = serde_json::to_string(&tag).unwrap();
+    assert!(text.len() < 700_000, "{} bytes", text.len());
+    let leaves = fragments(&tag);
+    assert!(
+        (1..=3).contains(&leaves.len()),
+        "the definition travels while the budget lasts: {} fragments",
+        leaves.len()
+    );
+    assert!(leaves.iter().all(|leaf| leaf["$defs"]["Big"]["enum"]
+        .as_array()
+        .is_some_and(|w| w.len() == 5000)));
+    assert_eq!(elements_written(&tag), 1024, "the element budget stands");
+    assert!(
+        free_text_runs(&tag) >= 900,
+        "the number leaves past the budget are free text: {}",
+        free_text_runs(&tag)
+    );
+}
+
+/// An enum reused through a reference is spelled out while the budget lasts; the properties after
+/// that take text as it is, typed as strings still.
+#[test]
+fn m3_an_enum_reused_through_references_stops_at_the_byte_budget() {
+    let words: Vec<String> = (0..2000).map(|i| format!("choice_{i:04}")).collect();
+    let properties: serde_json::Map<String, serde_json::Value> = (0..30)
+        .map(|i| (format!("e{i:02}"), json!({"$ref": "#/$defs/E"})))
+        .collect();
+    let required: Vec<String> = properties.keys().cloned().collect();
+    let tool = schema_tool(json!({
+        "type": "object",
+        "$defs": {"E": {"type": "string", "enum": words}},
+        "properties": properties,
+        "required": required,
+    }));
+    let tag = MinimaxM3Parser::build_structural_tag(&[tool], true);
+    let text = serde_json::to_string(&tag).unwrap();
+    // One copy is 2,000 words of 11 bytes plus their framing, about 94 KB: two fit, the third
+    // does not.
+    assert_eq!(enums_spelled(&tag, 2000), 2, "{} bytes", text.len());
+    assert!(text.len() < 400_000, "{} bytes", text.len());
+    let members = first_invoke(&tag)["elements"].clone();
+    assert_eq!(
+        members[2],
+        expected_element("e02", expected_text("e02")),
+        "typed text, no enum"
+    );
+    assert_eq!(members[29], expected_element("e29", expected_text("e29")));
+    assert_eq!(free_text_runs(&tag), 0, "nothing untyped");
+}
+
+/// A hub definition that reaches thousands of small ones, from a thousand number leaves: the walk
+/// behind each leaf stops at the budget and is remembered per leaf, so the tag stays small and the
+/// build stays quick however many definitions a refused leaf would have reached.
+#[test]
+fn m3_a_hub_of_thousands_of_definitions_is_walked_within_the_budget() {
+    let mut defs = serde_json::Map::new();
+    let branches: Vec<serde_json::Value> = (0..4000)
+        .map(|i| {
+            defs.insert(format!("d{i:05}"), json!({}));
+            json!({"$ref": format!("#/$defs/d{i:05}")})
+        })
+        .collect();
+    defs.insert("Hub".to_string(), json!({"anyOf": branches}));
+    let row: serde_json::Map<String, serde_json::Value> = (0..32)
+        .map(|i| {
+            (
+                format!("n{i:02}"),
+                json!({"type": "number", "not": {"$ref": "#/$defs/Hub"}}),
+            )
+        })
+        .collect();
+    let row_required: Vec<String> = row.keys().cloned().collect();
+    defs.insert(
+        "Row".to_string(),
+        json!({"type": "object", "properties": row, "required": row_required}),
+    );
+    let root: serde_json::Map<String, serde_json::Value> = (0..32)
+        .map(|i| (format!("r{i:02}"), json!({"$ref": "#/$defs/Row"})))
+        .collect();
+    let required: Vec<String> = root.keys().cloned().collect();
+    let tool = schema_tool(json!({
+        "type": "object",
+        "$defs": defs,
+        "properties": root,
+        "required": required,
+    }));
+    let started = std::time::Instant::now();
+    let tag = MinimaxM3Parser::build_structural_tag(&[tool], true);
+    let took = started.elapsed();
+    let text = serde_json::to_string(&tag).unwrap();
+    assert!(text.len() < 700_000, "{} bytes", text.len());
+    assert_eq!(elements_written(&tag), 1024);
+    // The hub and its four thousand entries are about 120 KB: they travel with the first leaves
+    // while the budget lasts, and the leaves after that are free text without walking the hub.
+    let leaves = fragments(&tag);
+    assert!(
+        (1..=3).contains(&leaves.len()),
+        "{} fragments",
+        leaves.len()
+    );
+    assert!(leaves.iter().all(|leaf| leaf["$defs"]["Hub"].is_object()));
+    assert!(
+        took.as_secs() < 5,
+        "the walk is bounded by the budget and remembered per leaf: {took:?}"
+    );
+}
+
+/// A hub of 6,300 one-word definitions whose closure sits just past the byte budget, reached by
+/// 1,023 number leaves written inline, each its own schema, and a plain integer after them: a
+/// refused walk spends none of the leaves' budget, so the walks have an allowance of their own,
+/// the leaves after it are free text without a walk, and the integer, which walks nothing, is a
+/// fragment still.
+#[test]
+fn m3_distinct_leaves_at_a_hub_past_the_budget_stop_walking() {
+    let mut defs = serde_json::Map::new();
+    let branches: Vec<serde_json::Value> = (0..6300)
+        .map(|i| {
+            defs.insert(format!("d{i:05}"), json!({"type": "string"}));
+            json!({"$ref": format!("#/$defs/d{i:05}")})
+        })
+        .collect();
+    defs.insert("Hub".to_string(), json!({"anyOf": branches}));
+    let mut root: serde_json::Map<String, serde_json::Value> = (0..1023)
+        .map(|i| {
+            (
+                format!("n{i:04}"),
+                json!({"type": "number", "not": {"$ref": "#/$defs/Hub"}}),
+            )
+        })
+        .collect();
+    root.insert(
+        "plain".to_string(),
+        json!({"type": "integer", "minimum": 0}),
+    );
+    let required: Vec<String> = root.keys().cloned().collect();
+    let tool = schema_tool(json!({
+        "type": "object",
+        "$defs": defs,
+        "properties": root,
+        "required": required,
+    }));
+    let started = std::time::Instant::now();
+    let tag = MinimaxM3Parser::build_structural_tag(&[tool], true);
+    let took = started.elapsed();
+    let text = serde_json::to_string(&tag).unwrap();
+    assert!(text.len() < 400_000, "{} bytes", text.len());
+    assert_eq!(elements_written(&tag), 1024);
+    let leaves = fragments(&tag);
+    assert_eq!(leaves.len(), 1, "the plain integer's fragment alone");
+    assert_eq!(leaves[0]["type"], "integer");
+    assert!(
+        free_text_runs(&tag) >= 1000,
+        "{} free-text runs",
+        free_text_runs(&tag)
+    );
+    assert!(
+        took.as_secs() < 5,
+        "an allowance bounds the refused walks: {took:?}"
+    );
+}
+
+/// A list's item element counts against the budget like a property's; a list reached once the
+/// budget is spent is free text.
+#[test]
+fn m3_lists_count_against_the_element_budget() {
+    let lists = schema_tool(json!({
+        "type": "object",
+        "properties": {
+            "a": {"type": "array", "items": {"type": "object", "properties": {"x": {"type": "string"}}, "required": ["x"]}},
+        },
+        "required": ["a"],
+    }));
+    let tag = MinimaxM3Parser::build_structural_tag(&[lists], true);
+    assert_eq!(
+        elements_written(&tag),
+        3,
+        "the property, its item, the item's property"
+    );
+    assert_eq!(free_text_runs(&tag), 0);
+
+    // 1023 string properties, then a list: the list is the 1024th element, its item is past the
+    // budget and free text.
+    let mut properties = serde_json::Map::new();
+    let mut required = Vec::new();
+    for i in 0..1023 {
+        properties.insert(format!("s{i:04}"), json!({"type": "string"}));
+        required.push(json!(format!("s{i:04}")));
+    }
+    properties.insert(
+        "zlist".to_string(),
+        json!({"type": "array", "items": {"type": "string"}}),
+    );
+    required.push(json!("zlist"));
+    let edge =
+        schema_tool(json!({"type": "object", "properties": properties, "required": required}));
+    let tag = MinimaxM3Parser::build_structural_tag(&[edge], true);
+    assert_eq!(elements_written(&tag), 1024);
+    assert_eq!(
+        free_text_runs(&tag),
+        1,
+        "the list's content is free text once the budget is spent"
+    );
+}

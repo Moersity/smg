@@ -35,18 +35,24 @@ from collections.abc import Mapping
 from typing import Any
 
 from smg_grpc_servicer.constrained_decoding import (
+    grammar_backend_entry,
     grammar_start_labels,
     tokenspeed_constrained_decoding_start,
+    tokenspeed_grammar_backend,
 )
+from smg_grpc_servicer.metrics_flag import add_metrics_arguments as _add_metrics_arguments
 from smg_grpc_servicer.pd_pairing import pairing_protocol_from_env
 
-# The lifecycle's defaults and the switch's choices, re-exported: this
-# launcher's own documented values.
+# The lifecycle's defaults and the switch's flag and choices, re-exported:
+# this launcher's own documented values.
 from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     DEFAULT_DRAIN_SECS,
+    DEFAULT_PREFILL_TOKENS_PER_SEC,
+    DEFAULT_SILENCE_TIMEOUT_SECS,
     DEFAULT_STARTUP_CEILING_SECS,
     DEFAULT_STARTUP_TIMEOUT_SECS,
     IMPLS,
+    SERVICER_IMPL_FLAG,
     EngineProcess,
     EngineProcessGroup,
     FaultLatch,
@@ -59,10 +65,15 @@ from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     servicer_switch,
     wait_for_ready_reports,
 )
+from smg_grpc_servicer.servicer_impl_flag import (
+    add_servicer_impl_argument as _add_servicer_impl_argument,
+)
+from smg_grpc_servicer.tokenspeed import METRICS_HOST_ENV, METRICS_PORT_ENV
 from smg_grpc_servicer.tokenspeed.config_view import EngineConfigView
 from smg_grpc_servicer.tokenspeed.kv_events import resolve_kv_events_config
 from smg_grpc_servicer.tokenspeed.loads import running_window
 from smg_grpc_servicer.tokenspeed.redact import redact_secrets
+from smg_grpc_servicer.tokenspeed.warmup import WARMUP_ENV, warmup_inputs, warmup_wire
 
 logger = logging.getLogger(__name__)
 
@@ -71,34 +82,43 @@ HANDSHAKE_PORT_ENV = "SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT"
 DRAIN_SECS_ENV = "SMG_TOKENSPEED_SERVICER_DRAIN_SECS"
 STARTUP_TIMEOUT_SECS_ENV = "SMG_TOKENSPEED_SERVICER_STARTUP_TIMEOUT_SECS"
 STARTUP_CEILING_SECS_ENV = "SMG_TOKENSPEED_SERVICER_STARTUP_CEILING_SECS"
+SILENCE_TIMEOUT_SECS_ENV = "SMG_TOKENSPEED_SERVICER_SILENCE_TIMEOUT_SECS"
+PREFILL_TOKENS_PER_SEC_ENV = "SMG_TOKENSPEED_SERVICER_PREFILL_TOKENS_PER_SEC"
 # Set to 0/false/no/off to keep TokenSpeed's KV event publisher off when the
 # launcher was given no --kv-events-config (see `default_kv_events_config`).
 KV_EVENTS_ENV = "SMG_TOKENSPEED_SERVICER_KV_EVENTS"
-# What a launcher without --kv-events-config gets under the Rust servicer:
-# the ZMQ publisher, with TokenSpeed's own defaults for the rest (the
-# endpoint, the topic).
-DEFAULT_KV_EVENTS_CONFIG = '{"enable_kv_cache_events": true, "publisher": "zmq"}'
-SERVICER_IMPL_FLAG = "--servicer-impl"
+
+
+def default_kv_events_json(endpoint: str) -> str:
+    """What a launcher without --kv-events-config gets under the Rust servicer,
+    as TokenSpeed's server args carry it (JSON text): the ZMQ publisher at
+    ``endpoint``, with TokenSpeed's own defaults for the rest (the topic)."""
+    return json.dumps({"enable_kv_cache_events": True, "publisher": "zmq", "endpoint": endpoint})
 
 
 def add_servicer_impl_argument(parser: argparse.ArgumentParser) -> bool:
     """Add ``--servicer-impl`` to a launcher's parser that lacks it; returns
     whether it was added."""
-    actions = parser._option_string_actions  # noqa: SLF001 — argparse's registry of option strings
-    if SERVICER_IMPL_FLAG in actions:
-        return False
-    parser.add_argument(
-        SERVICER_IMPL_FLAG,
-        dest="servicer_impl",
-        choices=list(IMPLS),
-        default=None,
+    return _add_servicer_impl_argument(
+        parser,
         help=(
             "Which implementation serves the gRPC contract: the Python servicer (default) "
             "or the Rust one (smg.servicer.TokenSpeedGrpcServer, with the scheduler(s) "
             f"headless). Unset falls back to ${SERVICER_IMPL_ENV}."
         ),
     )
-    return True
+
+
+def add_metrics_arguments(parser: argparse.ArgumentParser) -> bool:
+    """Add ``--metrics-port`` and ``--metrics-host`` (the Rust servicer's
+    Prometheus endpoint) to a launcher's parser that lacks them; returns
+    whether they were added."""
+    return _add_metrics_arguments(
+        parser,
+        port_env=METRICS_PORT_ENV,
+        host_env=METRICS_HOST_ENV,
+        server_class="smg.servicer.TokenSpeedGrpcServer",
+    )
 
 
 def resolve_servicer_impl(args: Any = None, environ: Mapping[str, str] | None = None) -> str:
@@ -147,6 +167,45 @@ def _dtype_name(dtype: Any) -> str:
     return text.removeprefix("torch.")
 
 
+def _config_section(config: Any, name: str) -> Any:
+    """``config[name]`` or ``config.name``, ``None`` when absent."""
+    if isinstance(config, Mapping):
+        return config.get(name)
+    return getattr(config, name, None)
+
+
+def mrope_positions(hf_config: Any) -> bool | None:
+    """Whether the language model's rotary positions are MRoPE, read off the
+    checkpoint's text rope config: ``rope_scaling`` / ``rope_parameters`` (on the
+    text config when the checkpoint nests one, and the top level) with an
+    ``mrope_section``, or a rope type named ``mrope``. A checkpoint whose rope
+    config is plain (``rope_type: default`` with no section) uses 1-D positions,
+    so its vision grid tensors only lay out the patches. ``None`` when the
+    config carries no rope section at all."""
+    if hf_config is None:
+        return None
+    # Both the nested text config and the top level are read: a config class
+    # may fill a plain rope default on one while the checkpoint declares its
+    # MRoPE section on the other, and either declaration means MRoPE.
+    sections = [hf_config]
+    text = _config_section(hf_config, "text_config")
+    if text is not None:
+        sections.insert(0, text)
+    found = False
+    for section in sections:
+        for key in ("rope_scaling", "rope_parameters"):
+            rope = _config_section(section, key)
+            if rope is None:
+                continue
+            found = True
+            if _config_section(rope, "mrope_section") is not None:
+                return True
+            kind = _config_section(rope, "rope_type") or _config_section(rope, "type")
+            if isinstance(kind, str) and "mrope" in kind:
+                return True
+    return False if found else None
+
+
 def model_facts(server_args: Any, model_config: Any | None = None) -> dict[str, Any]:
     """``TokenSpeedGrpcServer`` keyword arguments for ``GetModelInfo``: the
     Python servicer's ``GetModelInfo`` fields, computed up front."""
@@ -170,10 +229,14 @@ def model_facts(server_args: Any, model_config: Any | None = None) -> dict[str, 
         "eos_token_ids": model.eos_token_ids,
         "pad_token_id": model.pad_token_id,
         "bos_token_id": model.bos_token_id,
+        # The engine's declared constrained-decoding policy: off the server args,
+        # else the model config, as the Python servicer reads it.
+        "constrained_decoding": view.constrained_decoding,
         "default_sampling_params_json": str(args.preferred_sampling_params or ""),
         "supports_vision": any(modality in (1, 3) for modality in supported_modalities),
         "supports_multimodal": bool(supported_modalities),
         "supported_modalities": [int(modality) for modality in supported_modalities],
+        "mrope_positions": mrope_positions(model.hf_config),
         "model_dtype": dtype,
         "multimodal_encoder_dtype": dtype,
     }
@@ -199,6 +262,11 @@ def server_facts(server_args: Any) -> dict[str, Any]:
     # The engine's reasoning parser and where it starts a grammar on a thinking
     # prompt, as the Python servicer adds them.
     args_dict.update(grammar_start_labels(server_args, tokenspeed_constrained_decoding_start()))
+    # The grammar backend the scheduler runs, resolved (an unset flag is the
+    # checkpoint's default, which the engine may not have read yet): the Rust
+    # servicer refuses a constraint that backend cannot enforce before the
+    # scheduler, and judges nothing when the backend is not known.
+    grammar_backend_entry(args_dict, tokenspeed_grammar_backend(server_args))
     kv_events = resolve_kv_events_config(server_args)
     try:
         from tokenspeed.version import __version__ as tokenspeed_version
@@ -218,16 +286,86 @@ def server_facts(server_args: Any) -> dict[str, Any]:
     }
 
 
+def cache_layer_labels(model_config: Any) -> tuple[str, ...]:
+    """The served model's per-layer cache-group labels, read as TokenSpeed's
+    cache recipes read them off its ``ModelConfig`` (the checkpoint's
+    ``cache_layer_types``, else its ``layer_types``, on the config the engine
+    holds, else on the text config nested in it); empty for a checkpoint that
+    declares none, whose layers are all full attention."""
+    hf_config = getattr(model_config, "hf_config", None)
+    for config in (hf_config, getattr(hf_config, "text_config", None)):
+        labels = getattr(config, "cache_layer_types", None) or getattr(config, "layer_types", None)
+        if labels:
+            return tuple(str(label) for label in labels)
+    return ()
+
+
+def kv_events_unpublishable(server_args: Any, model_config: Any = None) -> str | None:
+    """Why TokenSpeed's KV event publisher cannot serve the model this process
+    loads, or ``None`` when it can.
+
+    TokenSpeed keeps a hybrid model's recurrent state (its Gated DeltaNet,
+    Mamba or KDA layers) in State groups of its cache: blocks that hold one
+    checkpoint each and span no tokens. Its KV-event drain walks every cache
+    group of a published boundary for a token-span quantity, and a State
+    group has none: the scheduler's assertion (``a State group has no token
+    span``) ends the engine process at the first drain of a request's tail,
+    under the fused scheduler as under the prefill and decode roles. Which
+    layer labels get a State group is the engine's own vocabulary (the
+    recipes' ``STATE_LAYER_TYPES``, over :func:`cache_layer_labels`), so the
+    answer follows the engine installed: one without that vocabulary has no
+    State groups, and a model whose labels are all history (full, sliding or
+    sparse attention) is served. ``model_config`` is TokenSpeed's
+    ``ModelConfig`` for the served model, built here when not given
+    (:func:`_model_config`), after the vocabulary was found."""
+    try:
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import STATE_LAYER_TYPES
+    except ImportError as error:
+        # An engine that does not spell its State-group vocabulary there (an
+        # older one, with no State groups, or one that moved the module), or
+        # no engine at all (the launcher's unit tests): the default is not
+        # guarded, and the log says so, since a hybrid model on an engine
+        # that moved the module would abort in the drain again.
+        logger.info(
+            "TokenSpeed's State-group vocabulary could not be read (%s): the KV-events default "
+            "is not guarded against State groups on this engine",
+            error,
+        )
+        return None
+    if model_config is None:
+        model_config = _model_config(server_args)
+    labels = cache_layer_labels(model_config)
+    state = [label for label in labels if label in STATE_LAYER_TYPES]
+    if not state:
+        return None
+    return (
+        f"{EngineConfigView(server_args).server_args.model} keeps recurrent state in "
+        f"{len(state)} of its {len(labels)} layers ({', '.join(sorted(set(state)))}): State "
+        "groups of TokenSpeed's cache, which span no tokens, and TokenSpeed's KV-event drain "
+        "aborts the engine on a group with no token span"
+    )
+
+
 def default_kv_events_config(
-    server_args: Any, environ: Mapping[str, str] | None = None
+    server_args: Any, environ: Mapping[str, str] | None = None, model_config: Any = None
 ) -> str | None:
     """Turn TokenSpeed's KV event publisher on when the launcher was given no
     ``--kv-events-config``; returns the configuration applied, or None: the
     shared rule (``rust_lifecycle.apply_kv_events_default``) with
-    ``DEFAULT_KV_EVENTS_CONFIG``, applied to the server args before the facts
-    and the headless scheduler are built from them."""
+    :func:`default_kv_events_json` at a free port of this host, one per
+    attention-DP rank (each publishes at the port after its predecessor's),
+    applied to the server args before the facts and the schedulers are built
+    from them, unless the engine cannot serve the publisher for this model
+    (:func:`kv_events_unpublishable`, on ``model_config`` when the caller has
+    TokenSpeed's ``ModelConfig`` already): then the publisher stays off and
+    the reason is logged once."""
     return apply_kv_events_default(
-        server_args, DEFAULT_KV_EVENTS_CONFIG, env_name=KV_EVENTS_ENV, environ=environ
+        server_args,
+        default_kv_events_json,
+        env_name=KV_EVENTS_ENV,
+        environ=environ,
+        ranks=EngineConfigView(server_args).server_args.attention_dp_size or 1,
+        unless=lambda: kv_events_unpublishable(server_args, model_config),
     )
 
 
@@ -403,20 +541,43 @@ class TokenSpeedLauncher(RustLauncher):
     drain_secs_env = DRAIN_SECS_ENV
     startup_timeout_secs_env = STARTUP_TIMEOUT_SECS_ENV
     startup_ceiling_secs_env = STARTUP_CEILING_SECS_ENV
+    silence_timeout_secs_env = SILENCE_TIMEOUT_SECS_ENV
+    prefill_tokens_per_sec_env = PREFILL_TOKENS_PER_SEC_ENV
     kv_events_env = KV_EVENTS_ENV
+    metrics_port_env = METRICS_PORT_ENV
+    metrics_host_env = METRICS_HOST_ENV
     without_tokenizer = "string stops will be refused"
+    warmup_env = WARMUP_ENV
+    # TokenSpeed's ``ModelConfig`` for the served model, built on first use
+    # and kept for the hooks after it: the KV-events default reads the cache's
+    # layer labels off it, the facts the rest.
+    _cached_model_config: Any = None
+
+    def model_config(self, args: Any) -> Any:
+        if self._cached_model_config is None:
+            self._cached_model_config = _model_config(args)
+        return self._cached_model_config
 
     def kv_events_default(self, args: Any) -> str | None:
-        return default_kv_events_config(args)
+        # The config is built here rather than in the facts: the facts need
+        # it a hook later in any case, so an explicit configuration or the
+        # opt-out, which do not read it, cost nothing extra.
+        return default_kv_events_config(args, model_config=self.model_config(args))
 
     def facts(self, args: Any) -> dict[str, Any]:
-        return {**model_facts(args), **server_facts(args)}
+        return {**model_facts(args, self.model_config(args)), **server_facts(args)}
 
     def tokenizer_dir(self, args: Any) -> str | None:
         return tokenizer_dir_for(args)
 
     def launch(self, args: Any, handshake_port: int, facts: Mapping[str, Any]) -> Any:
         return launch_scheduler_ranks(headless_server_args(args, handshake_port=handshake_port))
+
+    def warmup_inputs(self, args: Any, facts: Mapping[str, Any]) -> Any:
+        return warmup_inputs(args, facts)
+
+    def warmup_wire(self, target: str) -> Any:
+        return warmup_wire(target)
 
 
 async def serve_rust(server_args: Any) -> int:

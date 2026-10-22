@@ -1,7 +1,7 @@
 //! Admission control for disaggregated (PD) dispatch, bounded by the decode
 //! engine's running window.
 //!
-//! SGLang-lineage engines start a bootstrap deadline on the prefill leg the
+//! SGLang-lineage engines start a bootstrap deadline on the prefill side the
 //! moment a request lands, and it clears only once the decode scheduler has
 //! *admitted* that request and answered with its KV manifest. Decode admission
 //! is bounded by the engine's running window (`--max-num-seqs` /
@@ -42,7 +42,7 @@
 //! Nothing here runs when the engine does not report a window: admission is
 //! not the gateway's to decide then, and dispatch behaves exactly as it did
 //! before this module existed. That is said once, loudly, when such a decode
-//! worker registers ([`announce_decode_window`]), and the window itself is
+//! worker registers (`announce_decode_window`), and the window itself is
 //! published per worker, so a gate that is off is a value an operator can
 //! read rather than an absence of series.
 
@@ -102,8 +102,8 @@ fn admission_wait() -> Duration {
 /// A claim on `rooms` slots in the decode engine's running window.
 ///
 /// Rides in the dispatch's `LoadGuards`, so the rooms are released on every
-/// path the dispatch can end on: an error before the legs go out, a failed
-/// leg, a client disconnect mid-stream, a retry that re-selects, or normal
+/// path the dispatch can end on: an error before the sides go out, a failed
+/// side, a client disconnect mid-stream, a retry that re-selects, or normal
 /// completion.
 pub(crate) struct PdAdmissionGuard {
     worker: Arc<dyn Worker>,
@@ -213,7 +213,7 @@ async fn claim_within(
     }
 }
 
-/// Gate one disaggregated dispatch on the decode leg's admission window,
+/// Gate one disaggregated dispatch on the decode side's admission window,
 /// claiming the `rooms` bootstrap rooms it is about to post.
 ///
 /// `Ok(Some(guard))` holds the claim; `Ok(None)` means the engine reports no

@@ -168,14 +168,17 @@ async fn run_for(
     let spec = components.model_registry.lookup(&metadata).unwrap();
     preprocess_modality(
         &media,
-        components,
-        metadata.model_id,
-        Some("qwen2_vl"),
-        spec,
-        tokenizer_id,
-        config,
-        image_wire_dtype,
-        TransparencyPolicy::KeepAlpha,
+        &PlanContext {
+            components,
+            model_id: metadata.model_id,
+            model_type: Some("qwen2_vl"),
+            spec,
+            tokenizer_id,
+            model_config: config,
+            image_wire_dtype,
+            transparency: TransparencyPolicy::KeepAlpha,
+            encoder_budget: None,
+        },
     )
     .await
     .unwrap()
@@ -455,14 +458,17 @@ async fn run_probe(
     let spec = components.model_registry.lookup(&metadata).unwrap();
     preprocess_modality(
         &media,
-        components,
-        metadata.model_id,
-        Some("qwen2_vl"),
-        spec,
-        "tok",
-        config,
-        None,
-        policy,
+        &PlanContext {
+            components,
+            model_id: metadata.model_id,
+            model_type: Some("qwen2_vl"),
+            spec,
+            tokenizer_id: "tok",
+            model_config: config,
+            image_wire_dtype: None,
+            transparency: policy,
+            encoder_budget: None,
+        },
     )
     .await
     .unwrap();

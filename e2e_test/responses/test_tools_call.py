@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from infra import BRAVE_MCP_URL
+from infra.streams import collect_streamed_response
 
 logger = logging.getLogger(__name__)
 
@@ -259,6 +260,13 @@ def assert_previous_response_id_mcp_binding_behavior_non_streaming(model, api_cl
     assert resp1.status == "completed"
     assert mcp_list_tools_labels(resp1.output) == ["brave"]
 
+    # The chained turns force their tool call (tool_choice="required"): the
+    # gateway sends it with the first model round and resumes with "auto"
+    # once the call ran, so the turn still ends in an answer. Whether the
+    # model would call a tool on its own is not the contract under test;
+    # the gateway's guarantee is that the bindings of the earlier turns,
+    # carried by previous_response_id, serve the call without being listed
+    # again.
     resp2 = api_client.responses.create(
         model=model,
         input=(
@@ -267,13 +275,18 @@ def assert_previous_response_id_mcp_binding_behavior_non_streaming(model, api_cl
         ),
         previous_response_id=resp1.id,
         tools=[BRAVE_MCP_TOOL],
+        tool_choice="required",
         stream=False,
         reasoning={"effort": "low"},
     )
     assert resp2.error is None
     assert resp2.status == "completed"
-    assert mcp_list_tools_labels(resp2.output) == []
-    assert any(item.type == "mcp_call" for item in resp2.output)
+    assert mcp_list_tools_labels(resp2.output) == [], (
+        "a server bound by the previous response is never listed again on a chained turn"
+    )
+    assert any(item.type == "mcp_call" for item in resp2.output), (
+        "the forced call must run through the binding carried by previous_response_id"
+    )
 
     resp3 = api_client.responses.create(
         model=model,
@@ -284,6 +297,7 @@ def assert_previous_response_id_mcp_binding_behavior_non_streaming(model, api_cl
         ),
         previous_response_id=resp2.id,
         tools=[BRAVE_MCP_TOOL, DEEPWIKI_MCP_TOOL],
+        tool_choice="required",
         stream=False,
         reasoning={"effort": "low"},
     )
@@ -292,9 +306,17 @@ def assert_previous_response_id_mcp_binding_behavior_non_streaming(model, api_cl
     # OpenAI may serve the newly added server's tool list from cache (other
     # tests in this suite attach deepwiki minutes earlier), in which case no
     # mcp_list_tools item is emitted. Pin only the stable contract: existing
-    # bindings are never relisted, and the request still completes with calls.
-    assert mcp_list_tools_labels(resp3.output) in ([], ["deepwiki"])
-    assert any(item.type == "mcp_call" for item in resp3.output)
+    # bindings are never relisted, and the turn still ends with a call (the
+    # forced call may go to the newly attached server; turn 2, where the
+    # carried server is the only tool, is the check that a call runs
+    # through a carried binding).
+    assert mcp_list_tools_labels(resp3.output) in ([], ["deepwiki"]), (
+        "only the newly attached server may be listed; the bindings carried by "
+        "previous_response_id are never listed again"
+    )
+    assert any(item.type == "mcp_call" for item in resp3.output), (
+        "a chained turn that adds a server to the carried bindings must still end with a call"
+    )
 
 
 def assert_previous_response_id_mcp_binding_behavior_streaming(model, api_client):
@@ -311,6 +333,9 @@ def assert_previous_response_id_mcp_binding_behavior_streaming(model, api_client
     )
     assert streaming_added_mcp_list_tools_labels(events1) == ["brave"]
 
+    # Both chained turns force their tool call, as in the non-streaming
+    # variant: the contract under test is the gateway's handling of the
+    # carried bindings, not the model's choice to use them.
     events2 = list(
         api_client.responses.create(
             model=model,
@@ -322,12 +347,17 @@ def assert_previous_response_id_mcp_binding_behavior_streaming(model, api_client
                 0
             ].response.id,
             tools=[BRAVE_MCP_TOOL],
+            tool_choice="required",
             stream=True,
             reasoning={"effort": "low"},
         )
     )
-    assert streaming_added_mcp_list_tools_labels(events2) == []
-    assert any(event.type == "response.mcp_call.completed" for event in events2)
+    assert streaming_added_mcp_list_tools_labels(events2) == [], (
+        "a server bound by the previous response is never listed again on a chained turn"
+    )
+    assert any(event.type == "response.mcp_call.completed" for event in events2), (
+        "the forced call must run through the binding carried by previous_response_id"
+    )
 
     events3 = list(
         api_client.responses.create(
@@ -341,6 +371,7 @@ def assert_previous_response_id_mcp_binding_behavior_streaming(model, api_client
                 0
             ].response.id,
             tools=[BRAVE_MCP_TOOL, DEEPWIKI_MCP_TOOL],
+            tool_choice="required",
             stream=True,
             reasoning={"effort": "low"},
         )
@@ -350,7 +381,10 @@ def assert_previous_response_id_mcp_binding_behavior_streaming(model, api_client
     # server must never reappear, and the event stream must stay consistent
     # with whichever happened.
     labels3 = streaming_added_mcp_list_tools_labels(events3)
-    assert labels3 in ([], ["deepwiki"])
+    assert labels3 in ([], ["deepwiki"]), (
+        "only the newly attached server may be listed; the bindings carried by "
+        "previous_response_id are never listed again"
+    )
     expected_listings = len(labels3)
     assert [e.type for e in events3].count(
         "response.mcp_list_tools.in_progress"
@@ -359,6 +393,9 @@ def assert_previous_response_id_mcp_binding_behavior_streaming(model, api_client
     completed_events = [e for e in events3 if e.type == "response.completed"]
     assert len(completed_events) == 1
     assert mcp_list_tools_labels(completed_events[0].response.output) == labels3
+    assert any(item.type == "mcp_call" for item in completed_events[0].response.output), (
+        "a chained turn that adds a server to the carried bindings must still end with a call"
+    )
 
 
 @pytest.mark.vendor("openai")
@@ -505,10 +542,11 @@ class TestToolCallingCloud:
             reasoning={"effort": "low"},
         )
 
-        events = list(resp)
+        streamed = collect_streamed_response(resp)
+        events = streamed.events
         assert len(events) > 0
 
-        event_types = [event.type for event in events]
+        event_types = streamed.event_types
         assert "response.created" in event_types, "Should have response.created event"
         assert "response.completed" in event_types, "Should have response.completed event"
         assert "response.output_item.added" in event_types, "Should have output_item.added events"
@@ -530,10 +568,9 @@ class TestToolCallingCloud:
         assert "response.mcp_call.completed" in event_types, "Should have mcp_call.completed event"
         assert_streaming_mcp_call_ids_match(events)
 
-        completed_events = [e for e in events if e.type == "response.completed"]
-        assert len(completed_events) == 1
+        assert len(streamed.completed_events) == 1
 
-        final_response = completed_events[0].response
+        final_response = streamed.final_response
         assert final_response.id is not None
         assert final_response.status == "completed"
         assert final_response.output is not None
@@ -640,7 +677,8 @@ class TestToolCallingCloud:
             reasoning={"effort": "low"},
         )
 
-        events = list(resp)
+        streamed = collect_streamed_response(resp)
+        events = streamed.events
         assert len(events) > 0
 
         list_tools_events = [
@@ -654,9 +692,8 @@ class TestToolCallingCloud:
         list_tool_labels = {event.item.server_label for event in list_tools_events}
         assert list_tool_labels == {"brave", "deepwiki"}
 
-        completed_events = [e for e in events if e.type == "response.completed"]
-        assert len(completed_events) == 1
-        final_response = completed_events[0].response
+        assert len(streamed.completed_events) == 1
+        final_response = streamed.final_response
         assert final_response.output is not None
 
         final_list_tools = [item for item in final_response.output if item.type == "mcp_list_tools"]
@@ -872,16 +909,16 @@ class TestToolChoiceGptOss:
             stream=True,
         )
 
-        events = list(resp)
+        streamed = collect_streamed_response(resp)
+        events = streamed.events
         assert len(events) > 0
 
-        event_types = [e.type for e in events]
+        event_types = streamed.event_types
         assert "response.function_call_arguments.delta" in event_types
 
-        completed_events = [e for e in events if e.type == "response.completed"]
-        assert len(completed_events) == 1
+        assert len(streamed.completed_events) == 1
 
-        output = completed_events[0].response.output
+        output = streamed.final_response.output
         function_calls = [item for item in output if item.type == "function_call"]
         assert len(function_calls) > 0
 
@@ -1023,10 +1060,11 @@ class TestToolChoiceGptOss:
             reasoning={"effort": "low"},
         )
 
-        events = list(resp)
+        streamed = collect_streamed_response(resp)
+        events = streamed.events
         assert len(events) > 0
 
-        event_types = [event.type for event in events]
+        event_types = streamed.event_types
         assert "response.created" in event_types
         assert "response.completed" in event_types
         assert "response.mcp_list_tools.completed" in event_types
@@ -1070,10 +1108,11 @@ class TestToolChoiceGptOss:
             tool_choice="auto",
         )
 
-        events = list(resp)
+        streamed = collect_streamed_response(resp)
+        events = streamed.events
         assert len(events) > 0
 
-        event_types = [e.type for e in events]
+        event_types = streamed.event_types
         assert "response.created" in event_types
         assert "response.mcp_list_tools.completed" in event_types
         assert "response.function_call_arguments.delta" in event_types
@@ -1126,7 +1165,8 @@ class TestToolChoiceGptOss:
             reasoning={"effort": "low"},
         )
 
-        events = list(resp)
+        streamed = collect_streamed_response(resp)
+        events = streamed.events
         assert len(events) > 0
 
         list_tools_events = [
@@ -1140,9 +1180,8 @@ class TestToolChoiceGptOss:
         list_tool_labels = {event.item.server_label for event in list_tools_events}
         assert list_tool_labels == {"brave", "deepwiki"}
 
-        completed_events = [e for e in events if e.type == "response.completed"]
-        assert len(completed_events) == 1
-        final_response = completed_events[0].response
+        assert len(streamed.completed_events) == 1
+        final_response = streamed.final_response
         assert final_response.output is not None
 
         final_list_tools = [item for item in final_response.output if item.type == "mcp_list_tools"]
@@ -1268,10 +1307,11 @@ class TestToolChoiceLocal:
             reasoning={"effort": "low"},
         )
 
-        events = list(resp)
+        streamed = collect_streamed_response(resp)
+        events = streamed.events
         assert len(events) > 0
 
-        event_types = [event.type for event in events]
+        event_types = streamed.event_types
         assert "response.created" in event_types
         assert "response.completed" in event_types
 
@@ -1376,10 +1416,11 @@ class TestToolChoiceLocal:
             tool_choice="auto",
         )
 
-        events = list(resp)
+        streamed = collect_streamed_response(resp)
+        events = streamed.events
         assert len(events) > 0
 
-        event_types = [e.type for e in events]
+        event_types = streamed.event_types
         assert "response.created" in event_types
         assert "response.mcp_list_tools.completed" in event_types
         assert "response.function_call_arguments.delta" in event_types
@@ -1432,7 +1473,8 @@ class TestToolChoiceLocal:
             reasoning={"effort": "low"},
         )
 
-        events = list(resp)
+        streamed = collect_streamed_response(resp)
+        events = streamed.events
         assert len(events) > 0
 
         list_tools_events = [
@@ -1446,9 +1488,8 @@ class TestToolChoiceLocal:
         list_tool_labels = {event.item.server_label for event in list_tools_events}
         assert list_tool_labels == {"brave", "deepwiki"}
 
-        completed_events = [e for e in events if e.type == "response.completed"]
-        assert len(completed_events) == 1
-        final_response = completed_events[0].response
+        assert len(streamed.completed_events) == 1
+        final_response = streamed.final_response
         assert final_response.output is not None
 
         final_list_tools = [item for item in final_response.output if item.type == "mcp_list_tools"]

@@ -11,9 +11,12 @@
 //! reach travel with it, and the annotations JSON Schema defines as such (`title`, `description`,
 //! `examples`, `$comment`), which constrain nothing, are dropped at every schema position.
 
+use std::collections::HashSet;
+
 use serde_json::{json, Value};
 
 use super::Grammar;
+use crate::format::Whitespace;
 
 /// The arguments a tool's schema asks for, as a syntax writes them: `each` property in the
 /// schema's order, each optional unless the schema requires it; `none` for a schema without
@@ -136,51 +139,74 @@ pub(super) fn keyword<'a>(
         .or_else(|| target.and_then(|target| target.get(name)))
 }
 
-/// The type a property's schema pins, by the name the templates write (`integer` as `number`),
-/// and the grammar of a value of that type: a string as `text`, the syntax's own spelling of a
-/// value written as it is; a string `enum` as one of its values; a number, an object or an array
-/// as JSON the property's schema accepts, the tool's definitions attached; a boolean as JSON;
-/// `null` as the word. `None` when the schema pins no type the syntaxes have, or a `$ref` in it
-/// points at nothing (a grammar with such a pointer would not compile, and the whole call with
-/// it). A `$ref` lends its target's keywords, and the property's own win, as in JSON Schema
-/// 2020-12.
+/// The type a property's schema pins, by the name the templates write (`integer` as `number`), a
+/// string `enum` a string; `None` when the schema pins no type the syntaxes have, or a `$ref` in
+/// it points at nothing (a grammar with such a pointer would not compile, and the whole call with
+/// it). What [`shape`] decides before it writes the value's grammar, on its own for a writer that
+/// spells objects and arrays itself and needs no grammar for them. A `$ref` lends its target's
+/// keywords, and the property's own win, as in JSON Schema 2020-12.
+pub(super) fn kind(schema: &Value, definitions: Definitions<'_>) -> Option<&'static str> {
+    if !definitions.pointers_resolve(schema) {
+        return None;
+    }
+    let target = definitions.target_of(schema);
+    if string_enum(schema, target).is_some() {
+        return Some("string");
+    }
+    match keyword(schema, target, "type").and_then(Value::as_str)? {
+        "string" => Some("string"),
+        "integer" | "number" => Some("number"),
+        "boolean" => Some("boolean"),
+        "object" => Some("object"),
+        "array" => Some("array"),
+        "null" => Some("null"),
+        _ => None,
+    }
+}
+
+/// The words of a string `enum`, where the schema (or its `$ref` target) has one with a word in
+/// it and nothing else.
+pub(super) fn string_enum<'a>(schema: &'a Value, target: Option<&'a Value>) -> Option<&'a [Value]> {
+    keyword(schema, target, "enum")
+        .and_then(Value::as_array)
+        .filter(|values| !values.is_empty() && values.iter().all(Value::is_string))
+        .map(Vec::as_slice)
+}
+
+/// The type a property's schema pins ([`kind`]) and the grammar of a value of that type: a string
+/// as `text`, the syntax's own spelling of a value written as it is; a string `enum` as one of its
+/// values; a number, an object or an array as JSON the property's schema accepts, the tool's
+/// definitions attached; a boolean as JSON; `null` as the word.
 pub(super) fn shape(
     schema: &Value,
     definitions: Definitions<'_>,
     text: impl FnOnce() -> Grammar,
 ) -> Option<(&'static str, Grammar)> {
-    if !definitions.pointers_resolve(schema) {
-        return None;
-    }
+    let kind = kind(schema, definitions)?;
     let target = definitions.target_of(schema);
-    let keyword = |name: &str| {
-        schema
-            .get(name)
-            .or_else(|| target.and_then(|target| target.get(name)))
-    };
-    if let Some(values) = keyword("enum").and_then(Value::as_array) {
-        if !values.is_empty() && values.iter().all(Value::is_string) {
-            let options = values
-                .iter()
-                .filter_map(Value::as_str)
-                .map(|value| Grammar::ConstString(value.to_string()))
-                .collect();
-            return Some(("string", Grammar::Or(options)));
-        }
-    }
     let json = |schema: Value| Grammar::JsonSchema {
         schema,
         style: None,
+        excludes: Vec::new(),
+        whitespace: Whitespace::Free,
     };
-    match keyword("type").and_then(Value::as_str)? {
-        "string" => Some(("string", text())),
-        "integer" | "number" => Some(("number", json(definitions.attached_to(schema)))),
-        "boolean" => Some(("boolean", json(json!({"type": "boolean"})))),
-        "object" => Some(("object", json(definitions.attached_to(schema)))),
-        "array" => Some(("array", json(definitions.attached_to(schema)))),
-        "null" => Some(("null", Grammar::ConstString("null".to_string()))),
-        _ => None,
-    }
+    let grammar = match kind {
+        "string" => match string_enum(schema, target) {
+            Some(values) => Grammar::Or(
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|value| Grammar::ConstString(value.to_string()))
+                    .collect(),
+            ),
+            None => text(),
+        },
+        "number" | "object" | "array" => json(definitions.attached_to(schema)),
+        "boolean" => json(json!({"type": "boolean"})),
+        // The one kind left: `null`.
+        _ => Grammar::ConstString("null".to_string()),
+    };
+    Some((kind, grammar))
 }
 
 /// The definitions at the root of a tool's schema, `$defs` and `definitions`. Each property's
@@ -192,13 +218,24 @@ pub(super) fn shape(
 pub(super) struct Definitions<'a> {
     defs: Option<&'a Value>,
     definitions: Option<&'a Value>,
+    /// Whether every local pointer anywhere in the root names something, worked out once, so
+    /// the check each property's [`kind`] makes costs nothing when the tool's schema is whole.
+    whole: bool,
 }
 
 impl<'a> Definitions<'a> {
     pub(super) fn of(root: &'a Value) -> Self {
-        Self {
+        let definitions = Self {
             defs: root.get("$defs"),
             definitions: root.get("definitions"),
+            whole: false,
+        };
+        let whole = local_pointers(root)
+            .into_iter()
+            .all(|pointer| definitions.resolve(pointer).is_some());
+        Self {
+            whole,
+            ..definitions
         }
     }
 
@@ -229,10 +266,13 @@ impl<'a> Definitions<'a> {
     /// at nothing inside one of them reaches the engine too. A definition that names itself is
     /// followed once.
     fn pointers_resolve(self, schema: &Value) -> bool {
-        self.pointers_resolve_from(schema, &mut Vec::new())
+        self.whole || self.pointers_resolve_from(schema, &mut HashSet::new())
     }
 
-    fn pointers_resolve_from(self, schema: &Value, followed: &mut Vec<String>) -> bool {
+    fn pointers_resolve_from<'s>(self, schema: &'s Value, followed: &mut HashSet<&'s str>) -> bool
+    where
+        'a: 's,
+    {
         match schema {
             Value::Object(map) => map.iter().all(|(key, value)| {
                 let local = value
@@ -240,10 +280,8 @@ impl<'a> Definitions<'a> {
                     .filter(|pointer| is_reference(key) && pointer.starts_with('#'));
                 let named_resolves = local.is_none_or(|pointer| match self.resolve(pointer) {
                     None => false,
-                    Some(_) if followed.iter().any(|seen| seen == pointer) => true,
                     Some(target) => {
-                        followed.push(pointer.to_string());
-                        self.pointers_resolve_from(target, followed)
+                        !followed.insert(pointer) || self.pointers_resolve_from(target, followed)
                     }
                 });
                 named_resolves && self.pointers_resolve_from(value, followed)
@@ -301,22 +339,54 @@ impl<'a> Definitions<'a> {
     /// The root's definitions the pointers in `schema` reach, directly or through one another:
     /// each as its block (`$defs` or `definitions`) and its name, the first segment after the
     /// block, since a pointer deeper into an entry needs the whole entry.
-    fn reached_from(self, schema: &Value) -> Vec<(&'static str, &'a str)> {
-        let mut reached: Vec<(&'static str, &'a str)> = Vec::new();
+    fn reached_from(self, schema: &Value) -> HashSet<(&'static str, &'a str)> {
+        let mut reached: HashSet<(&'static str, &'a str)> = HashSet::new();
         let mut pending: Vec<&Value> = vec![schema];
         while let Some(node) = pending.pop() {
             for pointer in local_pointers(node) {
                 let Some((block, name, entry)) = self.entry_of(pointer) else {
                     continue;
                 };
-                if reached.contains(&(block, name)) {
-                    continue;
+                if reached.insert((block, name)) {
+                    pending.push(entry);
                 }
-                reached.push((block, name));
-                pending.push(entry);
             }
         }
         reached
+    }
+
+    /// What a fragment of `schema` would cost, the leaf's schema and the entries
+    /// [`Self::reached_from`] finds each sized by `size`, within `limit`: `None` as soon as the
+    /// running count passes it, so a leaf a budget refuses costs the walk up to the budget and no
+    /// more.
+    pub(super) fn reached_within(
+        self,
+        schema: &Value,
+        limit: usize,
+        mut size: impl FnMut(&Value) -> usize,
+    ) -> Option<usize> {
+        let mut cost = size(schema);
+        if cost > limit {
+            return None;
+        }
+        let mut seen: HashSet<(&'static str, &'a str)> = HashSet::new();
+        let mut pending: Vec<&Value> = vec![schema];
+        while let Some(node) = pending.pop() {
+            for pointer in local_pointers(node) {
+                let Some((block, name, entry)) = self.entry_of(pointer) else {
+                    continue;
+                };
+                if !seen.insert((block, name)) {
+                    continue;
+                }
+                cost += size(entry);
+                if cost > limit {
+                    return None;
+                }
+                pending.push(entry);
+            }
+        }
+        Some(cost)
     }
 
     /// The block, the entry name and the entry a local pointer names, with the pointer's escapes
@@ -365,7 +435,7 @@ const LISTED_SCHEMAS: [&str; 4] = ["anyOf", "oneOf", "allOf", "prefixItems"];
 
 /// `schema` with its annotations dropped at every schema position (a property named
 /// `description` is a name, not an annotation, and stays), as the engine gets it.
-fn without_annotations(schema: &Value) -> Value {
+pub(super) fn without_annotations(schema: &Value) -> Value {
     let Value::Object(map) = schema else {
         return schema.clone();
     };
@@ -433,13 +503,53 @@ fn collect_local_pointers<'v>(schema: &'v Value, pointers: &mut Vec<&'v str>) {
     }
 }
 
+/// About how many bytes `schema` takes as the engine gets it, its annotations dropped
+/// ([`json_bytes`] of [`without_annotations`]): what a number leaf, or a definition it reaches,
+/// costs an invoke's byte budget before it is written.
+pub(super) fn sent_bytes(schema: &Value) -> usize {
+    json_bytes(&without_annotations(schema))
+}
+
+/// About how many bytes `value` takes serialized, the escapes counted.
+fn json_bytes(value: &Value) -> usize {
+    match value {
+        Value::Null => 4,
+        Value::Bool(flag) => {
+            if *flag {
+                4
+            } else {
+                5
+            }
+        }
+        Value::Number(number) => number.to_string().len(),
+        Value::String(text) => {
+            text.len()
+                + 2
+                + text
+                    .bytes()
+                    .filter(|byte| matches!(byte, b'"' | b'\\') || *byte < 0x20)
+                    .count()
+        }
+        Value::Array(items) => {
+            2 + items.iter().map(json_bytes).sum::<usize>() + items.len().saturating_sub(1)
+        }
+        Value::Object(object) => {
+            2 + object
+                .iter()
+                .map(|(key, value)| key.len() + 3 + json_bytes(value))
+                .sum::<usize>()
+                + object.len().saturating_sub(1)
+        }
+    }
+}
+
 /// Whether `key` is one of the keywords that point at another schema.
 fn is_reference(key: &str) -> bool {
     matches!(key, "$ref" | "$dynamicRef" | "$recursiveRef")
 }
 
 /// Whether `schema` points anywhere inside its own document.
-fn has_local_reference(schema: &Value) -> bool {
+pub(super) fn has_local_reference(schema: &Value) -> bool {
     match schema {
         Value::Object(map) => map.iter().any(|(key, value)| {
             is_reference(key)

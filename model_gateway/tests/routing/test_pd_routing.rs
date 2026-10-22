@@ -145,7 +145,6 @@ mod pd_routing_unit_tests {
                     decode_policy: None,
                 },
                 PolicyConfig::PowerOfTwo {
-                    load_check_interval_secs: 5,
                     load_metric: Default::default(),
                 },
             ),
@@ -176,6 +175,8 @@ mod pd_routing_unit_tests {
                     cache_boundaries: Vec::new(),
                     selection_policy: None,
                     selection_accounting_ttl_ms: 0,
+                    balance_prefix_margin_tokens: 0,
+                    balance_uncached_credit: false,
                 },
             ),
             (
@@ -230,7 +231,7 @@ mod pd_routing_unit_tests {
                     MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
                 };
 
-                let client = smg::http_client::client();
+                let client = smg::clients::http_client();
 
                 // Initialize rate limiter
                 let rate_limiter = Some(Arc::new(TokenBucket::new(64, 64)));

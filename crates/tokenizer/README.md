@@ -52,10 +52,18 @@ as of `tokenizer/src/*`.
 - Loads `tokenizer.json` (or similar) using `tokenizers::Tokenizer::from_file`.
 - Caches vocab forward and reverse maps for `token_to_id`/`id_to_token` support.
 - Extracts special tokens using common patterns (e.g. `<s>`, `[CLS]`).
+- Adds special tokens on request the way the checkpoint's configuration prescribes: `encode(text, true)`
+  carries the configured BOS/EOS when `tokenizer_config.json` sets `add_bos_token` / `add_eos_token`
+  to `true`, through the post-processor the `transformers` Llama-style fast classes install at load
+  (`update_post_processor`), even where `tokenizer.json` alone has none or a plain `ByteLevel` one;
+  `encode(text, false)` gives the ids of the file alone. The serving engine's tokenizer, not the bare
+  file, is the reference, so a cross-check against the `tokenizers` crate compares with
+  `HuggingFaceTokenizer::tokenizers_pipeline()` (the same post-processor) or with the flag off.
 - Supports optional chat templates: either auto-discovered next to the tokenizer via
   `tokenizer_config.json` or overridable with an explicit template path.
-- Exposes `apply_chat_template` which renders a minijinja template given JSON message payloads and
-  template parameters.
+- Exposes `apply_chat_template` for JSON message payloads and template parameters.
+- GLM-5.3 and GLM-5.3-Flash use native Rust chat rendering when checkpoint metadata and
+  the template matches the current official one. Any other template keeps MiniJinja.
 
 ### TiktokenTokenizer (`tiktoken.rs`)
 - Wraps the `tiktoken-rs` `CoreBPE` builders (`cl100k_base`, `p50k_base`, `p50k_edit`, `r50k_base`).

@@ -2,15 +2,15 @@
 //! building and response processing.
 //!
 //! Request building is the last reader of the parsed request; the spec it
-//! produces is the only request-derived input available to response
-//! processing and streaming tasks. The Harmony variant is the one deliberate
-//! exception: its tool loop re-reads the request across iterations, so its
-//! spec explicitly owns a handle to it.
+//! hands on (the Messages spec is begun by preparation, which renders its
+//! tools, and completed by request building) is the only request-derived
+//! input available to response processing and streaming tasks. The Harmony
+//! variant is the one deliberate exception: its tool loop re-reads the
+//! request across iterations, so its spec explicitly owns a handle to it.
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use llm_multimodal::registry::transcription::TranscriptionFamily;
-use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::{
     chat::ChatCompletionRequest,
     common::{StreamOptions, StringOrArray, Tool, ToolChoice},
@@ -20,14 +20,12 @@ use openai_protocol::{
     profile::ProviderProfile,
     responses::ResponsesRequest,
 };
-use serde_json::Value;
 
-use crate::routers::grpc::{
-    regular::{stages::decisions::scoring::DecisionScoring, symphony::Assignment},
-    utils,
+use crate::routers::grpc::regular::{
+    stages::decisions::scoring::DecisionScoring, symphony::Assignment,
 };
 
-/// Response-phase contract for one request, produced by request building.
+/// Response-phase contract for one request, handed on by request building.
 #[derive(Clone)]
 pub(crate) enum ResponseSpec {
     Chat(Box<ChatResponseSpec>),
@@ -80,19 +78,11 @@ pub(crate) struct ChatResponseSpec {
     pub provider: ProviderProfile,
     pub separate_reasoning: bool,
     pub tool_choice: Option<ToolChoice>,
-    pub tools: Option<Vec<Tool>>,
+    /// The tools the response is read against, shared with the readers that
+    /// type its calls (one per choice) rather than copied into each.
+    pub tools: Option<Arc<[Tool]>>,
     pub history_tool_calls_count: usize,
     pub stream_options: Option<StreamOptions>,
-    pub chat_template_kwargs: Option<HashMap<String, Value>>,
-    /// The effective effort (`thinking.effort` else `reasoning_effort`).
-    pub reasoning_effort: Option<String>,
-    /// The typed `thinking.type` toggle as the provider profile reads it
-    /// (`ChatCompletionRequest::effective_thinking_toggle`).
-    pub thinking: Option<bool>,
-    /// `continue_final_message` on a trailing assistant message. Request
-    /// building replaces the request's ask with what the rendered prompt did
-    /// (`ProcessedMessages::continued_final_message`).
-    pub continues_final_assistant: bool,
     /// `parallel_tool_calls: false`: only the first tool call is returned.
     pub first_tool_call_only: bool,
     /// `n`, normalized.
@@ -108,38 +98,46 @@ pub(crate) struct ChatResponseSpec {
     pub skip_special_tokens: bool,
     /// Rendered prompt tokens the provider does not bill; set by request building.
     pub unbilled_prompt_tokens: u32,
-    /// Native channel formats can derive the initial state from the rendered prompt.
-    pub reasoning_in_prefill: Option<bool>,
+    /// Whether the prompt ends inside the model's thinking block, decided by
+    /// request building from the rendered prompt.
+    pub reasoning_in_prefill: bool,
     /// Set by request building when Symphony reads the response (`regular::symphony`):
     /// the table, and the part of the rendered prompt the engine replays.
     pub symphony: Option<Assignment>,
 }
 
+/// Whether the response to a chat `request` is scanned for tool calls: the
+/// request declares tools (an empty list included), a message declares one,
+/// or the model's provider reads tool calls without any
+/// ([`ProviderProfile::parses_tool_calls_without_tools`]). A `tool_choice`
+/// of `none` is the drivers' to check. [`ChatResponseSpec::tools`] is `Some`
+/// exactly then, and Symphony keeps a table's calls exactly then
+/// (`regular::symphony::assign`), so a call the conversation established
+/// without a tool inventory comes back as a call under either parser.
+pub(crate) fn scans_for_tool_calls(request: &ChatCompletionRequest) -> bool {
+    request.declares_tools()
+        || ProviderProfile::for_model(&request.model).parses_tool_calls_without_tools()
+}
+
 impl From<&ChatCompletionRequest> for ChatResponseSpec {
     fn from(request: &ChatCompletionRequest) -> Self {
+        let provider = ProviderProfile::for_model(&request.model);
         Self {
-            provider: ProviderProfile::for_model(&request.model),
+            provider,
             separate_reasoning: request.separate_reasoning,
             tool_choice: request.tool_choice.clone(),
             // Every tool the model may call, dynamic tools declared on messages
-            // included. `None` when the response is not scanned for tool calls:
-            // the request declares no tools anywhere and the provider does not
-            // parse tool calls without them.
-            tools: {
-                let tools: Vec<Tool> = request.effective_tools().cloned().collect();
-                let scanned = request.tools.is_some()
-                    || !tools.is_empty()
-                    || ProviderProfile::for_model(&request.model).parses_tool_calls_without_tools();
-                scanned.then_some(tools)
-            },
-            history_tool_calls_count: utils::get_history_tool_calls_count(request),
+            // included: the request's own list shared, not copied (a new list
+            // only when a message declares a tool). `None` when the response is
+            // not scanned for tool calls: the request declares no tools anywhere
+            // (`ChatCompletionRequest::declares_tools`, the one answer every
+            // gate reads) and the provider does not parse tool calls without
+            // them (`scans_for_tool_calls`).
+            tools: scans_for_tool_calls(request).then(|| request.shared_tool_list()),
+            history_tool_calls_count: request.history_tool_calls_count(),
             stream_options: request.stream_options.clone(),
-            chat_template_kwargs: request.chat_template_kwargs.clone(),
-            reasoning_effort: request.effective_reasoning_effort().map(str::to_string),
-            thinking: request.effective_thinking_toggle(),
-            continues_final_assistant: request.continues_final_assistant(),
             first_tool_call_only: request.disables_parallel_tool_calls(),
-            expected_choices: request.n.unwrap_or(1).max(1),
+            expected_choices: request.choices(),
             logprobs: request.logprobs,
             top_logprobs: request.top_logprobs,
             stop: request.stop.clone(),
@@ -148,27 +146,9 @@ impl From<&ChatCompletionRequest> for ChatResponseSpec {
             ignore_eos: request.ignore_eos,
             skip_special_tokens: request.skip_special_tokens,
             unbilled_prompt_tokens: 0,
-            reasoning_in_prefill: None,
+            reasoning_in_prefill: false,
             symphony: None,
         }
-    }
-}
-
-impl ChatResponseSpec {
-    /// Whether the reasoning parser starts in reasoning mode for this
-    /// request (see [`utils::reasoning_starts_in_prefill`]).
-    pub(crate) fn reasoning_starts_in_prefill(&self, tokenizer: &dyn Tokenizer) -> bool {
-        if let Some(in_prefill) = self.reasoning_in_prefill {
-            return in_prefill;
-        }
-        utils::reasoning_starts_in_prefill(
-            self.chat_template_kwargs.as_ref(),
-            self.reasoning_effort.as_deref(),
-            self.thinking,
-            self.continues_final_assistant,
-            tokenizer,
-            self.provider,
-        )
     }
 }
 
@@ -183,37 +163,36 @@ impl From<&GenerateRequest> for GenerateResponseSpec {
     fn from(request: &GenerateRequest) -> Self {
         Self {
             return_logprob: request.return_logprob.unwrap_or(false),
-            expected_choices: request
-                .sampling_params
-                .as_ref()
-                .and_then(|p| p.n)
-                .unwrap_or(1)
-                .max(1),
+            expected_choices: request.choices(),
         }
     }
 }
 
+/// The response-phase contract of a Messages request. Preparation builds it
+/// (`PreparationOutput::Messages`), since the template renders its chat
+/// tools; request building fills in what the rendered prompt and the worker
+/// decide.
 #[derive(Clone)]
 pub(crate) struct MessagesResponseSpec {
-    /// The provider profile the requested model selects.
-    pub provider: ProviderProfile,
-    pub thinking: Option<messages::ThinkingConfig>,
-    /// Native channel formats can derive the initial state from the rendered prompt.
-    pub reasoning_in_prefill: Option<bool>,
+    /// The `thinking` block asks for thinking (`enabled` or `adaptive`).
+    pub thinking_requested: bool,
+    /// The thinking blocks carry their text: a `thinking.display` other than
+    /// `omitted`, or none (see `ThinkingDisplay::returns_text`).
+    pub thinking_text_returned: bool,
+    /// Whether the prompt ends inside the model's thinking block, decided by
+    /// request building from the rendered prompt.
+    pub reasoning_in_prefill: bool,
     pub tool_choice: Option<messages::ToolChoice>,
     pub has_tools: bool,
     pub history_tool_calls_count: usize,
-    /// Messages tools pre-converted to Chat tools for parser reuse.
-    pub chat_tools: Vec<Tool>,
-    pub stop_sequences: Option<Vec<String>>,
+    /// The custom tools as chat tools, converted once: the template renders
+    /// them (narrowed by `tool_choice`), the constraints and the parsers
+    /// read them; shared with the reader that types the calls.
+    pub chat_tools: Arc<[Tool]>,
+    /// The stop sequences as the decoders match them.
+    pub stop_sequences: Option<StringOrArray>,
     /// Symphony's assignment when a table reads the message (see `regular::symphony`).
     pub symphony: Option<Assignment>,
-    /// A trailing assistant message with text and no tool call, continued as
-    /// a prefill. Request building replaces the request's ask with what the
-    /// rendered prompt did (`ProcessedMessages::continued_final_message`).
-    pub continues_final_assistant: bool,
-    /// `output_config.effort`, the `reasoning_effort` the template rendered.
-    pub reasoning_effort: Option<String>,
     /// `disable_parallel_tool_use: true`: only the first tool call is
     /// returned.
     pub first_tool_call_only: bool,
@@ -222,45 +201,19 @@ pub(crate) struct MessagesResponseSpec {
 impl From<&CreateMessageRequest> for MessagesResponseSpec {
     fn from(request: &CreateMessageRequest) -> Self {
         Self {
-            provider: ProviderProfile::for_model(&request.model),
-            thinking: request.thinking.clone(),
-            reasoning_in_prefill: None,
+            thinking_requested: request.thinking_toggle().unwrap_or(false),
+            thinking_text_returned: request
+                .thinking_display()
+                .is_none_or(messages::ThinkingDisplay::returns_text),
+            reasoning_in_prefill: false,
             tool_choice: request.tool_choice.clone(),
             has_tools: request.tools.is_some(),
-            history_tool_calls_count: utils::message_utils::get_history_tool_calls_count_messages(
-                request,
-            ),
-            chat_tools: request
-                .tools
-                .as_deref()
-                .map(utils::message_utils::extract_chat_tools)
-                .unwrap_or_default(),
-            stop_sequences: request.stop_sequences.clone(),
+            history_tool_calls_count: request.history_tool_calls_count(),
+            chat_tools: request.chat_tools().into(),
+            stop_sequences: request.stop_sequences.clone().map(StringOrArray::Array),
             symphony: None,
-            continues_final_assistant: request.continues_final_assistant(),
-            reasoning_effort: request.reasoning_effort().map(str::to_owned),
             first_tool_call_only: request.disables_parallel_tool_use(),
         }
-    }
-}
-
-impl MessagesResponseSpec {
-    /// Whether the reasoning parser starts in reasoning mode for this
-    /// request (see [`utils::messages_reasoning_starts_in_prefill`]).
-    pub(crate) fn reasoning_starts_in_prefill(&self, tokenizer: &dyn Tokenizer) -> bool {
-        if let Some(in_prefill) = self.reasoning_in_prefill {
-            return in_prefill;
-        }
-        utils::reasoning_starts_in_prefill(
-            None,
-            self.reasoning_effort.as_deref(),
-            self.thinking
-                .as_ref()
-                .map(messages::ThinkingConfig::enabled),
-            self.continues_final_assistant,
-            tokenizer,
-            self.provider,
-        )
     }
 }
 
@@ -292,7 +245,7 @@ impl From<&CompletionRequest> for CompletionResponseSpec {
             Vec::new()
         };
         Self {
-            choices_per_prompt: request.n.unwrap_or(1).max(1),
+            choices_per_prompt: request.choices(),
             echo: request.echo,
             suffix: request.suffix.clone(),
             logprobs: request.logprobs.is_some(),
@@ -322,7 +275,7 @@ pub(crate) enum HarmonyResponseSpec {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     use super::*;
 
@@ -340,7 +293,7 @@ mod tests {
     fn tool_names(spec: &ChatResponseSpec) -> Vec<String> {
         spec.tools
             .iter()
-            .flatten()
+            .flat_map(|tools| tools.iter())
             .map(|tool| tool.function.name.clone())
             .collect()
     }
@@ -361,6 +314,24 @@ mod tests {
         assert_eq!(tool_names(&spec), ["get_weather"]);
     }
 
+    /// The point of sharing: with request tools and no message-declared tool,
+    /// the spec holds the request's own list, not a copy of it.
+    #[test]
+    fn chat_spec_shares_the_request_s_tool_list() {
+        let request = chat_request(json!({
+            "model": "kimi-k3",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [tool("get_weather")]
+        }));
+
+        let spec = ChatResponseSpec::from(&request);
+
+        assert!(Arc::ptr_eq(
+            request.tools.as_ref().expect("the request's tools"),
+            spec.tools.as_ref().expect("the spec's tools")
+        ));
+    }
+
     #[test]
     fn chat_spec_tools_keep_request_tools_first() {
         let request = chat_request(json!({
@@ -379,31 +350,36 @@ mod tests {
     }
 
     #[test]
-    fn gemma4_rendered_prompt_state_overrides_the_thinking_preference() {
+    fn chat_spec_tools_follow_an_empty_request_list_beside_a_message_declaration() {
+        // The empty request-level list is a declaration (the normalizer answers
+        // it with `tool_choice: none`, which switches the calls off); the
+        // message's tool is the set.
         let request = chat_request(json!({
-            "model": "vllm-model",
-            "messages": [{"role": "user", "content": "hi"}],
-            "chat_template_kwargs": {"enable_thinking": true}
+            "model": "kimi-k3",
+            "messages": [
+                {"role": "system", "content": "", "tools": [tool("get_weather")]},
+                {"role": "user", "content": "hi"}
+            ],
+            "tools": []
         }));
-        let tokenizer = llm_tokenizer::MockTokenizer::new();
-        let mut spec = ChatResponseSpec::from(&request);
-        assert_eq!(spec.reasoning_in_prefill, None);
-        for in_prefill in [false, true] {
-            spec.reasoning_in_prefill = Some(in_prefill);
-            assert_eq!(spec.reasoning_starts_in_prefill(&tokenizer), in_prefill);
-        }
 
-        let request: CreateMessageRequest = serde_json::from_value(json!({
-            "model":"vllm-model", "max_tokens":16, "messages":[],
-            "thinking":{"type":"enabled", "budget_tokens":1024}
-        }))
-        .unwrap();
-        let mut spec = MessagesResponseSpec::from(&request);
-        assert_eq!(spec.reasoning_in_prefill, None);
-        for in_prefill in [false, true] {
-            spec.reasoning_in_prefill = Some(in_prefill);
-            assert_eq!(spec.reasoning_starts_in_prefill(&tokenizer), in_prefill);
-        }
+        assert_eq!(
+            tool_names(&ChatResponseSpec::from(&request)),
+            ["get_weather"]
+        );
+    }
+
+    #[test]
+    fn chat_spec_tools_none_for_a_message_declaration_the_profile_does_not_read() {
+        let request = chat_request(json!({
+            "model": "self-hosted-model",
+            "messages": [
+                {"role": "system", "content": "", "tools": [tool("get_weather")]},
+                {"role": "user", "content": "hi"}
+            ]
+        }));
+
+        assert!(ChatResponseSpec::from(&request).tools.is_none());
     }
 
     #[test]
@@ -444,6 +420,9 @@ mod tests {
             "messages": [{"role": "user", "content": "try again"}]
         }));
 
-        assert_eq!(ChatResponseSpec::from(&request).tools, Some(Vec::new()));
+        assert_eq!(
+            ChatResponseSpec::from(&request).tools.as_deref(),
+            Some(&[][..])
+        );
     }
 }

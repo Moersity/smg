@@ -6,8 +6,9 @@
 //! output, and the stream's end closes the call.
 //!
 //! The value reads through [`Arguments`]: the whitespace before it is dropped, its bytes are
-//! fragments while they keep it a JSON prefix, and the rest is `Malformed { InvalidArguments }`.
-//! The value's first byte starts the call, named by the function the request forces
+//! fragments, a JSON prefix until a `Malformed { InvalidArguments }` event of no bytes says where
+//! they stopped being one, and the model's own from there to the end of the stream. The value's
+//! first byte starts the call, named by the function the request forces
 //! ([`Declared::forced`]) and with no source byte of its own, since no output byte names it; the
 //! call ends where the value is whole, or with the stream. Bytes after a whole value are not
 //! taken: the engine reports them as text after the object. Without a forced function the output
@@ -15,15 +16,16 @@
 //! `Malformed { Other }`.
 //!
 //! [`formats::forced`]: crate::formats::forced()
-//! [`Declared::forced`]: crate::tagged::Declared::forced
+//! [`Declared::forced`]: crate::Declared::forced
 
 use crate::{
     event::{Event, Events, MalformedReason, Text},
-    json::arguments::{json_space, Arguments, AsWritten},
-    tagged::Declared,
+    json::{
+        arguments::{Arguments, AsWritten},
+        prefix::json_space,
+    },
+    Declared,
 };
-
-const NO_FORCED_FUNCTION: &str = "arguments with no forced function to name them";
 
 /// The events of the forced call, from the output's first byte.
 #[derive(Debug)]
@@ -113,8 +115,8 @@ impl Assembler {
 /// Bytes with no forced function to name a call for them: reported, not read.
 fn unnamed(bytes: &str, out: &mut Events) {
     out.push(Event::Malformed {
-        text: Text::uncounted(bytes),
-        why: MalformedReason::Other(NO_FORCED_FUNCTION.to_string()),
+        text: Text::uncounted(bytes.to_owned()),
+        why: MalformedReason::NoForcedFunction,
     });
 }
 
@@ -137,10 +139,11 @@ impl crate::engine::CallAssembler for Assembler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::names;
 
     const ARGUMENTS: &str = "{\"city\": \"Paris\", \"days\": [1, 2]}";
 
-    fn run(pieces: &[&str], declared: &Declared) -> (Vec<Event>, usize) {
+    fn run(pieces: &[&str], declared: &Declared) -> (Vec<Event<'static>>, usize) {
         let mut assembler = Assembler::new(0, "call_0");
         let mut out = Events::new();
         let mut taken = 0;
@@ -156,16 +159,6 @@ mod tests {
             .iter()
             .filter_map(|e| match e {
                 Event::ToolCallArguments { json, .. } => Some(json.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn names(events: &[Event]) -> Vec<&str> {
-        events
-            .iter()
-            .filter_map(|e| match e {
-                Event::ToolCallStart { name, .. } => Some(name.as_str()),
                 _ => None,
             })
             .collect()
@@ -228,8 +221,8 @@ mod tests {
             .filter_map(|e| match e {
                 Event::Malformed {
                     text,
-                    why: MalformedReason::Other(why),
-                } if why == NO_FORCED_FUNCTION => Some(text.text.as_str()),
+                    why: MalformedReason::NoForcedFunction,
+                } => Some(&*text.text),
                 _ => None,
             })
             .collect();

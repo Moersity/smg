@@ -23,7 +23,7 @@ def managed_ranks(engine):
         parallel = getattr(config, "parallel_config", None)
         size = getattr(parallel, "data_parallel_size", 1)
         # Without a frontend's managed-rank list, only DP=1 is unambiguous.
-        ranks = (0,) if size == 1 else ()
+        ranks = (getattr(parallel, "data_parallel_rank", 0),) if size == 1 else ()
     return sorted(
         {
             rank
@@ -48,7 +48,11 @@ def _scheduler_stats_by_rank(engine, ranks):
                     rank: getattr(nested, "last_scheduler_stats", None)
                     for rank, nested in per_engine.items()
                 }
-            elif len(ranks) == 1 and not getattr(logger, "aggregated", False):
+            elif (
+                len(ranks) == 1
+                and not getattr(logger, "aggregated", False)
+                and getattr(logger, "engine_index", ranks[0]) == ranks[0]
+            ):
                 candidates = {ranks[0]: getattr(logger, "last_scheduler_stats", None)}
             else:
                 continue
@@ -61,6 +65,7 @@ def _scheduler_stats_by_rank(engine, ranks):
 
 
 def _is_nonnegative_int32(value):
+    """Accept only counts representable by the protobuf int32 fields."""
     return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= _MAX_INT32
 
 
@@ -109,8 +114,7 @@ def build_loads_response(engine, request, version="", *, trackers=None):
         if waiting > _MAX_INT32 or total > _MAX_INT32:
             continue
 
-        tracker = trackers.for_rank(rank) if trackers is not None else None
-        estimate = tracker.estimate(waiting) if tracker is not None else None
+        estimate = trackers.estimate(waiting, rank=rank) if trackers is not None else None
         fields = scheduler_load_fields(
             running,
             waiting,

@@ -2,6 +2,7 @@
 #![allow(dead_code, clippy::allow_attributes, clippy::large_futures)]
 
 pub mod gateway_launch;
+pub mod grpc_harness;
 pub mod mock_mcp_server;
 #[cfg(feature = "provider-openai")]
 pub mod mock_openai_server;
@@ -22,7 +23,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
-use llm_tokenizer::registry::TokenizerRegistry;
+use llm_tokenizer::{mock::MockTokenizer, registry::TokenizerRegistry, traits::Tokenizer};
 use mock_worker::{MockWorker, MockWorkerConfig};
 use openai_protocol::common::{Function, Tool};
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
@@ -87,7 +88,7 @@ impl WorkerTestContext {
         endpoint: &str,
         body: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let client = smg::http_client::client_builder()
+        let client = smg::clients::http_client_builder()
             .no_proxy()
             .build()
             .map_err(|e| format!("test client: {e}"))?;
@@ -119,7 +120,7 @@ impl WorkerTestContext {
     ) -> Result<Vec<String>, String> {
         use futures_util::StreamExt;
 
-        let client = smg::http_client::client_builder()
+        let client = smg::clients::http_client_builder()
             .no_proxy()
             .build()
             .map_err(|e| format!("test client: {e}"))?;
@@ -387,6 +388,16 @@ impl AppTestContext {
         )
     }
 
+    /// The production routers: the data listener's and, with
+    /// `admin_listener`, the admin listener's.
+    pub fn create_apps(&self, admin_listener: bool) -> smg::server::GatewayApps {
+        test_app::create_test_apps_with_context(
+            Arc::clone(&self.router),
+            Arc::clone(&self.app_context),
+            admin_listener,
+        )
+    }
+
     pub async fn shutdown(mut self) {
         for worker in &mut self.workers {
             worker.stop().await;
@@ -417,7 +428,7 @@ async fn build_test_app_context(
     use smg_mcp::McpOrchestrator;
 
     // See `test_app::create_test_app_context`: no environment proxy in a test's path.
-    let client = smg::http_client::client_builder()
+    let client = smg::clients::http_client_builder()
         .no_proxy()
         .build()
         .expect("test client");
@@ -472,6 +483,9 @@ async fn build_test_app_context(
 
     let app_context = Arc::new(
         AppContext::builder()
+            // Building applies the configuration's liveness budgets
+            // (process-wide, the first context a test binary builds sets
+            // them), as it does for the server.
             .router_config(config.clone())
             .client(client)
             .rate_limiter(rate_limiter)
@@ -605,6 +619,52 @@ pub fn create_test_context_with_tokenizer_registry(
     })
 }
 
+/// `create_test_context_with_tokenizer_registry` over a registry holding the
+/// mock tokenizer for `model` (loaded as `tokenizer-id`, source `test`): the
+/// context the gRPC worker tests run their routers in.
+pub fn create_test_context_with_mock_tokenizer(
+    config: RouterConfig,
+    model: &str,
+) -> Pin<Box<dyn Future<Output = Arc<AppContext>> + Send>> {
+    let model = model.to_string();
+    Box::pin(async move {
+        let tokenizer_registry = mock_tokenizer_registry(&model).await;
+        create_test_context_with_tokenizer_registry(config, tokenizer_registry).await
+    })
+}
+
+/// A tokenizer registry holding the mock tokenizer for `model`, loaded as
+/// `tokenizer-id` from source `test`: what the context helpers run on, for
+/// the tests that build their context some other way.
+pub async fn mock_tokenizer_registry(model: &str) -> Arc<TokenizerRegistry> {
+    tokenizer_registry_with(model, Arc::new(MockTokenizer::new())).await
+}
+
+/// A tokenizer registry holding `tokenizer` for `model`, loaded as
+/// `tokenizer-id` from source `test`: the one load behind
+/// [`mock_tokenizer_registry`] and the gRPC harness's context over a
+/// tokenizer of the binary's own.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+pub async fn tokenizer_registry_with(
+    model: &str,
+    tokenizer: Arc<dyn Tokenizer>,
+) -> Arc<TokenizerRegistry> {
+    let tokenizer_registry = Arc::new(TokenizerRegistry::new());
+    tokenizer_registry
+        .load(
+            "tokenizer-id",
+            model,
+            "test",
+            || async move { Ok(tokenizer) },
+        )
+        .await
+        .expect("the tokenizer loads");
+    tokenizer_registry
+}
+
 /// `create_test_context_with_tokenizer_registry` over the caller's storage
 /// backends instead of the in-memory ones.
 #[expect(
@@ -714,7 +774,7 @@ pub fn ensure_tokenizer_cached() -> PathBuf {
         println!("Downloading TinyLlama tokenizer from HuggingFace...");
 
         // Use blocking reqwest client since we're in tests/benchmarks
-        let client = smg::http_client::blocking_client();
+        let client = smg::clients::blocking_http_client();
         let response = client
             .get(TINYLLAMA_TOKENIZER_URL)
             .send()

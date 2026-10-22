@@ -22,7 +22,7 @@ from types import SimpleNamespace
 
 import pytest
 from smg_grpc_servicer import rust_lifecycle
-from smg_grpc_servicer.sglang import plugin, rust, zmq_plugin
+from smg_grpc_servicer.sglang import plugin, rust
 
 
 def _install(monkeypatch, name: str, **attrs) -> types.ModuleType:
@@ -340,6 +340,28 @@ def test_server_facts_carry_where_the_engine_starts_a_grammar(monkeypatch):
     assert "constrained_decoding_start" not in older and "engine_reasoning_parser" not in older
 
 
+def test_server_facts_carry_the_grammar_backend_the_scheduler_runs(monkeypatch):
+    # The grammar backend, resolved, under the engine's own argument name: the
+    # Rust servicer refuses a constraint that backend cannot enforce before
+    # the scheduler. The raw argument is None unless set (the engine's default
+    # is xgrammar); without the scheduler's tokenizer there is no backend.
+    monkeypatch.setattr(rust, "pairing_protocol_from_env", lambda: "")
+    pinned = json.loads(
+        rust.server_facts(_server_args(grammar_backend="outlines"))["server_args_json"]
+    )
+    assert pinned["grammar_backend"] == "outlines"
+    default = json.loads(rust.server_facts(_server_args(grammar_backend=None))["server_args_json"])
+    assert default["grammar_backend"] == "xgrammar"
+    no_tokenizer = json.loads(
+        rust.server_facts(_server_args(grammar_backend="xgrammar", skip_tokenizer_init=True))[
+            "server_args_json"
+        ]
+    )
+    assert no_tokenizer["grammar_backend"] == "none"
+    older = json.loads(rust.server_facts(_server_args())["server_args_json"])
+    assert "grammar_backend" not in older
+
+
 def test_server_facts_carry_the_kv_events_publisher(monkeypatch):
     monkeypatch.setattr(rust, "pairing_protocol_from_env", lambda: "")
     off = rust.server_facts(_server_args())
@@ -388,29 +410,50 @@ def test_server_facts_refuse_non_finite_floats():
 def test_kv_event_publishing_is_on_by_default_under_the_rust_servicer():
     """A launcher without --kv-events-config left SGLang publishing nothing and
     the router's cache-aware routing blind (smg-lab #1): the Rust path turns
-    the ZMQ publisher on itself unless told otherwise."""
-    expected = '{"publisher": "zmq"}'
-    # Nothing given: SGLang's own defaults behind the ZMQ publisher.
+    the ZMQ publisher on itself unless told otherwise, at a free port of this
+    host (one per scheduler) rather than SGLang's fixed default."""
+
+    def published_at(args) -> int:
+        """The publisher's port, from the JSON the server args carry: on, at
+        a free port of this host, never the fixed default; SGLang's own
+        defaults for the rest."""
+        config = json.loads(args.kv_events_config)
+        assert config == {"publisher": "zmq", "endpoint": config["endpoint"]}
+        endpoint = config["endpoint"]
+        assert endpoint.startswith("tcp://*:") and endpoint != "tcp://*:5557"
+        port = int(endpoint.rpartition(":")[2])
+        assert rust_lifecycle._bindable(port)
+        return port
+
+    # Nothing given: the ZMQ publisher at a free port, and the relay is told
+    # the same endpoint.
     args = _server_args()
-    assert rust.default_kv_events_config(args, environ={}) == expected
-    assert args.kv_events_config == expected
-    assert rust.kv_events_publisher(args) == ("tcp://*:5557", "", "")
-    args = _server_args(kv_events_config=None)
-    assert rust.default_kv_events_config(args, environ={}) == expected
-    args = _server_args(kv_events_config="")
-    assert rust.default_kv_events_config(args, environ={}) == expected
+    assert rust.default_kv_events_config(args, environ={}) == args.kv_events_config
+    port = published_at(args)
+    assert rust.kv_events_publisher(args) == (f"tcp://*:{port}", "", "")
+    for args in (_server_args(kv_events_config=None), _server_args(kv_events_config="")):
+        assert rust.default_kv_events_config(args, environ={}) == args.kv_events_config
+        published_at(args)
+    # Four schedulers (two data-parallel, two attention-DP each) publish on
+    # four consecutive ports: all free.
+    args = _server_args(dp_size=2, attn_dp_size=2, enable_dp_attention=False)
+    rust.default_kv_events_config(args, environ={})
+    base = published_at(args)
+    assert all(rust_lifecycle._bindable(base + rank) for rank in range(4))
     # The opt-out.
     for value in ("0", "false", "No", " off "):
         args = _server_args(kv_events_config=None)
         assert rust.default_kv_events_config(args, environ={rust.KV_EVENTS_ENV: value}) is None
         assert args.kv_events_config is None
     args = _server_args()
-    assert rust.default_kv_events_config(args, environ={rust.KV_EVENTS_ENV: "1"}) == expected
-    # An explicit configuration is kept as given, off included.
+    assert rust.default_kv_events_config(args, environ={rust.KV_EVENTS_ENV: "1"}) is not None
+    published_at(args)
+    # An explicit configuration is kept as given, its endpoint and off included.
     for given in ('{"publisher": "null"}', '{"publisher": "zmq", "endpoint": "tcp://*:6100"}'):
         args = _server_args(kv_events_config=given)
         assert rust.default_kv_events_config(args, environ={}) is None
         assert args.kv_events_config == given
+    assert rust.kv_events_publisher(args) == ("tcp://*:6100", "", "")
     # Server args that cannot be written are left alone.
 
     class Frozen:
@@ -501,10 +544,6 @@ def _stub_rank_launch(monkeypatch, *, ranks: int = 2) -> dict:
         publish=lambda args, role: recorded["calls"].append(f"publish:{role}"),
     )
     _install(monkeypatch, "sglang.srt.server_args", PortArgs=PortArgs)
-    # The launch writes the plugin's two variables straight into the
-    # environment; registered here so the teardown puts their absence back.
-    monkeypatch.setenv(zmq_plugin.HANDSHAKE_ENV, "")
-    monkeypatch.setenv(zmq_plugin.ENGINE_INDEX_ENV, "")
     # SGLang's own setup sets the spawn method; the launcher's guard reads it
     # and must not switch this test process over.
     recorded["start_method_calls"] = []
@@ -553,8 +592,6 @@ def test_launch_scheduler_ranks_starts_them_from_this_process_as_the_headless_la
     from smg_grpc_servicer.sglang.zmq_plugin import ENGINE_INDEX_ENV, HANDSHAKE_ENV
 
     recorded = _stub_rank_launch(monkeypatch)
-    monkeypatch.delenv(HANDSHAKE_ENV, raising=False)
-    monkeypatch.delenv(ENGINE_INDEX_ENV, raising=False)
     monkeypatch.setattr(
         rust.multiprocessing,
         "get_context",
@@ -660,7 +697,6 @@ def test_serve_rust_starts_the_scheduler_ranks_from_this_process(
         init_servicer_tracing=lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(rust.multiprocessing, "get_context", lambda method: pytest.fail(method))
-    monkeypatch.delenv(HANDSHAKE_ENV, raising=False)
     monkeypatch.setenv(rust.HANDSHAKE_PORT_ENV, "24321")
     monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(tmp_path))
     monkeypatch.setattr(rust, "model_facts", lambda args: {"model_path": args.model_path})
@@ -725,21 +761,39 @@ def test_serve_rust_wires_the_server_the_scheduler_and_the_supervisor(monkeypatc
     assert created["engine_count"] == 1 and created["tokenizer_dir"] == "/tok"
     assert created["model_path"] == "org/model" and created["sglang_version"] == "x"
     assert launched == {"args": args, "port": 24321}
-    # No --kv-events-config was given: the headless scheduler publishes.
-    assert args.kv_events_config == '{"publisher": "zmq"}'
+    # No --kv-events-config was given: the headless scheduler publishes, at a
+    # free port of this host.
+    published = json.loads(args.kv_events_config)
+    assert published == {"publisher": "zmq", "endpoint": published["endpoint"]}
+    assert published["endpoint"].startswith("tcp://*:") and published["endpoint"] != "tcp://*:5557"
 
 
 def _run_serve_rust(monkeypatch, tmp_path, *, real_facts: bool = False) -> dict:
     """``serve_rust`` against a recording fake server, the scheduler launch and
     the supervisor stubbed; the keywords the server was constructed with. With
     ``real_facts`` the launcher's own fact producers run, over a fake model
-    config, as at a real start."""
+    config, as at a real start: the facts then carry a vocabulary and a
+    context, so a warm-up is planned and readiness held, as at a real start.
+    The fake carries both readiness setters of the binding (``set_ready``, the
+    health-only hold; ``set_serving``, the drain switch) and records their
+    calls; ``_run_serve_rust.recorded`` holds the server and the keywords the
+    supervisor got."""
     created: dict = {}
+    recorded: dict = {}
 
     class FakeServer:
         def __init__(self, **kwargs):
             created.update(kwargs)
             self.address = kwargs["bind_address"]
+            self.serving: list[bool] = []
+            self.ready: list[bool] = []
+            recorded["server"] = self
+
+        def set_serving(self, serving: bool) -> None:
+            self.serving.append(serving)
+
+        def set_ready(self, ready: bool) -> None:
+            self.ready.append(ready)
 
     _install_fake_servicer(monkeypatch, FakeServer)
     monkeypatch.setenv(rust.HANDSHAKE_PORT_ENV, "24321")
@@ -756,12 +810,33 @@ def _run_serve_rust(monkeypatch, tmp_path, *, real_facts: bool = False) -> dict:
         rust, "launch_scheduler_ranks", lambda server_args, *, handshake_port: "engine"
     )
 
-    async def fake_supervise(server, engine, *, drain_secs, **_kwargs):
+    async def fake_supervise(server, engine, *, drain_secs, **kwargs):
+        recorded["supervise_kwargs"] = kwargs
         return 0
 
     monkeypatch.setattr(rust_lifecycle, "supervise", fake_supervise)
     assert asyncio.run(rust.serve_rust(_server_args())) == 0
+    _run_serve_rust.recorded = recorded
     return created
+
+
+def test_serve_rust_holds_readiness_for_the_planned_warm_up(monkeypatch, tmp_path):
+    """With a warm-up planned (the default knob, a generation model whose
+    facts carry a vocabulary and a context), the server's readiness is held
+    before the scheduler starts through the health-only setter (admission
+    stays open for the pass's own requests; the drain switch is never
+    touched) and the supervisor is handed the pass, which flips SERVING when
+    it ran; with the knob off, neither happens."""
+    _run_serve_rust(monkeypatch, tmp_path, real_facts=True)
+    recorded = _run_serve_rust.recorded
+    assert recorded["server"].ready == [False] and recorded["server"].serving == []
+    assert callable(recorded["supervise_kwargs"]["warmup"])
+
+    monkeypatch.setenv(rust.WARMUP_ENV, "off")
+    _run_serve_rust(monkeypatch, tmp_path, real_facts=True)
+    recorded = _run_serve_rust.recorded
+    assert recorded["server"].ready == [] and recorded["server"].serving == []
+    assert recorded["supervise_kwargs"] == {}
 
 
 def test_serve_rust_hands_the_server_both_startup_bounds(monkeypatch, tmp_path):
@@ -770,15 +845,23 @@ def test_serve_rust_hands_the_server_both_startup_bounds(monkeypatch, tmp_path):
     ceiling."""
     monkeypatch.delenv(rust.STARTUP_TIMEOUT_SECS_ENV, raising=False)
     monkeypatch.delenv(rust.STARTUP_CEILING_SECS_ENV, raising=False)
+    monkeypatch.delenv(rust.SILENCE_TIMEOUT_SECS_ENV, raising=False)
+    monkeypatch.delenv(rust.PREFILL_TOKENS_PER_SEC_ENV, raising=False)
     created = _run_serve_rust(monkeypatch, tmp_path)
     assert created["engine_startup_timeout_secs"] == rust.DEFAULT_STARTUP_TIMEOUT_SECS
     assert created["engine_startup_ceiling_secs"] == rust.DEFAULT_STARTUP_CEILING_SECS
+    assert created["engine_silence_timeout_secs"] == rust.DEFAULT_SILENCE_TIMEOUT_SECS
+    assert created["engine_prefill_tokens_per_sec"] == rust.DEFAULT_PREFILL_TOKENS_PER_SEC
 
     monkeypatch.setenv(rust.STARTUP_TIMEOUT_SECS_ENV, "42")
     monkeypatch.setenv(rust.STARTUP_CEILING_SECS_ENV, "0")
+    monkeypatch.setenv(rust.SILENCE_TIMEOUT_SECS_ENV, "900")
+    monkeypatch.setenv(rust.PREFILL_TOKENS_PER_SEC_ENV, "0")
     created = _run_serve_rust(monkeypatch, tmp_path)
     assert created["engine_startup_timeout_secs"] == 42.0
     assert created["engine_startup_ceiling_secs"] == 0.0
+    assert created["engine_silence_timeout_secs"] == 900.0
+    assert created["engine_prefill_tokens_per_sec"] == 0
 
 
 def test_serve_rust_constructs_the_server_with_keywords_the_binding_takes(monkeypatch, tmp_path):

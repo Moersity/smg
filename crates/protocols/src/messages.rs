@@ -11,7 +11,7 @@ use validator::Validate;
 
 use crate::{
     chat::deserialize_reasoning_effort,
-    common::{CachePartition, GenerationRequest},
+    common::{self, invalid, CachePartition, GenerationRequest},
     model_card::ModelCard,
     profile::ProviderProfile,
     validated::Normalizable,
@@ -157,6 +157,12 @@ impl CreateMessageRequest {
         self.thinking.as_ref().map(ThinkingConfig::enabled)
     }
 
+    /// The `thinking.display` the `thinking` block states, none without one;
+    /// [`ThinkingDisplay::returns_text`] says what it decides.
+    pub fn thinking_display(&self) -> Option<ThinkingDisplay> {
+        self.thinking.as_ref().and_then(ThinkingConfig::display)
+    }
+
     /// The thinking preference the prompt is rendered with.
     pub fn template_thinking(&self) -> Option<bool> {
         template_thinking(&self.model, self.thinking_toggle(), self.reasoning_effort())
@@ -184,6 +190,26 @@ impl CreateMessageRequest {
         self.tool_choice
             .as_ref()
             .is_some_and(ToolChoice::disables_parallel_tool_use)
+    }
+
+    /// The request's custom tools as chat tools, the shape the templates and
+    /// the parsers read (see [`chat_tools`]).
+    pub fn chat_tools(&self) -> Vec<common::Tool> {
+        self.tools.as_deref().map(chat_tools).unwrap_or_default()
+    }
+
+    /// The tool calls the history already holds, across the assistant
+    /// messages: the index the next call continues from.
+    pub fn history_tool_calls_count(&self) -> usize {
+        self.messages
+            .iter()
+            .filter(|message| message.role == Role::Assistant)
+            .flat_map(|message| match &message.content {
+                InputContent::Blocks(blocks) => blocks.as_slice(),
+                InputContent::String(_) => &[],
+            })
+            .filter(|block| matches!(block, InputContentBlock::ToolUse(_)))
+            .count()
     }
 }
 
@@ -289,9 +315,10 @@ fn validate_message_request(req: &CreateMessageRequest) -> Result<(), validator:
     crate::messages_validation::validate(req)?;
 
     if req.has_mcp_toolset() && req.mcp_server_configs().is_none() {
-        let mut e = validator::ValidationError::new("mcp_servers_required");
-        e.message = Some("mcp_servers is required when mcp_toolset tools are present".into());
-        return Err(e);
+        return Err(invalid(
+            "mcp_servers_required",
+            "mcp_servers is required when mcp_toolset tools are present",
+        ));
     }
 
     let Some(tool_choice) = &req.tool_choice else {
@@ -302,12 +329,10 @@ fn validate_message_request(req: &CreateMessageRequest) -> Result<(), validator:
     let requires_tools = !matches!(tool_choice, ToolChoice::None);
 
     if requires_tools && !has_tools {
-        let mut e = validator::ValidationError::new("tool_choice_requires_tools");
-        e.message = Some(
-            "Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified."
-                .into(),
-        );
-        return Err(e);
+        return Err(invalid(
+            "tool_choice_requires_tools",
+            "Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified.",
+        ));
     }
 
     if let ToolChoice::Tool { name, .. } = tool_choice {
@@ -317,12 +342,10 @@ fn validate_message_request(req: &CreateMessageRequest) -> Result<(), validator:
             .is_some_and(|tools| tools.iter().any(|tool| tool.matches_tool_choice_name(name)));
 
         if !tool_exists {
-            let mut e = validator::ValidationError::new("tool_choice_tool_not_found");
-            e.message = Some(
-                format!("Invalid value for 'tool_choice': tool '{name}' not found in 'tools'.")
-                    .into(),
-            );
-            return Err(e);
+            return Err(invalid(
+                "tool_choice_tool_not_found",
+                format!("Invalid value for 'tool_choice': tool '{name}' not found in 'tools'."),
+            ));
         }
     }
 
@@ -388,7 +411,11 @@ pub enum Role {
     /// forwarded to the chat template **in place**, so backends that render
     /// `system` inline (e.g. GLM-4.5+/5.x) keep its position, while backends
     /// that only read a leading system (e.g. MiniMax-M2) handle it per their
-    /// own template. See https://github.com/smg-project/smg/issues/1795
+    /// own template. See https://github.com/smg-project/smg/issues/1795. A
+    /// renderer whose reference writes no turn for a system message past the
+    /// leading run (`RendererCapabilities::leading_system_only`) gets such a
+    /// message as a user turn at its position instead, so the prompt keeps
+    /// its assistant header; the leading run is the system prompt and stays.
     System,
 }
 
@@ -568,6 +595,16 @@ pub enum ToolResultContentBlock {
     Image(ImageBlock),
     Document(DocumentBlock),
     SearchResult(SearchResultBlock),
+    /// A tool loaded by tool search (Claude Code's ToolSearch over deferred tools)
+    ToolReference(ToolResultReferenceBlock),
+}
+
+/// `tool_reference` inside a tool result: names a tool the search loaded
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ToolResultReferenceBlock {
+    pub tool_name: String,
+    pub cache_control: Option<CacheControl>,
 }
 
 /// Thinking block
@@ -576,8 +613,14 @@ pub struct ThinkingBlock {
     /// The thinking content
     pub thinking: String,
 
-    /// Signature for the thinking block
+    /// Signature for the thinking block; history echoed without one (the
+    /// Anthropic Python SDK sends `null` or drops the field) reads as empty
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub signature: String,
+}
+
+fn null_as_empty<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
 }
 
 /// Redacted thinking block
@@ -841,6 +884,62 @@ pub struct InputSchema {
     pub additional: Map<String, Value>,
 }
 
+impl From<&InputSchema> for Value {
+    /// The schema as the JSON object a chat tool's `parameters` holds.
+    fn from(schema: &InputSchema) -> Self {
+        let mut object = Map::new();
+        object.insert(
+            "type".to_string(),
+            Value::String(schema.schema_type.clone()),
+        );
+        if let Some(properties) = &schema.properties {
+            object.insert("properties".to_string(), Value::Object(properties.clone()));
+        }
+        if let Some(required) = &schema.required {
+            object.insert(
+                "required".to_string(),
+                Value::Array(required.iter().cloned().map(Value::String).collect()),
+            );
+        }
+        object.extend(
+            schema
+                .additional
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+        Value::Object(object)
+    }
+}
+
+impl From<&CustomTool> for common::Tool {
+    /// The chat tool a custom tool reads as: a function with the input
+    /// schema as its parameters.
+    fn from(tool: &CustomTool) -> Self {
+        Self {
+            tool_type: "function".to_string(),
+            function: common::Function {
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                parameters: Value::from(&tool.input_schema),
+                strict: None,
+                extra: Default::default(),
+            },
+        }
+    }
+}
+
+/// The custom tools among `tools` as chat tools, in order; the other kinds
+/// render and parse through their own paths.
+pub fn chat_tools(tools: &[Tool]) -> Vec<common::Tool> {
+    tools
+        .iter()
+        .filter_map(|tool| match tool {
+            Tool::Custom(custom) => Some(common::Tool::from(custom)),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Bash tool for computer use
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct BashTool {
@@ -945,6 +1044,22 @@ impl ToolChoice {
     }
 }
 
+impl From<&ToolChoice> for common::ToolChoice {
+    /// The chat tool choice a Messages choice reads as: `auto`, `required` for
+    /// `any`, the named function, `none`.
+    fn from(choice: &ToolChoice) -> Self {
+        match choice {
+            ToolChoice::Auto { .. } => Self::Value(common::ToolChoiceValue::Auto),
+            ToolChoice::Any { .. } => Self::Value(common::ToolChoiceValue::Required),
+            ToolChoice::Tool { name, .. } => Self::Function {
+                tool_type: "function".to_string(),
+                function: common::FunctionChoice { name: name.clone() },
+            },
+            ToolChoice::None => Self::Value(common::ToolChoiceValue::None),
+        }
+    }
+}
+
 // ============================================================================
 // Thinking Configuration
 // ============================================================================
@@ -976,16 +1091,94 @@ impl ThinkingConfig {
     pub fn enabled(&self) -> bool {
         matches!(self, Self::Enabled { .. } | Self::Adaptive { .. })
     }
+
+    /// The `display` the block states, under `enabled` and `adaptive` alike;
+    /// `disabled` states none.
+    pub fn display(&self) -> Option<ThinkingDisplay> {
+        match self {
+            Self::Enabled { display, .. } | Self::Adaptive { display } => *display,
+            Self::Disabled => None,
+        }
+    }
 }
 
-/// How thinking content is returned in API responses
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+/// How thinking content is returned in API responses: the documented set,
+/// `summarized`, `omitted` and `updates` (the beta value that returns the
+/// model's progress notes between tool calls). What each value returns from
+/// the gateway is [`ThinkingDisplay::returns_text`]'s to say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ThinkingDisplay {
-    /// Thinking blocks contain summarized reasoning text
+    /// Thinking blocks carry readable reasoning text: a summary where the
+    /// provider writes one, the reasoning itself here
     Summarized,
-    /// Thinking blocks return empty text; signature still carries encrypted content
+    /// Thinking blocks return an empty text; the block and its signature
+    /// still arrive
     Omitted,
+    /// As `omitted`, with the model's progress notes between tool calls as
+    /// short thinking blocks (beta `thinking-display-updates-2026-08-18`);
+    /// the reasoning as it arrives here
+    Updates,
+}
+
+impl ThinkingDisplay {
+    /// The documented values by wire name, in the order a refusal lists them.
+    const VALUES: [(&'static str, Self); 3] = [
+        ("summarized", Self::Summarized),
+        ("omitted", Self::Omitted),
+        ("updates", Self::Updates),
+    ];
+
+    /// The set as a refusal lists it.
+    const EXPECTED: &'static str = "one of `summarized`, `omitted`, `updates`";
+
+    /// Whether the thinking blocks of the response carry their text.
+    ///
+    /// `omitted` returns them empty: the block, its `signature` and the
+    /// thinking tokens in `usage` still arrive, the text does not.
+    /// `summarized` and `updates` return the reasoning as the engine wrote
+    /// it, as it arrives: the gateway has no summarizer, and a model served
+    /// through it writes no progress notes apart from its reasoning, so the
+    /// live text is the readable form the one asks for and the update stream
+    /// the other does; returned, the client can send it back, and a template
+    /// that reads the reasoning of the turn's earlier calls then has it.
+    pub fn returns_text(self) -> bool {
+        !matches!(self, Self::Omitted)
+    }
+}
+
+/// A `display` outside the documented set is refused with the field's name:
+/// serde's words for the derived enum would read `thinking: unknown
+/// variant`, the same as for a `thinking.type` outside its own set. The
+/// refusal still opens with serde's words, so the public `code` follows
+/// them (`invalid_value`, `invalid_type`).
+impl<'de> Deserialize<'de> for ThinkingDisplay {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct DisplayVisitor;
+
+        impl serde::de::Visitor<'_> for DisplayVisitor {
+            type Value = ThinkingDisplay;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(ThinkingDisplay::EXPECTED)
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                ThinkingDisplay::VALUES
+                    .iter()
+                    .find(|(name, _)| *name == value)
+                    .map(|(_, display)| *display)
+                    .ok_or_else(|| {
+                        E::custom(format!(
+                            "unknown variant `{value}` for `thinking.display`, expected {}",
+                            ThinkingDisplay::EXPECTED
+                        ))
+                    })
+            }
+        }
+
+        deserializer.deserialize_str(DisplayVisitor)
+    }
 }
 
 // ============================================================================
@@ -1417,6 +1610,11 @@ impl Normalizable for CountMessageTokensRequest {
 }
 
 impl CountMessageTokensRequest {
+    /// The request's custom tools as chat tools, as [`CreateMessageRequest::chat_tools`].
+    pub fn chat_tools(&self) -> Vec<common::Tool> {
+        self.tools.as_deref().map(chat_tools).unwrap_or_default()
+    }
+
     /// Whether the request's final message is an assistant prefill the
     /// response continues (see [`continues_final_assistant`]).
     pub fn continues_final_assistant(&self) -> bool {
@@ -2279,6 +2477,32 @@ mod tests {
 
     use super::*;
 
+    /// History echoed by Claude Code (a ToolSearch result) and by the Anthropic
+    /// Python SDK (thinking without a signature, or with a null one) parses, and
+    /// is forwarded with the reference intact and an empty signature.
+    #[test]
+    fn echoed_tool_reference_and_unsigned_thinking_are_accepted() {
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m", "max_tokens": 8,
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "t"},
+                    {"type": "thinking", "thinking": "u", "signature": null},
+                    {"type": "tool_use", "id": "t1", "name": "ToolSearch", "input": {}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1",
+                    "content": [{"type": "tool_reference", "tool_name": "WebSearch"}]}]}]
+        }))
+        .expect("a Messages request");
+        let forwarded = serde_json::to_value(&request).unwrap();
+        assert_eq!(forwarded["messages"][1]["content"][0]["signature"], "");
+        assert_eq!(forwarded["messages"][1]["content"][1]["signature"], "");
+        assert_eq!(
+            forwarded["messages"][2]["content"][0]["content"][0],
+            json!({"type": "tool_reference", "tool_name": "WebSearch"})
+        );
+    }
+
     /// A trailing assistant message is continued when it has text and no
     /// tool call: as a string, as text blocks, with thinking before the
     /// text. A tool call closes the turn, and so does a trailing user turn.
@@ -2928,6 +3152,145 @@ mod tests {
         assert_eq!(json, r#"{"type":"enabled","budget_tokens":1024}"#);
     }
 
+    /// `display` takes every documented value under `adaptive` and
+    /// `enabled` alike, and each comes back out as it went in.
+    #[test]
+    fn thinking_display_takes_every_documented_value() {
+        for (name, display) in ThinkingDisplay::VALUES {
+            for input in [
+                json!({"type": "adaptive", "display": name}),
+                json!({"type": "enabled", "budget_tokens": 1024, "display": name}),
+            ] {
+                let cfg: ThinkingConfig = serde_json::from_value(input.clone()).expect(name);
+                let parsed = match &cfg {
+                    ThinkingConfig::Adaptive { display }
+                    | ThinkingConfig::Enabled { display, .. } => *display,
+                    ThinkingConfig::Disabled => None,
+                };
+                assert_eq!(parsed, Some(display), "{input}");
+                assert_eq!(serde_json::to_value(&cfg).unwrap(), input);
+            }
+        }
+        assert_eq!(
+            ThinkingDisplay::EXPECTED,
+            format!(
+                "one of {}",
+                ThinkingDisplay::VALUES
+                    .iter()
+                    .map(|(name, _)| format!("`{name}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        );
+    }
+
+    /// A `display` outside the set is refused with the field's name and the
+    /// set, a wrong type the same way; `null` is no display. The words open
+    /// with serde's own, so the public `code` follows them.
+    #[test]
+    fn thinking_display_outside_the_documented_set_is_refused_by_name() {
+        let refusal = |input: Value| -> String {
+            serde_json::from_value::<ThinkingConfig>(input.clone())
+                .expect_err(&input.to_string())
+                .to_string()
+        };
+        assert_eq!(
+            refusal(json!({"type": "adaptive", "display": "full"})),
+            "unknown variant `full` for `thinking.display`, expected one of `summarized`, `omitted`, `updates`"
+        );
+        assert_eq!(
+            refusal(json!({"type": "enabled", "budget_tokens": 1024, "display": "Updates"})),
+            "unknown variant `Updates` for `thinking.display`, expected one of `summarized`, `omitted`, `updates`"
+        );
+        assert_eq!(
+            refusal(json!({"type": "adaptive", "display": 1})),
+            "invalid type: integer `1`, expected one of `summarized`, `omitted`, `updates`"
+        );
+        let cfg: ThinkingConfig =
+            serde_json::from_value(json!({"type": "adaptive", "display": null})).unwrap();
+        assert!(matches!(cfg, ThinkingConfig::Adaptive { display: None }));
+    }
+
+    /// `omitted` is the one value that returns the thinking blocks without
+    /// their text; the request states the display under `adaptive` and
+    /// `enabled` alike, and none under `disabled` or without `thinking`.
+    #[test]
+    fn thinking_display_decides_whether_the_thinking_text_is_returned() {
+        assert!(ThinkingDisplay::Summarized.returns_text());
+        assert!(ThinkingDisplay::Updates.returns_text());
+        assert!(!ThinkingDisplay::Omitted.returns_text());
+        let display = |thinking: Value| -> Option<ThinkingDisplay> {
+            let request: CreateMessageRequest = serde_json::from_value(json!({
+                "model": "m", "max_tokens": 16, "messages": [], "thinking": thinking
+            }))
+            .expect("the request deserializes");
+            request.thinking_display()
+        };
+        assert_eq!(
+            display(json!({"type": "adaptive", "display": "omitted"})),
+            Some(ThinkingDisplay::Omitted)
+        );
+        assert_eq!(
+            display(json!({"type": "enabled", "budget_tokens": 1024, "display": "updates"})),
+            Some(ThinkingDisplay::Updates)
+        );
+        assert_eq!(
+            display(json!({"type": "enabled", "budget_tokens": 1024, "display": "summarized"})),
+            Some(ThinkingDisplay::Summarized)
+        );
+        assert_eq!(display(json!({"type": "adaptive"})), None);
+        assert_eq!(display(json!({"type": "disabled"})), None);
+        assert_eq!(display(Value::Null), None);
+    }
+
+    /// The first request of a coding agent: an adaptive thinking with
+    /// `display` `updates`, the effort under `output_config`, a context
+    /// management edit and a safeguards list (beta fields that ride in
+    /// `other`), a JSON string as `metadata.user_id`, a system-role entry in
+    /// `messages`, cache-controlled system blocks and custom tools. Nothing
+    /// in it is refused.
+    #[test]
+    fn a_coding_agents_first_request_deserializes_whole() {
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "List the files."}]},
+                {"role": "system", "content": [{"type": "text", "text": "Workspace notes."}]}
+            ],
+            "system": [
+                {"type": "text", "text": "You are a coding agent."},
+                {"type": "text", "text": "Tool rules.", "cache_control": {"type": "ephemeral"}}
+            ],
+            "tools": [{
+                "name": "Bash",
+                "description": "Runs a command.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"]
+                }
+            }],
+            "metadata": {"user_id": "{\"device_id\":\"d\",\"session_id\":\"s\"}"},
+            "max_tokens": 32000,
+            "thinking": {"type": "adaptive", "display": "updates"},
+            "context_management": {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]},
+            "safeguards": [{"type": "dangerous_tool_use", "classifier_context": {"v": 1}}],
+            "output_config": {"effort": "high"},
+            "stream": true
+        }))
+        .expect("the request deserializes");
+        assert!(matches!(
+            request.thinking,
+            Some(ThinkingConfig::Adaptive {
+                display: Some(ThinkingDisplay::Updates)
+            })
+        ));
+        assert_eq!(request.reasoning_effort(), Some("high"));
+        assert!(request.other.contains_key("context_management"));
+        assert!(request.other.contains_key("safeguards"));
+        request.validate().expect("the request validates");
+    }
+
     #[test]
     fn test_full_message_with_tool_search_flow_deserialization() {
         // Simulates the full response from Anthropic API with tool search flow
@@ -3153,5 +3516,120 @@ mod tests {
                 "{choice}"
             );
         }
+    }
+
+    /// A Messages tool choice reads as the chat choice the templates and
+    /// parsers know: `auto`, `required` for `any`, the named function, `none`.
+    #[test]
+    fn a_tool_choice_reads_as_a_chat_tool_choice() {
+        let choice = |body: Value| -> common::ToolChoice {
+            let choice: ToolChoice = serde_json::from_value(body).expect("a tool choice");
+            common::ToolChoice::from(&choice)
+        };
+        assert!(matches!(
+            choice(json!({"type": "auto"})),
+            common::ToolChoice::Value(common::ToolChoiceValue::Auto)
+        ));
+        assert!(matches!(
+            choice(json!({"type": "any"})),
+            common::ToolChoice::Value(common::ToolChoiceValue::Required)
+        ));
+        assert!(matches!(
+            choice(json!({"type": "none"})),
+            common::ToolChoice::Value(common::ToolChoiceValue::None)
+        ));
+        match choice(json!({"type": "tool", "name": "calc"})) {
+            common::ToolChoice::Function {
+                tool_type,
+                function,
+            } => {
+                assert_eq!(tool_type, "function");
+                assert_eq!(function.name, "calc");
+            }
+            other => panic!("a named tool reads as a function choice, not {other:?}"),
+        }
+    }
+
+    /// A custom tool reads as a function tool whose parameters are the input
+    /// schema, keys in the order the client wrote them; the other tool kinds
+    /// are left out of the chat tools.
+    #[test]
+    fn custom_tools_read_as_chat_tools_in_order() {
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m", "max_tokens": 8, "messages": [],
+            "tools": [
+                {"name": "weather", "description": "Get weather", "input_schema": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                    "additionalProperties": false
+                }},
+                {"type": "web_search_20250305", "name": "web_search"},
+                {"name": "calc", "input_schema": {"type": "object"}}
+            ]
+        }))
+        .expect("a Messages request");
+        let tools = request.chat_tools();
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|tool| tool.function.name.as_str())
+            .collect();
+        assert_eq!(names, ["weather", "calc"]);
+        let weather = &tools[0];
+        assert_eq!(weather.tool_type, "function");
+        assert_eq!(weather.function.description.as_deref(), Some("Get weather"));
+        let keys: Vec<&str> = weather.function.parameters["properties"]
+            .as_object()
+            .expect("properties")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["city"]);
+        let keys: Vec<&str> = weather
+            .function
+            .parameters
+            .as_object()
+            .expect("an object schema")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            ["type", "properties", "required", "additionalProperties"]
+        );
+        assert_eq!(tools[1].function.parameters, json!({"type": "object"}));
+        let none: CreateMessageRequest =
+            serde_json::from_value(json!({"model": "m", "max_tokens": 8, "messages": []}))
+                .expect("a Messages request");
+        assert!(none.chat_tools().is_empty());
+    }
+
+    /// The history's tool calls are the `tool_use` blocks of the assistant
+    /// turns; user turns and text blocks do not count.
+    #[test]
+    fn the_history_counts_the_assistant_tool_uses() {
+        let request = |messages: Value| -> CreateMessageRequest {
+            serde_json::from_value(json!({"model": "m", "max_tokens": 8, "messages": messages}))
+                .expect("a Messages request")
+        };
+        assert_eq!(
+            request(json!([{"role": "user", "content": "Hello"}])).history_tool_calls_count(),
+            0
+        );
+        let history = json!([
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "Let me check."},
+                {"type": "tool_use", "id": "tu_1", "name": "calc", "input": {"x": 1}},
+                {"type": "tool_use", "id": "tu_2", "name": "search", "input": {"q": "t"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "tu_1", "content": "2"}
+            ]},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "tu_3", "name": "calc", "input": {}}
+            ]}
+        ]);
+        assert_eq!(request(history).history_tool_calls_count(), 3);
     }
 }

@@ -17,12 +17,8 @@
 use openai_protocol::common::Tool;
 use serde_json::Value;
 
-use super::{
-    block_of,
-    schema::{self, shape, Definitions},
-    CallMarkers, Count, Grammar, Tag, WayIn,
-};
-use crate::tagged::keyed::Tags;
+use super::{calls, CallMarkers, Count, Grammar, Tag, WayIn};
+use crate::{format::Whitespace, tagged::keyed::Tags};
 
 /// The calls for `tools`: in a block, the block's ways in around one or more calls (one, when
 /// `count` asks for one); without one, one tag per tool, triggered by the call's opener.
@@ -46,42 +42,48 @@ pub(super) fn calls(
             &tool.function.parameters,
         )
     });
-    match markers.block.as_ref() {
-        Some(block) => {
-            let one_call = Grammar::Or(
-                calls
-                    .map(|(begin, content, end)| {
-                        Grammar::Sequence(vec![
-                            Grammar::ConstString(begin),
-                            content,
-                            Grammar::ConstString(end),
-                        ])
-                    })
-                    .collect(),
-            );
-            // The block's own newlines, where the template writes them: before each call and
-            // before the block's close (K2-Horizon); Hy4's block writes none.
-            let newlines = &tags.newlines;
-            let each = match newlines.block_before_call {
-                "" => one_call,
-                before => {
-                    Grammar::Sequence(vec![Grammar::ConstString(before.to_string()), one_call])
-                }
-            };
-            let all = count.calls(each);
-            let inside = match newlines.block_before_close {
-                "" => all,
-                before => Grammar::Sequence(vec![all, Grammar::ConstString(before.to_string())]),
-            };
-            block_of(ways_in, inside, block.close, count)
+    // The block's own newlines, where the template writes them: before each call and before the
+    // block's close (K2-Horizon); Hy4's block writes none.
+    let newlines = &tags.newlines;
+    calls::in_block(markers, ways_in, calls.collect(), count, |one_call| {
+        let each = match newlines.block_before_call {
+            "" => one_call,
+            before => Grammar::Sequence(vec![Grammar::ConstString(before.to_string()), one_call]),
+        };
+        let all = count.calls(each);
+        match newlines.block_before_close {
+            "" => all,
+            before => Grammar::Sequence(vec![all, Grammar::ConstString(before.to_string())]),
         }
-        None => count.triggered(
-            vec![markers.call_open.to_string()],
-            calls
-                .map(|(begin, content, end)| Tag::new(begin, content, end))
-                .collect(),
-        ),
-    }
+    })
+}
+
+/// Keyed arguments in the compact spelling (GLM 4.7 and later, IQuest): each call is the call
+/// opener and the tool's name, the schema written in the engines' `glm_xml` style (`<arg_key>`
+/// and `<arg_value>` pairs with nothing between them), and the call's close; the shape
+/// xgrammar's built-in GLM tag has and the gateway writes today. Ling's and Hy4's spellings
+/// are not this one, and are written from their own tags instead ([`calls()`]).
+pub(super) fn compact_calls(
+    markers: &CallMarkers<'_>,
+    tools: &[&Tool],
+    count: Count<'_>,
+) -> Grammar {
+    let tags = tools
+        .iter()
+        .map(|tool| {
+            Tag::new(
+                format!("{}{}", markers.call_open, tool.function.name),
+                Grammar::JsonSchema {
+                    schema: tool.function.parameters.clone(),
+                    style: Some("glm_xml".to_string()),
+                    excludes: Vec::new(),
+                    whitespace: Whitespace::Free,
+                },
+                markers.call_close,
+            )
+        })
+        .collect();
+    count.triggered(vec![markers.call_open.to_string()], tags)
 }
 
 /// What ends a value: its own closing tag, and the terminals the table has a row for out of the
@@ -121,14 +123,12 @@ fn call(
 /// The arguments the tool's schema asks for: one pair per property, in the schema's order, each
 /// optional unless required; any pairs at all for a schema without properties.
 fn arguments(tags: &Tags, ends: &Ends<'_>, parameters: &Value) -> Grammar {
-    let pair = |key: &str, property: &Value, definitions: Definitions<'_>| {
-        let value = shape(property, definitions, || ends.text())
-            .map_or_else(|| ends.text(), |(_, value)| value);
-        argument(tags, Grammar::ConstString(key.to_string()), value)
-    };
-    schema::arguments(parameters, pair, || {
-        Grammar::Star(Box::new(any_argument(tags, ends)))
-    })
+    calls::arguments(
+        parameters,
+        || ends.text(),
+        |key, value| argument(tags, key, value),
+        || any_argument(tags, ends),
+    )
 }
 
 /// One pair: the key between its tags, the newline the spelling writes after the key, the value

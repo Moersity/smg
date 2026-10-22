@@ -206,6 +206,59 @@ class TestBuildProcessor:
         with pytest.raises(ValueError, match="Rust servicer"):
             mm_processor.build_mm_processor(self._Engine(), env={"SMG_VLLM_MM_PROCESSOR": "smg"})
 
+    def test_smg_mode_is_refused_before_any_engine_exists(self, caplog):
+        # The launcher's settings alone decide: the same refusal, with no
+        # engine built and no model loaded, in the flag and the env form.
+        MmSettings = mm_processor.MmSettings
+        check = mm_processor.require_python_servicer_mode
+        with pytest.raises(ValueError, match="Rust servicer") as flagged:
+            check(MmSettings(processor="smg"), env={})
+        with pytest.raises(ValueError, match="Rust servicer") as exported:
+            check(MmSettings(), env={"SMG_VLLM_MM_PROCESSOR": "smg"})
+        with pytest.raises(ValueError, match="Rust servicer") as late:
+            mm_processor.build_mm_processor(self._Engine(), env={"SMG_VLLM_MM_PROCESSOR": "smg"})
+        assert str(flagged.value) == str(exported.value) == str(late.value)
+        assert str(late.value) == mm_processor.SMG_MODE_REFUSAL
+        # A resolved settings object gets the same verdict.
+        with pytest.raises(ValueError, match="Rust servicer"):
+            check(MmSettings(processor="smg").resolve(env={}), env={})
+        # The modes the Python servicer serves pass, flag over env, default off.
+        assert check(MmSettings(processor="inprocess"), env={}) == "inprocess"
+        assert check(MmSettings(processor="inprocess"), env={"SMG_VLLM_MM_PROCESSOR": "smg"}) == (
+            "inprocess"
+        )
+        assert check(MmSettings(), env={"SMG_VLLM_MM_PROCESSOR": "redis"}) == "redis"
+        assert check(MmSettings(), env={}) == "off"
+        assert check(None, env={}) == "off"
+        with pytest.raises(ValueError, match="is not one of"):
+            check(MmSettings(), env={"SMG_VLLM_MM_PROCESSOR": "sidecar"})
+        # Every other setting is validated as the servicer's constructor
+        # validates it, whatever the mode: a knob it cannot use is refused
+        # before the load too.
+        with pytest.raises(ValueError, match="--mm-max-inflight=0 must be positive"):
+            check(MmSettings(processor="off", max_inflight=0), env={})
+        with pytest.raises(ValueError, match="SMG_VLLM_MM_MAX_ITEM_BYTES='abc' is not an integer"):
+            check(MmSettings(), env={"SMG_VLLM_MM_MAX_ITEM_BYTES": "abc"})
+        with pytest.raises(ValueError, match="SMG_VLLM_MM_SIDECAR_MAX_QUEUE='-1' must be positive"):
+            check(MmSettings(processor="inprocess"), env={"SMG_VLLM_MM_SIDECAR_MAX_QUEUE": "-1"})
+        assert check(MmSettings(processor="off", max_inflight=8), env={}) == "off"
+        # So is the frame budget the processors read at construction, for the
+        # modes that read it.
+        frames = "SMG_VLLM_MM_MAX_VIDEO_FRAMES"
+        with pytest.raises(ValueError, match=f"{frames}='abc' is not an integer"):
+            check(MmSettings(processor="inprocess"), env={frames: "abc"})
+        with pytest.raises(ValueError, match=f"{frames}='-1' must be at least 0"):
+            check(MmSettings(processor="redis"), env={frames: "-1"})
+        assert check(MmSettings(processor="inprocess"), env={frames: "0"}) == "inprocess"
+        assert check(MmSettings(processor="off"), env={frames: "abc"}) == "off"
+        # No deprecation line of its own for the variable behind a defined
+        # flag: the servicer's own resolve logs that once, later.
+        caplog.set_level(logging.WARNING)
+        ns = argparse.Namespace(mm_processor=None, mm_max_items=None)
+        env = {"SMG_VLLM_MM_PROCESSOR": "inprocess", "SMG_VLLM_MM_MAX_ITEMS": "2"}
+        assert check(MmSettings.from_args(ns), env=env) == "inprocess"
+        assert "deprecated" not in caplog.text
+
     def test_invalid_item_cap_is_rejected_before_construction(self):
         env = {"SMG_VLLM_MM_PROCESSOR": "inprocess", "SMG_VLLM_MM_MAX_ITEM_BYTES": "0"}
         with pytest.raises(ValueError, match="SMG_VLLM_MM_MAX_ITEM_BYTES"):
@@ -254,6 +307,7 @@ class TestMmSettings:
         assert resolved.sidecar_timeout_ms == 30_000
         assert resolved.sidecar_max_queue == 256
         assert resolved.sidecar_namespace is None
+        assert resolved.turbojpeg == "prefer"
         assert resolved.source == "default"
         assert set(resolved.sources.values()) == {"default"}
         assert resolved.resolved
@@ -310,6 +364,17 @@ class TestMmSettings:
             assert resolved.source == "env" and resolved.sources["max_item_bytes"] == "env"
             assert resolved.flags_defined == frozenset()
 
+    def test_the_turbojpeg_variable_is_not_deprecated_beside_its_flag(self, caplog):
+        """`SMG_VLLM_MM_TURBOJPEG` is documented beside `--mm-turbojpeg` as a
+        supported way to set the policy (as the router's `SMG_MM_TURBOJPEG`
+        is), not a legacy spelling of it: a launcher that defines the flag
+        reads the variable without a deprecation line."""
+        settings = mm_processor.MmSettings.from_args(self._launcher_with_the_flags())
+        with caplog.at_level("WARNING", logger=self.LOGGER):
+            resolved = settings.resolve(env={"SMG_VLLM_MM_TURBOJPEG": "require"})
+        assert not [r for r in caplog.records if "deprecated" in r.getMessage()]
+        assert (resolved.turbojpeg, resolved.sources["turbojpeg"]) == ("require", "env")
+
     def test_the_deprecation_line_follows_the_flags_the_launcher_defines(self, caplog):
         """A launcher with some of the flags: the variable behind a flag it
         defines logs the line, the variable behind one it lacks does not."""
@@ -356,6 +421,7 @@ class TestMmSettings:
             mm_sidecar_timeout_ms=None,
             mm_sidecar_max_queue=None,
             mm_sidecar_namespace="ns",
+            mm_turbojpeg=None,
             model="m",
         )
         settings = mm_processor.MmSettings.from_args(args)
@@ -376,6 +442,30 @@ class TestMmSettings:
             mm_processor.MmSettings(max_item_bytes=0).resolve(env={})
         with pytest.raises(ValueError, match="SMG_VLLM_MM_MAX_INFLIGHT"):
             mm_processor.MmSettings().resolve(env={"SMG_VLLM_MM_MAX_INFLIGHT": "0"})
+
+    def test_turbojpeg_policy_reads_prefer_or_require_and_refuses_the_rest(self):
+        """The TurboJPEG policy: `prefer` by default, either value in any case
+        from the flag or the variable, anything else refused at start."""
+        assert mm_processor.MmSettings().resolve(env={}).turbojpeg == "prefer"
+        resolved = mm_processor.MmSettings(turbojpeg=" Require ").resolve(env={})
+        assert (resolved.turbojpeg, resolved.sources["turbojpeg"]) == ("require", "flag")
+        resolved = mm_processor.MmSettings().resolve(env={"SMG_VLLM_MM_TURBOJPEG": "REQUIRE"})
+        assert (resolved.turbojpeg, resolved.sources["turbojpeg"]) == ("require", "env")
+        blank = mm_processor.MmSettings().resolve(env={"SMG_VLLM_MM_TURBOJPEG": "  "})
+        assert (blank.turbojpeg, blank.sources["turbojpeg"]) == ("prefer", "default")
+        with pytest.raises(ValueError, match="--mm-turbojpeg='required' is not one of"):
+            mm_processor.MmSettings(turbojpeg="required").resolve(env={})
+        with pytest.raises(ValueError, match="SMG_VLLM_MM_TURBOJPEG='required' is not one of"):
+            mm_processor.MmSettings().resolve(env={"SMG_VLLM_MM_TURBOJPEG": "required"})
+        parser = argparse.ArgumentParser()
+        assert "--mm-turbojpeg" in mm_processor.add_mm_arguments(parser)
+        assert parser.parse_args(["--mm-turbojpeg", "require"]).mm_turbojpeg == "require"
+        # argparse checks `choices` after `type`: the flag reads in any case
+        # with blanks around it, as `_validate_flag` reads the value.
+        assert parser.parse_args(["--mm-turbojpeg", " REQUIRE "]).mm_turbojpeg == "require"
+        assert parser.parse_args(["--mm-processor", "SMG"]).mm_processor == "smg"
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--mm-turbojpeg", "required"])
 
     def test_a_subset_resolves_only_itself_under_its_own_flag_names(self, caplog):
         env = {
@@ -590,6 +680,23 @@ class TestInProcessConstruction:
         self._stub_vllm(monkeypatch, loaded, video_io=False)
         mm_processor.InProcessMediaProcessor(self._engine({"image": {}}), max_video_frames=64)
         assert loaded["media_io_kwargs"] == {"image": {}}
+
+    def test_the_served_familys_short_side_floor_is_read_at_construction(self, monkeypatch, caplog):
+        caplog.set_level(logging.INFO)
+        self._stub_vllm(monkeypatch, {})
+        engine = self._engine(None)
+        engine.model_config.model = "/models/ckpt"
+        engine.model_config.hf_config = types.SimpleNamespace(model_type="minimax_m3_vl")
+        p = mm_processor.InProcessMediaProcessor(engine)
+        assert p._short_side_floor.floor == 112
+        assert (p._short_side_floor.factor, p._short_side_floor.max_pixels) == (28, 451584)
+        assert "images below a 112 px short side are raised" in caplog.text
+        caplog.clear()
+        engine = self._engine(None)
+        engine.model_config.model = "Qwen/Qwen3-VL-8B-Instruct"
+        engine.model_config.hf_config = types.SimpleNamespace(model_type="qwen3_vl")
+        assert mm_processor.InProcessMediaProcessor(engine)._short_side_floor is None
+        assert "short side" not in caplog.text
 
 
 class TestRedisClient:
@@ -896,6 +1003,45 @@ class TestProcess:
         p = self.processor(self._Renderer(RuntimeError("Expected 1 image placeholders, found 0")))
         with pytest.raises(ValueError, match="multimodal placeholder validation failed: Expected"):
             run(p.process([1, 2, 3], None, [_Item("image", "https://a/1.png")], 0.0))
+
+    def test_a_fetched_image_below_the_familys_floor_is_raised_before_the_renderer(self):
+        from smg_grpc_servicer.vllm.short_side_floor import FloorRule
+
+        M3_RULE = FloorRule(floor=112, factor=28, min_pixels=3136, max_pixels=451584)
+
+        class _Image:
+            def __init__(self, width, height):
+                self.size = (width, height)
+
+            def resize(self, size, resample):
+                assert resample == 3  # bicubic
+                return _Image(*size)
+
+        for size, floor, expected in [
+            ((16, 16), M3_RULE, (112, 112)),
+            ((1, 1), M3_RULE, (112, 112)),
+            ((400, 20), M3_RULE, (2240, 112)),
+            ((400, 112), M3_RULE, (400, 112)),
+            ((16, 16), None, (16, 16)),
+        ]:
+            renderer = self._Renderer()
+            p = self.processor(renderer)
+            fetched = _Image(*size)
+
+            async def fetch_image(url, fetched=fetched):
+                return fetched
+
+            p._connector.fetch_image_async = fetch_image
+            p._short_side_floor = floor
+            run(p.process([1, 2, 3], None, [_Item("image", "https://a/1.png")], 0.0))
+            (image,) = renderer.calls[0]["multi_modal_data"]["image"]
+            assert image.size == expected
+            if expected == size:
+                assert image is fetched
+
+    def test_a_processor_built_without_init_raises_nothing(self):
+        # The class default: a processor stood up without __init__ has no floor.
+        assert self.processor(self._Renderer())._short_side_floor is None
 
 
 class TestServicerWiring:

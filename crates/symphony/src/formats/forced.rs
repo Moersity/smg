@@ -2,7 +2,7 @@
 //! engine writes it under the JSON-schema constraint the gateway builds when `tool_choice` names a
 //! function (the function's `parameters` as the schema), with no marker and no name in the output.
 //! The one format known from the request rather than from the model: the gateway picks it for such
-//! a request, with the function's name in [`Declared::forcing`](crate::tagged::Declared::forcing),
+//! a request, with the function's name in [`Declared::forcing`](crate::Declared::forcing),
 //! and no operator names it. A required call under the same constraint is a list of
 //! `{"name": …, "parameters": …}` objects, which the [`json`](super::json()) table reads.
 //!
@@ -29,10 +29,11 @@ mod tests {
         event::{Event, Events, FinishReason, MalformedReason},
         input::{EngineFinish, Input},
         parser::Parser,
-        tagged::Declared,
+        testing::calls,
+        Declared,
     };
 
-    fn run(pieces: &[&str], declared: Declared) -> Vec<Event> {
+    fn run(pieces: &[&str], declared: Declared) -> Vec<Event<'static>> {
         let mut parser = Engine::new(forced(), declared);
         let mut out = Events::new();
         parser
@@ -64,21 +65,7 @@ mod tests {
                 &mut out,
             )
             .expect("end");
-        out.drain()
-    }
-
-    fn calls(events: &[Event]) -> Vec<(String, String)> {
-        let mut calls: Vec<(String, String)> = Vec::new();
-        for event in events {
-            match event {
-                Event::ToolCallStart { name, .. } => calls.push((name.clone(), String::new())),
-                Event::ToolCallArguments { json, .. } => {
-                    calls.last_mut().expect("a call started").1.push_str(json);
-                }
-                _ => {}
-            }
-        }
-        calls
+        out.into_owned().drain()
     }
 
     fn finish(events: &[Event]) -> (FinishReason, u32) {
@@ -134,7 +121,7 @@ mod tests {
         assert!(events.iter().any(|event| matches!(
             event,
             Event::Malformed {
-                why: MalformedReason::Other(_),
+                why: MalformedReason::NoForcedFunction,
                 ..
             }
         )));

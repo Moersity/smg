@@ -41,8 +41,7 @@ use smg_response_template::{
     load_response_template, Event as RegionEvent, ResponseParser, ResponseTemplate,
 };
 use symphony::{
-    adapt, Declared, Engine, EngineFinish, Event, Events, Format, Input, MalformedReason, Parser,
-    TokenSpan,
+    adapt, Declared, Engine, EngineFinish, Event, Events, Format, Input, Parser, TokenSpan,
 };
 
 /// The compiled tables of a fixture directory by template id, each with the literal text of its
@@ -127,15 +126,9 @@ fn check_tokens(
 ) {
     let boundaries = token_boundaries(text);
     let tokens: Vec<(usize, usize)> = boundaries.windows(2).map(|w| (w[0], w[1])).collect();
-    let mut parser = Engine::new(format.clone(), declared.clone());
-    let mut out = Events::new();
-    if !prompt.is_empty() {
-        let input = Input::Prompt {
-            token_ids: &[],
-            text: prompt,
-        };
-        parser.feed(input, &mut out).unwrap();
-    }
+    // Each delta's spans are built first: a delta's events borrow it for as long as the buffer
+    // they are read into lives, here the whole output.
+    let mut deltas: Vec<(usize, usize, Vec<TokenSpan>)> = Vec::new();
     let mut from = 0;
     for &cut in cuts.iter().chain(std::iter::once(&text.len())) {
         if cut > from {
@@ -149,14 +142,26 @@ fn check_tokens(
                     continued: start < from,
                 })
                 .collect();
-            let delta = Input::Delta {
-                token_ids: &[],
-                text: &text[from..cut],
-                spans: &spans,
-            };
-            parser.feed(delta, &mut out).unwrap();
+            deltas.push((from, cut, spans));
             from = cut;
         }
+    }
+    let mut parser = Engine::new(format.clone(), declared.clone());
+    let mut out = Events::new();
+    if !prompt.is_empty() {
+        let input = Input::Prompt {
+            token_ids: &[],
+            text: prompt,
+        };
+        parser.feed(input, &mut out).unwrap();
+    }
+    for (from, cut, spans) in &deltas {
+        let delta = Input::Delta {
+            token_ids: &[],
+            text: &text[*from..*cut],
+            spans,
+        };
+        parser.feed(delta, &mut out).unwrap();
     }
     let end = Input::End {
         finish: EngineFinish::Stop,
@@ -197,42 +202,6 @@ struct Message {
     reasoning: String,
     content: String,
     calls: Vec<(String, Value)>,
-}
-
-/// The message a client folds from the events, with every call the stream cut closed: its
-/// arguments' object closed and the text the cut gave back, which no parameter took, left out.
-/// `None` when the stream cut no call.
-fn closed(events: &[Event]) -> Option<Message> {
-    let kept: Vec<Event> = events
-        .iter()
-        .filter(|event| {
-            !matches!(
-                event,
-                Event::Malformed {
-                    why: MalformedReason::UnterminatedRegion,
-                    ..
-                }
-            )
-        })
-        .cloned()
-        .collect();
-    let mut message = ours(&kept);
-    let mut cut = false;
-    for (_, arguments) in &mut message.calls {
-        let Value::String(text) = arguments else {
-            continue;
-        };
-        let whole = if text.is_empty() {
-            "{}".to_owned()
-        } else {
-            format!("{text}}}")
-        };
-        if let Ok(value) = serde_json::from_str::<Value>(&whole) {
-            *arguments = value;
-            cut = true;
-        }
-    }
-    cut.then_some(message)
 }
 
 fn ours(events: &[Event]) -> Message {
@@ -458,11 +427,6 @@ fn replay_sessions(
 /// - X1: a field that does not repeat was written more than once; the table keeps every stay
 ///   where transformers keeps the last. The table reads what the template's reader closes in
 ///   each field, joined.
-/// - X5: the stream was cut for length inside a call, which the table reports cut (its arguments'
-///   object left open, the text of a parameter the cut left unfinished malformed), where
-///   transformers closes the region at the end of the text. With each cut call closed and that
-///   text left out, it reads as transformers reads it. The stream's stop closes every call, so
-///   this never explains a session that stopped.
 fn explain(
     session: &Session,
     format: &Format,
@@ -510,12 +474,6 @@ fn explain(
             );
             let read = ours(&events);
             if read == *theirs {
-                return Some(codes.join(" "));
-            }
-            if !matches!(session.end, EngineFinish::Stop)
-                && closed(&events).as_ref() == Some(theirs)
-            {
-                codes.push("X5");
                 return Some(codes.join(" "));
             }
             let moved = Session {

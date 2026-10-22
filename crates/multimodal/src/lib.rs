@@ -5,6 +5,7 @@ pub mod error;
 mod fetch_policy;
 pub use fetch_policy::effective_allowed_domains;
 pub mod hasher;
+#[cfg(feature = "hf-hub")]
 pub mod hub;
 pub mod jpeg_turbo;
 pub mod media;
@@ -15,6 +16,7 @@ mod pixel_convert;
 pub mod registry;
 pub mod tracker;
 pub mod types;
+mod video_seek;
 pub mod vision;
 pub mod webp_native;
 
@@ -24,7 +26,8 @@ pub use encoder_inputs::{
     ModelSpecificValue, PixelNorm, PreprocessedEncoderInputs,
 };
 pub use error::{
-    MediaConnectorError, MediaFault, MultiModalError, MultiModalResult, TransformError,
+    MediaConnectorError, MediaErrorCode, MediaFault, MultiModalError, MultiModalResult,
+    TransformError,
 };
 pub use media::{
     init_log_video_decode_timing, FrameSampling, ImageFetchConfig, MediaConnector,
@@ -45,7 +48,7 @@ pub use types::{
 pub use vision::execution::{configure_parallelism, parallelism, Parallelism, POOL_THREADS_ENV};
 pub use vision::{
     DeepseekV41Processor, LlavaNextProcessor, LlavaProcessor, PreProcessorConfig,
-    VisionPreProcessor, VisionProcessorRegistry,
+    VisionPreProcessor, VisionPreprocessingContext, VisionProcessorRegistry,
 };
 
 /// Support for this crate's unit tests.

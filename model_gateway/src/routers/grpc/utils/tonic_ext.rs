@@ -2,17 +2,27 @@
 
 use axum::response::Response;
 use http::StatusCode;
-use smg_grpc_client::{is_transport_failure, WorkerMediaFault};
+use llm_multimodal::MediaErrorCode;
+use smg_grpc_client::{is_constraint_failure, is_transport_failure, WorkerMediaFault};
 use tonic::Code;
 
-use crate::routers::error;
+use crate::routers::{common::retry::mark_non_retryable, error};
+
+/// The code the public API answers when the engine could not continue the
+/// request under the request's own constraint (see
+/// [`TonicStatusExt::constraint_failure_response`]).
+pub(crate) const CONSTRAINT_FAILED_CODE: &str = "constraint_failed";
 
 /// Extension methods for `tonic::Status`.
 pub(crate) trait TonicStatusExt {
     /// Map gRPC status code to the corresponding HTTP status code. A failure
     /// of the request's media (see [`TonicStatusExt::media_fault`]) is
-    /// answered for the media: the request's own fault 400, the media host's
-    /// 502. A `CANCELLED` the worker answered is the worker's side ending the
+    /// answered for the media, a 400 whichever side of the fetch failed: a
+    /// reference the request got wrong and an origin that does not deliver
+    /// within the fetch budget are both the request's input, which the
+    /// reference APIs answer a 4xx for; the worker's own trouble with the
+    /// media stays the worker's 5xx (it carries no media fault). A
+    /// `CANCELLED` the worker answered is the worker's side ending the
     /// call (its connection closed under it, its server reset the stream):
     /// a bad gateway, never the request's fault. So is a status tonic made
     /// of an HTTP/2 fault under the call (the connection went away, a stream
@@ -29,10 +39,30 @@ pub(crate) trait TonicStatusExt {
     /// `UNAVAILABLE`.
     fn media_fault(&self) -> Option<WorkerMediaFault>;
 
+    /// The code the public API answers for a failure of the request's media
+    /// (see [`TonicStatusExt::media_fault`]): the one the worker names in its
+    /// `smg-media-code` trailer (`media_too_large` for a size refusal), or
+    /// `media_fetch_failed` from a worker that names none or one this router
+    /// does not know.
+    fn media_code(&self) -> MediaErrorCode;
+
     /// The HTTP status the circuit breaker samples for this failure; `None`
     /// for a failure of the request's media, which says nothing about the
-    /// worker that fetched it.
+    /// worker that fetched it, and for a constraint the engine could not
+    /// continue the request under, which says nothing about the worker
+    /// either.
     fn breaker_status(&self) -> Option<u16>;
+
+    /// The client's answer when the status is a worker's report that the
+    /// engine could not continue the request under the request's own
+    /// constraint (the `smg-constraint-failed` trailer, see
+    /// `smg_grpc_client::constraint_failure`): a 422 under
+    /// [`CONSTRAINT_FAILED_CODE`] with the worker's words, terminal for the
+    /// retry layer. The request was well formed and the engine admitted it,
+    /// so it is not a 400; the same tokens fail the same way on a replay, on
+    /// this worker or another of its kind, each replay a prefill, so it is
+    /// not a transient 5xx either. `None` for any other status.
+    fn constraint_failure_response(&self) -> Option<Response>;
 }
 
 /// Whether a status message is the media connector's account of a fetch that
@@ -46,10 +76,11 @@ fn names_a_fetch_failure(message: &str) -> bool {
 
 impl TonicStatusExt for tonic::Status {
     fn http_status(&self) -> StatusCode {
-        match self.media_fault() {
-            Some(WorkerMediaFault::Client) => return StatusCode::BAD_REQUEST,
-            Some(WorkerMediaFault::Transient) => return StatusCode::BAD_GATEWAY,
-            None => {}
+        if is_constraint_failure(self) {
+            return StatusCode::UNPROCESSABLE_ENTITY;
+        }
+        if self.media_fault().is_some() {
+            return StatusCode::BAD_REQUEST;
         }
         // tonic makes a status of a failure in the HTTP/2 layer under the
         // call (the connection went away: a GOAWAY of either side, the one
@@ -96,11 +127,26 @@ impl TonicStatusExt for tonic::Status {
         })
     }
 
+    fn media_code(&self) -> MediaErrorCode {
+        smg_grpc_client::media_code(self)
+            .and_then(MediaErrorCode::parse)
+            .unwrap_or(MediaErrorCode::FetchFailed)
+    }
+
     fn breaker_status(&self) -> Option<u16> {
-        match self.media_fault() {
-            Some(_) => None,
-            None => Some(self.http_status().as_u16()),
+        if is_constraint_failure(self) || self.media_fault().is_some() {
+            return None;
         }
+        Some(self.http_status().as_u16())
+    }
+
+    fn constraint_failure_response(&self) -> Option<Response> {
+        if !is_constraint_failure(self) {
+            return None;
+        }
+        let mut response = self.to_http_error(CONSTRAINT_FAILED_CODE, self.message().to_string());
+        mark_non_retryable(&mut response);
+        Some(response)
     }
 }
 
@@ -159,6 +205,34 @@ mod tests {
         );
     }
 
+    /// A worker's report that the engine could not continue the request under
+    /// its constraint is answered for the constraint: a 422 under its own
+    /// code with the worker's words, terminal for the retry layer, sampled by
+    /// no breaker; the same code without the report keeps its 400.
+    #[test]
+    fn a_constraint_failure_is_a_terminal_422_the_breaker_does_not_sample() {
+        use smg_grpc_client::constraint_failed_status;
+
+        use crate::routers::{common::retry::is_retryable_response, error};
+
+        let status = constraint_failed_status("the scheduler aborted the request: Aborted");
+        assert_eq!(status.http_status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let result: Result<(), tonic::Status> = Err(status.clone());
+        assert_eq!(result.breaker_status(), None);
+        let response = status
+            .constraint_failure_response()
+            .expect("the report is answered");
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            CONSTRAINT_FAILED_CODE
+        );
+        assert!(!is_retryable_response(&response));
+        let plain = tonic::Status::failed_precondition("the scheduler aborted the request");
+        assert_eq!(plain.http_status(), StatusCode::BAD_REQUEST);
+        assert!(plain.constraint_failure_response().is_none());
+    }
+
     #[test]
     fn invalid_argument_maps_to_400_and_is_not_a_circuit_breaker_failure() {
         for status in [
@@ -215,8 +289,10 @@ mod tests {
     }
 
     /// A worker's report that the request's media failed is answered for the
-    /// media (the request's own fault 400, the media host's 502) and is no
-    /// circuit-breaker sample, whichever code carries it.
+    /// media (a 400 for the request's own fault and for the media host's
+    /// alike) and is no circuit-breaker sample, whichever code carries it.
+    /// The API's code is the one the worker names, `media_fetch_failed` when
+    /// it names none or one this router does not know.
     #[test]
     fn a_media_fault_answers_for_the_media_and_is_no_breaker_sample() {
         let client = WorkerMediaFault::Client.stamp(tonic::Status::invalid_argument(
@@ -225,21 +301,41 @@ mod tests {
         ));
         assert_eq!(client.media_fault(), Some(WorkerMediaFault::Client));
         assert_eq!(client.http_status(), StatusCode::BAD_REQUEST);
+        assert_eq!(client.media_code(), MediaErrorCode::FetchFailed);
         assert_eq!(client.breaker_status(), None);
 
         let transient = WorkerMediaFault::Transient.stamp(tonic::Status::unavailable(
             "media fetch of https://media.example/a.png timed out after 10s",
         ));
         assert_eq!(transient.media_fault(), Some(WorkerMediaFault::Transient));
-        assert_eq!(transient.http_status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(transient.http_status(), StatusCode::BAD_REQUEST);
+        assert_eq!(transient.media_code(), MediaErrorCode::FetchFailed);
         let result: Result<(), tonic::Status> = Err(transient);
         assert_eq!(result.breaker_status(), None);
+
+        let too_large = smg_grpc_client::stamp_media_code(
+            WorkerMediaFault::Client.stamp(tonic::Status::invalid_argument(
+                "decoded video RGB payload would be 2208384000 bytes, exceeding \
+                 SMG_VIDEO_MAX_DECODED_BYTES=1073741824",
+            )),
+            "media_too_large",
+        );
+        assert_eq!(too_large.media_fault(), Some(WorkerMediaFault::Client));
+        assert_eq!(too_large.http_status(), StatusCode::BAD_REQUEST);
+        assert_eq!(too_large.media_code(), MediaErrorCode::TooLarge);
+        assert_eq!(too_large.breaker_status(), None);
+
+        let unknown = smg_grpc_client::stamp_media_code(
+            WorkerMediaFault::Client.stamp(tonic::Status::invalid_argument("new words")),
+            "media_from_the_future",
+        );
+        assert_eq!(unknown.media_code(), MediaErrorCode::FetchFailed);
     }
 
     /// A worker that predates the trailer reports a fetch failure on
     /// `UNAVAILABLE` in the connector's words; it is read as the media host's
-    /// fault. The worker's own trouble, and a caller fault the worker already
-    /// answers 4xx, are read as before.
+    /// fault and answered for the media. The worker's own trouble, and a
+    /// caller fault the worker already answers 4xx, are read as before.
     #[test]
     fn a_fetch_failure_in_the_connectors_words_is_read_without_the_trailer() {
         for message in [
@@ -255,7 +351,8 @@ mod tests {
                 Some(WorkerMediaFault::Transient),
                 "{message}"
             );
-            assert_eq!(legacy.http_status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(legacy.http_status(), StatusCode::BAD_REQUEST);
+            assert_eq!(legacy.media_code(), MediaErrorCode::FetchFailed);
             assert_eq!(legacy.breaker_status(), None);
         }
         let sidecar = tonic::Status::unavailable("sidecar_timeout: no result");

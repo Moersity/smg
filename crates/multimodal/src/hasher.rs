@@ -122,6 +122,22 @@ pub fn hash_video_with_sampling(
         FrameSampling::EvenRounded => {
             hasher.update(&[3]);
         }
+        FrameSampling::TemporalGroups {
+            frame_factor,
+            max_frames,
+        } => {
+            hasher.update(&[4]);
+            hasher.update(&(frame_factor as u64).to_le_bytes());
+            hasher.update(&(max_frames as u64).to_le_bytes());
+        }
+        FrameSampling::UpToThenRate {
+            max_frames,
+            rate_max_frames,
+        } => {
+            hasher.update(&[5]);
+            hasher.update(&(max_frames as u64).to_le_bytes());
+            hasher.update(&(rate_max_frames as u64).to_le_bytes());
+        }
     }
     hasher.finalize().to_hex().to_string()
 }

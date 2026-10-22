@@ -111,6 +111,37 @@ def test_mm_item_limits_follow_the_engines_per_prompt_limits():
     assert parsed.mm_item_limits == "image=8,video=2"
 
 
+def test_mm_encoder_budget_is_the_engines_own(caplog):
+    # A text model has none.
+    assert model_info.mm_encoder_budget(SimpleNamespace(model_config=_model_config())) == 0
+    assert model_info.mm_encoder_budget(None) == 0
+    # A multimodal engine's budget comes from vLLM's own helper over its config,
+    # as the number the scheduler places one item under.
+    config = SimpleNamespace(model_config=_model_config(is_multimodal_model=True))
+    seen = []
+
+    def factory(vllm_config):
+        seen.append(vllm_config)
+        return SimpleNamespace(get_encoder_budget=lambda: 192000)
+
+    assert model_info.mm_encoder_budget(config, budget_factory=factory) == 192000
+    assert seen == [config]
+
+    # A helper that cannot tell (or a vLLM without one) leaves the item's size
+    # to the engine, as before, and says so.
+    def failing(vllm_config):
+        raise RuntimeError("no dummy data for this processor")
+
+    with caplog.at_level(logging.WARNING):
+        assert model_info.mm_encoder_budget(config, budget_factory=failing) == 0
+        assert model_info.mm_encoder_budget(config) == 0  # no vLLM in this environment
+    assert sum("encoder budget" in r.getMessage() for r in caplog.records) == 2
+    # The proto carries it as it is.
+    info = vllm_engine_pb2.GetServerInfoResponse(mm_encoder_budget=192000)
+    parsed = vllm_engine_pb2.GetServerInfoResponse.FromString(info.SerializeToString())
+    assert parsed.mm_encoder_budget == 192000
+
+
 def test_model_facts_build_the_proto_as_they_are(caplog):
     with caplog.at_level(logging.WARNING, logger=model_info.__name__):
         facts = model_info.model_facts(_model_config())
@@ -212,6 +243,33 @@ def test_server_facts_build_the_proto_as_they_are(monkeypatch):
     assert (facts["kv_connector"], facts["kv_role"], facts["kv_engine_id"]) == ("", "", "")
     assert "block_size" not in facts and "model_dtype" not in facts
     vllm_engine_pb2.GetServerInfoResponse(**facts)
+
+
+def test_server_facts_project_a_multi_connector_onto_the_child_that_moves_the_kv():
+    """A wrapper around a store child and an offloading tier is reported as the
+    store child, the parent's engine id and role kept: the router pairs and
+    serves the deployment under the store's profile, not as an unknown
+    connector named ``MultiConnector``."""
+    config = SimpleNamespace(
+        model_config=_model_config(dtype="torch.bfloat16"),
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        kv_transfer_config=SimpleNamespace(
+            kv_connector="MultiConnector",
+            kv_role="kv_producer",
+            engine_id="eng-a",
+            kv_connector_extra_config={
+                "connectors": [
+                    {"kv_connector": "MooncakeStoreConnector"},
+                    {"kv_connector": "OffloadingConnector"},
+                ]
+            },
+        ),
+    )
+    facts = model_info.server_facts(config)
+    response = vllm_engine_pb2.GetServerInfoResponse(**facts)
+    assert response.kv_connector == "MooncakeStoreConnector"
+    assert response.kv_role == "kv_producer"
+    assert response.kv_engine_id == "eng-a"
 
 
 def test_server_facts_carry_the_running_window():

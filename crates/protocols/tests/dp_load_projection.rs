@@ -2,6 +2,7 @@ use openai_protocol::worker::{
     EngineAggregateMetricsSnapshot, SchedulerLoadSnapshot, WorkerLoadResponse,
 };
 
+/// Four distinct engine ranks plus a backend-wide aggregate.
 fn dp4() -> WorkerLoadResponse {
     WorkerLoadResponse {
         dp_rank_count: 4,
@@ -21,6 +22,7 @@ fn dp4() -> WorkerLoadResponse {
 }
 
 #[test]
+/// Projection keeps one global rank and discards the backend aggregate.
 fn virtual_workers_only_receive_their_global_rank() {
     for rank in 0..4 {
         let load = dp4().for_dp_rank(Some(rank)).unwrap();
@@ -35,6 +37,7 @@ fn virtual_workers_only_receive_their_global_rank() {
 }
 
 #[test]
+/// A worker without a rank identity keeps its complete backend response.
 fn non_virtual_worker_keeps_all_ranks() {
     let load = dp4().for_dp_rank(None).unwrap();
     assert_eq!(load.dp_rank_count, 4);
@@ -43,6 +46,7 @@ fn non_virtual_worker_keeps_all_ranks() {
 }
 
 #[test]
+/// Missing or unrepresentable ranks must stay unavailable.
 fn missing_rank_never_falls_back_to_rank_zero() {
     let mut partial = dp4();
     partial.loads.truncate(1);
@@ -52,12 +56,14 @@ fn missing_rank_never_falls_back_to_rank_zero() {
 }
 
 #[test]
+/// An empty snapshot cannot be interpreted as an idle worker.
 fn empty_response_is_unavailable_not_idle() {
     assert!(WorkerLoadResponse::default().for_dp_rank(None).is_none());
     assert!(WorkerLoadResponse::default().for_dp_rank(Some(0)).is_none());
 }
 
 #[test]
+/// Annotated downstream workers do not share one global DP rank space.
 fn fleet_rollup_is_not_mistaken_for_engine_dp_ranks() {
     let mut fleet = dp4();
     for (index, load) in fleet.loads.iter_mut().enumerate() {

@@ -1,4 +1,7 @@
 use std::{
+    convert::Infallible,
+    future::Future,
+    pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -10,10 +13,11 @@ use axum::{
     extract::{Extension, Path, Query, RawQuery, Request, State},
     http::{header::InvalidHeaderName, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, post, Route},
     Json, Router,
 };
 use llm_tokenizer::TokenizerRegistry;
+use metrics_exporter_prometheus::PrometheusHandle;
 use openai_protocol::{
     chat::ChatCompletionRequest,
     classify::ClassifyRequest,
@@ -40,12 +44,17 @@ use openai_protocol::{
 };
 use serde::Deserialize;
 use serde_json::Value;
-use smg_mesh::{MeshServerBuilder, MeshServerConfig, MeshServerHandler};
+use smg_mesh::{
+    ClusterState, MeshServer, MeshServerBuilder, MeshServerConfig, MeshServerHandler,
+    PreparedMeshServer,
+};
 use tokio::{signal, spawn};
 use tracing::{debug, error, info, warn, Level};
 use wfaas::LoggingSubscriber;
 
+pub mod connection_limit;
 pub mod connection_timeouts;
+pub mod posture;
 
 use crate::{
     app_context::AppContext,
@@ -62,14 +71,14 @@ use crate::{
         metrics_server, otel_trace, runtime_metrics,
     },
     routers::{
-        common::realtime::ws::RealtimeQueryParams,
-        error as route_error,
-        gateway::Gateway,
-        grpc::common::responses::spawn_unstored_sweeper,
-        http::router::{stream_eligible_request_bodies, StreamBodyState},
+        common::realtime::ws::RealtimeQueryParams, error as route_error, gateway::Gateway,
+        grpc::common::responses::spawn_unstored_sweeper, http::router::StreamBodyState,
         RouterTrait,
     },
-    server::connection_timeouts::{ConnectionTimeoutAcceptor, ConnectionTimeouts},
+    server::{
+        connection_limit::ConnectionLimitAcceptor,
+        connection_timeouts::{ConnectionTimeoutAcceptor, ConnectionTimeouts},
+    },
     service_discovery::{start_service_discovery, RuntimeDiscoveryConfig},
     tenant,
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
@@ -843,6 +852,10 @@ async fn create_worker(
     }
 }
 
+async fn inflight_requests(State(state): State<Arc<AppState>>) -> Response {
+    Json(state.context.inflight_tracker.snapshot()).into_response()
+}
+
 async fn list_workers_rest(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListWorkersQuery>,
@@ -1007,15 +1020,62 @@ pub struct ServerConfig {
     /// STUN server for ICE candidate gathering (host:port).
     /// Defaults to `stun.l.google.com:19302`; `"none"` to disable.
     pub webrtc_stun_server: Option<String>,
+    /// Where the serving keys and the store URLs were read from (the
+    /// command line, the environment or a file), for the start-up record;
+    /// a caller that did not track them leaves the default, which logs
+    /// nothing.
+    pub secret_sources: posture::SecretSources,
+}
+
+/// `Router::layer` and `Router::route_layer` for a layer a configuration may
+/// leave out.
+///
+/// axum wraps every route in a fresh boxed service for whatever layer it is
+/// given, an identity layer included, and each wrapper costs a clone of the
+/// service and a boxed future per request; a layer with nothing to do is left
+/// uninstalled rather than installed empty.
+trait LayerIfSome<L> {
+    /// `Router::layer` with `layer` when there is one; the router unchanged
+    /// otherwise.
+    fn layer_if_some(self, layer: Option<L>) -> Self;
+
+    /// `Router::route_layer` with `layer` when there is one; the router
+    /// unchanged otherwise.
+    fn route_layer_if_some(self, layer: Option<L>) -> Self;
+}
+
+impl<S, L> LayerIfSome<L> for Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+    L: tower::Layer<Route> + Clone + Send + Sync + 'static,
+    L::Service: tower::Service<Request> + Clone + Send + Sync + 'static,
+    <L::Service as tower::Service<Request>>::Response: IntoResponse + 'static,
+    <L::Service as tower::Service<Request>>::Error: Into<Infallible> + 'static,
+    <L::Service as tower::Service<Request>>::Future: Send + 'static,
+{
+    fn layer_if_some(self, layer: Option<L>) -> Self {
+        match layer {
+            Some(layer) => self.layer(layer),
+            None => self,
+        }
+    }
+
+    fn route_layer_if_some(self, layer: Option<L>) -> Self {
+        match layer {
+            Some(layer) => self.route_layer(layer),
+            None => self,
+        }
+    }
 }
 
 /// Apply the request-admission layer to a protected route group.
 ///
 /// `AdmissionMode::Priority` installs the priority scheduler middleware
 /// (carrying its own `Arc<SchedulerState>`); `AdmissionMode::Legacy` installs
-/// the original `concurrency_limit_middleware`. Either runs innermost of the
-/// protective layers (closest to the handler), after tenant resolution has
-/// populated `RouteRequestMeta`.
+/// the original concurrency limit (`ConcurrencyLimitLayer`) when a rate
+/// limiter is configured, and nothing otherwise (it would pass every request
+/// through). Either runs innermost of the protective layers (closest to the
+/// handler), after tenant resolution has populated `RouteRequestMeta`.
 ///
 /// Invariant: a request parked at admission keeps its body unread — bodies
 /// are collected only at handler extraction, after a permit is granted.
@@ -1031,19 +1091,35 @@ fn with_admission_layer(
                 middleware::scheduler::priority_admission_middleware,
             ))
         }
-        middleware::scheduler::AdmissionMode::Legacy => {
-            router.route_layer(axum::middleware::from_fn_with_state(
-                app_state,
-                middleware::concurrency_limit_middleware,
-            ))
+        // Without a rate limiter the legacy layer passes every request through;
+        // it is not installed then (axum wraps every route in a boxed service
+        // for any layer it is given, this lean one included).
+        middleware::scheduler::AdmissionMode::Legacy
+            if app_state.context.rate_limiter.is_some() =>
+        {
+            router.route_layer(middleware::ConcurrencyLimitLayer::new(app_state))
         }
+        middleware::scheduler::AdmissionMode::Legacy => router,
     }
 }
 
-/// `serving_auth_config` covers inference-serving routes and may include
-/// per-tenant keys. `admin_auth_config` is the admin/worker-management
-/// fallback (used when `control_plane_auth_state` is `None`) and must
-/// contain only the shared gateway-wide key, never per-tenant keys.
+/// A listener's serve future, boxed so the plain and the TLS stacks share a
+/// type.
+type Serving = Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>>;
+
+/// The routers of one start: the data plane's and, with an admin listener,
+/// the control plane's.
+pub struct GatewayApps {
+    /// The serving routes; the control-plane routes too without an admin
+    /// listener.
+    pub data: Router,
+    /// The control-plane routes (admin, worker registry, RL) with the probe
+    /// routes, for the admin listener; `None` without one.
+    pub admin: Option<Router>,
+}
+
+/// One router with every route: the layout without an admin listener. See
+/// [`build_apps`] for the arguments.
 pub fn build_app(
     app_state: Arc<AppState>,
     serving_auth_config: AuthConfig,
@@ -1053,6 +1129,40 @@ pub fn build_app(
     request_id_headers: Vec<String>,
     cors_allowed_origins: Vec<String>,
 ) -> Result<Router, InvalidHeaderName> {
+    build_apps(
+        app_state,
+        serving_auth_config,
+        admin_auth_config,
+        control_plane_auth_state,
+        max_payload_size,
+        request_id_headers,
+        cors_allowed_origins,
+        false,
+    )
+    .map(|apps| apps.data)
+}
+
+/// `serving_auth_config` covers inference-serving routes and may include
+/// per-tenant keys. `admin_auth_config` is the admin/worker-management
+/// fallback (used when `control_plane_auth_state` is `None`) and must
+/// contain only the shared gateway-wide key, never per-tenant keys.
+/// `admin_listener` puts the control-plane routes on a router of their own,
+/// for the admin listener, and leaves them off the data router, which then
+/// answers 404 for them.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the inputs of the route groups, named one by one as `build_app` names them"
+)]
+pub fn build_apps(
+    app_state: Arc<AppState>,
+    serving_auth_config: AuthConfig,
+    admin_auth_config: AuthConfig,
+    control_plane_auth_state: Option<smg_auth::ControlPlaneAuthState>,
+    max_payload_size: usize,
+    request_id_headers: Vec<String>,
+    cors_allowed_origins: Vec<String>,
+    admin_listener: bool,
+) -> Result<GatewayApps, InvalidHeaderName> {
     // Pending (upgrade not completed): 30s TTL
     // Disconnected: 60 min TTL
     app_state.context.realtime_registry.start_reaper(
@@ -1063,6 +1173,18 @@ pub fn build_app(
 
     let tenant_resolution_state =
         middleware::TenantResolutionState::new(&app_state.context.router_config)?;
+    // The serving auth layer, built once for every route group that takes
+    // it: with no serving key configured it would pass every request through,
+    // so it is not installed then (a from_fn layer clones and boxes per request
+    // whatever it does, and axum wraps every route in a boxed service for an
+    // empty layer as well). The keys are fixed at start-up, so the decision at
+    // build time is the one the layer made per request.
+    let serving_auth_layer = serving_auth_config.is_enabled().then(|| {
+        axum::middleware::from_fn_with_state(
+            serving_auth_config.clone(),
+            middleware::auth_middleware,
+        )
+    });
 
     // Choose the admission path once at startup: priority scheduler when
     // enabled (and it starts cleanly), otherwise the legacy concurrency limit.
@@ -1119,23 +1241,21 @@ pub fn build_app(
             // Bound the buffered body read: inside admission, so a stalled
             // upload releases its permit, and inside the stream-vs-buffer
             // decision, since the streamed relay has its own watchdog.
-            .route_layer(axum::middleware::from_fn_with_state(
-                middleware::RequestBodyTimeouts::from_config(&app_state.context.router_config),
-                middleware::request_body_timeout_middleware,
-            ))
+            .route_layer(
+                middleware::RequestBodyTimeouts::from_config(&app_state.context.router_config)
+                    .layer(),
+            )
             // Per-request buffer-vs-stream decision for typed-JSON bodies;
             // declined requests pass to the handlers untouched.
-            .route_layer(axum::middleware::from_fn_with_state(
-                StreamBodyState::new(app_state.router.clone(), app_state.context.clone()),
-                stream_eligible_request_bodies,
-            ))
+            .route_layer(
+                StreamBodyState::new(app_state.router.clone(), app_state.context.clone()).layer(),
+            )
             // Every SSE stream of these routes carries a keep-alive through an
             // upstream silence (a comment; the Messages API's ping event),
             // written between frames, nothing while frames flow.
-            .route_layer(axum::middleware::from_fn_with_state(
-                middleware::SseKeepAlive::from_config(&app_state.context.router_config),
-                middleware::sse_keepalive_middleware,
-            ))
+            .route_layer(
+                middleware::SseKeepAlive::from_config(&app_state.context.router_config).layer(),
+            )
             // Tokenize / Detokenize endpoints
             .route("/v1/tokenize", post(v1_tokenize))
             .route("/v1/detokenize", post(v1_detokenize))
@@ -1152,23 +1272,19 @@ pub fn build_app(
         &admission_mode,
         app_state.clone(),
     )
-    .route_layer(axum::middleware::from_fn_with_state(
-        tenant_resolution_state.clone(),
-        middleware::route_request_meta_middleware,
-    ))
-    .route_layer(axum::middleware::from_fn_with_state(
-        serving_auth_config.clone(),
-        middleware::auth_middleware,
-    ))
-    .route_layer(axum::middleware::from_fn_with_state(
-        app_state.clone(),
-        middleware::wasm_middleware,
-    ))
+    .route_layer(tenant_resolution_state.clone().layer())
+    .route_layer_if_some(serving_auth_layer.clone())
+    // The wasm hooks run only with wasm enabled and a module manager; the
+    // layer is not installed otherwise.
+    .route_layer_if_some(
+        (app_state.context.router_config.enable_wasm && app_state.context.wasm_manager.is_some())
+            .then(|| {
+                axum::middleware::from_fn_with_state(app_state.clone(), middleware::wasm_middleware)
+            }),
+    )
     // Outermost on these routes: a refusal by any layer inside (authentication,
     // admission, the body timeout) leaves in the Messages envelope as well.
-    .route_layer(axum::middleware::from_fn(
-        middleware::messages_error_envelope_middleware,
-    ));
+    .route_layer(middleware::MessagesErrorEnvelopeLayer);
 
     // WebSocket and WebRTC routes: auth + concurrency but NO WASM middleware.
     // WASM OnResponse reconstructs the response from status/headers/body,
@@ -1180,14 +1296,8 @@ pub fn build_app(
         &admission_mode,
         app_state.clone(),
     )
-    .route_layer(axum::middleware::from_fn_with_state(
-        tenant_resolution_state.clone(),
-        middleware::route_request_meta_middleware,
-    ))
-    .route_layer(axum::middleware::from_fn_with_state(
-        serving_auth_config.clone(),
-        middleware::auth_middleware,
-    ));
+    .route_layer(tenant_resolution_state.clone().layer())
+    .route_layer_if_some(serving_auth_layer.clone());
 
     // Multipart upload routes: auth + concurrency but NO WASM middleware.
     // The WASM OnRequest phase buffers the full body into a `Vec<u8>` subject
@@ -1199,14 +1309,8 @@ pub fn build_app(
         &admission_mode,
         app_state.clone(),
     )
-    .route_layer(axum::middleware::from_fn_with_state(
-        tenant_resolution_state,
-        middleware::route_request_meta_middleware,
-    ))
-    .route_layer(axum::middleware::from_fn_with_state(
-        serving_auth_config.clone(),
-        middleware::auth_middleware,
-    ));
+    .route_layer(tenant_resolution_state.layer())
+    .route_layer_if_some(serving_auth_layer.clone());
 
     let public_routes = Router::new()
         .route("/liveness", get(liveness))
@@ -1224,6 +1328,7 @@ pub fn build_app(
 
     // Build admin routes with control plane auth if configured, otherwise use simple API key auth
     let admin_routes = Router::new()
+        .route("/inflight", get(inflight_requests))
         .route("/flush_cache", post(flush_cache))
         .route("/start_profile", post(start_profile))
         .route("/stop_profile", post(stop_profile))
@@ -1296,29 +1401,58 @@ pub fn build_app(
     // A v2-aware admin surface will return in a follow-up PR once
     // adapters are production-wired.
 
-    let mut app = Router::new()
+    let data = Router::new()
         .merge(protected_routes)
         .merge(realtime_routes)
         .merge(multipart_upload_routes)
-        .merge(public_routes)
-        .merge(admin_routes)
-        .merge(worker_routes);
+        .merge(public_routes);
+    let mut control_plane = Router::new().merge(admin_routes).merge(worker_routes);
     if let Some(rl_routes) = rl_routes {
-        app = app.merge(rl_routes);
+        control_plane = control_plane.merge(rl_routes);
     }
 
-    Ok(attach_edge_layers(
-        app,
-        max_payload_size,
-        app_state.context.inflight_tracker.clone(),
-        request_id_headers,
-        cors_allowed_origins,
-    )
-    .with_state(app_state))
+    // Each listener's router gets the edge layers; their not-found fallback
+    // is what answers 404 for a route that lives on the other listener.
+    let access_log_fields = middleware::AccessLogFields::from_fields(
+        &app_state.context.router_config.access_log_fields,
+    );
+    let finish = |app: Router<Arc<AppState>>| {
+        attach_edge_layers(
+            app,
+            max_payload_size,
+            app_state.context.inflight_tracker.clone(),
+            request_id_headers.clone(),
+            cors_allowed_origins.clone(),
+            access_log_fields,
+        )
+        .with_state(Arc::clone(&app_state))
+    };
+    if admin_listener {
+        // The public `/loads` stays with the data routes: a gateway registered
+        // as a worker is polled there by its parent's monitor.
+        // The probe routes answer on the admin listener too, so it can be
+        // checked on its own, by an orchestrator or through a network policy.
+        let probes = Router::new()
+            .route("/liveness", get(liveness))
+            .route("/readiness", get(readiness))
+            .route("/health", get(health));
+        Ok(GatewayApps {
+            admin: Some(finish(control_plane.merge(probes))),
+            data: finish(data),
+        })
+    } else {
+        Ok(GatewayApps {
+            data: finish(data.merge(control_plane)),
+            admin: None,
+        })
+    }
 }
 
 /// The middleware every request crosses, matched or not: body limits, the
 /// trace-context echo, access logging, HTTP metrics, request ids and CORS.
+/// The metrics layer wraps the response body, once, with everything the
+/// layers inside hold until the body ends (the request span, an admission
+/// permit, an SSE keep-alive): see `middleware::edge_body`.
 ///
 /// `Router::layer` wraps only what the router holds when it is called, so the
 /// not-found fallback goes in first. Registered after the layers, unknown
@@ -1330,44 +1464,31 @@ fn attach_edge_layers<S>(
     inflight_tracker: Arc<InFlightRequestTracker>,
     request_id_headers: Vec<String>,
     cors_allowed_origins: Vec<String>,
+    access_log_fields: middleware::AccessLogFields,
 ) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
     app.fallback(sink_handler)
         .method_not_allowed_fallback(method_not_allowed_handler)
-        // Marks every response that came back through the body-limit layer
-        // below, so the envelope pass outside it re-shapes only the limit
-        // layer's own refusal (a 413 minted inside, a handler's or a relayed
-        // upstream's, keeps its body).
-        .layer(axum::middleware::from_fn(
-            middleware::mark_passed_body_limit_middleware,
-        ))
         .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
-        .layer(tower_http::limit::RequestBodyLimitLayer::new(
-            max_payload_size,
-        ))
-        // The limit layer refuses a declared over-limit length with a plain
-        // text 413: the gateway's envelope and error code go on here, outside
-        // it, the same as the chunked refusal the extractor builds.
-        .layer(axum::middleware::from_fn(
-            middleware::payload_too_large_envelope_middleware,
-        ))
+        // The payload limit on the request body: a declared over-limit
+        // length is refused here, in the gateway's envelope, before any
+        // layer inside runs; a chunked upload is capped on its way in.
+        .layer(middleware::RequestBodyLimitLayer::new(max_payload_size))
         // The Messages envelope once more, outside the body-size limit: a
         // declared over-limit length is refused by the limit layer before any
         // route layer runs, and still leaves in the envelope.
-        .layer(axum::middleware::from_fn(
-            middleware::messages_error_envelope_middleware,
+        .layer(middleware::MessagesErrorEnvelopeLayer)
+        .layer(tower::util::MapResponseLayer::new(
+            middleware::trace_context_on_response,
         ))
-        .layer(axum::middleware::from_fn(
-            middleware::trace_context_response,
-        ))
-        .layer(middleware::create_logging_layer())
+        .layer(middleware::create_logging_layer(access_log_fields))
         .layer(middleware::HttpMetricsLayer::new(inflight_tracker))
         .layer(middleware::RequestIdLayer::new(request_id_headers))
-        .layer(tower::util::option_layer(create_cors_layer(
-            cors_allowed_origins,
-        )))
+        // CORS runs only with allowed origins configured; the layer is not
+        // installed otherwise.
+        .layer_if_some(create_cors_layer(cors_allowed_origins))
 }
 
 /// Discovery tasks owned by `startup`, aborted when this guard drops.
@@ -1409,190 +1530,138 @@ fn supervise_discovery(
     abort
 }
 
-pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
-    crate::tls::install_crypto_provider();
-
-    // Defense in depth: the CLI and Python bindings both validate via
-    // `RouterConfigBuilder::build()` before reaching here, but `RouterConfig`
-    // is public and `Deserialize`, so a Rust library caller can construct
-    // `ServerConfig` directly (or deserialize it) and call `startup` without
-    // ever going through the builder. Validate here too so `tenant_api_keys`
-    // (and everything else `ConfigValidator` checks) is enforced regardless
-    // of construction path — a bypassed empty/duplicate tenant key would
-    // otherwise silently reach `AuthConfig`.
-    config.router_config.validate()?;
-    // The mesh listener's port against the others: the mesh configuration is
-    // not part of `RouterConfig`, so the validator cannot see it, and this is
-    // the one place the CLI, the Python binding and a library caller all pass.
-    if let Some(mesh_server_config) = &config.mesh_server_config {
-        crate::config::validate_mesh_listener_port(
-            mesh_server_config.bind_addr.port(),
-            config.port,
-            config
-                .prometheus_config
-                .as_ref()
-                .map(|prometheus_config| prometheus_config.port),
-            config.health_check_port,
-        )?;
-    }
-
-    // The TLS material is parsed before anything binds: a certificate or key
-    // file the gateway could read but not use used to fail at the HTTP bind,
-    // after the metrics listener was up.
-    let tls_config = match (
-        &config.router_config.server_cert,
-        &config.router_config.server_key,
-    ) {
-        (Some(cert), Some(key)) => Some(
-            axum_server::tls_rustls::RustlsConfig::from_pem(cert.clone(), key.clone())
-                .await
-                .map_err(|e| format!("Failed to create TLS config: {e}"))?,
-        ),
-        _ => None,
-    };
-
-    static LOGGING_INITIALIZED: AtomicBool = AtomicBool::new(false);
-
-    if let Some(trace_config) = &config.router_config.trace_config {
-        otel_trace::otel_tracing_init(
-            trace_config.enable_trace,
-            Some(&trace_config.otlp_traces_endpoint),
-        )?;
-    }
-
-    let _log_guard = if LOGGING_INITIALIZED.swap(true, Ordering::SeqCst) {
-        None
-    } else {
-        Some(logging::init_logging(
-            LoggingConfig {
-                level: config
-                    .log_level
-                    .as_deref()
-                    .and_then(|s| match s.to_uppercase().parse::<Level>() {
-                        Ok(l) => Some(l),
-                        Err(_) => {
-                            warn!("Invalid log level string: '{s}'. Defaulting to INFO.");
-                            None
-                        }
-                    })
-                    .unwrap_or(Level::INFO),
-                json_format: config.log_json,
-                log_dir: config.log_dir.clone(),
-                colorize: true,
-                log_file_name: "smg".to_string(),
-                log_targets: None,
-            },
-            config.router_config.trace_config.clone(),
-        ))
-    };
-
-    // The runtime was built by the caller (the CLI's `main`, the Python
-    // binding, a library caller) before the subscriber existed: its size is
-    // logged here, where the line reaches the log. `pinned` is the
-    // configuration's say; only the CLI's `main` sizes its runtime from it.
-    info!(
-        worker_threads = tokio::runtime::Handle::current().metrics().num_workers(),
-        pinned = config.runtime_worker_threads.is_some(),
-        "Tokio runtime sized"
+/// The observability the gateway serves beside its routes, started once the
+/// router and the app context are built (the storage hooks, policy files and
+/// store connections are behind us; the mesh TLS material, the apps and the
+/// listener addresses can still fail the start after this, with these
+/// listeners bound) and before the admin and HTTP listeners: the O(1)
+/// readiness state the probes read (maintained from
+/// WorkerRegistry events plus a short checkpoint for broadcast-bypassing
+/// mutations, served by `/readiness` on the main listener and on the optional
+/// probe listener); the metrics listener (the recorder exists since the top of
+/// start-up, the port binds only now, eagerly, so a conflict or a bad address
+/// fails the start before the HTTP listener) with the Tokio runtime observer
+/// on it (event-loop canary and sampler; `startup` runs on the main runtime,
+/// so the observer lands on, and measures, the runtime that serves requests);
+/// the sweeper of unstored background responses whose polling window ended
+/// with no gateway there to retire them (swept now whatever this gateway's
+/// background setting, an earlier one may have had it on, then once per window
+/// while background mode is on); and the optional isolated probe listener
+/// (`--health-check-port`: /liveness, /readiness, /health on a dedicated
+/// single-worker runtime on its own OS thread, so probes cannot be starved by
+/// the request runtime; the same routes stay on the main listener). The
+/// maintainer's and the sweeper's join handles detach on drop; the tasks run
+/// on. Returns the probe state the app and the probe listener share.
+async fn start_observability(
+    config: &ServerConfig,
+    app_context: &Arc<AppContext>,
+    metrics_handle: Option<PrometheusHandle>,
+) -> Result<Arc<crate::health::ProbeState>, Box<dyn std::error::Error>> {
+    let probe_state = crate::health::ProbeState::new(app_context.inflight_tracker.clone());
+    let _readiness_maintainer = crate::health::spawn_readiness_maintainer(
+        probe_state.clone(),
+        app_context.worker_registry.clone(),
+        app_context.tokenizer_registry.clone(),
+        config.router_config.clone(),
     );
 
-    // Who else can read the private key files: checked here, once the
-    // subscriber exists, so the line reaches the log (the configuration is
-    // validated before logging starts).
-    if let Some(path) = &config.router_config.server_key_path {
-        crate::tls::warn_if_private_key_is_shared(std::path::Path::new(path), "--tls-key-path");
-    }
-    if let Some(path) = &config.router_config.client_key_path {
-        crate::tls::warn_if_private_key_is_shared(std::path::Path::new(path), "--client-key-path");
-    }
-    if let Some(mtls) = config
-        .mesh_server_config
-        .as_ref()
-        .and_then(|mesh| mesh.mtls_config.as_ref())
-    {
-        crate::tls::warn_if_private_key_is_shared(&mtls.server_key_path, "--mesh-tls-key");
+    if let (Some(handle), Some(prometheus_config)) = (metrics_handle, &config.prometheus_config) {
+        let (_metrics_addr, _server_handle) = metrics_server::start_metrics_server(
+            handle,
+            prometheus_config.host.clone(),
+            prometheus_config.port,
+        )
+        .await?;
+        runtime_metrics::spawn_observer();
     }
 
-    // Seed the process-wide multimodal tensor transport defaults from the
-    // resolved router config; per-worker specs still override at request time.
-    use crate::routers::grpc::multimodal::{
-        init_mm_settings, init_mm_transport_defaults, MultimodalSettings,
-    };
-    init_mm_transport_defaults(
-        config.router_config.multimodal_tensor_transport,
-        config.router_config.multimodal_shm_min_bytes,
+    let _unstored_sweeper = spawn_unstored_sweeper(
+        app_context.response_storage.clone(),
+        config.router_config.max_background_responses > 0,
     );
-    // Flag > env > default, resolved once; an unreadable env value stops
-    // startup here rather than at router creation.
-    let mm_settings = MultimodalSettings::resolve(&config.router_config)
-        .map_err(|error| format!("multimodal settings: {error:#}"))?;
-    llm_multimodal::init_log_video_decode_timing(mm_settings.log_mm_timing.value);
-    init_mm_settings(mm_settings);
 
-    // The metrics recorder is installed now so start-up records land in it;
-    // its listener binds further down, once every configuration read that
-    // can still fail (storage hooks, policy files, store connections) has
-    // happened, right before the probe and HTTP listeners: nothing binds
-    // before a fatal configuration error.
-    let metrics_handle = config.prometheus_config.as_ref().map(|prometheus_config| {
-        let handle = metrics::start_prometheus(prometheus_config.clone());
-        metrics::init_startup_series();
-        handle
-    });
+    if let Some(probe_port) = config.health_check_port {
+        let probe_addr =
+            crate::health::start_probe_listener(&config.host, probe_port, probe_state.clone())?;
+        info!("Probe listener started on {probe_addr} (--health-check-port {probe_port})");
+    }
+    Ok(probe_state)
+}
 
-    // Build the mesh server if configured. Starting gossip is deferred until
-    // MeshAdapters has registered the `worker:`/`rl:` CRDT namespaces below —
-    // a remote op arriving for an unregistered prefix would merge through the
-    // default last-writer-wins engine with the wrong semantics.
-    let (mesh_server, mesh_handler) = match &config.mesh_server_config {
-        Some(mesh_server_config) => {
-            let (server, handler) = MeshServerBuilder::from(mesh_server_config).build();
-            (Some(server), Some(Arc::new(handler)))
+/// Worker discovery and mesh-router discovery, two independent lifetimes:
+/// either may run without the other, each is supervised for an unexpected exit
+/// (see [`supervise_discovery`]) and its abort handle sits in the returned
+/// [`DiscoveryTasks`] so shutdown cancels it. A discovery that fails to start
+/// is logged and the gateway goes on without it. The mesh-router discovery
+/// needs the mesh's cluster state and advertised port; configured without a
+/// mesh, it is skipped with a warning.
+async fn start_discovery(
+    service_discovery_config: Option<RuntimeDiscoveryConfig>,
+    mesh_discovery_config: Option<MeshDiscoveryConfig>,
+    app_context: &Arc<AppContext>,
+    mesh_cluster_state: Option<ClusterState>,
+    mesh_port: Option<u16>,
+) -> DiscoveryTasks {
+    let mut discovery_tasks = DiscoveryTasks::default();
+
+    if let Some(service_discovery_config) = service_discovery_config {
+        let app_context_arc = Arc::clone(app_context);
+        match start_service_discovery(service_discovery_config, app_context_arc).await {
+            Ok(handle) => {
+                info!("Service discovery started");
+                discovery_tasks
+                    .0
+                    .push(supervise_discovery("Worker discovery", handle));
+            }
+            Err(e) => {
+                error!("Failed to start service discovery: {e}");
+                warn!("Continuing without service discovery");
+            }
         }
-        None => (None, None),
-    };
-
-    info!(
-        "Starting router on {}:{} | mode: {:?} | policy: {:?} | max_payload: {}MB",
-        config.host,
-        config.port,
-        config.router_config.mode,
-        config.router_config.policy,
-        config.max_payload_size / (1024 * 1024)
-    );
-
-    let app_context = Arc::new(
-        AppContext::from_config(
-            config.router_config.clone(),
-            config.request_timeout_secs,
-            config.webrtc_bind_addr,
-            config.webrtc_stun_server.clone(),
-        )
-        .await?,
-    );
-    // The history store's size on /metrics, from the stores that can count.
-    if config.prometheus_config.is_some() {
-        history_metrics::spawn_sampler(Arc::clone(&app_context));
     }
 
-    // Register the CRDT namespaces and start the inbound sync adapters now;
-    // gossip starts further down, after the metrics and probe listeners are
-    // bound. Order matters: see the note at the mesh build above.
-    let mesh_adapters = mesh_handler.as_ref().map(|handler| {
-        MeshAdapters::start(
-            handler.mesh_kv(),
-            handler.self_name.clone(),
-            app_context.worker_registry.clone(),
-            handler.state.clone(),
-            app_context.policy_registry.clone(),
-        )
-    });
-
-    if config.prometheus_config.is_some() {
-        app_context.inflight_tracker.start_sampler(20);
+    if let Some(mesh_discovery_config) = mesh_discovery_config {
+        match (
+            mesh_discovery_config.is_enabled(),
+            mesh_cluster_state,
+            mesh_port,
+        ) {
+            (true, Some(cluster_state), Some(port)) => {
+                match start_mesh_discovery(mesh_discovery_config, cluster_state, port).await {
+                    Ok(handle) => {
+                        info!("Mesh router discovery started");
+                        discovery_tasks
+                            .0
+                            .push(supervise_discovery("Mesh router discovery", handle));
+                    }
+                    Err(e) => {
+                        error!("Failed to start mesh router discovery: {e}");
+                        warn!("Continuing without mesh router discovery");
+                    }
+                }
+            }
+            (true, _, _) => warn!(
+                "Router selector configured but mesh is not enabled (mesh cluster state or \
+                 mesh port not provided). Skipping router discovery."
+            ),
+            (false, _, _) => {}
+        }
     }
+    discovery_tasks
+}
 
-    let weak_context = Arc::downgrade(&app_context);
+/// The job queue and the typed workflow engines, then the start-up jobs on
+/// them, in this order: the tokenizer (when a tokenizer or model path is
+/// configured and autoload is on; before the workers, so the tokenizer is
+/// there when they arrive), the workers from the configuration, and the MCP
+/// servers when an MCP configuration is given (the orchestrator then refreshes
+/// its inventory on its own channel, by `inventory.refresh_interval`). Each
+/// job completes in the background; a job the queue refuses fails the start.
+async fn start_workflow_engines(
+    app_context: &Arc<AppContext>,
+    config: &ServerConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let weak_context = Arc::downgrade(app_context);
     let worker_job_queue = JobQueue::new(
         JobQueueConfig {
             queue_capacity: config.router_config.job_queue_capacity,
@@ -1706,6 +1775,292 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     } else {
         info!("No MCP config provided, skipping MCP server initialization");
     }
+    Ok(())
+}
+
+/// The mesh server bound and prepared, before the admin and HTTP listeners
+/// bind; `None` without a mesh: the listener against the configured address,
+/// the TLS configuration from the mesh TLS material (the mesh TLS flags check
+/// only that their files exist), the gossip service and its controller. It
+/// runs before the other listeners bind because a failure here, a held port
+/// or bad material, used to be one error line from the mesh server's task a
+/// second after the gateway was already serving (`Mesh server failed: ...`
+/// once, `/readiness` ready), as a node outside the mesh with its rate limits
+/// and worker state shared with nobody; now it fails the start. The prepared
+/// server serves once every listener is bound.
+async fn prepare_mesh_server(
+    mesh_server: Option<MeshServer>,
+    mesh_server_config: Option<&MeshServerConfig>,
+) -> Result<Option<PreparedMeshServer>, Box<dyn std::error::Error>> {
+    let Some((mesh_server, mesh_server_config)) = mesh_server.zip(mesh_server_config) else {
+        return Ok(None);
+    };
+    let mesh_addr = mesh_server_config.bind_addr;
+    let mesh_listener = tokio::net::TcpListener::bind(mesh_addr)
+        .await
+        .map_err(|e| {
+            format!("Failed to bind the mesh listener on {mesh_addr} (--mesh-port): {e}")
+        })?;
+    let flags = if mesh_server_config.mtls_config.is_some() {
+        "--enable-mesh with --mesh-tls-ca-cert, --mesh-tls-cert and --mesh-tls-key"
+    } else {
+        "--enable-mesh"
+    };
+    let prepared = mesh_server
+        .prepare_with_listener(mesh_listener)
+        .await
+        .map_err(|e| format!("Failed to start the mesh server ({flags}): {e:#}"))?;
+    Ok(Some(prepared))
+}
+
+/// [`startup`] on `runtime` to its end, then the process-wide observability
+/// closed behind it, on every exit alike: the log writers are flushed and
+/// stopped, then the tracer is flushed and shut down (a bounded wait, see
+/// [`otel_trace::shutdown_otel`]), and only then is the result read. A
+/// failed start-up used to return before the tracer's shutdown, and the
+/// spans the batch exporter still held were lost with the process. The
+/// result is `startup`'s own: the error line and the exit code are the
+/// caller's, as before. The runtime stays up throughout: the exporter's
+/// connection lives on it, and the shutdown is driven from it, so a
+/// current-thread runtime serves as well as a multi-thread one.
+///
+/// For a caller whose process goes on after the server (a language
+/// binding), [`startup`] alone is the entry point.
+pub fn run(
+    runtime: &tokio::runtime::Runtime,
+    config: ServerConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let served = runtime.block_on(Box::pin(startup(config)));
+    // The writer threads outlive `startup` (a process may start more than one
+    // router); flush and stop them now that this process is done logging.
+    logging::close_logging();
+    // Driven from the runtime: on a current-thread runtime nothing else polls
+    // the exporter's connection while the shutdown waits for the export.
+    if let Err(e) = runtime.block_on(runtime.spawn_blocking(otel_trace::shutdown_otel)) {
+        #[expect(clippy::print_stderr)]
+        {
+            eprintln!("[tracing] OpenTelemetry shutdown task failed: {e}");
+        }
+    }
+    served
+}
+
+pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+    crate::tls::install_crypto_provider();
+
+    // Defense in depth: the CLI and Python bindings both validate via
+    // `RouterConfigBuilder::build()` before reaching here, but `RouterConfig`
+    // is public and `Deserialize`, so a Rust library caller can construct
+    // `ServerConfig` directly (or deserialize it) and call `startup` without
+    // ever going through the builder. Validate here too so `tenant_api_keys`
+    // (and everything else `ConfigValidator` checks) is enforced regardless
+    // of construction path — a bypassed empty/duplicate tenant key would
+    // otherwise silently reach `AuthConfig`.
+    config.router_config.validate()?;
+    // The mesh listener's port against the others: the mesh configuration is
+    // not part of `RouterConfig`, so the validator cannot see it, and this is
+    // the one place the CLI, the Python binding and a library caller all pass.
+    if let Some(mesh_server_config) = &config.mesh_server_config {
+        crate::config::validate_mesh_listener_port(
+            mesh_server_config.bind_addr.port(),
+            config.port,
+            config
+                .prometheus_config
+                .as_ref()
+                .map(|prometheus_config| prometheus_config.port),
+            config.health_check_port,
+            config.router_config.admin_port,
+        )?;
+    }
+
+    // The TLS material is parsed before anything binds: a certificate or key
+    // file the gateway could read but not use used to fail at the HTTP bind,
+    // after the metrics listener was up.
+    let tls_config = match (
+        &config.router_config.server_cert,
+        &config.router_config.server_key,
+    ) {
+        (Some(cert), Some(key)) => Some(
+            axum_server::tls_rustls::RustlsConfig::from_pem(cert.clone(), key.clone())
+                .await
+                .map_err(|e| format!("Failed to create TLS config: {e}"))?,
+        ),
+        _ => None,
+    };
+
+    static LOGGING_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+    if let Some(trace_config) = &config.router_config.trace_config {
+        otel_trace::otel_tracing_init(
+            trace_config.enable_trace,
+            Some(&trace_config.otlp_traces_endpoint),
+        )?;
+    }
+
+    let _log_guard = if LOGGING_INITIALIZED.swap(true, Ordering::SeqCst) {
+        None
+    } else {
+        Some(logging::init_logging(
+            LoggingConfig {
+                level: config
+                    .log_level
+                    .as_deref()
+                    .and_then(|s| match s.to_uppercase().parse::<Level>() {
+                        Ok(l) => Some(l),
+                        Err(_) => {
+                            warn!("Invalid log level string: '{s}'. Defaulting to INFO.");
+                            None
+                        }
+                    })
+                    .unwrap_or(Level::INFO),
+                json_format: config.log_json,
+                log_dir: config.log_dir.clone(),
+                colorize: logging::color_for_stdout(),
+                log_file_name: "smg".to_string(),
+                log_targets: None,
+            },
+            config.router_config.trace_config.clone(),
+        ))
+    };
+
+    // The runtime was built by the caller (the CLI's `main`, the Python
+    // binding, a library caller) before the subscriber existed: its size is
+    // logged here, where the line reaches the log. `pinned` is the
+    // configuration's say; only the CLI's `main` sizes its runtime from it.
+    info!(
+        worker_threads = tokio::runtime::Handle::current().metrics().num_workers(),
+        pinned = config.runtime_worker_threads.is_some(),
+        "Tokio runtime sized"
+    );
+    // A pinned count well above the CPUs available to the process is the
+    // operator's choice, served with a warning: a worker thread beyond the
+    // CPUs only waits for one. The ceiling on the count is the validator's,
+    // and reads nothing of the host.
+    if let Some(warning) = config.runtime_worker_threads.and_then(|threads| {
+        crate::config::runtime_worker_threads_oversubscription(
+            threads,
+            crate::config::available_cpus(),
+        )
+    }) {
+        tracing::warn!("{warning}");
+    }
+
+    // Who else can read the private key files: checked here, once the
+    // subscriber exists, so the line reaches the log (the configuration is
+    // validated before logging starts).
+    if let Some(path) = &config.router_config.server_key_path {
+        crate::tls::warn_if_private_key_is_shared(std::path::Path::new(path), "--tls-key-path");
+    }
+    if let Some(path) = &config.router_config.client_key_path {
+        crate::tls::warn_if_private_key_is_shared(std::path::Path::new(path), "--client-key-path");
+    }
+    if let Some(mtls) = config
+        .mesh_server_config
+        .as_ref()
+        .and_then(|mesh| mesh.mtls_config.as_ref())
+    {
+        crate::tls::warn_if_private_key_is_shared(&mtls.server_key_path, "--mesh-tls-key");
+    }
+
+    // Seed the process-wide multimodal tensor transport defaults from the
+    // resolved router config; per-worker specs still override at request time.
+    use crate::routers::grpc::multimodal::{
+        enforce_jpeg_decoder_policy, init_mm_settings, init_mm_transport_defaults,
+        report_jpeg_decoder, MultimodalSettings,
+    };
+    init_mm_transport_defaults(
+        config.router_config.multimodal_tensor_transport,
+        config.router_config.multimodal_shm_min_bytes,
+    );
+    // Flag > env > default, resolved once; an unreadable env value stops
+    // startup here rather than at router creation.
+    let mm_settings = MultimodalSettings::resolve(&config.router_config)
+        .map_err(|error| format!("multimodal settings: {error:#}"))?;
+    llm_multimodal::init_log_video_decode_timing(mm_settings.log_mm_timing.value);
+    let turbojpeg = mm_settings.turbojpeg.value;
+    init_mm_settings(mm_settings);
+
+    // The metrics recorder is installed now so start-up records land in it;
+    // its listener binds further down, once every configuration read that
+    // can still fail (storage hooks, policy files, store connections) has
+    // happened, right before the probe and HTTP listeners: nothing binds
+    // before a fatal configuration error.
+    let metrics_handle = config.prometheus_config.as_ref().map(|prometheus_config| {
+        let handle = metrics::start_prometheus(prometheus_config.clone());
+        metrics::init_startup_series();
+        handle
+    });
+
+    // The JPEG decoder report and the TurboJPEG policy come after the
+    // recorder: the report sets its gauges (`smg_mm_turbojpeg_available`,
+    // `smg_mm_webp_available`) on every call, on the recorder in force (the
+    // log lines alone are said once per process); the gauges must land in the
+    // recorder /metrics serves, not the no-op one before it. The policy is
+    // still enforced once, in every routing mode and before anything binds:
+    // under `require` a host without the library stops the process here,
+    // where a refusal at router creation would be turned into a warning by
+    // the gateway's try-register (--enable-igw) and the process would start
+    // with no gRPC router behind its routes.
+    report_jpeg_decoder();
+    enforce_jpeg_decoder_policy(turbojpeg)
+        .map_err(|error| format!("TurboJPEG policy: {error:#}"))?;
+
+    // Build the mesh server if configured. Starting gossip is deferred until
+    // MeshAdapters has registered the `worker:`/`rl:` CRDT namespaces below —
+    // a remote op arriving for an unregistered prefix would merge through the
+    // default last-writer-wins engine with the wrong semantics.
+    let (mesh_server, mesh_handler) = match &config.mesh_server_config {
+        Some(mesh_server_config) => {
+            let (server, handler) = MeshServerBuilder::from(mesh_server_config).build();
+            (Some(server), Some(Arc::new(handler)))
+        }
+        None => (None, None),
+    };
+
+    info!(
+        "Starting router on {}:{} | mode: {:?} | policy: {:?} | max_payload: {}MB",
+        config.host,
+        config.port,
+        config.router_config.mode,
+        config.router_config.policy,
+        config.max_payload_size / (1024 * 1024)
+    );
+
+    let app_context = Arc::new(
+        AppContext::from_config(
+            config.router_config.clone(),
+            config.request_timeout_secs,
+            config.webrtc_bind_addr,
+            config.webrtc_stun_server.clone(),
+        )
+        .await?,
+    );
+    // The history store's size on /metrics, from the stores that can count.
+    if config.prometheus_config.is_some() {
+        history_metrics::spawn_sampler(Arc::clone(&app_context));
+    }
+
+    // Register the CRDT namespaces and start the inbound sync adapters now;
+    // gossip starts further down, after the metrics and probe listeners are
+    // bound. Order matters: see the note at the mesh build above.
+    let mesh_adapters = mesh_handler.as_ref().map(|handler| {
+        MeshAdapters::start(
+            handler.mesh_kv(),
+            handler.self_name.clone(),
+            app_context.worker_registry.clone(),
+            handler.state.clone(),
+            app_context.policy_registry.clone(),
+        )
+    });
+
+    if config.prometheus_config.is_some() {
+        app_context.inflight_tracker.start_sampler(20);
+    }
+
+    // The job queue, the typed workflow engines and the start-up jobs on
+    // them: the tokenizer, the workers from the configuration, the MCP
+    // servers; the jobs complete in the background.
+    start_workflow_engines(&app_context, &config).await?;
 
     // Note: MCP orchestrator handles background refresh internally via refresh channel
     // configured by inventory.refresh_interval in mcp.yaml
@@ -1777,55 +2132,13 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .as_ref()
         .map(|c| c.advertise_addr.port());
 
-    // O(1) readiness state: maintained from WorkerRegistry events (plus a
-    // short checkpoint for broadcast-bypassing mutations), read by
-    // `/readiness` on the main listener and on the optional dedicated
-    // probe listener below. Dropping the JoinHandle detaches the task.
-    let probe_state = crate::health::ProbeState::new(app_context.inflight_tracker.clone());
-    let _readiness_maintainer = crate::health::spawn_readiness_maintainer(
-        probe_state.clone(),
-        app_context.worker_registry.clone(),
-        app_context.tokenizer_registry.clone(),
-        config.router_config.clone(),
-    );
-
-    // The metrics listener: the recorder exists since the top of start-up,
-    // the port binds only now (see there). It still binds eagerly, so a port
-    // conflict or a bad address fails the start before the HTTP listener.
-    if let (Some(handle), Some(prometheus_config)) = (metrics_handle, &config.prometheus_config) {
-        let (_metrics_addr, _server_handle) = metrics_server::start_metrics_server(
-            handle,
-            prometheus_config.host.clone(),
-            prometheus_config.port,
-        )
-        .await?;
-        // Tokio runtime self-observability (event-loop canary + sampler).
-        // `startup` runs on the main runtime, so the observer lands on —
-        // and therefore measures — the runtime that serves requests.
-        runtime_metrics::spawn_observer();
-    }
-
-    // The records of unstored background responses whose polling window
-    // ended with no gateway there to retire them (a stop or a crash inside
-    // the window, with a store that outlives the process) are swept now,
-    // whatever this gateway's background setting (an earlier one may have had
-    // it on), and then once per window while background mode is on, where new
-    // unstored records can appear. Dropping the JoinHandle detaches the task.
-    let _unstored_sweeper = spawn_unstored_sweeper(
-        app_context.response_storage.clone(),
-        config.router_config.max_background_responses > 0,
-    );
-
-    // Optional isolated probe listener (additive): when `--health-check-port`
-    // is set, serves /liveness, /readiness, /health on that port from a
-    // dedicated single-worker runtime on its own OS thread, so probes
-    // cannot be starved by the request runtime. The same routes always remain
-    // on the main listener.
-    if let Some(probe_port) = config.health_check_port {
-        let probe_addr =
-            crate::health::start_probe_listener(&config.host, probe_port, probe_state.clone())?;
-        info!("Probe listener started on {probe_addr} (--health-check-port {probe_port})");
-    }
+    // The readiness state, the metrics listener, the sweeper and the probe
+    // listener: the router and the app context are built (the storage hooks,
+    // policy files and store connections are behind us), so the listeners
+    // among them bind now, before the admin and HTTP listeners; the mesh TLS
+    // material, the apps and the listener addresses can still fail the start
+    // after this point, with these two bound.
+    let probe_state = start_observability(&config, &app_context, metrics_handle).await?;
 
     let app_state = Arc::new(AppState {
         router,
@@ -1836,54 +2149,20 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         mesh_adapters,
         probe_state,
     });
+    // For the shutdown task below: the mesh is told of the stop before the
+    // listeners drain (`app_state` moves into the route groups first).
+    let mesh_handler = app_state.mesh_handler.clone();
     // Worker discovery and mesh-router discovery are independent lifetimes:
     // either may run without the other. Each is supervised for unexpected exit
     // and its abort handle held so shutdown cancels it.
-    let mut discovery_tasks = DiscoveryTasks::default();
-
-    if let Some(service_discovery_config) = config.service_discovery_config {
-        let app_context_arc = Arc::clone(&app_state.context);
-        match start_service_discovery(service_discovery_config, app_context_arc).await {
-            Ok(handle) => {
-                info!("Service discovery started");
-                discovery_tasks
-                    .0
-                    .push(supervise_discovery("Worker discovery", handle));
-            }
-            Err(e) => {
-                error!("Failed to start service discovery: {e}");
-                warn!("Continuing without service discovery");
-            }
-        }
-    }
-
-    if let Some(mesh_discovery_config) = config.mesh_discovery_config {
-        match (
-            mesh_discovery_config.is_enabled(),
-            mesh_cluster_state,
-            mesh_port,
-        ) {
-            (true, Some(cluster_state), Some(port)) => {
-                match start_mesh_discovery(mesh_discovery_config, cluster_state, port).await {
-                    Ok(handle) => {
-                        info!("Mesh router discovery started");
-                        discovery_tasks
-                            .0
-                            .push(supervise_discovery("Mesh router discovery", handle));
-                    }
-                    Err(e) => {
-                        error!("Failed to start mesh router discovery: {e}");
-                        warn!("Continuing without mesh router discovery");
-                    }
-                }
-            }
-            (true, _, _) => warn!(
-                "Router selector configured but mesh is not enabled (mesh cluster state or \
-                 mesh port not provided). Skipping router discovery."
-            ),
-            (false, _, _) => {}
-        }
-    }
+    let discovery_tasks = start_discovery(
+        config.service_discovery_config,
+        config.mesh_discovery_config,
+        &app_state.context,
+        mesh_cluster_state,
+        mesh_port,
+    )
+    .await;
 
     info!(
         "Router ready | workers: {:?}",
@@ -1912,17 +2191,44 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let control_plane_auth_state =
         smg_auth::ControlPlaneAuthState::try_init(config.control_plane_auth.as_ref()).await;
 
+    // The admin listener's address, when the control plane has a listener of
+    // its own (`--admin-port`); its bind host defaults to the data listener's.
+    // Read from the router configuration, the copy `validate` above checked
+    // (port, host, distinct ports), whichever way the caller built it.
+    let admin_addr = match config.router_config.admin_port {
+        Some(admin_port) => Some(
+            crate::config::bind_socket_addr(
+                config
+                    .router_config
+                    .admin_host
+                    .as_deref()
+                    .unwrap_or(&config.host),
+                admin_port,
+            )
+            .map_err(|e| {
+                format!("Invalid admin listener address (--admin-host, --admin-port): {e}")
+            })?,
+        ),
+        None => None,
+    };
+
     // Name what this start leaves open, once, before the listener opens:
     // an unauthenticated gateway is a decision, not an omission.
-    crate::posture::log_open_posture(
+    posture::log_open_posture(
         &serving_auth_config,
         &admin_auth_config,
         control_plane_auth_state.is_some(),
         config.prometheus_config.as_ref(),
         config.mesh_server_config.as_ref(),
+        admin_addr,
     );
+    // And where a keyed start's secrets came from, sources alone.
+    posture::log_secret_sources(&config.secret_sources);
 
-    let app = build_app(
+    let GatewayApps {
+        data: app,
+        admin: admin_app,
+    } = build_apps(
         app_state,
         serving_auth_config,
         admin_auth_config,
@@ -1930,57 +2236,28 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.max_payload_size,
         request_id_headers,
         config.router_config.cors_allowed_origins.clone(),
+        admin_addr.is_some(),
     )?;
 
     // One bind-host rule for every listener: IPv6 with or without brackets.
     let addr = crate::config::bind_socket_addr(&config.host, config.port)
         .map_err(|e| format!("Invalid address: {e}"))?;
-    // The mesh listener binds now too, eagerly, before the HTTP listener: a
-    // mesh port another process holds used to surface as one error line from
-    // the mesh server's task after the gateway was already serving, as a node
-    // outside the mesh, its rate limits and worker state shared with nobody.
-    // The bound socket is handed to the mesh server below.
-    let mesh_listener = match &config.mesh_server_config {
-        Some(mesh_server_config) => {
-            let mesh_addr = mesh_server_config.bind_addr;
-            Some(
-                tokio::net::TcpListener::bind(mesh_addr)
-                    .await
-                    .map_err(|e| {
-                        format!(
-                            "Failed to bind the mesh listener on {mesh_addr} (--mesh-port): {e}"
-                        )
-                    })?,
-            )
-        }
+    // The mesh listener binds and the mesh server prepares now, eagerly,
+    // before the admin and HTTP listeners bind (see `prepare_mesh_server`).
+    let mesh_server = prepare_mesh_server(mesh_server, config.mesh_server_config.as_ref()).await?;
+    // The admin listener binds now, before the HTTP listener, for the reason
+    // the mesh listener did: a port another process holds fails the start
+    // here, before anything serves.
+    let admin_listener = match admin_addr {
+        Some(admin_addr) => Some(
+            tokio::net::TcpListener::bind(admin_addr)
+                .await
+                .and_then(tokio::net::TcpListener::into_std)
+                .map_err(|e| {
+                    format!("Failed to bind the admin listener on {admin_addr} (--admin-port): {e}")
+                })?,
+        ),
         None => None,
-    };
-    // Everything the mesh server does before it serves happens now, before
-    // the HTTP listener binds: the listener against the configured address,
-    // the TLS configuration from the mesh TLS material, the gossip service
-    // and its controller. A failure here used to be one error line from the
-    // mesh server's task a second after the gateway was serving, as a node
-    // outside the mesh (`Mesh server failed: ...` once, `/readiness` ready);
-    // the mesh TLS flags check only that their files exist.
-    let mesh_server = match (mesh_server, mesh_listener) {
-        (Some(mesh_server), Some(mesh_listener)) => {
-            let with_tls = config
-                .mesh_server_config
-                .as_ref()
-                .is_some_and(|mesh| mesh.mtls_config.is_some());
-            let flags = if with_tls {
-                "--enable-mesh with --mesh-tls-ca-cert, --mesh-tls-cert and --mesh-tls-key"
-            } else {
-                "--enable-mesh"
-            };
-            Some(
-                mesh_server
-                    .prepare_with_listener(mesh_listener)
-                    .await
-                    .map_err(|e| format!("Failed to start the mesh server ({flags}): {e:#}"))?,
-            )
-        }
-        _ => None,
     };
     // The HTTP listener binds now, eagerly, the last of the listeners: a port
     // another process holds fails the start here, before the mesh server
@@ -2015,57 +2292,54 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     let handle = axum_server::Handle::new();
     let handle_clone = handle.clone();
+    let data_stop = handle.clone();
+    // The admin listener's handle: it drains with the data listener's.
+    let admin_handle = axum_server::Handle::new();
+    let admin_handle_clone = admin_handle.clone();
+    let admin_stop = admin_handle.clone();
     let inflight_tracker = app_context.inflight_tracker.clone();
-    let grace = Duration::from_secs(config.shutdown_grace_period_secs);
-    // Keep accepting for a short settle window before gating, so requests still
-    // routed here during load-balancer / EndpointSlice propagation lag are
-    // served instead of connection-refused — readiness already reports 503 by
-    // then (#1694), so the orchestrator is removing this endpoint meanwhile.
-    // Carved out of the grace budget (never more than half, capped at 5s — the
-    // per-worker `drain_settle_secs` default) so total shutdown stays within
-    // `shutdown_grace_period_secs` and never overruns terminationGracePeriod.
-    let settle = (grace / 2).min(Duration::from_secs(5));
-    let drain_timeout = grace.saturating_sub(settle);
+    let budget = ShutdownBudget::from_grace_secs(config.shutdown_grace_period_secs);
+    let drain_timeout = budget.drain;
     #[expect(
         clippy::disallowed_methods,
         reason = "shutdown signal handler must outlive the server to trigger graceful shutdown"
     )]
     spawn(async move {
         shutdown_signal().await;
-
-        // Phase 1: Flip readiness to 503, hold the listener open through the
-        // settle window so propagation-lagged requests still land, then gate
-        // new connections.
-        info!(
-            in_flight = inflight_tracker.len(),
-            "Beginning graceful shutdown: readiness draining"
-        );
-        inflight_tracker.begin_drain();
-        if !settle.is_zero() {
-            info!(
-                settle_secs = settle.as_secs(),
-                "Keeping listener open during load-balancer propagation window"
-            );
-            tokio::time::sleep(settle).await;
-        }
-        handle_clone.graceful_shutdown(Some(drain_timeout));
-
-        // Phase 2: Drain — wait for in-flight requests to complete
-        // Re-check after gating to catch requests that arrived between the
-        // snapshot and graceful_shutdown stopping the accept loop.
-        if !inflight_tracker.is_empty() {
-            let drained = inflight_tracker.wait_for_drain(drain_timeout).await;
-            if drained {
-                info!("All in-flight requests drained");
-            } else {
-                warn!(
-                    remaining = inflight_tracker.len(),
-                    timeout_secs = drain_timeout.as_secs(),
-                    "Drain timed out, forcing shutdown with requests still in-flight"
-                );
+        // The mesh hears of the stop first: `Leaving` goes to the live
+        // members during the settle window (the broadcast is bounded by 3 s,
+        // then a second for propagation, then the gossip loop stops), so
+        // they know as soon as this member stops serving, instead of finding
+        // out from failed probes once it is gone. The leave gets the window
+        // and no more (with no window, what the grace allows); cut short, its
+        // broadcast tasks run on and the gossip loop is stopped by
+        // `stop_mesh`.
+        let leave_mesh = async {
+            if let Some(mesh) = &mesh_handler {
+                if let Err(e) = mesh.graceful_shutdown().await {
+                    warn!("Leaving the mesh failed: {e:#}");
+                }
             }
-        }
-        // Phase 3: Teardown proceeds after axum server stops (in the main task)
+        };
+        // The leave's own stop of the gossip loop did not run: stop it as a
+        // finished leave would have, so both paths end the same way; the
+        // broadcast tasks the leave spawned run on.
+        let stop_mesh = || {
+            if let Some(mesh) = &mesh_handler {
+                mesh.shutdown();
+            }
+        };
+        graceful_shutdown(
+            &inflight_tracker,
+            budget,
+            leave_mesh,
+            stop_mesh,
+            |drain_timeout| {
+                handle_clone.graceful_shutdown(Some(drain_timeout));
+                admin_handle_clone.graceful_shutdown(Some(drain_timeout));
+            },
+        )
+        .await;
     });
 
     // Bounds on connections that carry no request (a head that never
@@ -2080,22 +2354,100 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         idle_connection_timeout_secs = config.router_config.idle_connection_timeout_secs,
         "HTTP connection timeouts (0 = disabled)"
     );
+    // The bound on the connections open at once (see [`connection_limit`]):
+    // a connection beyond it is closed at accept, unanswered. 0 is no bound.
+    let max_connections = config.router_config.max_connections;
+    info!(
+        max_connections,
+        "HTTP connection limit on the data listener (0 = unlimited; the admin and probe listeners \
+         are outside it)"
+    );
+    // The admission limit the bound is compared with is the effective one
+    // (the one resolution of `max_concurrent_requests`, shared with the
+    // admission bucket).
+    let admission_limit = crate::app_context::effective_max_concurrent_requests(
+        config.router_config.max_concurrent_requests,
+    );
+    if let Some(admission_limit) =
+        admission_limit.filter(|limit| max_connections > 0 && max_connections < *limit)
+    {
+        warn!(
+            max_connections,
+            admission_limit,
+            "The connection limit is below the admission limit: clients on HTTP/1, one request \
+             per connection, are refused at the listener (a closed connection, no response) \
+             before admission can queue or answer them"
+        );
+    }
 
-    let server_result = if let Some(tls_config) = tls_config {
+    // The admin listener serves the control plane with the data listener's
+    // TLS material and connection timeouts, but outside its connection limit
+    // (`--max-connections`), so the control plane and the probes it serves
+    // stay reachable while the data plane is saturated; it drains with it
+    // (the shutdown above closes both handles together).
+    let admin_serving: Serving = match (admin_listener, admin_app) {
+        (Some(admin_listener), Some(admin_app)) => {
+            let admin_addr = admin_listener.local_addr()?;
+            info!(
+                "Admin listener serving the control plane on {admin_addr} (--admin-port): the \
+                 admin, worker-registry and RL routes answer there, and 404 on {addr}"
+            );
+            let admin_app = admin_app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+            match tls_config.clone() {
+                Some(tls_config) => Box::pin(
+                    axum_server::from_tcp_rustls(admin_listener, tls_config)?
+                        .map(|acceptor| tls_acceptor(acceptor, connection_timeouts))
+                        .handle(admin_handle)
+                        .serve(admin_app),
+                ),
+                None => Box::pin(
+                    axum_server::from_tcp(admin_listener)?
+                        .acceptor(http_acceptor(connection_timeouts))
+                        .handle(admin_handle)
+                        .serve(admin_app),
+                ),
+            }
+        }
+        _ => Box::pin(std::future::ready(Ok(()))),
+    };
+    let app = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+    let data_serving: Serving = if let Some(tls_config) = tls_config {
         info!("TLS enabled");
 
-        axum_server::from_tcp_rustls(listener, tls_config)?
-            .map(|acceptor| ConnectionTimeoutAcceptor::new(acceptor, connection_timeouts))
-            .handle(handle)
-            .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-            .await
+        Box::pin(
+            axum_server::from_tcp_rustls(listener, tls_config)?
+                .map(|acceptor| {
+                    ConnectionLimitAcceptor::new(
+                        tls_acceptor(acceptor, connection_timeouts),
+                        max_connections,
+                    )
+                })
+                .handle(handle)
+                .serve(app),
+        )
     } else {
-        axum_server::from_tcp(listener)?
-            .acceptor(http_acceptor(connection_timeouts))
-            .handle(handle)
-            .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-            .await
+        Box::pin(
+            axum_server::from_tcp(listener)?
+                .acceptor(ConnectionLimitAcceptor::new(
+                    http_acceptor(connection_timeouts),
+                    max_connections,
+                ))
+                .handle(handle)
+                .serve(app),
+        )
     };
+    // Until both listeners have stopped; one that fails stops the other
+    // (see `serve_together`), so the gateway is never half-served.
+    let (server_result, admin_result) = serve_together(
+        data_serving,
+        admin_serving,
+        move || data_stop.graceful_shutdown(Some(drain_timeout)),
+        move || admin_stop.graceful_shutdown(Some(drain_timeout)),
+    )
+    .await;
+    if let Err(e) = &admin_result {
+        error!("Admin listener stopped with an error: {e}");
+    }
 
     // Graceful Shutdown
 
@@ -2110,20 +2462,440 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     info!("Cleanup complete. Process exiting.");
 
-    // Return original server error if any, otherwise Ok
-    server_result.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+    // The data listener's error if any, else the admin listener's, else Ok.
+    match (server_result, admin_result) {
+        (Err(e), _) | (Ok(()), Err(e)) => Err(Box::new(e) as Box<dyn std::error::Error>),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+/// The graceful shutdown's time: the grace the process has
+/// (`shutdown_grace_period_secs`), the settle window carved out of it, and
+/// the drain that is left.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ShutdownBudget {
+    grace: Duration,
+    /// Accepting goes on for a short settle window before gating, so
+    /// requests still routed here during load-balancer / EndpointSlice
+    /// propagation lag are served instead of connection-refused; readiness
+    /// already reports 503 by then (#1694), so the orchestrator is removing
+    /// this endpoint meanwhile.
+    settle: Duration,
+    /// What the settle window leaves of the grace for the in-flight requests.
+    drain: Duration,
+}
+
+impl ShutdownBudget {
+    /// The settle window is carved out of the grace budget (never more than
+    /// half, capped at 5 s, the per-worker `drain_settle_secs` default) so
+    /// total shutdown stays within `shutdown_grace_period_secs` and never
+    /// overruns terminationGracePeriod.
+    fn from_grace_secs(grace_secs: u64) -> Self {
+        let grace = Duration::from_secs(grace_secs);
+        let settle = (grace / 2).min(Duration::from_secs(5));
+        Self {
+            grace,
+            settle,
+            drain: grace.saturating_sub(settle),
+        }
+    }
+}
+
+/// The graceful shutdown after the signal, in its phases. Phase 1: readiness
+/// flips to 503 and the listeners stay open through the settle window, during
+/// which `leave_mesh` runs (with no window, it gets what the grace allows;
+/// one that does not finish in time is cut short and `stop_mesh` is called),
+/// then `stop_listeners` gates new connections with what is left of the
+/// grace. Phase 2: the in-flight requests drain within that, or the drain
+/// gives up and says so. Phase 3, the teardown, is the caller's once the
+/// listeners have stopped.
+async fn graceful_shutdown(
+    inflight_tracker: &InFlightRequestTracker,
+    budget: ShutdownBudget,
+    leave_mesh: impl Future<Output = ()>,
+    stop_mesh: impl FnOnce(),
+    stop_listeners: impl FnOnce(Duration),
+) {
+    // Phase 1: Flip readiness to 503, hold the listener open through the
+    // settle window so propagation-lagged requests still land, then gate
+    // new connections.
+    info!(
+        in_flight = inflight_tracker.len(),
+        "Beginning graceful shutdown: readiness draining"
+    );
+    // Everything below shares the grace: the drain takes what the settle
+    // window and the leave of the mesh leave of it.
+    let deadline = tokio::time::Instant::now() + budget.grace;
+    inflight_tracker.begin_drain();
+    let left_in_time = if budget.settle.is_zero() {
+        tokio::time::timeout(budget.grace, leave_mesh).await.is_ok()
+    } else {
+        info!(
+            settle_secs = budget.settle.as_secs(),
+            "Keeping listener open during load-balancer propagation window"
+        );
+        let (left, ()) = tokio::join!(
+            tokio::time::timeout(budget.settle, leave_mesh),
+            tokio::time::sleep(budget.settle)
+        );
+        left.is_ok()
+    };
+    if !left_in_time {
+        stop_mesh();
+        if !budget.grace.is_zero() {
+            info!(
+                "Leaving the mesh was cut short by the settle window; its broadcast runs on \
+                 and the gossip loop is stopped now"
+            );
+        }
+    }
+    let drain_timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
+    stop_listeners(drain_timeout);
+
+    // Phase 2: Drain — wait for in-flight requests to complete
+    // Re-check after gating to catch requests that arrived between the
+    // snapshot and graceful_shutdown stopping the accept loop.
+    if !inflight_tracker.is_empty() {
+        let drained = inflight_tracker.wait_for_drain(drain_timeout).await;
+        if drained {
+            info!("All in-flight requests drained");
+        } else {
+            warn!(
+                remaining = inflight_tracker.len(),
+                timeout_secs = drain_timeout.as_secs(),
+                "Drain timed out, forcing shutdown with requests still in-flight"
+            );
+        }
+    }
+    // Phase 3: Teardown proceeds after axum server stops (in the main task)
+}
+
+#[cfg(test)]
+mod graceful_shutdown_tests {
+    use std::{
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
+        },
+        time::Duration,
+    };
+
+    use super::{graceful_shutdown, InFlightRequestTracker, ShutdownBudget};
+
+    /// The settle window is half the grace, capped at 5 s; the drain is the
+    /// rest; a zero grace has neither.
+    #[test]
+    fn the_budget_splits_the_grace() {
+        let secs = |s| Duration::from_secs(s);
+        assert_eq!(
+            ShutdownBudget::from_grace_secs(30),
+            ShutdownBudget {
+                grace: secs(30),
+                settle: secs(5),
+                drain: secs(25)
+            }
+        );
+        assert_eq!(
+            ShutdownBudget::from_grace_secs(6),
+            ShutdownBudget {
+                grace: secs(6),
+                settle: secs(3),
+                drain: secs(3)
+            }
+        );
+        assert_eq!(
+            ShutdownBudget::from_grace_secs(0),
+            ShutdownBudget {
+                grace: secs(0),
+                settle: secs(0),
+                drain: secs(0)
+            }
+        );
+    }
+
+    /// The phases in order, on a paused clock: readiness drains at once;
+    /// the leave finishes inside the settle window and the listeners stay
+    /// open through the whole of it; they are then gated with what the
+    /// settle left of the grace; the drain ends when the last request does,
+    /// well before the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn the_phases_run_in_order_within_the_grace() {
+        let tracker = InFlightRequestTracker::new();
+        let request = tracker.track();
+        let budget = ShutdownBudget::from_grace_secs(30);
+        let start = tokio::time::Instant::now();
+        let left = Arc::new(AtomicBool::new(false));
+        let leave_mesh = {
+            let left = Arc::clone(&left);
+            async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                left.store(true, Ordering::SeqCst);
+            }
+        };
+        let gated = Arc::new(Mutex::new(None));
+        let stop_listeners = {
+            let gated = Arc::clone(&gated);
+            let tracker = Arc::clone(&tracker);
+            move |drain_timeout| {
+                *gated.lock().expect("no poison") =
+                    Some((start.elapsed(), drain_timeout, tracker.is_draining()));
+            }
+        };
+        // The request ends 8 s in, during the drain.
+        let release = async {
+            tokio::time::sleep(Duration::from_secs(8)).await;
+            drop(request);
+        };
+        let shutdown = graceful_shutdown(
+            &tracker,
+            budget,
+            leave_mesh,
+            || panic!("the leave finished inside the settle window"),
+            stop_listeners,
+        );
+        tokio::join!(shutdown, release);
+        assert!(left.load(Ordering::SeqCst), "the leave ran");
+        assert_eq!(
+            gated.lock().expect("no poison").take(),
+            Some((Duration::from_secs(5), Duration::from_secs(25), true)),
+            "the listeners are gated after the settle window, with the rest of the grace, while \
+             draining"
+        );
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_secs(8),
+            "the drain ended with the request"
+        );
+        assert!(tracker.is_empty());
+    }
+
+    /// A leave that outlasts the settle window is cut short and the mesh is
+    /// stopped outright; the listeners are still gated on time; a request
+    /// that never ends does not hold the shutdown past the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_leave_is_cut_short_and_a_stuck_request_holds_nothing_past_the_deadline() {
+        let tracker = InFlightRequestTracker::new();
+        let _stuck = tracker.track();
+        let budget = ShutdownBudget::from_grace_secs(10);
+        let start = tokio::time::Instant::now();
+        let mesh_stopped = Arc::new(AtomicBool::new(false));
+        let gated = Arc::new(Mutex::new(None));
+        graceful_shutdown(
+            &tracker,
+            budget,
+            std::future::pending::<()>(),
+            {
+                let mesh_stopped = Arc::clone(&mesh_stopped);
+                move || mesh_stopped.store(true, Ordering::SeqCst)
+            },
+            {
+                let gated = Arc::clone(&gated);
+                move |drain_timeout| {
+                    *gated.lock().expect("no poison") = Some((start.elapsed(), drain_timeout));
+                }
+            },
+        )
+        .await;
+        assert!(
+            mesh_stopped.load(Ordering::SeqCst),
+            "the leave was cut short"
+        );
+        assert_eq!(
+            gated.lock().expect("no poison").take(),
+            Some((Duration::from_secs(5), Duration::from_secs(5)))
+        );
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_secs(10),
+            "the deadline held"
+        );
+        assert_eq!(
+            tracker.len(),
+            1,
+            "the stuck request is reported, not waited for"
+        );
+    }
+
+    /// With no grace there is no settle window: the leave gets no time (a
+    /// pending one is cut short and the mesh is stopped outright), the
+    /// listeners are gated at once with nothing left, and with nothing in
+    /// flight the drain is skipped.
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_grace_gates_at_once() {
+        let tracker = InFlightRequestTracker::new();
+        let start = tokio::time::Instant::now();
+        let mesh_stopped = Arc::new(AtomicBool::new(false));
+        let gated = Arc::new(Mutex::new(None));
+        graceful_shutdown(
+            &tracker,
+            ShutdownBudget::from_grace_secs(0),
+            std::future::pending::<()>(),
+            {
+                let mesh_stopped = Arc::clone(&mesh_stopped);
+                move || mesh_stopped.store(true, Ordering::SeqCst)
+            },
+            {
+                let gated = Arc::clone(&gated);
+                move |drain_timeout| {
+                    *gated.lock().expect("no poison") = Some((start.elapsed(), drain_timeout));
+                }
+            },
+        )
+        .await;
+        assert!(
+            mesh_stopped.load(Ordering::SeqCst),
+            "a zero grace cuts the leave short"
+        );
+        assert_eq!(
+            gated.lock().expect("no poison").take(),
+            Some((Duration::ZERO, Duration::ZERO))
+        );
+        assert!(tracker.is_draining());
+    }
+}
+
+/// Both listeners, until both have stopped. The normal end is the shutdown
+/// signal, which closes both handles together, so each ends by itself. A
+/// listener that stops on its own with an error (its accept loop failed)
+/// must not leave the gateway half-served, the data routes up with the
+/// control plane gone or the other way round: `stop_data` / `stop_admin`
+/// (a graceful shutdown of the other handle) is called, the other listener
+/// is awaited, and both results come back for the caller to report.
+async fn serve_together(
+    data: Serving,
+    admin: Serving,
+    stop_data: impl FnOnce(),
+    stop_admin: impl FnOnce(),
+) -> (std::io::Result<()>, std::io::Result<()>) {
+    tokio::pin!(data);
+    tokio::pin!(admin);
+    tokio::select! {
+        data_result = &mut data => {
+            if data_result.is_err() {
+                stop_admin();
+            }
+            (data_result, admin.await)
+        }
+        admin_result = &mut admin => {
+            if admin_result.is_err() {
+                stop_data();
+            }
+            (data.await, admin_result)
+        }
+    }
+}
+
+#[cfg(test)]
+mod serve_together_tests {
+    use std::{
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
+
+    use tokio::sync::oneshot;
+
+    use super::{serve_together, Serving};
+
+    /// A listener that fails at once, one that ends when told to, and one
+    /// that ends by itself a moment later.
+    fn failing() -> Serving {
+        Box::pin(async { Err(std::io::Error::other("accept failed")) })
+    }
+    fn until_stopped() -> (Serving, oneshot::Sender<()>) {
+        let (tx, rx) = oneshot::channel::<()>();
+        let serving: Serving = Box::pin(async move {
+            let _ = rx.await;
+            Ok(())
+        });
+        (serving, tx)
+    }
+    fn ending_by_itself() -> Serving {
+        Box::pin(async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Ok(())
+        })
+    }
+
+    /// The failing listener's error comes back with the other's clean end,
+    /// after the other was told to stop.
+    #[tokio::test]
+    async fn a_listener_that_fails_stops_the_other() {
+        for data_fails in [true, false] {
+            let (other, stop) = until_stopped();
+            let stopped = Arc::new(AtomicBool::new(false));
+            let told = {
+                let stopped = Arc::clone(&stopped);
+                move || {
+                    stopped.store(true, Ordering::SeqCst);
+                    let _ = stop.send(());
+                }
+            };
+            let not_told = || panic!("the failing listener is not the one to stop");
+            let (data, admin) = if data_fails {
+                serve_together(failing(), other, not_told, told).await
+            } else {
+                serve_together(other, failing(), told, not_told).await
+            };
+            let (failed, clean) = if data_fails {
+                (data, admin)
+            } else {
+                (admin, data)
+            };
+            assert_eq!(
+                failed.expect_err("the failure").to_string(),
+                "accept failed",
+                "data_fails = {data_fails}"
+            );
+            clean.expect("the other listener ended cleanly once told");
+            assert!(stopped.load(Ordering::SeqCst), "data_fails = {data_fails}");
+        }
+    }
+
+    /// A listener that ends cleanly (the shutdown signal's doing) tells the
+    /// other nothing; the other ends by itself, as the signal closes both.
+    #[tokio::test]
+    async fn a_clean_end_leaves_the_other_to_end_by_itself() {
+        let ready: Serving = Box::pin(async { Ok(()) });
+        let (data, admin) = serve_together(
+            ready,
+            ending_by_itself(),
+            || panic!("nothing to stop"),
+            || panic!("nothing to stop"),
+        )
+        .await;
+        data.expect("clean");
+        admin.expect("ended by itself");
+    }
 }
 
 /// The plain-HTTP acceptor: Nagle buffering disabled on accepted sockets so
 /// small streaming writes need not wait for outstanding data to be
 /// acknowledged, and the connections that carry no request bounded (see
 /// [`connection_timeouts`]). This changes no HTTP payload; the separately
-/// configured TLS listener applies the same bounds around its handshake
-/// acceptor.
+/// configured TLS listener gets the same through [`tls_acceptor`].
 fn http_acceptor(
     timeouts: ConnectionTimeouts,
 ) -> ConnectionTimeoutAcceptor<axum_server::accept::NoDelayAcceptor> {
     ConnectionTimeoutAcceptor::new(axum_server::accept::NoDelayAcceptor::new(), timeouts)
+}
+
+/// The TLS acceptor: Nagle buffering disabled on the accepted TCP socket
+/// before the handshake, as [`http_acceptor`] does for plain HTTP, so small
+/// streaming records need not wait for the client's delayed ACK; the
+/// connections that carry no request are bounded around the handshake.
+fn tls_acceptor(
+    acceptor: axum_server::tls_rustls::RustlsAcceptor,
+    timeouts: ConnectionTimeouts,
+) -> ConnectionTimeoutAcceptor<
+    axum_server::tls_rustls::RustlsAcceptor<axum_server::accept::NoDelayAcceptor>,
+> {
+    ConnectionTimeoutAcceptor::new(
+        acceptor.acceptor(axum_server::accept::NoDelayAcceptor::new()),
+        timeouts,
+    )
 }
 
 /// A plain-HTTP server bound on `addr` with [`http_acceptor`]. Start-up
@@ -2313,6 +3085,7 @@ mod tests {
             InFlightRequestTracker::new(),
             vec![],
             vec![],
+            middleware::AccessLogFields::NONE,
         );
         for (path, status) in [("/known", StatusCode::OK), ("/nope", StatusCode::NOT_FOUND)] {
             let response = app
@@ -2348,6 +3121,7 @@ mod tests {
             InFlightRequestTracker::new(),
             vec![],
             vec![],
+            middleware::AccessLogFields::NONE,
         );
         for (method, path, version, status, messages_shape) in [
             (
@@ -2458,6 +3232,7 @@ mod tests {
             InFlightRequestTracker::new(),
             vec![],
             vec![],
+            middleware::AccessLogFields::NONE,
         );
         let oversized = format!(
             r#"{{"model":"m","messages":[{{"role":"user","content":"{}"}}]}}"#,
@@ -2525,9 +3300,8 @@ mod tests {
         assert_eq!(json["error"]["type"], "request_too_large", "{json}");
         assert_eq!(json["request_id"], request_id, "{json}");
 
-        // Declared length: refused by the limit layer before the body, and
-        // still the JSON envelope with the same code as the chunked refusal
-        // (the limit layer's own answer is plain text).
+        // Declared length: refused by the limit layer before the body, with
+        // the JSON envelope and the same code as the chunked refusal.
         let response = app
             .oneshot(
                 http::Request::builder()
@@ -2578,14 +3352,14 @@ mod tests {
                         },
                     ),
                 )
-                .route_layer(axum::middleware::from_fn_with_state(
-                    middleware::RequestBodyTimeouts::from_config(&RouterConfig::default()),
-                    middleware::request_body_timeout_middleware,
-                )),
+                .route_layer(
+                    middleware::RequestBodyTimeouts::from_config(&RouterConfig::default()).layer(),
+                ),
             1024,
             InFlightRequestTracker::new(),
             vec![],
             vec![],
+            middleware::AccessLogFields::NONE,
         );
         let oversized = format!(
             r#"{{"model":"m","messages":[{{"role":"user","content":"{}"}}]}}"#,
@@ -2640,6 +3414,7 @@ mod tests {
                 InFlightRequestTracker::new(),
                 vec![],
                 origins,
+                middleware::AccessLogFields::NONE,
             );
             let mut request = http::Request::builder()
                 .method(if preflight { "OPTIONS" } else { "GET" })
@@ -2803,6 +3578,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tls_acceptor_enables_nodelay_before_the_handshake() {
+        use axum_server::tls_rustls::{RustlsAcceptor, RustlsConfig};
+        use rustls::{
+            crypto::ring,
+            server::{ClientHello, ResolvesServerCert},
+            sign::CertifiedKey,
+            ServerConfig,
+        };
+
+        /// A server certificate is never reached: the client is gone before
+        /// the handshake, which only needs to run after the TCP acceptor.
+        #[derive(Debug)]
+        struct NoCertificate;
+        impl ResolvesServerCert for NoCertificate {
+            fn resolve(&self, _: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+                None
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (client, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
+            drop(client.unwrap());
+            let (socket, _) = accepted.unwrap();
+            socket.set_nodelay(false).unwrap();
+            // The acceptor consumes the socket; a duplicate descriptor observes it.
+            let socket = socket.into_std().unwrap();
+            let probe = socket.try_clone().unwrap();
+            let socket = TcpStream::from_std(socket).unwrap();
+            let config = ServerConfig::builder_with_provider(Arc::new(ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::new(NoCertificate));
+            let acceptor = tls_acceptor(
+                RustlsAcceptor::new(RustlsConfig::from_config(Arc::new(config))),
+                ConnectionTimeouts::disabled(),
+            );
+            assert!(acceptor.accept(socket, ()).await.is_err());
+            assert!(probe.nodelay().unwrap());
+        })
+        .await
+        .expect("TLS acceptor test timed out");
+    }
+
+    #[tokio::test]
     async fn plain_http_acceptor_preserves_response_bytes() {
         tokio::time::timeout(Duration::from_secs(5), async {
             let handle = axum_server::Handle::new();
@@ -2828,7 +3649,7 @@ mod tests {
             .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>());
             let checking = async {
                 let addr = handle.listening().await.expect("HTTP server did not bind");
-                let client = crate::http_client::client_builder()
+                let client = crate::clients::http_client_builder()
                     .no_proxy()
                     .build()
                     .unwrap();
@@ -2879,6 +3700,7 @@ mod tests {
             mesh_server_config: None,
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
+            secret_sources: Default::default(),
         }
     }
 

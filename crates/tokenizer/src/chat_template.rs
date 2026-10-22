@@ -187,7 +187,8 @@ fn mentions_thinking_variable(template: &str) -> bool {
 /// same templates as the engine does (see [`ChatTemplateState::apply`]). A
 /// template is of the "openai" format when it has a loop over a message's
 /// content, a message being a loop variable over `messages` or over a
-/// variable assigned from it: the loop runs over `message.content` (also
+/// variable assigned from it (a namespace attribute included, `{% set
+/// ns.rest = messages[1:] %}`): the loop runs over `message.content` (also
 /// through a filter, a test or a slice), over a macro parameter the template
 /// fills with a message's content, or, outside any macro, over a variable
 /// named `content`. Any other template is of the "string" format, one that
@@ -402,8 +403,11 @@ fn is_var_or_elems_access(expr: &Expr<'_>, varname: &str, key: Option<&str>) -> 
         Expr::Var(v) => key.is_none() && v.id == varname,
         // The base of the attribute is the name itself, as in the engine's
         // `_is_attr_access`; the wrappers above are allowed around the whole
-        // access only.
-        Expr::GetAttr(g) => key.is_some_and(|key| g.name == key && is_var(&g.expr, varname)),
+        // access only. Without a key, a namespace attribute path is the name.
+        Expr::GetAttr(g) => match key {
+            Some(key) => g.name == key && is_var(&g.expr, varname),
+            None => attr_path(expr).as_deref() == Some(varname),
+        },
         Expr::GetItem(g) => key.is_some_and(|key| {
             matches!(&g.subscript_expr, Expr::Const(c) if c.value.as_str() == Some(key))
                 && is_var(&g.expr, varname)
@@ -412,27 +416,50 @@ fn is_var_or_elems_access(expr: &Expr<'_>, varname: &str, key: Option<&str>) -> 
     }
 }
 
-/// Whether `expr` is the plain name `varname`: the engine's `_is_var_access`.
+/// Whether `expr` is the plain name `varname`, or the namespace attribute
+/// path `varname` spells (`ns.rest`): the engine's `_is_var_access`, plus
+/// the namespace attributes [`names_assigned_from`] records.
 fn is_var(expr: &Expr<'_>, varname: &str) -> bool {
-    matches!(expr, Expr::Var(v) if v.id == varname)
+    match expr {
+        Expr::Var(v) => v.id == varname,
+        Expr::GetAttr(_) => attr_path(expr).as_deref() == Some(varname),
+        _ => false,
+    }
+}
+
+/// The dotted path of a chain of attribute accesses on a plain name
+/// (`ns.rest`), the way a namespace attribute is written; `None` for any
+/// other expression.
+fn attr_path(expr: &Expr<'_>) -> Option<String> {
+    match expr {
+        Expr::Var(v) => Some(v.id.to_string()),
+        Expr::GetAttr(g) => attr_path(&g.expr).map(|base| format!("{base}.{}", g.name)),
+        _ => None,
+    }
 }
 
 /// `root` and every name assigned from it or from such a name, through
 /// filters, tests and slices: the engine's `_iter_nodes_assign_var_or_elems`.
-fn names_assigned_from<'a>(sets: &[&'a Set<'a>], root: &'a str) -> Result<Vec<&'a str>, NotAName> {
-    let mut names = vec![root];
-    let mut queue = std::collections::VecDeque::from([root]);
+/// A namespace attribute assigned that way (`{% set ns.rest = messages[1:] %}`,
+/// which a template loops over as `ns.rest`) is recorded by its dotted path,
+/// where the engine's walk stops; any other target that is not a name stops
+/// this one too.
+fn names_assigned_from<'a>(sets: &[&'a Set<'a>], root: &'a str) -> Result<Vec<String>, NotAName> {
+    let mut names = vec![root.to_string()];
+    let mut queue = std::collections::VecDeque::from([root.to_string()]);
     while let Some(related) = queue.pop_front() {
         for set in sets {
-            if !is_var_or_elems_access(&set.expr, related, None) {
+            if !is_var_or_elems_access(&set.expr, &related, None) {
                 continue;
             }
-            let Expr::Var(target) = &set.target else {
-                return Err(NotAName);
+            let target = match &set.target {
+                Expr::Var(target) => target.id.to_string(),
+                Expr::GetAttr(_) => attr_path(&set.target).ok_or(NotAName)?,
+                _ => return Err(NotAName),
             };
-            if !names.contains(&target.id) {
-                names.push(target.id);
-                queue.push_back(target.id);
+            if !names.contains(&target) {
+                names.push(target.clone());
+                queue.push_back(target);
             }
         }
     }
@@ -443,7 +470,7 @@ fn names_assigned_from<'a>(sets: &[&'a Set<'a>], root: &'a str) -> Result<Vec<&'
 /// `_iter_nodes_assign_messages_item`.
 fn message_loop_vars<'a>(
     loops: &[(&'a ForLoop<'a>, Vec<&'a Macro<'a>>)],
-    messages_names: &[&str],
+    messages_names: &[String],
 ) -> Result<Vec<&'a str>, NotAName> {
     let mut vars = Vec::new();
     for (fl, _) in loops {
@@ -831,21 +858,26 @@ pub struct ChatTemplateParams<'a> {
     pub continue_final_message: bool,
 }
 
-/// JSON separator pair passed through HuggingFace's `tojson` filter.
+/// The initial size of a `tojson` output buffer: room for a function schema
+/// of the usual size without a reallocation.
+const TOJSON_BUFFER_BYTES: usize = 1024;
+
+/// JSON separator pair passed through HuggingFace's `tojson` filter. The
+/// defaults are the static bytes; only a `separators` argument owns its own.
 #[derive(Debug, Clone)]
 struct JsonSeparators {
-    item: Vec<u8>,
-    key: Vec<u8>,
+    item: Cow<'static, [u8]>,
+    key: Cow<'static, [u8]>,
 }
 
 impl JsonSeparators {
     fn python_default(indent: Option<i64>) -> Self {
         // Python's json.dumps defaults to `(', ', ': ')` for compact output
         // and `(',', ': ')` when pretty indentation is enabled.
-        let item = if indent.is_some() { "," } else { ", " };
+        let item: &'static [u8] = if indent.is_some() { b"," } else { b", " };
         Self {
-            item: item.as_bytes().to_vec(),
-            key: b": ".to_vec(),
+            item: Cow::Borrowed(item),
+            key: Cow::Borrowed(b": "),
         }
     }
 }
@@ -1076,8 +1108,8 @@ fn parse_separators(
         .ok_or_else(|| invalid_tojson_option("key separator must be a string"))?;
 
     Ok(JsonSeparators {
-        item: item.as_bytes().to_vec(),
-        key: key.as_bytes().to_vec(),
+        item: Cow::Owned(item.as_bytes().to_vec()),
+        key: Cow::Owned(key.as_bytes().to_vec()),
     })
 }
 
@@ -1098,7 +1130,9 @@ fn serialize_with_python_json<T: Serialize>(
         .transpose()?;
 
     let formatter = PythonJsonFormatter::new(indent, separators, ensure_ascii);
-    let mut buf = Vec::new();
+    // Sized for a tool schema up front: a buffer grown from empty is
+    // reallocated at every doubling on the way to the same size.
+    let mut buf = Vec::with_capacity(TOJSON_BUFFER_BYTES);
     let mut serializer = serde_json::Serializer::with_formatter(&mut buf, formatter);
     value.serialize(&mut serializer).map_err(|e| {
         MinijinjaError::new(
@@ -1112,6 +1146,12 @@ fn serialize_with_python_json<T: Serialize>(
             format!("Invalid UTF-8 in JSON output: {e}"),
         )
     })
+}
+
+/// Compact JSON spelling shared by the Jinja filter and native renderers.
+pub(crate) fn compact_python_json(value: &JsonValue) -> Result<String> {
+    serialize_with_python_json(value, None, JsonSeparators::python_default(None), false)
+        .map_err(Into::into)
 }
 
 /// Custom tojson filter compatible with HuggingFace transformers' implementation.
@@ -1134,30 +1174,28 @@ fn tojson_filter(value: Value, kwargs: Kwargs) -> std::result::Result<Value, Min
     // Ensure all kwargs are consumed to avoid "unknown keyword argument" errors
     kwargs.assert_all_used()?;
 
-    let json_value: serde_json::Value = serde_json::to_value(&value).map_err(|e| {
-        MinijinjaError::new(
-            ErrorKind::InvalidOperation,
-            format!("Failed to convert to JSON value: {e}"),
-        )
-    })?;
-
-    // Serialize with options
-    let json_str: std::result::Result<String, MinijinjaError> = {
-        let sorted_json;
-        let value_to_serialize = if sort_keys.unwrap_or(false) {
-            sorted_json = sort_json_keys(&json_value);
-            &sorted_json
-        } else {
-            &json_value
-        };
-
-        let separators = parse_separators(separators, indent)?;
+    let separators = parse_separators(separators, indent)?;
+    let ensure_ascii = ensure_ascii.unwrap_or(false);
+    // The template value is written straight into its JSON text: its serde
+    // form is what a `serde_json::Value` built from it would serialize as
+    // (the same `Serialize` impl drives both, in the same key order), so
+    // the tree is built only when the keys are to be sorted, which needs
+    // the value as a whole.
+    let json_str = if sort_keys.unwrap_or(false) {
+        let json_value: serde_json::Value = serde_json::to_value(&value).map_err(|e| {
+            MinijinjaError::new(
+                ErrorKind::InvalidOperation,
+                format!("Failed to convert to JSON value: {e}"),
+            )
+        })?;
         serialize_with_python_json(
-            value_to_serialize,
+            &sort_json_keys(&json_value),
             indent,
             separators,
-            ensure_ascii.unwrap_or(false),
+            ensure_ascii,
         )
+    } else {
+        serialize_with_python_json(&value, indent, separators, ensure_ascii)
     };
 
     json_str.map(Value::from_safe_string)
@@ -1422,7 +1460,9 @@ fn detect_root_role_support(template: &str) -> bool {
 /// message is not the first message (the engine's `_consolidate_system_messages`,
 /// which follows the rewrite in its renderer). `None` when no message has
 /// the role, so the caller keeps its slice.
-fn developer_messages_as_system(messages: &[serde_json::Value]) -> Option<Vec<serde_json::Value>> {
+pub(crate) fn developer_messages_as_system(
+    messages: &[serde_json::Value],
+) -> Option<Vec<serde_json::Value>> {
     let is_developer =
         |m: &serde_json::Value| m.get("role").and_then(|r| r.as_str()) == Some("developer");
     if !messages.iter().any(is_developer) {
@@ -1454,7 +1494,9 @@ fn developer_messages_as_system(messages: &[serde_json::Value]) -> Option<Vec<se
 /// [`developer_messages_as_system`]), so a template that reads one leading
 /// system message keeps a system message that followed the root. `None`
 /// when no message has the role, so the caller keeps its slice.
-fn root_messages_as_system(messages: &[serde_json::Value]) -> Option<Vec<serde_json::Value>> {
+pub(crate) fn root_messages_as_system(
+    messages: &[serde_json::Value],
+) -> Option<Vec<serde_json::Value>> {
     let is_root = |m: &serde_json::Value| m.get("role").and_then(|r| r.as_str()) == Some("root");
     if !messages.iter().any(is_root) {
         return None;
@@ -1644,6 +1686,18 @@ fn render_continuing_final_message(
     messages: &[JsonValue],
     params: ChatTemplateParams,
 ) -> Result<(String, bool)> {
+    continue_final_message(messages, params, |messages, params| {
+        render_messages(env, messages.iter(), params).map(|(text, _)| text)
+    })
+}
+
+/// Continue a message with the same marker, cut and fallback rules for both
+/// Jinja and native renderers. The supplied renderer receives no continuation flag.
+pub(crate) fn continue_final_message(
+    messages: &[JsonValue],
+    params: ChatTemplateParams,
+    render: impl Fn(&[JsonValue], ChatTemplateParams) -> Result<String>,
+) -> Result<(String, bool)> {
     if params.add_generation_prompt {
         return Err(anyhow!(
             "continue_final_message and add_generation_prompt are not compatible"
@@ -1662,7 +1716,9 @@ fn render_continuing_final_message(
             continue_final_message: false,
             ..params
         };
-        let (rendered, _) = render_messages(env, head.iter().chain(iter::once(&tagged)), params)?;
+        let mut tagged_messages = head.to_vec();
+        tagged_messages.push(tagged);
+        let rendered = render(&tagged_messages, params)?;
         cut_at_final_message(rendered, text, &marker)
     })();
     let reason = match continued {
@@ -1680,8 +1736,7 @@ fn render_continuing_final_message(
         ));
     }
     tracing::debug!(%reason, "appending the continued message after the generation prompt");
-    let (mut prompt, _) = render_chat_template(
-        env,
+    let mut prompt = render(
         head,
         ChatTemplateParams {
             add_generation_prompt: true,
@@ -1788,7 +1843,9 @@ fn render_messages<'a>(
 
 /// The messages with every string `content` of a non-tool message replaced by
 /// a one-item text part list, or `None` when no message has one.
-fn string_content_as_text_parts(messages: &[serde_json::Value]) -> Option<Vec<serde_json::Value>> {
+pub(crate) fn string_content_as_text_parts(
+    messages: &[serde_json::Value],
+) -> Option<Vec<serde_json::Value>> {
     fn needs_wrap(message: &serde_json::Value) -> bool {
         message
             .get("content")
@@ -1841,21 +1898,6 @@ impl ChatTemplateProcessor {
     ) -> Result<String> {
         render_chat_template(&self.env, messages, params).map(|(prompt, _)| prompt)
     }
-}
-
-/// Load chat template from tokenizer config JSON
-pub fn load_chat_template_from_config(config_path: &str) -> Result<Option<String>> {
-    let content = fs::read_to_string(config_path)?;
-    let config: serde_json::Value = serde_json::from_str(&content)?;
-
-    // Look for chat_template in the config
-    if let Some(template) = config.get("chat_template") {
-        if let Some(template_str) = template.as_str() {
-            return Ok(Some(template_str.to_string()));
-        }
-    }
-
-    Ok(None)
 }
 
 /// Load chat template from a file (.jinja or .json containing Jinja).
@@ -1921,6 +1963,9 @@ pub struct ChatTemplateState {
     /// messages, the way such a request was dispatched before the MiniMax
     /// profile kept the role, instead of letting the template drop them.
     root_role_supported: bool,
+    /// Whether the template writes a history tool call's `arguments` as the
+    /// text the request sent (see [`Self::raw_tool_call_arguments`]).
+    raw_tool_call_arguments: bool,
 }
 
 impl std::fmt::Debug for ChatTemplateState {
@@ -1948,7 +1993,7 @@ impl ChatTemplateState {
             .is_none_or(detect_developer_role_support);
         let root_role_supported = template.as_deref().is_none_or(detect_root_role_support);
         let env = template.map(build_environment).transpose()?;
-        Ok(Self {
+        let mut state = Self {
             env,
             content_format,
             thinking_toggle,
@@ -1957,7 +2002,10 @@ impl ChatTemplateState {
             prefill_opens_think_block,
             developer_role_supported,
             root_role_supported,
-        })
+            raw_tool_call_arguments: false,
+        };
+        state.raw_tool_call_arguments = state.writes_tool_call_arguments_as_text();
+        Ok(state)
     }
 
     /// Create a `ChatTemplateState` with no template set.
@@ -1974,6 +2022,7 @@ impl ChatTemplateState {
             prefill_opens_think_block: false,
             developer_role_supported: true,
             root_role_supported: true,
+            raw_tool_call_arguments: false,
         }
     }
 
@@ -2115,6 +2164,7 @@ impl ChatTemplateState {
         self.think_in_prefill = think_in_prefill;
         self.prefill_opens_think_block = prefill_opens_think_block;
         self.env = Some(env);
+        self.raw_tool_call_arguments = self.writes_tool_call_arguments_as_text();
         Ok(())
     }
 
@@ -2155,11 +2205,102 @@ impl ChatTemplateState {
     pub fn prefill_opens_think_block(&self) -> bool {
         self.prefill_opens_think_block
     }
+
+    /// Whether the template writes a history tool call's `arguments` as the
+    /// text the request sent: the Jinja renderer's answer to
+    /// `RendererCapabilities::raw_tool_call_arguments`. The API carries the
+    /// arguments as a JSON string and the gateway parses them into the object
+    /// the Transformers docs say a template reads; a template that writes
+    /// them by string concatenation (`'<sep>' + tool['function']['arguments']
+    /// + '<end>'`) cannot render that object, so the string must reach it as
+    /// written. Resolved when the template is bound (see
+    /// [`Self::writes_tool_call_arguments_as_text`]).
+    pub fn raw_tool_call_arguments(&self) -> bool {
+        self.raw_tool_call_arguments
+    }
+
+    /// Decide [`Self::raw_tool_call_arguments`] by the template's behaviour,
+    /// not its source: one history call rendered with the arguments as the
+    /// string and as the object. The template takes the text only when the
+    /// object fails to render and the string renders, so a template that
+    /// takes the object (`tojson`, indexing, an `is string` branch) and one
+    /// that renders neither keep the parsed form the gateway hands every
+    /// template today.
+    fn writes_tool_call_arguments_as_text(&self) -> bool {
+        if self.env.is_none() {
+            return false;
+        }
+        let renders = |arguments: serde_json::Value| {
+            let messages = [
+                serde_json::json!({"role": "user", "content": "probe"}),
+                serde_json::json!({"role": "assistant", "content": "", "tool_calls": [{
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {"name": "probe", "arguments": arguments},
+                }]}),
+                serde_json::json!({"role": "tool", "tool_call_id": "call_0", "content": "probe"}),
+            ];
+            self.apply(&messages, ChatTemplateParams::default()).is_ok()
+        };
+        renders(serde_json::json!("{\"probe\": 1}")) && !renders(serde_json::json!({"probe": 1}))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A history call's `arguments` reach a template as the text the request
+    /// sent only when the template writes them that way: one that concatenates
+    /// them cannot render the parsed object; one that serializes or indexes
+    /// the object, or branches on its type, and one without a tool-call branch
+    /// keep the object.
+    #[test]
+    fn a_template_that_concatenates_tool_call_arguments_takes_them_as_text() {
+        let state = ChatTemplateState::new(Some(CONCATENATING_CALLS.to_string())).unwrap();
+        assert!(state.raw_tool_call_arguments());
+
+        let indexing = "{% for m in messages %}{% if m.tool_calls %}{% for t in m.tool_calls %}\
+                        <call>{{ t.function.name }}:{% for k, v in t.function.arguments | items %}\
+                        {{ k }}={{ v }}{% endfor %}</call>{% endfor %}{% else %}{{ m.content }}\
+                        {% endif %}{% endfor %}";
+        let branching = "{% for m in messages %}{% if m.tool_calls %}{% for t in m.tool_calls %}\
+                         <call>{{ t.function.name }}:{% if t.function.arguments is string %}\
+                         {{ t.function.arguments }}{% else %}{{ t.function.arguments | tojson }}\
+                         {% endif %}</call>{% endfor %}{% else %}{{ m.content }}{% endif %}{% endfor %}";
+        let without_calls = "{% for m in messages %}{{ m.content }}{% endfor %}";
+        for template in [SERIALIZING_CALLS, indexing, branching, without_calls] {
+            let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+            assert!(!state.raw_tool_call_arguments(), "{template}");
+        }
+        assert!(!ChatTemplateState::empty().raw_tool_call_arguments());
+        assert!(!ChatTemplateState::new(None)
+            .unwrap()
+            .raw_tool_call_arguments());
+    }
+
+    /// A replacement template answers for itself.
+    #[test]
+    fn a_replacement_template_refreshes_the_tool_call_arguments_answer() {
+        let mut state = ChatTemplateState::new(Some(SERIALIZING_CALLS.to_string())).unwrap();
+        assert!(!state.raw_tool_call_arguments());
+        state.set(CONCATENATING_CALLS.to_string()).unwrap();
+        assert!(state.raw_tool_call_arguments());
+        state.set(SERIALIZING_CALLS.to_string()).unwrap();
+        assert!(!state.raw_tool_call_arguments());
+    }
+
+    /// A template that writes a history call by string concatenation, as the
+    /// DeepSeek V3 line's templates do.
+    const CONCATENATING_CALLS: &str =
+        "{% for m in messages %}{% if m.tool_calls %}{% for t in m.tool_calls %}\
+         {{ '<call>' + t.function.name + ':' + t.function.arguments + '</call>' }}\
+         {% endfor %}{% else %}{{ m.content }}{% endif %}{% endfor %}";
+    /// A template that serializes the arguments object, as most do.
+    const SERIALIZING_CALLS: &str =
+        "{% for m in messages %}{% if m.tool_calls %}{% for t in m.tool_calls %}\
+         <call>{{ t.function.name }}:{{ t.function.arguments | tojson }}</call>\
+         {% endfor %}{% else %}{{ m.content }}{% endif %}{% endfor %}";
 
     /// Transformers' `{% generation %}` block (the assistant-token mask marker)
     /// renders its body; the engine here has no such statement, so the block
@@ -2187,6 +2328,51 @@ mod tests {
         assert_eq!(
             detect_chat_template_content_format(parts_template),
             ChatTemplateContentFormat::OpenAI
+        );
+    }
+
+    /// A template that keeps the messages it loops over in a namespace
+    /// attribute (`ns.rest = messages[1:]`) and renders each message's
+    /// content through a macro that walks its parts is of the "openai"
+    /// format: its parts reach the template, which writes the media anchors
+    /// itself. Any other non-name assignment target still falls back to the
+    /// "string" format.
+    #[test]
+    fn namespace_message_lists_are_followed_to_their_content_loop() {
+        let template = "{%- macro render_content(content) -%}\
+                        {%- if content is string -%}{{ content }}\
+                        {%- else -%}{%- for part in content -%}\
+                        {%- if part.get('type', '') in ['image', 'image_url'] -%}<|patch|>\
+                        {%- elif part.get('type', '') == 'text' -%}{{ part.get('text', '') }}\
+                        {%- endif -%}{%- endfor -%}{%- endif -%}{%- endmacro -%}\
+                        {%- set ns = namespace(rest=messages) -%}\
+                        {%- if messages and messages[0]['role'] == 'system' -%}\
+                        {%- set ns.rest = messages[1:] -%}{%- endif -%}\
+                        {%- for message in ns.rest -%}\
+                        <|start|>{{ message['role'] }}<|message|>{{ render_content(message['content']) }}<|eot|>\
+                        {%- endfor -%}";
+        assert_eq!(
+            detect_chat_template_content_format(template),
+            ChatTemplateContentFormat::OpenAI
+        );
+        let processor = ChatTemplateProcessor::new(template.to_string()).unwrap();
+        let messages = [serde_json::json!({"role": "user", "content": [
+            {"type": "image"}, {"type": "text", "text": "what is this?"}
+        ]})];
+        let rendered = processor
+            .apply_chat_template(&messages, ChatTemplateParams::default())
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "<|start|>user<|message|><|patch|>what is this?<|eot|>"
+        );
+
+        // A plain string-content template with the same namespace shape stays string-format.
+        let plain = "{%- set ns = namespace(rest=messages) -%}{%- for message in ns.rest -%}\
+                     {{ message['content'] }}{%- endfor -%}";
+        assert_eq!(
+            detect_chat_template_content_format(plain),
+            ChatTemplateContentFormat::String
         );
     }
 
@@ -2273,6 +2459,69 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("2 is required"), "{error}");
+    }
+
+    /// `tojson` writes the template value straight into its text; the text is
+    /// Python's `json.dumps` of the value under each option, and the same as
+    /// a `serde_json::Value` built from the template value would serialize
+    /// as (the path the sorted form still takes).
+    #[test]
+    fn tojson_writes_the_value_as_python_and_as_its_tree_would() {
+        let value = serde_json::json!({
+            "name": "Zoë", "n": 1, "big": 18446744073709551615u64, "neg": -5, "f": 1.5,
+            "whole": 2.0, "t": true, "none": null,
+            "list": [1, "two", [3.25, {"k": "v"}]],
+            "nested": {"b": 1, "a": {"c": [], "d": {}}},
+            "esc": "quote\" back\\ tab\t nl\n ctl\u{1} emoji😀",
+        });
+        let template = "{{ messages[0].v | tojson }}\n\
+                        {{ messages[0].v | tojson(ensure_ascii=True) }}\n\
+                        {{ messages[0].v | tojson(indent=2) }}\n\
+                        {{ messages[0].v | tojson(separators=(',', ':')) }}\n\
+                        {{ messages[0].v | tojson(sort_keys=True) }}";
+        let messages = [serde_json::json!({"role": "user", "v": value})];
+        let processor = ChatTemplateProcessor::new(template.to_string()).unwrap();
+        let rendered = processor
+            .apply_chat_template(&messages, ChatTemplateParams::default())
+            .unwrap();
+        // Each line is `json.dumps(v, ensure_ascii=False, ...)` with that option.
+        let want = [
+            r#"{"name": "Zoë", "n": 1, "big": 18446744073709551615, "neg": -5, "f": 1.5, "whole": 2.0, "t": true, "none": null, "list": [1, "two", [3.25, {"k": "v"}]], "nested": {"b": 1, "a": {"c": [], "d": {}}}, "esc": "quote\" back\\ tab\t nl\n ctl\u0001 emoji😀"}"#,
+            r#"{"name": "Zo\u00eb", "n": 1, "big": 18446744073709551615, "neg": -5, "f": 1.5, "whole": 2.0, "t": true, "none": null, "list": [1, "two", [3.25, {"k": "v"}]], "nested": {"b": 1, "a": {"c": [], "d": {}}}, "esc": "quote\" back\\ tab\t nl\n ctl\u0001 emoji\ud83d\ude00"}"#,
+            "{\n  \"name\": \"Zoë\",\n  \"n\": 1,\n  \"big\": 18446744073709551615,\n  \"neg\": -5,\n  \"f\": 1.5,\n  \"whole\": 2.0,\n  \"t\": true,\n  \"none\": null,\n  \"list\": [\n    1,\n    \"two\",\n    [\n      3.25,\n      {\n        \"k\": \"v\"\n      }\n    ]\n  ],\n  \"nested\": {\n    \"b\": 1,\n    \"a\": {\n      \"c\": [],\n      \"d\": {}\n    }\n  },\n  \"esc\": \"quote\\\" back\\\\ tab\\t nl\\n ctl\\u0001 emoji😀\"\n}",
+            r#"{"name":"Zoë","n":1,"big":18446744073709551615,"neg":-5,"f":1.5,"whole":2.0,"t":true,"none":null,"list":[1,"two",[3.25,{"k":"v"}]],"nested":{"b":1,"a":{"c":[],"d":{}}},"esc":"quote\" back\\ tab\t nl\n ctl\u0001 emoji😀"}"#,
+            r#"{"big": 18446744073709551615, "esc": "quote\" back\\ tab\t nl\n ctl\u0001 emoji😀", "f": 1.5, "list": [1, "two", [3.25, {"k": "v"}]], "n": 1, "name": "Zoë", "neg": -5, "nested": {"a": {"c": [], "d": {}}, "b": 1}, "none": null, "t": true, "whole": 2.0}"#,
+        ];
+        assert_eq!(rendered, want.join("\n"));
+
+        // The direct write and the write of the tree agree byte for byte.
+        let given = Value::from_serialize(&messages[0]["v"]);
+        for (indent, ensure_ascii) in [
+            (None, false),
+            (None, true),
+            (Some(2), false),
+            (Some(0), true),
+        ] {
+            let direct = serialize_with_python_json(
+                &given,
+                indent,
+                JsonSeparators::python_default(indent),
+                ensure_ascii,
+            )
+            .unwrap();
+            let tree: serde_json::Value = serde_json::to_value(&given).unwrap();
+            let through_tree = serialize_with_python_json(
+                &tree,
+                indent,
+                JsonSeparators::python_default(indent),
+                ensure_ascii,
+            )
+            .unwrap();
+            assert_eq!(
+                direct, through_tree,
+                "indent {indent:?} ensure_ascii {ensure_ascii}"
+            );
+        }
     }
 
     /// transformers renders with `tools=None` and `documents=None` when the

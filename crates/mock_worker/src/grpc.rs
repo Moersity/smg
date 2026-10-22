@@ -12,7 +12,9 @@ use std::{
 };
 
 use futures::{stream, Stream, StreamExt};
-use smg_grpc_client::{common_proto as common, tokenspeed_scheduler::tokenspeed_proto as ts};
+use smg_grpc_client::{
+    common_proto as common, constraint_failed_status, tokenspeed_scheduler::tokenspeed_proto as ts,
+};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{mpsc, watch},
@@ -29,6 +31,7 @@ use crate::{
     drain::InFlight,
     engine::{self, Engine, KvEventStream, LoadsLike, NewRequest},
     replay::Capture,
+    script::{self, Answer, MatchedStop},
 };
 
 /// Serve the mock TokenSpeed gRPC service on `port` until the process exits.
@@ -81,12 +84,17 @@ pub async fn serve_with_listener_until(
         },
         None => None,
     };
+    if let Err(e) = script::ensure_loaded(&cfg) {
+        tracing::error!("grpc worker {addr:?} cannot load script: {e}");
+        return;
+    }
     // One simulated engine per listener (i.e. per virtual worker), registered
     // in the process fleet under `grpc:<port>` for the oracle and admin API.
     let name = format!("grpc:{}", addr.map(|a| a.port()).unwrap_or(0));
+    script::register(&name);
     let engine = cfg
         .realistic
-        .then(|| Engine::spawn_named(cfg.engine.clone(), name, true));
+        .then(|| Engine::spawn_named(cfg.engine.clone(), name.clone(), true));
     // The worker's vLLM-wire KV-event publisher, numbered by its port offset.
     let publisher = engine.as_ref().and_then(|engine| {
         let port = addr.map(|a| a.port())?;
@@ -106,12 +114,26 @@ pub async fn serve_with_listener_until(
     };
     let service = MockScheduler {
         cfg,
+        name,
         engine,
         capture,
         stopped,
         prefill_pending: Arc::new(AtomicU64::new(0)),
+        overrides: crate::overrides::for_port(addr.map(|a| a.port()).unwrap_or(0)),
     };
     let server = async {
+        // tonic drains on incoming EOF when graceful shutdown is enabled,
+        // but retains the stream while waiting for existing connections.
+        // Drop the listener at EOF so the port closes before that wait.
+        let incoming = stream::unfold(
+            Box::pin(connections(listener).take_until(shutdown)),
+            |mut incoming| async move {
+                incoming
+                    .next()
+                    .await
+                    .map(|connection| (connection, incoming))
+            },
+        );
         // tonic's 4 MiB default would refuse the Generate of a long prompt (a
         // million token ids are a few megabytes as varints, more with the
         // prompt text alongside); the limit follows the config: none by
@@ -122,7 +144,7 @@ pub async fn serve_with_listener_until(
                     .max_decoding_message_size(max_message_bytes)
                     .max_encoding_message_size(max_message_bytes),
             )
-            .serve_with_incoming_shutdown(connections(listener), shutdown)
+            .serve_with_incoming_shutdown(incoming, pending())
             .await
         {
             tracing::error!("grpc worker {addr:?} stopped: {e}");
@@ -164,6 +186,9 @@ fn connections(listener: TcpListener) -> impl Stream<Item = std::io::Result<TcpS
 #[derive(Clone)]
 struct MockScheduler {
     cfg: Arc<Config>,
+    /// The worker's name in the process (`grpc:<port>`): what the admin API
+    /// and the script store address it by.
+    name: String,
     /// Present iff the worker runs the realistic engine simulator.
     engine: Option<Engine>,
     /// Present iff `--capture` is set: every `Generate` request is recorded.
@@ -174,6 +199,9 @@ struct MockScheduler {
     /// Prompt tokens of the requests handed to the engine with no token yet:
     /// the prefill work in hand, as a servicer reports it on its load record.
     prefill_pending: Arc<AtomicU64>,
+    /// What the admin API made this worker report about itself (serving,
+    /// server args, model capabilities).
+    overrides: Arc<crate::overrides::WorkerOverrides>,
 }
 
 type GenStream = Pin<Box<dyn Stream<Item = Result<ts::GenerateResponse, Status>> + Send>>;
@@ -201,6 +229,28 @@ impl TokenSpeedScheduler for MockScheduler {
                 tracing::error!("capturing request {} failed: {e}", req.request_id);
                 return Err(Status::internal(format!("mock-worker capture failed: {e}")));
             }
+        }
+
+        // A scripted answer, ahead of either engine mode: the worker's queue
+        // or the prompt's key decides ([`crate::script`]).
+        let prompt_ids: &[u32] = req
+            .tokenized
+            .as_ref()
+            .map(|tokenized| tokenized.input_ids.as_slice())
+            .unwrap_or(&[]);
+        let scripted = script::take_ids(&self.cfg, &self.name, prompt_ids)
+            .map_err(Status::failed_precondition)?;
+        if let Some(answer) = scripted {
+            let prompt_tokens = answer.prompt_tokens(prompt_ids.len());
+            let stream = scripted_stream(
+                answer,
+                req.request_id.clone(),
+                prompt_tokens,
+                req.stream,
+                req.return_logprob,
+                self.cfg.weight_version.clone(),
+            );
+            return Ok(Response::new(Box::pin(in_flight.until_done(stream))));
         }
 
         // Realistic mode: submit to the engine simulator and stream its output.
@@ -312,16 +362,20 @@ impl TokenSpeedScheduler for MockScheduler {
         &self,
         _request: Request<ts::HealthCheckRequest>,
     ) -> Result<Response<ts::HealthCheckResponse>, Status> {
+        let serving = self.overrides.serving();
         Ok(Response::new(ts::HealthCheckResponse {
-            healthy: true,
-            message: "ok".to_string(),
+            healthy: serving,
+            message: if serving { "ok" } else { "not serving" }.to_string(),
         }))
     }
 
     async fn abort(
         &self,
-        _request: Request<ts::AbortRequest>,
+        request: Request<ts::AbortRequest>,
     ) -> Result<Response<ts::AbortResponse>, Status> {
+        if let Some(engine) = &self.engine {
+            engine.abort(request.into_inner().request_id);
+        }
         Ok(Response::new(ts::AbortResponse {
             success: true,
             message: String::new(),
@@ -346,7 +400,7 @@ impl TokenSpeedScheduler for MockScheduler {
             bos_token_id: 1,
             weight_version: "mock".to_string(),
             default_sampling_params_json: String::new(),
-            supports_vision: false,
+            supports_vision: self.overrides.info_bool("supports_vision").unwrap_or(false),
             ..Default::default()
         }))
     }
@@ -355,21 +409,23 @@ impl TokenSpeedScheduler for MockScheduler {
         &self,
         _request: Request<ts::GetServerInfoRequest>,
     ) -> Result<Response<ts::GetServerInfoResponse>, Status> {
-        let server_args = (!self.cfg.server_args.is_empty()).then(|| prost_types::Struct {
-            fields: self
-                .cfg
-                .server_args
-                .iter()
-                .map(|(k, v)| {
-                    (
-                        k.clone(),
-                        prost_types::Value {
-                            kind: Some(prost_types::value::Kind::StringValue(v.clone())),
-                        },
-                    )
-                })
-                .collect(),
-        });
+        // The configured server args, with the admin API's overrides on top:
+        // what the gateway flattens into this worker's labels.
+        let mut fields: std::collections::BTreeMap<String, prost_types::Value> = self
+            .cfg
+            .server_args
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    prost_types::Value {
+                        kind: Some(prost_types::value::Kind::StringValue(v.clone())),
+                    },
+                )
+            })
+            .collect();
+        fields.extend(crate::overrides::server_args(&self.overrides.info()).fields);
+        let server_args = (!fields.is_empty()).then_some(prost_types::Struct { fields });
         Ok(Response::new(ts::GetServerInfoResponse {
             server_args,
             scheduler_info: None,
@@ -379,6 +435,7 @@ impl TokenSpeedScheduler for MockScheduler {
             max_total_num_tokens: 1_000_000,
             tokenspeed_version: "mock".to_string(),
             start_time: None,
+            constrained_decoding: String::new(),
         }))
     }
 
@@ -486,8 +543,10 @@ impl TokenSpeedScheduler for MockScheduler {
 /// chosen so the gateway's mapping of codes to HTTP statuses gives that status
 /// back where it can: 408 reads back as 504 and 502 as 503 (both still
 /// retryable), 499 as 502 (`cancelled`: the worker's side ending the call,
-/// retryable and charged to the worker), any other 4xx as 400 (not
-/// retryable, as on the HTTP worker), any other 5xx as 500.
+/// retryable and charged to the worker), 422 as the engine's report that it
+/// could not continue the request under its constraint (a 422
+/// `constraint_failed` at the gateway, never replayed), any other 4xx as 400
+/// (not retryable, as on the HTTP worker), any other 5xx as 500.
 fn injected_status(status: u16) -> Status {
     const MESSAGE: &str = "injected";
     match status {
@@ -497,6 +556,7 @@ fn injected_status(status: u16) -> Status {
         404 => Status::not_found(MESSAGE),
         408 | 504 => Status::deadline_exceeded(MESSAGE),
         409 => Status::aborted(MESSAGE),
+        422 => constraint_failed_status(MESSAGE),
         429 => Status::resource_exhausted(MESSAGE),
         // The call the worker's side ended: what a connection that closed
         // under it produces at the gateway.
@@ -665,6 +725,120 @@ fn generate_stream(
                 }
                 None => return None,
             }
+        }
+    }))
+}
+
+/// The generate stream of a scripted answer: a `Chunk` per frame when the
+/// request streams, then the `Complete`, with the answer's pause before every
+/// frame but the first; the logprobs ride along when the request asked for
+/// them. A `Complete` that follows no chunk is what a non-streaming request
+/// reads, as it reads the engine's.
+fn scripted_stream(
+    answer: Answer,
+    request_id: String,
+    prompt_tokens: u32,
+    stream_chunks: bool,
+    return_logprob: bool,
+    weight_version: Option<String>,
+) -> GenStream {
+    struct Scripted {
+        answer: Answer,
+        frames: std::collections::VecDeque<script::Frame>,
+        request_id: String,
+        prompt_tokens: u32,
+        stream_chunks: bool,
+        return_logprob: bool,
+        weight_version: Option<String>,
+        /// Output tokens sent so far (the chunks' running `completion_tokens`).
+        sent: u32,
+        started: bool,
+        done: bool,
+    }
+    let frames = answer.token_frames().into();
+    let init = Scripted {
+        answer,
+        frames,
+        request_id,
+        prompt_tokens,
+        stream_chunks,
+        return_logprob,
+        weight_version,
+        sent: 0,
+        started: false,
+        done: false,
+    };
+    Box::pin(stream::unfold(init, |mut st| async move {
+        loop {
+            if st.done {
+                return None;
+            }
+            let Some(frame) = st.frames.pop_front() else {
+                st.done = true;
+                let answer = &st.answer;
+                let output_logprobs = answer
+                    .logprobs
+                    .as_ref()
+                    .filter(|logprobs| {
+                        st.return_logprob && logprobs.len() == answer.output_ids.len()
+                    })
+                    .map(|logprobs| ts::OutputLogProbs {
+                        token_logprobs: logprobs.clone(),
+                        token_ids: answer.output_ids.clone(),
+                        top_logprobs: Vec::new(),
+                    });
+                let matched_stop = answer.matched_stop.as_ref().map(|stop| match stop {
+                    MatchedStop::Token(id) => {
+                        ts::generate_complete::MatchedStop::MatchedTokenId(*id)
+                    }
+                    MatchedStop::Text(text) => {
+                        ts::generate_complete::MatchedStop::MatchedStopStr(text.clone())
+                    }
+                });
+                let complete = ts::GenerateResponse {
+                    request_id: st.request_id.clone(),
+                    response: Some(GenResp::Complete(ts::GenerateComplete {
+                        output_ids: answer.output_ids.clone(),
+                        finish_reason: answer.finish_reason.clone(),
+                        prompt_tokens: st.prompt_tokens,
+                        completion_tokens: answer.completion_tokens(),
+                        cached_tokens: answer.cached_tokens,
+                        output_logprobs,
+                        matched_stop,
+                        index: 0,
+                        weight_version: st.weight_version.clone(),
+                        ..Default::default()
+                    })),
+                };
+                return Some((Ok(complete), st));
+            };
+            if st.started && !st.answer.delay.is_zero() {
+                tokio::time::sleep(st.answer.delay).await;
+            }
+            st.started = true;
+            st.sent += u32::try_from(frame.ids.len()).unwrap_or(u32::MAX);
+            if !st.stream_chunks {
+                continue;
+            }
+            let output_logprobs = (st.return_logprob && frame.logprobs.len() == frame.ids.len())
+                .then(|| ts::OutputLogProbs {
+                    token_logprobs: frame.logprobs.clone(),
+                    token_ids: frame.ids.clone(),
+                    top_logprobs: Vec::new(),
+                });
+            let chunk = ts::GenerateResponse {
+                request_id: st.request_id.clone(),
+                response: Some(GenResp::Chunk(ts::GenerateStreamChunk {
+                    token_ids: frame.ids,
+                    prompt_tokens: st.prompt_tokens,
+                    completion_tokens: st.sent,
+                    cached_tokens: st.answer.cached_tokens,
+                    output_logprobs,
+                    index: 0,
+                    weight_version: st.weight_version.clone(),
+                })),
+            };
+            return Some((Ok(chunk), st));
         }
     }))
 }
@@ -1113,6 +1287,11 @@ mod tests {
         // 499 as 502) and a 4xx without its own code (read back as 400).
         assert_eq!(injected_status(408).code(), tonic::Code::DeadlineExceeded);
         assert_eq!(injected_status(502).code(), tonic::Code::Unavailable);
-        assert_eq!(injected_status(422).code(), tonic::Code::InvalidArgument);
+        assert_eq!(injected_status(418).code(), tonic::Code::InvalidArgument);
+        // 422 is the engine's report that it could not continue the request
+        // under its constraint, which the gateway reads back as its 422.
+        let constraint = injected_status(422);
+        assert_eq!(constraint.code(), tonic::Code::FailedPrecondition);
+        assert!(smg_grpc_client::is_constraint_failure(&constraint));
     }
 }

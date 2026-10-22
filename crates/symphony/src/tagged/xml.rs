@@ -22,24 +22,19 @@
 //! [`formats::minimax_m3`]: crate::formats::minimax_m3()
 
 use crate::{
-    event::{DropReason, Event, Events, MalformedReason, Text},
+    event::{release_between, runs, Event, Events, MalformedReason, Text},
     tagged::{
         assembler::{push_escaped, push_quoted},
-        value::{json, Declared, Kind, ITEM, NULL_WORDS},
+        end_cut_call,
+        value::{json, Kind, ITEM, NULL_WORDS},
     },
+    Declared,
 };
 
 /// The invoke's closing tag: the one terminal a started call's end carries. The next invoke's
 /// opening and the block's close end a call too, but they belong to the region, and the engine
 /// drops them.
 pub const INVOKE_CLOSE: &str = "</invoke>";
-
-const TEXT_BETWEEN_TAGS: &str = "text between a call's tags";
-const TAG_OUT_OF_PLACE: &str = "a tag where the call's syntax has none";
-const TAG_CUT_SHORT: &str = "a tag that another tag cut short";
-const TAG_TAIL: &str = "text after a tag's name";
-const EMPTY_NAME: &str = "an invoke with no name";
-const WITHOUT_A_NAME: &str = "an invoke block without a name";
 
 /// The events of one invoke, from the bytes after `<invoke name="`.
 #[derive(Clone, Debug)]
@@ -64,6 +59,12 @@ pub struct Assembler {
     /// Whether the last bytes taken were the table's ignored terminal: the separator the
     /// template writes before every tag, and never inside a value.
     after_separator: bool,
+    /// Whether text where the syntax has tags was released as content since the last tag the
+    /// syntax read (a word between tags, a tag out of its place, a tag reported with its bytes):
+    /// the whitespace carried after it is the model's, between two pieces of its text, and leaves
+    /// with the next piece ([`release_between`]); before any, the whitespace after a tag is the
+    /// template's, dropped before a report or carried into the next event's source.
+    released: bool,
     done: bool,
 }
 
@@ -133,6 +134,7 @@ impl Assembler {
             written: 0,
             tag: None,
             after_separator: false,
+            released: false,
             done: false,
         }
     }
@@ -154,29 +156,24 @@ impl Assembler {
         }
     }
 
-    /// The table's ignored terminal arrived inside the call: `Dropped { Wrapper }` at once when
-    /// nothing is held before it, otherwise carried into the next fragment's source, so that its
-    /// bytes keep their place.
-    pub fn ignored(&mut self, bytes: &str, declared: &Declared, out: &mut Events) {
+    /// The table's ignored terminal arrived inside the call: a tag held before it is released, as
+    /// the separator ends it, and what follows stands after a separator. Its own bytes are the
+    /// engine's to place, in their order among the bytes this assembler holds.
+    pub fn ignored(&mut self, declared: &Declared, out: &mut Events) {
         if self.done {
             return;
         }
         self.release_tag(declared, out);
-        if self.carried.is_empty() {
-            out.push(Event::Dropped {
-                text: Text::uncounted(bytes),
-                why: DropReason::Wrapper,
-            });
-        } else {
-            self.carried.push_str(bytes);
-        }
         self.after_separator = true;
     }
 
     /// The call's end: `terminal` is the closing marker the engine read (its bytes go into
     /// `ToolCallEnd`), or nothing when the block ended another way. Every open container is
-    /// closed, an open string gets its quote, a leaf never written is reported, the object is
-    /// closed; an invoke whose name never closed, or that had none, has its bytes reported.
+    /// closed, a leaf never written is reported, the object is closed; inside a streamed string
+    /// nothing is closed, since nothing is made up for a value the model never finished: the
+    /// fragments stand, and one `Malformed` event with what was held, or no bytes, says that the
+    /// arguments are no whole value before the call's end ([`end_cut_call`]); an invoke whose
+    /// name never closed, or that had none, has its bytes reported.
     pub fn close(mut self, terminal: &str, out: &mut Events) {
         if self.done {
             return;
@@ -184,19 +181,26 @@ impl Assembler {
         self.hold_tag();
         if self.stage != Stage::Body || !self.started() {
             self.carried.push_str(terminal);
-            self.report(WITHOUT_A_NAME, out);
+            self.report(MalformedReason::CallWithoutName, out);
+            return;
+        }
+        if let Some(Element {
+            shape:
+                Shape::Leaf(Leaf {
+                    mode: Mode::Streaming,
+                    ..
+                }),
+            ..
+        }) = self.open.last()
+        {
+            // Inside a streamed string nothing is closed, neither the string nor the containers
+            // above it; the one word before the end carries the start of a tag held, or no bytes.
+            end_cut_call(self.index, std::mem::take(&mut self.carried), terminal, out);
+            self.done = true;
             return;
         }
         while let Some(element) = self.open.last() {
             match element.shape {
-                Shape::Leaf(Leaf {
-                    mode: Mode::Streaming,
-                    ..
-                }) => {
-                    // A tag the end cut short is reported, not hidden in the quote's source.
-                    self.report(TAG_CUT_SHORT, out);
-                    self.push_fragment("\"".to_string(), Text::default(), out);
-                }
                 Shape::Object => {
                     let source = Text::uncounted(std::mem::take(&mut self.carried));
                     self.push_fragment("}".to_string(), source, out);
@@ -209,7 +213,7 @@ impl Assembler {
                 // bytes are reported, and its member is never written.
                 Shape::Leaf(_) | Shape::Open => {
                     self.value.clear();
-                    self.report(TAG_CUT_SHORT, out);
+                    self.report(MalformedReason::TagCutShort, out);
                 }
             }
             self.open.pop();
@@ -218,32 +222,70 @@ impl Assembler {
         self.close_object(source, out);
         out.push(Event::ToolCallEnd {
             index: self.index,
-            source: Text::uncounted(terminal),
+            source: Text::uncounted(terminal.to_owned()),
         });
         self.done = true;
     }
 
     /// The stream was cut: nothing is closed, so arguments cut short never look complete to a
-    /// client. A streamed string's open fragment stays open; everything held comes back as
-    /// `Malformed { UnterminatedRegion }`; a call that started still ends, with no bytes of its
-    /// own, as every assembler ends one.
+    /// client. A streamed string's open fragment stays open; a call that started still ends, with
+    /// no bytes of its own, as every assembler ends one, after the one `Malformed {
+    /// UnterminatedRegion }` event that carries everything held and says that its arguments are
+    /// no whole value ([`end_cut_call`]); what a block that named no call held comes back as
+    /// `Malformed { UnterminatedRegion }` too.
     pub fn finish(mut self, out: &mut Events) {
         if self.done {
             return;
         }
         self.hold_tag();
-        if !self.carried.is_empty() {
+        if self.started() {
+            end_cut_call(self.index, std::mem::take(&mut self.carried), "", out);
+        } else if !self.carried.is_empty() {
             out.push(Event::Malformed {
                 text: Text::uncounted(std::mem::take(&mut self.carried)),
                 why: MalformedReason::UnterminatedRegion,
             });
         }
-        if self.started() {
-            out.push(Event::ToolCallEnd {
-                index: self.index,
-                source: Text::default(),
-            });
+    }
+
+    /// The stream's stop inside the invoke: the model's own end of output, not a cut. The call
+    /// ends as its closing tag would end it, with no bytes for the end ([`Self::close`]): every
+    /// open container is closed, a leaf never written and an element without a child are
+    /// reported, the object is closed, an invoke whose name never closed has its bytes reported.
+    /// A streamed string still open is closed first: the model wrote nothing after its bytes, so
+    /// they are the value whole, and the start of a tag held is its text too, since no tag
+    /// followed. One `Malformed { OpenAtTheStop }` event of no bytes stands before the fragment
+    /// that closes what was open ([`open_at_the_stop`](super::open_at_the_stop)): for a string
+    /// the stop closed under any table, and for the call itself where the table has no stop row
+    /// (`as_marker`), since there the template writes the marker the model skipped.
+    pub fn stop(mut self, as_marker: bool, out: &mut Events) {
+        if self.done {
+            return;
         }
+        self.hold_tag();
+        let string_open = matches!(
+            self.open.last(),
+            Some(Element {
+                shape: Shape::Leaf(Leaf {
+                    mode: Mode::Streaming,
+                    ..
+                }),
+                ..
+            })
+        );
+        if string_open {
+            let held = std::mem::take(&mut self.carried);
+            if !held.is_empty() {
+                self.leaf_text(&held, out);
+            }
+            super::open_at_the_stop(out);
+            self.open.pop();
+            self.value.clear();
+            self.push_fragment("\"".to_string(), Text::default(), out);
+        } else if self.started() && !as_marker {
+            super::open_at_the_stop(out);
+        }
+        self.close("", out);
     }
 
     /// Reads as much of `text` as one step takes and returns the rest.
@@ -290,7 +332,7 @@ impl Assembler {
         if name.is_empty() {
             self.carried.push_str(&tail_bytes);
             self.carried.push('>');
-            self.report(EMPTY_NAME, out);
+            self.report(MalformedReason::EmptyName, out);
             return;
         }
         out.push(Event::ToolCallStart {
@@ -300,10 +342,11 @@ impl Assembler {
             source: Text::uncounted(std::mem::take(&mut self.carried)),
         });
         self.function = Some(name);
+        self.released = false;
         if !tail_bytes.is_empty() {
             out.push(Event::Malformed {
                 text: Text::uncounted(tail_bytes),
-                why: MalformedReason::Other(TAG_TAIL.to_string()),
+                why: MalformedReason::TagTail,
             });
         }
         self.carried.push('>');
@@ -371,11 +414,13 @@ impl Assembler {
             return;
         }
         if !self.started() {
-            self.drop_carried(out);
-            out.push(Event::Malformed {
-                text: Text::uncounted(bytes),
-                why: MalformedReason::Other(TAG_OUT_OF_PLACE.to_string()),
-            });
+            release_between(
+                &mut self.carried,
+                &mut self.released,
+                bytes.into(),
+                MalformedReason::TagOutOfPlace,
+                out,
+            );
             return;
         }
         if closing {
@@ -419,6 +464,7 @@ impl Assembler {
             shape: Shape::Open,
             written: 0,
         });
+        self.released = false;
     }
 
     /// A closing tag: it closes the innermost element when it names it; inside a leaf, or under
@@ -430,13 +476,13 @@ impl Assembler {
                 shape: Shape::Leaf(_) | Shape::Open,
                 ..
             }) => self.text(bytes, declared, out),
-            Some(_) | None => {
-                self.drop_carried(out);
-                out.push(Event::Malformed {
-                    text: Text::uncounted(bytes),
-                    why: MalformedReason::Other(TAG_OUT_OF_PLACE.to_string()),
-                });
-            }
+            Some(_) | None => release_between(
+                &mut self.carried,
+                &mut self.released,
+                bytes.to_owned().into(),
+                MalformedReason::TagOutOfPlace,
+                out,
+            ),
         }
     }
 
@@ -506,25 +552,22 @@ impl Assembler {
         }
     }
 
-    /// Text where the syntax has tags: whitespace is the template's, anything else is reported.
+    /// Text where the syntax has tags: whitespace is carried, since whose it is depends on what
+    /// follows, anything else is released with the whitespace before it when text was released
+    /// since the last tag the syntax read, after it dropped otherwise ([`release_between`]).
     fn text_between(&mut self, text: &str, out: &mut Events) {
-        let mut rest = text;
-        while let Some(first) = rest.chars().next() {
-            let space = first.is_whitespace();
-            let length = rest
-                .char_indices()
-                .find(|(_, c)| c.is_whitespace() != space)
-                .map_or(rest.len(), |(at, _)| at);
+        for (run, space) in runs(text) {
             if space {
-                self.carried.push_str(&rest[..length]);
+                self.carried.push_str(run);
             } else {
-                self.drop_carried(out);
-                out.push(Event::Malformed {
-                    text: Text::uncounted(&rest[..length]),
-                    why: MalformedReason::Other(TEXT_BETWEEN_TAGS.to_string()),
-                });
+                release_between(
+                    &mut self.carried,
+                    &mut self.released,
+                    run.to_owned().into(),
+                    MalformedReason::TextBetweenTags,
+                    out,
+                );
             }
-            rest = &rest[length..];
         }
     }
 
@@ -670,38 +713,29 @@ impl Assembler {
         let mut source = std::mem::take(&mut self.carried);
         source.push_str(bytes);
         self.push_fragment(fragment, Text::uncounted(source), out);
+        self.released = false;
     }
 
-    /// Reports the carried bytes as `Malformed` with `why`, whitespace included.
-    fn report(&mut self, why: &str, out: &mut Events) {
+    /// Reports the carried bytes as `Malformed` with `why`, whitespace included: released, so the
+    /// whitespace after them is the model's.
+    fn report(&mut self, why: MalformedReason, out: &mut Events) {
         if self.carried.is_empty() {
             return;
         }
         out.push(Event::Malformed {
             text: Text::uncounted(std::mem::take(&mut self.carried)),
-            why: MalformedReason::Other(why.to_string()),
+            why,
         });
-    }
-
-    /// Whitespace carried before text that is reported: the template's, dropped so the report
-    /// holds only the text.
-    fn drop_carried(&mut self, out: &mut Events) {
-        if self.carried.is_empty() {
-            return;
-        }
-        out.push(Event::Dropped {
-            text: Text::uncounted(std::mem::take(&mut self.carried)),
-            why: DropReason::Wrapper,
-        });
+        self.released = true;
     }
 
     /// `}` or `{}`, with `source` as its bytes.
-    fn close_object(&mut self, source: Text, out: &mut Events) {
+    fn close_object<'d>(&mut self, source: Text<'d>, out: &mut Events<'d>) {
         let json = if self.written == 0 { "{}" } else { "}" }.to_string();
         self.push_fragment(json, source, out);
     }
 
-    fn push_fragment(&self, json: String, source: Text, out: &mut Events) {
+    fn push_fragment<'d>(&self, json: String, source: Text<'d>, out: &mut Events<'d>) {
         out.push(Event::ToolCallArguments {
             index: self.index,
             json,
@@ -716,8 +750,8 @@ impl crate::engine::CallAssembler for Assembler {
         text.len()
     }
 
-    fn ignored(&mut self, text: &str, declared: &Declared, out: &mut Events) {
-        self.ignored(text, declared, out);
+    fn ignored(&mut self, _text: &str, declared: &Declared, out: &mut Events) {
+        self.ignored(declared, out);
     }
 
     /// Only the invoke's closing tag is a started call's end; the next invoke's opening and the
@@ -735,5 +769,9 @@ impl crate::engine::CallAssembler for Assembler {
 
     fn finish(self: Box<Self>, out: &mut Events) {
         (*self).finish(out);
+    }
+
+    fn stop(self: Box<Self>, as_marker: bool, out: &mut Events) {
+        (*self).stop(as_marker, out);
     }
 }

@@ -14,7 +14,6 @@ import asyncio
 import dataclasses
 import enum
 import functools
-import hashlib
 import json
 import logging
 import math
@@ -27,11 +26,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import grpc
-import msgspec
 import numpy as np
 import torch
-import zmq
-import zmq.asyncio
 from google.protobuf.struct_pb2 import Struct
 from google.protobuf.timestamp_pb2 import Timestamp
 from smg_grpc_proto import tokenspeed_scheduler_pb2_grpc
@@ -42,14 +38,17 @@ from tokenspeed.runtime.multimodal.inputs import (
     MultimodalInputs,
 )
 from tokenspeed.runtime.multimodal.shm_transport import ShmTensorHandle
-from tokenspeed.runtime.pd.kv_events import KVEventBatch
 
-from smg_grpc_servicer.kv_events import endpoint_for_rank, stream_kv_events
+from smg_grpc_servicer import mm_shm
+from smg_grpc_servicer.health_probe import await_probe
 from smg_grpc_servicer.mm_rdma import RdmaPixelPuller
-from smg_grpc_servicer.tokenizer_bundle import CHUNK_SIZE, build_tokenizer_zip
+from smg_grpc_servicer.tokenizer_bundle import tokenizer_bundle, tokenizer_chunks
 from smg_grpc_servicer.tokenspeed.config_view import EngineConfigView
 from smg_grpc_servicer.tokenspeed.health_servicer import TokenSpeedHealthServicer
-from smg_grpc_servicer.tokenspeed.kv_events import resolve_kv_events_config
+from smg_grpc_servicer.tokenspeed.kv_events import (
+    resolve_kv_events_config,
+    subscribe_kv_events,
+)
 from smg_grpc_servicer.tokenspeed.loads import (
     convert_load_to_protobuf,
     convert_snapshot_to_protobuf,
@@ -58,7 +57,12 @@ from smg_grpc_servicer.tokenspeed.loads import (
 )
 from smg_grpc_servicer.tokenspeed.redact import redact_secrets
 
-from ..constrained_decoding import grammar_start_labels, tokenspeed_constrained_decoding_start
+from ..constrained_decoding import (
+    grammar_backend_entry,
+    grammar_start_labels,
+    tokenspeed_constrained_decoding_start,
+    tokenspeed_grammar_backend,
+)
 from ..pd_pairing import pairing_protocol_from_env
 
 if TYPE_CHECKING:
@@ -96,11 +100,6 @@ LOG_MM_TIMING = os.getenv("TOKENSPEED_LOG_MM_TIMING", "").lower() in (
     "1",
     "true",
     "yes",
-)
-UNLINK_MM_SHM_AFTER_READ = os.getenv("TOKENSPEED_UNLINK_MM_SHM_AFTER_READ", "1").lower() not in (
-    "0",
-    "false",
-    "no",
 )
 
 
@@ -258,6 +257,11 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         # n>1 emits a *list* of final dicts (non-streaming) or per-choice
         # streamed dicts tagged with ``index`` — both handled below.
         expanded_rid = getattr(req_obj, "rid", None)
+        # The stream closes once every requested choice has its Complete: the
+        # engine's iterator may stay open briefly after its final output, and a
+        # client must not wait on transport EOF for a response that is whole.
+        expected_choices = len(expanded_rid) if isinstance(expanded_rid, list) else 1
+        completed_indices: set[int] = set()
         if os.environ.get("SMG_CACHE_TRACE") == "1":
             logger.info(
                 "cache_request_mapping %s",
@@ -277,10 +281,17 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         no_stop_trim = bool(request.sampling_params.no_stop_trim)
 
         aborted = False
+        # Held so the finally can close it: a return at semantic completion
+        # leaves the engine's iterator suspended at its final yield, and the
+        # close releases what it holds there now, not in asyncio's generator
+        # finalizer later.
+        engine_outputs = self.async_llm.generate_request(req_obj)
+        # Choices that have sent a Chunk; only their empty terminal delta is skipped.
+        indices_with_chunks: set[int] = set()
         try:
             engine_started = time.perf_counter()
             first_output = True
-            async for output in self.async_llm.generate_request(req_obj):
+            async for output in engine_outputs:
                 if LOG_MM_TIMING and first_output:
                     first_output = False
                     logger.info(
@@ -306,7 +317,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                         yield self._complete_response(
                             rid, item, item_reason, ci, no_stop_trim=no_stop_trim
                         )
-                    continue
+                    return
 
                 meta = output.get("meta_info", {})
                 reason_dict = _finish_reason_to_dict(meta.get("finish_reason"))
@@ -320,9 +331,19 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                 choice_index = int(output.get("index", 0))
 
                 if request.stream:
-                    yield self._chunk_response(
+                    chunk_response = self._chunk_response(
                         rid, output, reason_dict, choice_index, no_stop_trim=no_stop_trim
                     )
+                    # A matched stop token may be the whole final engine delta;
+                    # trimmed, it leaves no client-visible payload, and an empty
+                    # Chunk before Complete would hold a streaming client at the
+                    # terminal boundary. A choice's first output goes out even
+                    # when empty: the gateway opens the choice (its role delta,
+                    # its first-token time) on the first Chunk, and a Complete
+                    # alone opens nothing.
+                    if chunk_response.chunk.token_ids or choice_index not in indices_with_chunks:
+                        indices_with_chunks.add(choice_index)
+                        yield chunk_response
                     if is_finished:
                         yield self._complete_response(
                             rid, output, reason_dict, choice_index, no_stop_trim=no_stop_trim
@@ -331,6 +352,11 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                     yield self._complete_response(
                         rid, output, reason_dict, choice_index, no_stop_trim=no_stop_trim
                     )
+
+                if is_finished:
+                    completed_indices.add(choice_index)
+                    if len(completed_indices) == expected_choices:
+                        return
 
         except ValueError as e:
             logger.warning("Generate invalid request %s: %s", rid, e)
@@ -352,6 +378,12 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             logger.exception("Generate failed for request %s", rid)
             await context.abort(grpc.StatusCode.INTERNAL, str(e))
         finally:
+            # The engine's iterator first: closing it runs the engine's own
+            # exit (the model-update reader lock it holds across yields) now
+            # rather than in asyncio's generator finalizer. Its per-request
+            # cleanup is not part of that close, so the check below is still
+            # what aborts an abandoned request.
+            await engine_outputs.aclose()
             # Defensive cleanup — the scheduler owns rid_to_state, but if the
             # stream was torn down before finish we need to notify it. When
             # n>1 we expanded rid to a list of per-choice ids, so walk them.
@@ -377,7 +409,10 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
     ) -> tokenspeed_scheduler_pb2.HealthCheckResponse:
         """Deep health probe — sends a 1-token generation to the scheduler.
 
-        Any scheduler push within ``HEALTH_CHECK_TIMEOUT`` counts as alive.
+        The wait is :func:`await_probe`'s: any scheduler push after the probe
+        started, or the probe's own output, counts as alive within
+        ``HEALTH_CHECK_TIMEOUT``; a probe the engine refuses at the request
+        (its stream raises, or ends without an output) is unhealthy at once.
         ``log_metrics=False`` so health checks don't skew Prometheus counters.
         """
         rid = f"HEALTH_CHECK_{time.time()}"
@@ -407,36 +442,43 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         )
         probe.rid = rid
 
-        tic = time.time()
+        started = time.time()
 
         async def _drive_probe() -> bool:
+            # Held so the finally can close it, as Generate holds its own: the
+            # return at the first output leaves the engine's iterator suspended
+            # at that yield, and the close runs the engine's exit now, in the
+            # probe's own task, not in asyncio's generator finalizer later.
+            engine_outputs = self.async_llm.generate_request(probe)
             try:
-                async for _ in self.async_llm.generate_request(probe):
+                async for _ in engine_outputs:
                     return True
             except Exception as e:  # noqa: BLE001 — the probe is best-effort.
                 logger.warning("Health probe failed: %s", e)
                 return False
+            finally:
+                # Best-effort like the probe itself: an error the engine's exit
+                # raises is logged, not raised over the probe's verdict (an
+                # exception out of a finally would replace the return).
+                try:
+                    await engine_outputs.aclose()
+                except Exception as e:  # noqa: BLE001 — the probe is best-effort.
+                    logger.warning("Health probe close failed: %s", e)
             return False
 
         task = asyncio.create_task(_drive_probe())
         try:
-            while time.time() - tic < HEALTH_CHECK_TIMEOUT:
-                await asyncio.sleep(0.5)
-                # Any scheduler push after we started counts as healthy.
-                if self.async_llm.last_receive_tstamp > tic:
-                    return tokenspeed_scheduler_pb2.HealthCheckResponse(
-                        healthy=True,
-                        message="Health check passed",
-                    )
-                if task.done():
-                    return tokenspeed_scheduler_pb2.HealthCheckResponse(
-                        healthy=bool(task.result()),
-                        message=(
-                            "Health check passed"
-                            if task.result()
-                            else "Scheduler returned no output"
-                        ),
-                    )
+            verdict = await await_probe(
+                task,
+                started=started,
+                last_receive=lambda: self.async_llm.last_receive_tstamp,
+                timeout=HEALTH_CHECK_TIMEOUT,
+            )
+            if verdict is not None:
+                return tokenspeed_scheduler_pb2.HealthCheckResponse(
+                    healthy=verdict,
+                    message="Health check passed" if verdict else "Scheduler returned no output",
+                )
         finally:
             if not task.done():
                 task.cancel()
@@ -586,11 +628,17 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             supported.append(image_modality)
             if hf_config is not None and config_value(hf_config, "video_token_id") is not None:
                 supported.append(video_modality)
-        if (
-            bool(getattr(model_config, "is_audio_model", False))
-            and hf_config is not None
+        # A checkpoint that declares a waveform tower in its own config
+        # (`audio_config` with an `audio_token_id`) takes audio whether or not
+        # the engine's architecture list names it an audio model.
+        declares_audio_tower = (
+            hf_config is not None
+            and config_value(hf_config, "audio_config") is not None
             and config_value(hf_config, "audio_token_id") is not None
-        ):
+        )
+        if (
+            bool(getattr(model_config, "is_audio_model", False)) or declares_audio_tower
+        ) and config_value(hf_config, "audio_token_id") is not None:
             supported.append(audio_modality)
         return supported
 
@@ -633,6 +681,9 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         server_args_dict.update(
             grammar_start_labels(self.server_args, tokenspeed_constrained_decoding_start())
         )
+        # The grammar backend the scheduler runs, resolved, under the same key
+        # the Rust servicer reads.
+        grammar_backend_entry(server_args_dict, tokenspeed_grammar_backend(self.server_args))
 
         # Control endpoint and capabilities for a fronting gateway (SMG reads
         # the `rl.*` keys straight into worker labels). Older engines have no
@@ -666,7 +717,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         except Exception:  # noqa: BLE001 — fall back gracefully.
             version = "unknown"
 
-        return tokenspeed_scheduler_pb2.GetServerInfoResponse(
+        info = tokenspeed_scheduler_pb2.GetServerInfoResponse(
             server_args=server_args_struct,
             scheduler_info=scheduler_info_struct,
             active_requests=len(self.async_llm.rid_to_state),
@@ -676,6 +727,15 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             start_time=start_timestamp,
             max_total_num_tokens=int(self.scheduler_info.get("max_total_num_tokens", 0)),
         )
+        # The engine's declared constrained-decoding policy, a field of its own:
+        # the gateway follows it per worker as the `constrained_decoding` label
+        # (a grammar on every turn, or only when the request asks). An engine
+        # that declares none, and a proto package predating the field, leave
+        # it out.
+        constrained_decoding = self._config.constrained_decoding
+        if constrained_decoding and "constrained_decoding" in info.DESCRIPTOR.fields_by_name:
+            info.constrained_decoding = constrained_decoding
+        return info
 
     # The in-flight pause probe, kept across calls. TokenSpeed answers the query
     # through a queueing communicator that resets its result state only after a
@@ -866,20 +926,13 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
 
     async def SubscribeKvEvents(
         self,
-        _request: common_pb2.SubscribeKvEventsRequest,
+        request: common_pb2.SubscribeKvEventsRequest,
         context: grpc.aio.ServicerContext,
     ) -> AsyncIterator[common_pb2.KvEventBatch]:
-        """Bridge TokenSpeed's in-process ZMQ KV cache events to a gRPC stream.
-
-        The scheduler subprocess publishes msgpack ``BlockStored`` /
-        ``BlockRemoved`` / ``AllBlocksCleared`` batches on a ZMQ PUB socket
-        (enabled via ``--kv-events-config``); we re-publish them as the
-        engine-neutral ``common.KvEventBatch`` stream SMG already consumes,
-        using the publisher's sequence numbers directly.
-
-        ``start_sequence_number`` (replay) is not honored — the stream starts
-        from the current ZMQ position, matching the other engine bridges.
-        """
+        """Relay the scheduler's ZMQ KV cache events, every attention
+        data-parallel rank's publisher, as one gRPC stream (see
+        :mod:`smg_grpc_servicer.tokenspeed.kv_events` and
+        :mod:`smg_grpc_servicer.kv_relay`)."""
         if self._kv_events_config is None:
             await context.abort(
                 grpc.StatusCode.UNIMPLEMENTED,
@@ -887,43 +940,16 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                 "--kv-events-config "
                 '\'{"enable_kv_cache_events": true, "publisher": "zmq"}\'',
             )
-            return  # defensive: context.abort() raises, but keep config non-None below
+            return  # defensive: context.abort() raises
 
-        config = self._kv_events_config
-
-        # DP attention publishes one PUB socket per rank (port + rank) with
-        # independent sequence counters; subscribing to several on one socket
-        # interleaves them and breaks gap detection. Subscribe to rank 0 only.
-        pub_endpoint = endpoint_for_rank(config.endpoint, 0)
-
-        zmq_ctx = zmq.asyncio.Context.instance()
-        sub_socket = zmq_ctx.socket(zmq.SUB)
-        try:
-            # subscribe/connect can raise on a malformed endpoint; keep them in
-            # the try so the finally below always closes the socket.
-            sub_socket.subscribe(config.topic.encode("utf-8"))
-            sub_socket.connect(pub_endpoint)
-            logger.info("SubscribeKvEvents: connected to ZMQ endpoint %s", pub_endpoint)
-
-            decoder = msgspec.msgpack.Decoder(KVEventBatch)
-            async for proto_batch in stream_kv_events(
-                sub_socket,
-                decoder.decode,
-                lambda: context.send_initial_metadata(()),
-                context.cancelled,
-                load_source=self._load_record,
-            ):
-                yield proto_batch
-        except asyncio.CancelledError:
-            pass
-        except grpc.aio.AbortError:
-            raise
-        except Exception as e:  # noqa: BLE001
-            logger.exception("SubscribeKvEvents failed")
-            await context.abort(grpc.StatusCode.INTERNAL, str(e))
-        finally:
-            sub_socket.close(linger=0)
-            logger.info("SubscribeKvEvents: stream closed")
+        async for batch in subscribe_kv_events(
+            self._kv_events_config,
+            self.server_args,
+            request.start_sequence_number,
+            context,
+            load_source=self._load_record,
+        ):
+            yield batch
 
     async def FlushCache(
         self,
@@ -1080,28 +1106,21 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             )
             return
 
+        # Reading and compressing the tokenizer directory is file I/O and CPU
+        # measured in hundreds of milliseconds: the shared bundle builds it in
+        # a worker thread, once, and the scheduler keeps answering everything
+        # else (streams, health checks, aborts) meanwhile.
         try:
-            zip_buffer = build_tokenizer_zip(Path(tokenizer_path))
+            zip_data, sha256 = await tokenizer_bundle(Path(tokenizer_path))
         except Exception as e:  # noqa: BLE001
             logger.exception("Failed to build tokenizer ZIP")
             await context.abort(grpc.StatusCode.INTERNAL, str(e))
             return
 
-        zip_data = zip_buffer.getbuffer()
-        sha256 = hashlib.sha256(zip_data).hexdigest()
-        total = len(zip_data)
-        logger.info("Streaming tokenizer bundle: %d bytes, sha256=%s", total, sha256)
+        logger.info("Streaming tokenizer bundle: %d bytes, sha256=%s", len(zip_data), sha256)
 
-        # Stream chunks; SHA-256 rides only on the final chunk.
-        offset = 0
-        while offset < total:
-            end = min(offset + CHUNK_SIZE, total)
-            is_last = end == total
-            yield common_pb2.GetTokenizerChunk(
-                data=bytes(zip_data[offset:end]),
-                sha256=sha256 if is_last else "",
-            )
-            offset = end
+        for chunk in tokenizer_chunks(zip_data, sha256):
+            yield chunk
 
     # ------------------------------------------------------------------
     # Helpers
@@ -1554,7 +1573,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         copied so it never aliases the transient proto bytes.
         """
         shape = list(tensor_data.shape)
-        raw = TokenSpeedSchedulerServicer._tensor_payload_bytes(tensor_data)
+        raw = mm_shm.tensor_payload_bytes(tensor_data)
 
         if tensor_data.dtype == "bfloat16":
             # numpy has no bfloat16 — read the raw bits as uint16, reinterpret.
@@ -1616,53 +1635,8 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                 f"shape={list(shape)}: expected {expected}, got {int(shm.nbytes)}"
             )
 
-        name = TokenSpeedSchedulerServicer._validated_shm_name(shm.name)
+        name = mm_shm.validated_shm_name(shm.name)
         return ShmTensorHandle(shm_name=name, shape=shape, dtype=dtype)
-
-    @staticmethod
-    def _tensor_payload_bytes(tensor_data: tokenspeed_scheduler_pb2.TensorData) -> bytes:
-        payload = tensor_data.WhichOneof("payload")
-        if payload == "inline":
-            return bytes(tensor_data.inline)
-        if payload == "shm":
-            return TokenSpeedSchedulerServicer._tensor_payload_bytes_from_shm(tensor_data.shm)
-        if payload == "remote":
-            raise ValueError("TensorData.remote payload is not implemented yet")
-        raise ValueError("TensorData payload is required")
-
-    @staticmethod
-    def _tensor_payload_bytes_from_shm(
-        shm_handle: common_pb2.ShmHandle,
-    ) -> bytes:
-        name = TokenSpeedSchedulerServicer._validated_shm_name(shm_handle.name)
-
-        path = os.path.join("/dev/shm", name)
-        fd = None
-        try:
-            fd = os.open(path, os.O_RDONLY)
-            raw = os.pread(fd, int(shm_handle.nbytes), int(shm_handle.offset))
-        finally:
-            if fd is not None:
-                os.close(fd)
-            if fd is not None and UNLINK_MM_SHM_AFTER_READ:
-                try:
-                    os.unlink(path)
-                except FileNotFoundError:
-                    pass
-
-        if len(raw) != int(shm_handle.nbytes):
-            raise ValueError(
-                f"TensorData.shm byte length mismatch for name={shm_handle.name!r}: "
-                f"expected {int(shm_handle.nbytes)}, got {len(raw)}"
-            )
-        return raw
-
-    @staticmethod
-    def _validated_shm_name(name: str) -> str:
-        name = name.lstrip("/")
-        if not name or "/" in name or name in (".", "..") or "\x00" in name:
-            raise ValueError(f"Invalid TensorData.shm name: {name!r}")
-        return name
 
     @staticmethod
     def _torch_dtype_from_proto(dtype: str) -> torch.dtype:

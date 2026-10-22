@@ -8,7 +8,10 @@ use std::collections::HashMap;
 
 use openai_protocol::common::Usage;
 
-use crate::routers::grpc::proto_wrapper::{ProtoGenerateComplete, ProtoGenerateStreamChunk};
+use crate::{
+    rate_limit::UsageSettlement,
+    routers::grpc::proto_wrapper::{ProtoGenerateComplete, ProtoGenerateStreamChunk},
+};
 
 /// The token counters of one request, aggregated over its choices the way
 /// the engines report them. The `n>1` choices of a chat/generate request
@@ -63,12 +66,18 @@ impl TokenCounts {
             .with_reasoning_tokens(self.reasoning)
             .with_speculative_tokens(self.spec_accepted, self.spec_drafted)
     }
-}
 
-/// Build usage information from collected gRPC responses (the
-/// [`TokenCounts`] aggregation of their counters).
-pub(crate) fn build_usage(responses: &[ProtoGenerateComplete]) -> Usage {
-    TokenCounts::of(responses).usage()
+    /// The settlement of the request's reservation: the engine's counts as
+    /// they are, before the client-facing usage drops unbilled prompt
+    /// tokens or substitutes the gateway parser's reasoning split.
+    pub(crate) fn settlement(self) -> UsageSettlement {
+        UsageSettlement {
+            actual_input_tokens: self.prompt,
+            completion_tokens: self.completion,
+            cached_input_tokens: self.cached,
+            reasoning_tokens: self.reasoning,
+        }
+    }
 }
 
 /// The usage of a chat completion from `engine_usage`, the usage the
@@ -169,6 +178,21 @@ impl CompletionTokenTracker {
         }
     }
 
+    /// Settle a choice the gateway's own stop ended, as its Complete would
+    /// have: a delta stream keeps the count it accumulated, a cumulative
+    /// stream takes the running count its latest chunk reported. The choice
+    /// is counted through the step in which the stop matched, as the engine's
+    /// own server counts a stopped request. An engine that ends the choice on
+    /// that same step still sends its Complete, recorded as usual (the same
+    /// step, in the engine's own count); the Complete of a choice the engine
+    /// generated past the stop carries the tail's count, and the stream does
+    /// not pass it on.
+    pub fn record_local_stop(&mut self, index: u32) {
+        let reported = self.reported.get(&index).copied().unwrap_or(0);
+        let known = self.tokens.entry(index).or_insert(0);
+        *known = (*known).max(reported);
+    }
+
     /// Get total completion tokens across all indices
     pub fn total(&self) -> u32 {
         self.tokens.values().sum()
@@ -193,6 +217,11 @@ mod tests {
     use smg_grpc_client::{tokenspeed_proto as tokenspeed, vllm_proto as vllm};
 
     use super::*;
+
+    /// The usage the counters of `responses` make.
+    fn build_usage(responses: &[ProtoGenerateComplete]) -> Usage {
+        TokenCounts::of(responses).usage()
+    }
 
     fn complete(
         prompt_tokens: u32,
@@ -415,5 +444,53 @@ mod tests {
             "default",
             "an empty registration label is unset"
         );
+    }
+
+    /// A choice the gateway's own stop ended is settled as its Complete would
+    /// have settled it: a delta stream keeps what it accumulated, a cumulative
+    /// stream takes the running count its latest chunk reported; the count is
+    /// through the step the stop matched in, never the engine's tail.
+    #[test]
+    fn a_local_stop_settles_the_count_the_stream_had_reached() {
+        // Cumulative stream: the running count of the latest chunk.
+        let mut tracker = CompletionTokenTracker::new();
+        tracker.record_chunk(&ProtoGenerateStreamChunk::TokenSpeed(
+            tokenspeed::GenerateStreamChunk {
+                token_ids: vec![5],
+                completion_tokens: 41,
+                ..Default::default()
+            },
+        ));
+        assert_eq!(tracker.total(), 0, "no settled count before the stop");
+        tracker.record_local_stop(0);
+        assert_eq!((tracker.total(), tracker.delivered()), (41, 41));
+
+        // Delta stream: the accumulated chunks.
+        let mut tracker = CompletionTokenTracker::new();
+        tracker.record_chunk(&ProtoGenerateStreamChunk::Vllm(vllm::GenerateStreamChunk {
+            token_ids: vec![1, 2, 3],
+            ..Default::default()
+        }));
+        tracker.record_local_stop(0);
+        assert_eq!((tracker.total(), tracker.delivered()), (3, 3));
+
+        // A choice that stopped before any chunk settled at zero.
+        let mut tracker = CompletionTokenTracker::new();
+        tracker.record_local_stop(2);
+        assert_eq!((tracker.total(), tracker.delivered()), (0, 0));
+
+        // The Complete of an engine that ended the choice on the stop's step
+        // is recorded as usual: the engine's own count of that step.
+        let mut tracker = CompletionTokenTracker::new();
+        tracker.record_chunk(&ProtoGenerateStreamChunk::TokenSpeed(
+            tokenspeed::GenerateStreamChunk {
+                token_ids: vec![5],
+                completion_tokens: 41,
+                ..Default::default()
+            },
+        ));
+        tracker.record_local_stop(0);
+        tracker.record_complete(&complete(0, 0, 42));
+        assert_eq!(tracker.total(), 42, "the engine's own count of the step");
     }
 }

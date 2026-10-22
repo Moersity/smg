@@ -35,8 +35,10 @@ from collections.abc import Mapping
 from typing import Any
 
 from smg_grpc_servicer.constrained_decoding import (
+    grammar_backend_entry,
     grammar_start_labels,
     sglang_constrained_decoding_start,
+    sglang_grammar_backend,
 )
 from smg_grpc_servicer.mm_item_limits import MM_ITEM_LIMITS_KEY, sglang_item_limits
 from smg_grpc_servicer.pd_pairing import pairing_protocol_from_env
@@ -45,6 +47,8 @@ from smg_grpc_servicer.pd_pairing import pairing_protocol_from_env
 # launcher's own documented values.
 from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     DEFAULT_DRAIN_SECS,
+    DEFAULT_PREFILL_TOKENS_PER_SEC,
+    DEFAULT_SILENCE_TIMEOUT_SECS,
     DEFAULT_STARTUP_CEILING_SECS,
     DEFAULT_STARTUP_TIMEOUT_SECS,
     IMPLS,
@@ -60,7 +64,9 @@ from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     resolve_tokenizer_dir,
     servicer_switch,
 )
+from smg_grpc_servicer.sglang import METRICS_HOST_ENV, METRICS_PORT_ENV
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
+from smg_grpc_servicer.sglang.warmup import WARMUP_ENV, warmup_inputs, warmup_wire
 
 logger = logging.getLogger(__name__)
 
@@ -69,13 +75,19 @@ HANDSHAKE_PORT_ENV = "SMG_SGLANG_SERVICER_HANDSHAKE_PORT"
 DRAIN_SECS_ENV = "SMG_SGLANG_SERVICER_DRAIN_SECS"
 STARTUP_TIMEOUT_SECS_ENV = "SMG_SGLANG_SERVICER_STARTUP_TIMEOUT_SECS"
 STARTUP_CEILING_SECS_ENV = "SMG_SGLANG_SERVICER_STARTUP_CEILING_SECS"
+SILENCE_TIMEOUT_SECS_ENV = "SMG_SGLANG_SERVICER_SILENCE_TIMEOUT_SECS"
+PREFILL_TOKENS_PER_SEC_ENV = "SMG_SGLANG_SERVICER_PREFILL_TOKENS_PER_SEC"
 # Set to 0/false/no/off to keep SGLang's KV event publisher off when the
 # launcher was given no --kv-events-config (see `default_kv_events_config`).
 KV_EVENTS_ENV = "SMG_SGLANG_SERVICER_KV_EVENTS"
-# What a launcher without --kv-events-config gets under the Rust servicer:
-# the ZMQ publisher, with SGLang's own defaults for the rest (the endpoint,
-# the topic; no replay socket).
-DEFAULT_KV_EVENTS_CONFIG = '{"publisher": "zmq"}'
+
+
+def default_kv_events_json(endpoint: str) -> str:
+    """What a launcher without --kv-events-config gets under the Rust servicer,
+    as SGLang's server args carry it (JSON text): the ZMQ publisher at
+    ``endpoint``, with SGLang's own defaults for the rest (the topic; no
+    replay socket)."""
+    return json.dumps({"publisher": "zmq", "endpoint": endpoint})
 
 
 def resolve_servicer_impl(args: Any = None, environ: Mapping[str, str] | None = None) -> str:
@@ -204,6 +216,10 @@ def server_facts(server_args: Any) -> dict[str, Any]:
     args_dict.update(
         grammar_start_labels(server_args, sglang_constrained_decoding_start(server_args))
     )
+    # The grammar backend the scheduler runs, resolved (the raw argument is
+    # None unless set): the Rust servicer refuses a constraint that backend
+    # cannot enforce before the scheduler.
+    grammar_backend_entry(args_dict, sglang_grammar_backend(server_args))
     try:
         from sglang.version import __version__ as sglang_version
     except ImportError:  # the launcher's unit tests run without SGLang
@@ -257,10 +273,16 @@ def default_kv_events_config(
     """Turn SGLang's KV event publisher on when the launcher was given no
     ``--kv-events-config``; returns the configuration applied, or None: the
     shared rule (``rust_lifecycle.apply_kv_events_default``) with
-    ``DEFAULT_KV_EVENTS_CONFIG``, applied to the server args before the facts
-    and the headless scheduler are built from them."""
+    :func:`default_kv_events_json` at a free port of this host, one per
+    scheduler (each publishes at the port after its predecessor's), applied
+    to the server args before the facts and the schedulers are built from
+    them."""
     return apply_kv_events_default(
-        server_args, DEFAULT_KV_EVENTS_CONFIG, env_name=KV_EVENTS_ENV, environ=environ
+        server_args,
+        default_kv_events_json,
+        env_name=KV_EVENTS_ENV,
+        environ=environ,
+        ranks=EngineConfigView(server_args).server_args.scheduler_count,
     )
 
 
@@ -400,9 +422,14 @@ class SglangLauncher(RustLauncher):
     drain_secs_env = DRAIN_SECS_ENV
     startup_timeout_secs_env = STARTUP_TIMEOUT_SECS_ENV
     startup_ceiling_secs_env = STARTUP_CEILING_SECS_ENV
+    silence_timeout_secs_env = SILENCE_TIMEOUT_SECS_ENV
+    prefill_tokens_per_sec_env = PREFILL_TOKENS_PER_SEC_ENV
     kv_events_env = KV_EVENTS_ENV
+    metrics_port_env = METRICS_PORT_ENV
+    metrics_host_env = METRICS_HOST_ENV
     # The scheduler keeps its own tokenizer for stop strings.
     without_tokenizer = "GetTokenizer will be unavailable"
+    warmup_env = WARMUP_ENV
 
     def kv_events_default(self, args: Any) -> str | None:
         return default_kv_events_config(args)
@@ -415,6 +442,12 @@ class SglangLauncher(RustLauncher):
 
     def launch(self, args: Any, handshake_port: int, facts: Mapping[str, Any]) -> Any:
         return launch_scheduler_ranks(args, handshake_port=handshake_port)
+
+    def warmup_inputs(self, args: Any, facts: Mapping[str, Any]) -> Any:
+        return warmup_inputs(args, facts)
+
+    def warmup_wire(self, target: str) -> Any:
+        return warmup_wire(target)
 
 
 async def serve_rust(server_args: Any) -> int:

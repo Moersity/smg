@@ -17,14 +17,16 @@ use std::{
 
 const IP: Ipv4Addr = Ipv4Addr::LOCALHOST;
 /// How long the gateway gets to refuse or to serve; one that serves is
-/// killed as soon as its port answers, one that hangs at this deadline.
+/// killed as soon as it logs its bind and its port answers, one that hangs
+/// at this deadline.
 const EXIT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// What became of a gateway launched with the configuration under test.
 struct Launch {
     /// The exit status; `None` when the gateway had to be killed.
     status: Option<ExitStatus>,
-    /// Whether its port accepted a connection at any point.
+    /// Whether the gateway served: its log says it bound its port and the
+    /// port accepted a connection.
     listened: bool,
     /// Its stdout and stderr.
     log: String,
@@ -41,7 +43,7 @@ fn free_ports() -> [u16; 2] {
 }
 
 /// Runs the gateway with `args` on fresh ports, its output in `log_path`,
-/// until it exits, binds its port or `EXIT_TIMEOUT` passes.
+/// until it exits, serves or `EXIT_TIMEOUT` passes.
 fn launch(args: &[&str], log_path: &Path) -> Launch {
     let [port, metrics_port] = free_ports();
     let ip = IP.to_string();
@@ -50,6 +52,10 @@ fn launch(args: &[&str], log_path: &Path) -> Launch {
         .args(["--enable-igw", "--host", &ip, "--port", &port.to_string()])
         .args(["--prometheus-host", &ip])
         .args(["--prometheus-port", &metrics_port.to_string()])
+        // The verdict reads an info line of the gateway's: its filter is the
+        // test's to set, not the shell's (`RUST_LOG` outranks `--log-level`).
+        .args(["--log-level", "info"])
+        .env_remove("RUST_LOG")
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone().expect("log handle")))
@@ -58,12 +64,21 @@ fn launch(args: &[&str], log_path: &Path) -> Launch {
         .expect("spawn the gateway");
     let deadline = Instant::now() + EXIT_TIMEOUT;
     let address = SocketAddr::from((IP, port));
+    // The probe ports were released for the gateway to bind, and another
+    // process on the host can take one in between: a connection the port
+    // accepts is the gateway's only with its own word, the line it logs once
+    // its bind succeeded. Without the line the loop goes on, to the exit
+    // status of a gateway that refused with its port in a stranger's hands.
+    let bound = format!("Starting server on {address}");
     let mut listened = false;
     let status = loop {
         if let Some(status) = child.try_wait().expect("poll the gateway") {
             break Some(status);
         }
-        listened = TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_ok();
+        listened = TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_ok()
+            && fs::read_to_string(log_path)
+                .unwrap_or_default()
+                .contains(&bound);
         if listened || Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();

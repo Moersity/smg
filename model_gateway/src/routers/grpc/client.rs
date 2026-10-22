@@ -3,13 +3,17 @@
 use std::{collections::HashMap, sync::Arc};
 
 use openai_protocol::{
-    chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
-    messages::CreateMessageRequest, worker::WorkerLoadResponse,
+    chat::ChatCompletionRequest,
+    completion::CompletionRequest,
+    generate::GenerateRequest,
+    messages::CreateMessageRequest,
+    worker::{ConstrainedDecoding, WorkerLoadResponse},
 };
 use smg_grpc_client::{
-    common_proto, tokenizer_bundle, tokenizer_bundle::StreamBundle, BoxedTraceInjector,
-    MlxEngineClient, SglangGenerateRequestOptions, SglangSchedulerClient,
-    TokenSpeedSchedulerClient, TrtllmServiceClient, VllmEngineClient,
+    common_proto, mlx_proto, sglang_proto, tokenizer_bundle, tokenizer_bundle::StreamBundle,
+    tokenspeed_proto, trtllm_proto, vllm_proto, BoxedTraceInjector, MlxEngineClient,
+    SglangGenerateRequestOptions, SglangSchedulerClient, TokenSpeedSchedulerClient,
+    TrtllmServiceClient, VllmEngineClient,
 };
 
 use super::multimodal::SUPPORTS_VISION_LABEL;
@@ -56,20 +60,15 @@ pub struct GenerateRequestBuildOptions {
     pub multimodal_inputs: Option<MultimodalData>,
     pub tool_constraints: Option<(String, String)>,
     pub require_reasoning: bool,
+    /// `tool_constraints` was led with the model's thought and its close for
+    /// a worker whose engine starts the grammar at the first generated token:
+    /// the request says so where its dialect has a switch for the gate behind
+    /// the engine's reasoning parser
+    /// (`ProtoGenerateRequest::set_grammar_from_first_token`).
+    pub first_token_grammar: bool,
 }
 
 impl GrpcClient {
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_sglang() check"
-    )]
-    pub fn as_sglang(&self) -> &SglangSchedulerClient {
-        match self {
-            Self::Sglang(client) => client,
-            _ => panic!("Expected SGLang client"),
-        }
-    }
-
     #[expect(
         clippy::panic,
         reason = "typed accessor: caller guarantees variant via is_sglang() check"
@@ -78,50 +77,6 @@ impl GrpcClient {
         match self {
             Self::Sglang(client) => client,
             _ => panic!("Expected SGLang client"),
-        }
-    }
-
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_vllm() check"
-    )]
-    pub fn as_vllm(&self) -> &VllmEngineClient {
-        match self {
-            Self::Vllm(client) => client,
-            _ => panic!("Expected vLLM client"),
-        }
-    }
-
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_vllm() check"
-    )]
-    pub fn as_vllm_mut(&mut self) -> &mut VllmEngineClient {
-        match self {
-            Self::Vllm(client) => client,
-            _ => panic!("Expected vLLM client"),
-        }
-    }
-
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_trtllm() check"
-    )]
-    pub fn as_trtllm(&self) -> &TrtllmServiceClient {
-        match self {
-            Self::Trtllm(client) => client,
-            _ => panic!("Expected TensorRT-LLM client"),
-        }
-    }
-
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_trtllm() check"
-    )]
-    pub fn as_trtllm_mut(&mut self) -> &mut TrtllmServiceClient {
-        match self {
-            Self::Trtllm(client) => client,
-            _ => panic!("Expected TensorRT-LLM client"),
         }
     }
 
@@ -137,28 +92,6 @@ impl GrpcClient {
         matches!(self, Self::Trtllm(_))
     }
 
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_mlx() check"
-    )]
-    pub fn as_mlx(&self) -> &MlxEngineClient {
-        match self {
-            Self::Mlx(client) => client,
-            _ => panic!("Expected MLX client"),
-        }
-    }
-
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_mlx() check"
-    )]
-    pub fn as_mlx_mut(&mut self) -> &mut MlxEngineClient {
-        match self {
-            Self::Mlx(client) => client,
-            _ => panic!("Expected MLX client"),
-        }
-    }
-
     pub fn is_mlx(&self) -> bool {
         matches!(self, Self::Mlx(_))
     }
@@ -168,17 +101,6 @@ impl GrpcClient {
         reason = "typed accessor: caller guarantees variant via is_tokenspeed() check"
     )]
     pub fn as_tokenspeed(&self) -> &TokenSpeedSchedulerClient {
-        match self {
-            Self::TokenSpeed(client) => client,
-            _ => panic!("Expected TokenSpeed client"),
-        }
-    }
-
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_tokenspeed() check"
-    )]
-    pub fn as_tokenspeed_mut(&mut self) -> &mut TokenSpeedSchedulerClient {
         match self {
             Self::TokenSpeed(client) => client,
             _ => panic!("Expected TokenSpeed client"),
@@ -506,10 +428,7 @@ impl GrpcClient {
         }
     }
 
-    #[expect(
-        clippy::unreachable,
-        reason = "assembly stage guarantees matching MultimodalData variant for each backend"
-    )]
+    /// Build the engine's generate request for a chat completion body.
     pub fn build_chat_request(
         &self,
         request_id: String,
@@ -518,90 +437,23 @@ impl GrpcClient {
         token_ids: Vec<u32>,
         options: GenerateRequestBuildOptions,
     ) -> Result<ProtoGenerateRequest, String> {
-        match self {
-            Self::Sglang(client) => {
-                let sglang_mm = options.multimodal_inputs.map(|mm| match mm {
-                    MultimodalData::Sglang(data) => data.into_proto(),
-                    _ => unreachable!("caller guarantees matching variant"),
-                });
-                let req = client.build_generate_request_from_chat(
-                    request_id,
-                    body,
-                    processed_text,
-                    token_ids,
-                    SglangGenerateRequestOptions {
-                        multimodal_inputs: sglang_mm,
-                        tool_call_constraint: options.tool_constraints,
-                        require_reasoning: options.require_reasoning,
-                    },
-                )?;
-                Ok(ProtoGenerateRequest::Sglang(Box::new(req)))
-            }
-            Self::Vllm(_) => {
-                let vllm_mm = options.multimodal_inputs.map(|mm| match mm {
-                    MultimodalData::Vllm(data) => data.into_protos(),
-                    _ => unreachable!("caller guarantees matching variant"),
-                });
-                finish_vllm_request(vllm_mm, |mm| {
-                    VllmEngineClient::build_generate_request_from_chat(
-                        request_id,
-                        body,
-                        processed_text,
-                        token_ids,
-                        mm,
-                        options.tool_constraints,
-                    )
-                })
-            }
-            Self::Trtllm(client) => {
-                let trtllm_mm = options.multimodal_inputs.map(|mm| match mm {
-                    MultimodalData::Trtllm(data) => data.into_proto(),
-                    _ => unreachable!("caller guarantees matching variant"),
-                });
-                let req = client.build_generate_request_from_chat(
-                    request_id,
-                    body,
-                    processed_text,
-                    token_ids,
-                    trtllm_mm,
-                    options.tool_constraints,
-                )?;
-                Ok(ProtoGenerateRequest::Trtllm(Box::new(req)))
-            }
-            // MLX: caller stage rejects multimodal before reaching this path.
-            Self::Mlx(client) => {
-                let req = client.build_generate_request_from_chat(
-                    request_id,
-                    body,
-                    processed_text,
-                    token_ids,
-                    options.tool_constraints,
-                )?;
-                Ok(ProtoGenerateRequest::Mlx(Box::new(req)))
-            }
-            Self::TokenSpeed(_) => {
-                let tokenspeed_mm = options.multimodal_inputs.map(|mm| match mm {
-                    MultimodalData::TokenSpeed(data) => data.into_proto(true),
-                    _ => unreachable!("caller guarantees matching variant"),
-                });
-                finish_tokenspeed_request(tokenspeed_mm, |mm| {
-                    TokenSpeedSchedulerClient::build_generate_request_from_chat(
-                        request_id,
-                        body,
-                        processed_text,
-                        token_ids,
-                        mm,
-                        options.tool_constraints,
-                    )
-                })
-            }
-        }
+        self.build_engine_request(
+            request_id,
+            body,
+            processed_text,
+            token_ids,
+            options,
+            EngineBuilders {
+                sglang: SglangSchedulerClient::build_generate_request_from_chat,
+                vllm: VllmEngineClient::build_generate_request_from_chat,
+                trtllm: TrtllmServiceClient::build_generate_request_from_chat,
+                mlx: MlxEngineClient::build_generate_request_from_chat,
+                tokenspeed: TokenSpeedSchedulerClient::build_generate_request_from_chat,
+            },
+        )
     }
 
-    #[expect(
-        clippy::unreachable,
-        reason = "assembly stage guarantees matching MultimodalData variant for each backend"
-    )]
+    /// Build the engine's generate request for a Messages body.
     pub fn build_messages_request(
         &self,
         request_id: String,
@@ -610,86 +462,23 @@ impl GrpcClient {
         token_ids: Vec<u32>,
         options: GenerateRequestBuildOptions,
     ) -> Result<ProtoGenerateRequest, String> {
-        match self {
-            Self::Sglang(client) => {
-                let sglang_mm = options.multimodal_inputs.map(|mm| match mm {
-                    MultimodalData::Sglang(data) => data.into_proto(),
-                    _ => unreachable!("caller guarantees matching variant"),
-                });
-                let req = client.build_generate_request_from_messages(
-                    request_id,
-                    body,
-                    processed_text,
-                    token_ids,
-                    SglangGenerateRequestOptions {
-                        multimodal_inputs: sglang_mm,
-                        tool_call_constraint: options.tool_constraints,
-                        require_reasoning: options.require_reasoning,
-                    },
-                )?;
-                Ok(ProtoGenerateRequest::Sglang(Box::new(req)))
-            }
-            Self::Vllm(_) => {
-                let vllm_mm = options.multimodal_inputs.map(|mm| match mm {
-                    MultimodalData::Vllm(data) => data.into_protos(),
-                    _ => unreachable!("caller guarantees matching variant"),
-                });
-                finish_vllm_request(vllm_mm, |mm| {
-                    VllmEngineClient::build_generate_request_from_messages(
-                        request_id,
-                        body,
-                        processed_text,
-                        token_ids,
-                        mm,
-                        options.tool_constraints,
-                    )
-                })
-            }
-            Self::Trtllm(client) => {
-                let trtllm_mm = options.multimodal_inputs.map(|mm| match mm {
-                    MultimodalData::Trtllm(data) => data.into_proto(),
-                    _ => unreachable!("caller guarantees matching variant"),
-                });
-                let req = client.build_generate_request_from_messages(
-                    request_id,
-                    body,
-                    processed_text,
-                    token_ids,
-                    trtllm_mm,
-                    options.tool_constraints,
-                )?;
-                Ok(ProtoGenerateRequest::Trtllm(Box::new(req)))
-            }
-            // MLX: caller stage rejects multimodal before reaching this path.
-            Self::Mlx(client) => {
-                let req = client.build_generate_request_from_messages(
-                    request_id,
-                    body,
-                    processed_text,
-                    token_ids,
-                    options.tool_constraints,
-                )?;
-                Ok(ProtoGenerateRequest::Mlx(Box::new(req)))
-            }
-            Self::TokenSpeed(_) => {
-                let tokenspeed_mm = options.multimodal_inputs.map(|mm| match mm {
-                    MultimodalData::TokenSpeed(data) => data.into_proto(true),
-                    _ => unreachable!("caller guarantees matching variant"),
-                });
-                finish_tokenspeed_request(tokenspeed_mm, |mm| {
-                    TokenSpeedSchedulerClient::build_generate_request_from_messages(
-                        request_id,
-                        body,
-                        processed_text,
-                        token_ids,
-                        mm,
-                        options.tool_constraints,
-                    )
-                })
-            }
-        }
+        self.build_engine_request(
+            request_id,
+            body,
+            processed_text,
+            token_ids,
+            options,
+            EngineBuilders {
+                sglang: SglangSchedulerClient::build_generate_request_from_messages,
+                vllm: VllmEngineClient::build_generate_request_from_messages,
+                trtllm: TrtllmServiceClient::build_generate_request_from_messages,
+                mlx: MlxEngineClient::build_generate_request_from_messages,
+                tokenspeed: TokenSpeedSchedulerClient::build_generate_request_from_messages,
+            },
+        )
     }
 
+    /// Build the engine's generate request for a completion body.
     pub fn build_completion_request(
         &self,
         request_id: String,
@@ -697,55 +486,22 @@ impl GrpcClient {
         original_text: String,
         token_ids: Vec<u32>,
     ) -> Result<ProtoGenerateRequest, String> {
-        match self {
-            Self::Sglang(client) => {
-                let req = client.build_generate_request_from_completion(
-                    request_id,
-                    body,
-                    original_text,
-                    token_ids,
-                )?;
-                Ok(ProtoGenerateRequest::Sglang(Box::new(req)))
-            }
-            Self::Vllm(_) => {
-                let req = VllmEngineClient::build_generate_request_from_completion(
-                    request_id,
-                    body,
-                    original_text,
-                    token_ids,
-                )?;
-                Ok(ProtoGenerateRequest::Vllm(Box::new(req)))
-            }
-            Self::Trtllm(client) => {
-                let req = client.build_generate_request_from_completion(
-                    request_id,
-                    body,
-                    original_text,
-                    token_ids,
-                )?;
-                Ok(ProtoGenerateRequest::Trtllm(Box::new(req)))
-            }
-            Self::Mlx(client) => {
-                let req = client.build_generate_request_from_completion(
-                    request_id,
-                    body,
-                    original_text,
-                    token_ids,
-                )?;
-                Ok(ProtoGenerateRequest::Mlx(Box::new(req)))
-            }
-            Self::TokenSpeed(_) => {
-                let req = TokenSpeedSchedulerClient::build_generate_request_from_completion(
-                    request_id,
-                    body,
-                    original_text,
-                    token_ids,
-                )?;
-                Ok(ProtoGenerateRequest::TokenSpeed(Box::new(req)))
-            }
-        }
+        self.build_engine_plain_request(
+            request_id,
+            body,
+            original_text,
+            token_ids,
+            EnginePlainBuilders {
+                sglang: SglangSchedulerClient::build_generate_request_from_completion,
+                vllm: VllmEngineClient::build_generate_request_from_completion,
+                trtllm: TrtllmServiceClient::build_generate_request_from_completion,
+                mlx: MlxEngineClient::build_generate_request_from_completion,
+                tokenspeed: TokenSpeedSchedulerClient::build_generate_request_from_completion,
+            },
+        )
     }
 
+    /// Build the engine's generate request for a plain generate body.
     pub fn build_generate_request(
         &self,
         request_id: String,
@@ -753,54 +509,301 @@ impl GrpcClient {
         original_text: Option<String>,
         token_ids: Vec<u32>,
     ) -> Result<ProtoGenerateRequest, String> {
-        match self {
+        self.build_engine_plain_request(
+            request_id,
+            body,
+            original_text,
+            token_ids,
+            EnginePlainBuilders {
+                sglang: SglangSchedulerClient::build_plain_generate_request,
+                vllm: VllmEngineClient::build_plain_generate_request,
+                trtllm: TrtllmServiceClient::build_plain_generate_request,
+                mlx: MlxEngineClient::build_plain_generate_request,
+                tokenspeed: TokenSpeedSchedulerClient::build_plain_generate_request,
+            },
+        )
+    }
+
+    /// The per-engine dispatch of a request kind that carries multimodal inputs
+    /// and tool constraints: the engine's own multimodal variant out of the
+    /// assembled data, its options, its builder, and the boxing into the
+    /// request enum. vLLM and TokenSpeed build through the wrappers that unlink
+    /// the `/dev/shm` segments of a request that fails to build.
+    fn build_engine_request<B>(
+        &self,
+        request_id: String,
+        body: &B,
+        processed_text: String,
+        token_ids: Vec<u32>,
+        options: GenerateRequestBuildOptions,
+        builders: EngineBuilders<B>,
+    ) -> Result<ProtoGenerateRequest, String> {
+        let GenerateRequestBuildOptions {
+            multimodal_inputs,
+            tool_constraints,
+            require_reasoning,
+            first_token_grammar,
+        } = options;
+        let EngineBuilders {
+            sglang,
+            vllm,
+            trtllm,
+            mlx,
+            tokenspeed,
+        } = builders;
+        let mut request = match self {
             Self::Sglang(client) => {
-                let req = client.build_plain_generate_request(
+                let sglang_mm = engine_multimodal(multimodal_inputs, |mm| match mm {
+                    MultimodalData::Sglang(data) => Some(data.into_proto()),
+                    _ => None,
+                });
+                let req = sglang(
+                    client,
                     request_id,
                     body,
-                    original_text,
+                    processed_text,
                     token_ids,
+                    SglangGenerateRequestOptions {
+                        multimodal_inputs: sglang_mm,
+                        tool_call_constraint: tool_constraints,
+                        require_reasoning,
+                    },
                 )?;
                 Ok(ProtoGenerateRequest::Sglang(Box::new(req)))
             }
             Self::Vllm(_) => {
-                let req = VllmEngineClient::build_plain_generate_request(
-                    request_id,
-                    body,
-                    original_text,
-                    token_ids,
-                )?;
-                Ok(ProtoGenerateRequest::Vllm(Box::new(req)))
+                let vllm_mm = engine_multimodal(multimodal_inputs, |mm| match mm {
+                    MultimodalData::Vllm(data) => Some(data.into_protos()),
+                    _ => None,
+                });
+                finish_vllm_request(vllm_mm, |mm| {
+                    vllm(
+                        request_id,
+                        body,
+                        processed_text,
+                        token_ids,
+                        mm,
+                        tool_constraints,
+                    )
+                })
             }
             Self::Trtllm(client) => {
-                let req = client.build_plain_generate_request(
+                let trtllm_mm = engine_multimodal(multimodal_inputs, |mm| match mm {
+                    MultimodalData::Trtllm(data) => Some(data.into_proto()),
+                    _ => None,
+                });
+                let req = trtllm(
+                    client,
                     request_id,
                     body,
-                    original_text,
+                    processed_text,
                     token_ids,
+                    trtllm_mm,
+                    tool_constraints,
                 )?;
                 Ok(ProtoGenerateRequest::Trtllm(Box::new(req)))
             }
+            // MLX: the assembly stage rejects multimodal before this path.
             Self::Mlx(client) => {
-                let req = client.build_plain_generate_request(
+                let req = mlx(
+                    client,
                     request_id,
                     body,
-                    original_text,
+                    processed_text,
                     token_ids,
+                    tool_constraints,
                 )?;
                 Ok(ProtoGenerateRequest::Mlx(Box::new(req)))
             }
             Self::TokenSpeed(_) => {
-                let req = TokenSpeedSchedulerClient::build_plain_generate_request(
-                    request_id,
-                    body,
-                    original_text,
-                    token_ids,
-                )?;
-                Ok(ProtoGenerateRequest::TokenSpeed(Box::new(req)))
+                let tokenspeed_mm = engine_multimodal(multimodal_inputs, |mm| match mm {
+                    MultimodalData::TokenSpeed(data) => Some(data.into_proto(true)),
+                    _ => None,
+                });
+                finish_tokenspeed_request(tokenspeed_mm, |mm| {
+                    tokenspeed(
+                        request_id,
+                        body,
+                        processed_text,
+                        token_ids,
+                        mm,
+                        tool_constraints,
+                    )
+                })
             }
-        }
+        }?;
+        request.set_grammar_from_first_token(first_token_grammar);
+        Ok(request)
     }
+
+    /// The per-engine dispatch of a request kind with neither multimodal inputs
+    /// nor tool constraints: the engine's builder, boxed into the request enum.
+    fn build_engine_plain_request<B, T>(
+        &self,
+        request_id: String,
+        body: &B,
+        text: T,
+        token_ids: Vec<u32>,
+        builders: EnginePlainBuilders<B, T>,
+    ) -> Result<ProtoGenerateRequest, String> {
+        let EnginePlainBuilders {
+            sglang,
+            vllm,
+            trtllm,
+            mlx,
+            tokenspeed,
+        } = builders;
+        Ok(match self {
+            Self::Sglang(client) => ProtoGenerateRequest::Sglang(Box::new(sglang(
+                client, request_id, body, text, token_ids,
+            )?)),
+            Self::Vllm(_) => {
+                ProtoGenerateRequest::Vllm(Box::new(vllm(request_id, body, text, token_ids)?))
+            }
+            Self::Trtllm(client) => ProtoGenerateRequest::Trtllm(Box::new(trtllm(
+                client, request_id, body, text, token_ids,
+            )?)),
+            Self::Mlx(client) => {
+                ProtoGenerateRequest::Mlx(Box::new(mlx(client, request_id, body, text, token_ids)?))
+            }
+            Self::TokenSpeed(_) => ProtoGenerateRequest::TokenSpeed(Box::new(tokenspeed(
+                request_id, body, text, token_ids,
+            )?)),
+        })
+    }
+}
+
+/// A vLLM builder for a request kind carrying multimodal inputs and tool
+/// constraints (chat, Messages). The ZMQ dispatch in `backend_client` builds
+/// through the same functions.
+pub(crate) type VllmMmBuilder<B> = fn(
+    String,
+    &B,
+    String,
+    Vec<u32>,
+    Option<vllm_proto::MultimodalInputs>,
+    Option<(String, String)>,
+) -> Result<vllm_proto::GenerateRequest, String>;
+
+/// The TokenSpeed counterpart of [`VllmMmBuilder`].
+pub(crate) type TokenSpeedMmBuilder<B> = fn(
+    String,
+    &B,
+    String,
+    Vec<u32>,
+    Option<tokenspeed_proto::MultimodalInputs>,
+    Option<(String, String)>,
+) -> Result<tokenspeed_proto::GenerateRequest, String>;
+
+/// The SGLang counterpart of [`VllmMmBuilder`] on the connected client; its
+/// builders take the multimodal inputs and constraints bundled as options.
+type SglangClientMmBuilder<B> = fn(
+    &SglangSchedulerClient,
+    String,
+    &B,
+    String,
+    Vec<u32>,
+    SglangGenerateRequestOptions,
+) -> Result<sglang_proto::GenerateRequest, String>;
+
+/// The TRT-LLM counterpart of [`VllmMmBuilder`] on the connected client.
+type TrtllmClientMmBuilder<B> = fn(
+    &TrtllmServiceClient,
+    String,
+    &B,
+    String,
+    Vec<u32>,
+    Option<trtllm_proto::MultimodalInput>,
+    Option<(String, String)>,
+) -> Result<trtllm_proto::GenerateRequest, String>;
+
+/// The MLX counterpart of [`VllmMmBuilder`] on the connected client; MLX
+/// takes no multimodal inputs (the assembly stage refuses them earlier).
+type MlxClientMmBuilder<B> = fn(
+    &MlxEngineClient,
+    String,
+    &B,
+    String,
+    Vec<u32>,
+    Option<(String, String)>,
+) -> Result<mlx_proto::GenerateRequest, String>;
+
+/// A vLLM builder for a request kind with neither multimodal inputs nor tool
+/// constraints (completion, plain generate); `T` is the builder's text
+/// parameter. The ZMQ dispatch in `backend_client` builds through the same
+/// functions.
+pub(crate) type VllmPlainBuilder<B, T> =
+    fn(String, &B, T, Vec<u32>) -> Result<vllm_proto::GenerateRequest, String>;
+
+/// The TokenSpeed counterpart of [`VllmPlainBuilder`].
+pub(crate) type TokenSpeedPlainBuilder<B, T> =
+    fn(String, &B, T, Vec<u32>) -> Result<tokenspeed_proto::GenerateRequest, String>;
+
+/// The SGLang counterpart of [`VllmPlainBuilder`] on the connected client.
+type SglangClientPlainBuilder<B, T> = fn(
+    &SglangSchedulerClient,
+    String,
+    &B,
+    T,
+    Vec<u32>,
+) -> Result<sglang_proto::GenerateRequest, String>;
+
+/// The TRT-LLM counterpart of [`VllmPlainBuilder`] on the connected client.
+type TrtllmClientPlainBuilder<B, T> = fn(
+    &TrtllmServiceClient,
+    String,
+    &B,
+    T,
+    Vec<u32>,
+) -> Result<trtllm_proto::GenerateRequest, String>;
+
+/// The MLX counterpart of [`VllmPlainBuilder`] on the connected client.
+type MlxClientPlainBuilder<B, T> =
+    fn(&MlxEngineClient, String, &B, T, Vec<u32>) -> Result<mlx_proto::GenerateRequest, String>;
+
+/// The engines' builders of one request kind that carries multimodal inputs and
+/// tool constraints (chat, Messages): the only thing that differs between the
+/// two build surfaces, so the per-engine dispatch lives once in
+/// [`GrpcClient::build_engine_request`]. SGLang, TRT-LLM and MLX build on their
+/// client; vLLM and TokenSpeed on the type.
+struct EngineBuilders<B> {
+    sglang: SglangClientMmBuilder<B>,
+    vllm: VllmMmBuilder<B>,
+    trtllm: TrtllmClientMmBuilder<B>,
+    mlx: MlxClientMmBuilder<B>,
+    tokenspeed: TokenSpeedMmBuilder<B>,
+}
+
+/// The engines' builders of one request kind with neither multimodal inputs nor
+/// tool constraints (completion, plain generate); `T` is the builders' text
+/// parameter (`String` for completion, `Option<String>` for plain generate).
+/// The per-engine dispatch lives once in
+/// [`GrpcClient::build_engine_plain_request`].
+struct EnginePlainBuilders<B, T> {
+    sglang: SglangClientPlainBuilder<B, T>,
+    vllm: VllmPlainBuilder<B, T>,
+    trtllm: TrtllmClientPlainBuilder<B, T>,
+    mlx: MlxClientPlainBuilder<B, T>,
+    tokenspeed: TokenSpeedPlainBuilder<B, T>,
+}
+
+/// The assembled multimodal data as the proto of the worker's engine, `own`
+/// picking the engine's variant. The assembly stage builds the variant of the
+/// worker's engine, so any other variant is a gateway bug.
+#[expect(
+    clippy::unreachable,
+    reason = "assembly stage guarantees matching MultimodalData variant for each backend"
+)]
+fn engine_multimodal<T>(
+    inputs: Option<MultimodalData>,
+    own: impl FnOnce(MultimodalData) -> Option<T>,
+) -> Option<T> {
+    inputs.map(|mm| {
+        let Some(proto) = own(mm) else {
+            unreachable!("caller guarantees matching variant")
+        };
+        proto
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -808,19 +811,19 @@ impl GrpcClient {
 // ---------------------------------------------------------------------------
 
 pub enum ModelInfo {
-    Sglang(Box<smg_grpc_client::sglang_proto::GetModelInfoResponse>),
-    Vllm(smg_grpc_client::vllm_proto::GetModelInfoResponse),
-    Trtllm(smg_grpc_client::trtllm_proto::GetModelInfoResponse),
-    Mlx(smg_grpc_client::mlx_proto::GetModelInfoResponse),
-    TokenSpeed(Box<smg_grpc_client::tokenspeed_proto::GetModelInfoResponse>),
+    Sglang(Box<sglang_proto::GetModelInfoResponse>),
+    Vllm(vllm_proto::GetModelInfoResponse),
+    Trtllm(trtllm_proto::GetModelInfoResponse),
+    Mlx(mlx_proto::GetModelInfoResponse),
+    TokenSpeed(Box<tokenspeed_proto::GetModelInfoResponse>),
 }
 
 pub enum ServerInfo {
-    Sglang(Box<smg_grpc_client::sglang_proto::GetServerInfoResponse>),
-    Vllm(Box<smg_grpc_client::vllm_proto::GetServerInfoResponse>),
-    Trtllm(smg_grpc_client::trtllm_proto::GetServerInfoResponse),
-    Mlx(smg_grpc_client::mlx_proto::GetServerInfoResponse),
-    TokenSpeed(Box<smg_grpc_client::tokenspeed_proto::GetServerInfoResponse>),
+    Sglang(Box<sglang_proto::GetServerInfoResponse>),
+    Vllm(Box<vllm_proto::GetServerInfoResponse>),
+    Trtllm(trtllm_proto::GetServerInfoResponse),
+    Mlx(mlx_proto::GetServerInfoResponse),
+    TokenSpeed(Box<tokenspeed_proto::GetServerInfoResponse>),
 }
 
 impl ModelInfo {
@@ -884,8 +887,19 @@ impl ServerInfo {
                 if let Some(ref args) = info.server_args {
                     pick_prost_fields(&mut labels, args, TOKENSPEED_GRPC_KEYS);
                 }
+                // TokenSpeed's global request window is shared by its attention-DP ranks.
+                labels.insert("enable_dp_attention".to_string(), "true".to_string());
                 if !info.tokenspeed_version.is_empty() {
                     labels.insert("version".to_string(), info.tokenspeed_version.clone());
+                }
+                // The engine's declared constrained-decoding policy, a field of
+                // its own rather than a `server_args` key: the `constrained_decoding`
+                // label the gateway follows per worker. "" is no declaration.
+                if !info.constrained_decoding.is_empty() {
+                    labels.insert(
+                        ConstrainedDecoding::LABEL.to_string(),
+                        info.constrained_decoding.clone(),
+                    );
                 }
                 // Carry the worker's /dev/shm namespace identity (advertised in
                 // scheduler_info). The router compares it to its own to decide the
@@ -1102,13 +1116,15 @@ mod tests {
     use super::{trtllm_status_healthy, ModelInfo, ServerInfo, SUPPORTS_VISION_LABEL};
 
     /// A vLLM worker's `GetServerInfo` fields flatten into labels as they
-    /// are: the engine's per-prompt media limits arrive as `mm_item_limits`,
-    /// and an engine without them (a text model) sets no such label.
+    /// are: the engine's per-prompt media limits arrive as `mm_item_limits`
+    /// and its encoder budget as `mm_encoder_budget`, and an engine without
+    /// them (a text model) sets no such labels.
     #[test]
     fn server_info_to_labels_vllm_carries_the_engines_item_limits() {
         let info = ServerInfo::Vllm(Box::new(vllm_proto::GetServerInfoResponse {
             server_type: "vllm-grpc".to_string(),
             mm_item_limits: "image=8,video=2".to_string(),
+            mm_encoder_budget: 192_000,
             ..Default::default()
         }));
         let labels = info.to_labels();
@@ -1116,8 +1132,13 @@ mod tests {
             labels.get("mm_item_limits").map(String::as_str),
             Some("image=8,video=2")
         );
-        let text_only = ServerInfo::Vllm(Box::default());
-        assert!(!text_only.to_labels().contains_key("mm_item_limits"));
+        assert_eq!(
+            labels.get("mm_encoder_budget").map(String::as_str),
+            Some("192000")
+        );
+        let text_only = ServerInfo::Vllm(Box::default()).to_labels();
+        assert!(!text_only.contains_key("mm_item_limits"));
+        assert!(!text_only.contains_key("mm_encoder_budget"));
     }
 
     /// A servicer's reasoning-parser facts flatten into the
@@ -1146,6 +1167,26 @@ mod tests {
         let silent = ServerInfo::Vllm(Box::default()).to_labels();
         assert!(!silent.contains_key("engine_reasoning_parser"));
         assert!(!silent.contains_key("constrained_decoding_start"));
+    }
+
+    /// A TokenSpeed servicer's declared constrained-decoding policy travels as
+    /// a field of its own and becomes the `constrained_decoding` label the
+    /// gateway follows per worker; an engine that declares none (the proto
+    /// default) sets no such label.
+    #[test]
+    fn server_info_to_labels_carries_the_engines_constrained_decoding_policy() {
+        let info = ServerInfo::TokenSpeed(Box::new(tokenspeed_proto::GetServerInfoResponse {
+            constrained_decoding: "always".to_string(),
+            ..Default::default()
+        }));
+        assert_eq!(
+            info.to_labels()
+                .get("constrained_decoding")
+                .map(String::as_str),
+            Some("always")
+        );
+        let silent = ServerInfo::TokenSpeed(Box::default()).to_labels();
+        assert!(!silent.contains_key("constrained_decoding"));
     }
 
     /// An SGLang servicer's own vision verdict travels in `server_args`,

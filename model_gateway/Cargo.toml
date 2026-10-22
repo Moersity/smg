@@ -1,6 +1,6 @@
 [package]
 name = "smg"
-version = "1.12.0"
+version = "1.13.0"
 edition = "2021"
 rust-version.workspace = true
 description = "High-performance model-routing gateway for large-scale LLM deployments"
@@ -82,7 +82,7 @@ reqwest = { workspace = true, features = ["stream", "blocking", "json", "rustls-
 serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["full"] }
 tokio-util.workspace = true
-uuid = { workspace = true, features = ["serde"] }
+uuid = { workspace = true, features = ["serde", "fast-rng"] }
 
 # Workspace crates
 openai-protocol = { workspace = true, features = ["axum"] }
@@ -97,7 +97,7 @@ smg-mcp.workspace = true
 smg-external-router = { workspace = true, default-features = false }
 kv-index.workspace = true
 smg-data-connector.workspace = true
-llm-multimodal = { workspace = true, default-features = false }
+llm-multimodal = { workspace = true, default-features = false, features = ["hf-hub"] }
 smg-mm-rdma.workspace = true
 smg-wasm = { workspace = true, features = ["storage-hooks"] }
 smg-mesh.workspace = true
@@ -115,12 +115,13 @@ memmap2 = "0.9"
 rayon = "1.12"
 rustix = { version = "1", features = ["fs", "process"] }
 tower = { version = "0.5", features = ["full"] }
-tower-http = { version = "0.7", features = ["trace", "compression-gzip", "cors", "timeout", "limit", "request-id", "util"] }
+tower-http = { version = "0.7", features = ["trace", "compression-gzip", "cors", "timeout", "request-id", "util"] }
 serde_json = { version = "1.0", default-features = false, features = ["std", "preserve_order", "raw_value"] }
 bytes = "1.12.0"
 http-body = "1.0"
 http-body-util = "0.1"
 futures-util = "0.3"
+pin-project-lite = "0.2"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 tracing-log = "0.2"
 tracing-appender = "0.2.5"
@@ -183,7 +184,6 @@ http-body-util = "0.1"
 portpicker = "0.1"
 lazy_static = "1.5"
 wasm-encoder = "0.261"
-npyz = { version = "0.9", features = ["npz"] }
 opentelemetry-proto = { version = "0.33", features = ["gen-tonic"] }
 serial_test = "3.5"
 rsa = { version = "0.9", features = ["sha2"] }
@@ -197,7 +197,7 @@ toml = "1.1"
 wasmtime-wasi = { workspace = true }
 lru = { workspace = true }
 wat = "1.252"
-zip = "8.6"
+zip = "9.0"
 # The KV-index exactness tests and the decision bench run the mock engine's
 # streams through the relay's decoder and normalizer into the gateway's index.
 engine-servicer.workspace = true
@@ -276,6 +276,16 @@ path = "benches/policy_selection.rs"
 name = "kv_index_decision"
 harness = false
 path = "benches/kv_index_decision.rs"
+
+[[bench]]
+name = "access_log"
+harness = false
+path = "benches/access_log.rs"
+
+[[bench]]
+name = "sse_rechunk"
+harness = false
+path = "benches/sse_rechunk.rs"
 
 [lints]
 workspace = true

@@ -5,13 +5,14 @@
 //! later, and nothing was sent in between. An idle-timeout proxy in front of
 //! the gateway cuts a connection that carries no byte for its idle window
 //! (sixty seconds is a common setting), and the client sees a stream that
-//! ends before it began. [`sse_keepalive_middleware`] wraps every SSE
-//! response body so an interval of silence is broken by a frame the client
-//! ignores: an SSE comment on the OpenAI-shaped routes, the `ping` event the
-//! Messages API specifies on `/v1/messages`. The interval runs from the
-//! headers and from every frame sent, so a flowing stream carries no
-//! keep-alive; a keep-alive is only ever written between frames, never
-//! inside one.
+//! ends before it began. [`sse_keepalive_middleware`] gives every SSE
+//! response a `KeepAlive`, carried by the edge's one body wrapper (the
+//! metrics layer's `EdgeBody`), so an interval
+//! of silence is broken by a frame the client ignores: an SSE comment on the
+//! OpenAI-shaped routes, the `ping` event the Messages API specifies on
+//! `/v1/messages`. The interval runs from the headers and from every frame
+//! sent, so a flowing stream carries no keep-alive; a keep-alive is only
+//! ever written between frames, never inside one.
 
 use std::{
     future::Future,
@@ -28,9 +29,12 @@ use axum::{
     response::Response,
 };
 use bytes::Bytes;
-use http_body::{Body as HttpBody, Frame, SizeHint};
+use http_body::Body as HttpBody;
+use pin_project_lite::pin_project;
 use tokio::time::{Instant, Sleep};
+use tower::{Layer, Service};
 
+use super::edge_body::BodyDuties;
 use crate::{
     config::types::RouterConfig,
     routers::http::stream_failure::{note_sent, on_frame_boundary},
@@ -64,13 +68,13 @@ impl SseKeepAlive {
         }
     }
 
-    /// Wraps the body of an SSE `response` whose length is not known up
-    /// front (a complete SSE answer has nothing to wait for, and a body sent
-    /// under a `Content-Length` header must not grow past it: the relays copy
-    /// an upstream's header onto a streamed body); `messages` selects the
-    /// Messages API's ping over the comment. Anything else is returned as it
-    /// came.
-    pub(crate) fn apply(self, response: Response, messages: bool) -> Response {
+    /// Gives an SSE `response` whose length is not known up front (a
+    /// complete SSE answer has nothing to wait for, and a body sent under a
+    /// `Content-Length` header must not grow past it: the relays copy an
+    /// upstream's header onto a streamed body) its keep-alive, handed to the
+    /// edge's body wrapper; `messages` selects the Messages API's ping over
+    /// the comment. Anything else is returned as it came.
+    pub(crate) fn apply(self, mut response: Response, messages: bool) -> Response {
         let Some(interval) = self.interval else {
             return response;
         };
@@ -81,7 +85,10 @@ impl SseKeepAlive {
             return response;
         }
         let frame = Bytes::from_static(if messages { MESSAGES_PING } else { COMMENT });
-        response.map(|body| Body::new(KeepAliveBody::new(body, interval, frame)))
+        BodyDuties::hand(&mut response, |duties| {
+            duties.keep_alive = Some(KeepAlive::new(interval, frame));
+        });
+        response
     }
 }
 
@@ -94,8 +101,87 @@ fn is_event_stream(response: &Response) -> bool {
         .is_some_and(|head| head.eq_ignore_ascii_case("text/event-stream"))
 }
 
+impl SseKeepAlive {
+    /// This keep-alive as a route layer: the service's own future maps the
+    /// response, nothing is cloned or boxed per request (the `from_fn` form
+    /// did both, on every request of the routes, streamed or not).
+    pub fn layer(self) -> SseKeepAliveLayer {
+        SseKeepAliveLayer { keep_alive: self }
+    }
+}
+
+/// [`SseKeepAlive::layer`].
+#[derive(Clone, Copy, Debug)]
+pub struct SseKeepAliveLayer {
+    keep_alive: SseKeepAlive,
+}
+
+impl<S> Layer<S> for SseKeepAliveLayer {
+    type Service = SseKeepAliveService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        SseKeepAliveService {
+            inner,
+            keep_alive: self.keep_alive,
+        }
+    }
+}
+
+/// The service [`SseKeepAliveLayer`] wraps a route in.
+#[derive(Clone, Debug)]
+pub struct SseKeepAliveService<S> {
+    inner: S,
+    keep_alive: SseKeepAlive,
+}
+
+impl<S, E> Service<Request<Body>> for SseKeepAliveService<S>
+where
+    S: Service<Request<Body>, Response = Response, Error = E>,
+{
+    type Response = Response;
+    type Error = E;
+    type Future = KeepAliveFuture<S::Future>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: Request<Body>) -> Self::Future {
+        let messages = request.uri().path() == MESSAGES_ROUTE;
+        KeepAliveFuture {
+            inner: self.inner.call(request),
+            keep_alive: self.keep_alive,
+            messages,
+        }
+    }
+}
+
+pin_project! {
+    /// The inner service's future, its response given the keep-alive.
+    pub struct KeepAliveFuture<F> {
+        #[pin]
+        inner: F,
+        keep_alive: SseKeepAlive,
+        messages: bool,
+    }
+}
+
+impl<F, E> Future for KeepAliveFuture<F>
+where
+    F: Future<Output = Result<Response, E>>,
+{
+    type Output = Result<Response, E>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        let response = std::task::ready!(this.inner.poll(cx))?;
+        Poll::Ready(Ok(this.keep_alive.apply(response, *this.messages)))
+    }
+}
+
 /// Route-layer middleware: the keep-alive on every SSE response of the
-/// routes it wraps.
+/// routes it wraps ([`SseKeepAlive::layer`] is the same without the per-request
+/// clone and boxes of `from_fn`).
 pub async fn sse_keepalive_middleware(
     State(keep_alive): State<SseKeepAlive>,
     request: Request<Body>,
@@ -105,12 +191,13 @@ pub async fn sse_keepalive_middleware(
     keep_alive.apply(next.run(request).await, messages)
 }
 
-/// Body wrapper that writes `frame` after `interval` of silence, on a frame
-/// boundary. The timer is lazy: when it fires it is re-armed from the time
-/// of the last frame rather than reset on every frame, so a flowing stream
-/// costs one timer wake per interval, not one per token.
-struct KeepAliveBody {
-    inner: Body,
+/// The keep-alive of one SSE body: `frame` after `interval` of silence, on a
+/// frame boundary. The edge's body wrapper tells it of every frame sent and
+/// polls it while the body is quiet. The timer is lazy: when it fires it is
+/// re-armed from the time of the last frame rather than reset on every
+/// frame, so a flowing stream costs one timer wake per interval, not one per
+/// token.
+pub(crate) struct KeepAlive {
     interval: Duration,
     frame: Bytes,
     /// When the headers, the last frame or the last keep-alive went out.
@@ -121,11 +208,10 @@ struct KeepAliveBody {
     timer: Pin<Box<Sleep>>,
 }
 
-impl KeepAliveBody {
-    fn new(inner: Body, interval: Duration, frame: Bytes) -> Self {
+impl KeepAlive {
+    fn new(interval: Duration, frame: Bytes) -> Self {
         let now = Instant::now();
         Self {
-            inner,
             interval,
             frame,
             last_sent: now,
@@ -133,56 +219,36 @@ impl KeepAliveBody {
             timer: Box::pin(tokio::time::sleep_until(now + interval)),
         }
     }
-}
 
-impl HttpBody for KeepAliveBody {
-    type Data = Bytes;
-    type Error = axum::Error;
+    /// A data frame of the body went out.
+    pub(crate) fn frame_out(&mut self, data: &[u8]) {
+        note_sent(&mut self.tail, data);
+        self.last_sent = Instant::now();
+    }
 
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, axum::Error>>> {
-        let this = &mut *self;
-        match Pin::new(&mut this.inner).poll_frame(cx) {
-            Poll::Ready(Some(Ok(frame))) => {
-                if let Some(data) = frame.data_ref() {
-                    note_sent(&mut this.tail, data);
-                    this.last_sent = Instant::now();
-                }
-                return Poll::Ready(Some(Ok(frame)));
-            }
-            Poll::Ready(end) => return Poll::Ready(end),
-            Poll::Pending => {}
-        }
-        // The upstream is quiet. The timer is due `interval` after the last
-        // frame: fired early (a frame went out since it was armed) it is
-        // re-armed for then; fired inside a frame it is re-armed for another
-        // interval and nothing is written.
+    /// The body is quiet: the keep-alive frame once `interval` has passed
+    /// since the last frame, on a frame boundary; pending, with the timer
+    /// armed, until then. The timer is due `interval` after the last frame:
+    /// fired early (a frame went out since it was armed) it is re-armed for
+    /// then; fired inside a frame it is re-armed for another interval and
+    /// nothing is written.
+    pub(crate) fn poll_silence(&mut self, cx: &mut Context<'_>) -> Poll<Bytes> {
         loop {
-            if this.timer.as_mut().poll(cx).is_pending() {
+            if self.timer.as_mut().poll(cx).is_pending() {
                 return Poll::Pending;
             }
             let now = Instant::now();
-            let due = this.last_sent + this.interval;
+            let due = self.last_sent + self.interval;
             if now < due {
-                this.timer.as_mut().reset(due);
-            } else if on_frame_boundary(&this.tail) {
-                this.last_sent = now;
-                this.timer.as_mut().reset(now + this.interval);
-                return Poll::Ready(Some(Ok(Frame::data(this.frame.clone()))));
+                self.timer.as_mut().reset(due);
+            } else if on_frame_boundary(&self.tail) {
+                self.last_sent = now;
+                self.timer.as_mut().reset(now + self.interval);
+                return Poll::Ready(self.frame.clone());
             } else {
-                this.timer.as_mut().reset(now + this.interval);
+                self.timer.as_mut().reset(now + self.interval);
             }
         }
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        self.inner.size_hint()
     }
 }
 
@@ -200,6 +266,10 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+    use crate::{
+        middleware::{edge_body::at_the_edge, HttpMetricsLayer},
+        observability::inflight_tracker::InFlightRequestTracker,
+    };
 
     const SECS: u64 = 15;
     type Chunk = Result<Bytes, std::io::Error>;
@@ -228,11 +298,12 @@ mod tests {
             .unwrap()
     }
 
-    /// An SSE body under the keep-alive, fed through the returned sender.
+    /// An SSE body under the keep-alive, at the edge, fed through the
+    /// returned sender.
     fn wrapped(secs: u64, messages: bool) -> (mpsc::Sender<Chunk>, Body) {
         let (tx, rx) = mpsc::channel(16);
         let response = SseKeepAlive::every_secs(secs).apply(sse(rx), messages);
-        (tx, response.into_body())
+        (tx, at_the_edge(response).into_body())
     }
 
     async fn send(tx: &mpsc::Sender<Chunk>, bytes: &'static [u8]) {
@@ -336,10 +407,8 @@ mod tests {
         Router::new()
             .route("/v1/chat/completions", post(move || async move { chat() }))
             .route(MESSAGES_ROUTE, post(move || async move { response() }))
-            .route_layer(axum::middleware::from_fn_with_state(
-                SseKeepAlive::every_secs(SECS),
-                sse_keepalive_middleware,
-            ))
+            .route_layer(SseKeepAlive::every_secs(SECS).layer())
+            .layer(HttpMetricsLayer::new(InFlightRequestTracker::new()))
     }
 
     async fn call(app: Router, path: &str) -> Response {

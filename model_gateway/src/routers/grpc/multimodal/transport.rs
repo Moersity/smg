@@ -134,7 +134,7 @@ fn read_env_nonempty(name: &str) -> Option<String> {
 /// Resolve whether large multimodal tensors should use the SHM transport for
 /// this request: per-worker override → router default. `shm` forces SHM whenever
 /// SMG can write `/dev/shm` (the operator asserts co-location); `auto` also
-/// requires the receiving worker leg to be verified as sharing SMG's `/dev/shm`;
+/// requires the receiving worker to be verified as sharing SMG's `/dev/shm`;
 /// `inline` (the default) keeps the gRPC path.
 pub(super) fn resolve_mm_shm_enabled(
     workers: Option<&WorkerSelection>,
@@ -497,7 +497,7 @@ impl DtypeOverrides {
 }
 
 /// The dtype every worker of the model's routing pools `pools` (the
-/// pipeline mode's legs) reads its image encoder input in, resolved before
+/// pipeline mode's pools) reads its image encoder input in, resolved before
 /// any of them is selected from what each already advertises (its runtime,
 /// its `multimodal_encoder_dtype` label) and the router's overrides, by the
 /// rules assembly applies to the selected worker. The pools are read as the
@@ -506,54 +506,19 @@ impl DtypeOverrides {
 /// picked. `None` for an empty or a disagreeing set, and whenever a worker is
 /// served otherwise (the pixels' own bytes for an engine that normalizes on
 /// device, a wire that carries no preprocessed floats): the per-destination
-/// write then stays as it is. `None` as well unless [`ONE_PASS_WIRE_ENV`]
-/// opts the one-pass write in: by default every request takes the two-pass
-/// path.
+/// write then stays as it is. `None` as well when the one-pass wire write
+/// is switched off (the `one_pass_wire` setting, `SMG_MM_ONE_PASS_WIRE=0`):
+/// every request then takes the two-pass path (the patch layout, then the
+/// write in the worker's dtype at assembly), which writes the same bytes.
 pub(crate) fn mm_shared_image_wire_dtype_over(
     registry: &WorkerRegistry,
     model_id: &str,
     pools: &[RoutingPool],
 ) -> Option<EncoderDtype> {
-    if !one_pass_wire_enabled() {
+    if !mm_settings().one_pass_wire.value {
         return None;
     }
     shared_image_wire_dtype_over(registry, model_id, pools, &DtypeOverrides::from_env())
-}
-
-/// Opts the one-pass wire write in (`1`, `true`, `yes` or `on`, like the
-/// other `SMG_MM_` switches): the images of a request whose workers all read
-/// one wire dtype are then preprocessed straight into it.
-/// Off, the request takes the two-pass path (the patch layout, then the
-/// write in the worker's dtype at assembly), whose layout pass is the faster
-/// one on every image size but one since the vectorised patch layout landed;
-/// the one-pass writer is turned back on by default once it is at least as
-/// fast at every size.
-pub const ONE_PASS_WIRE_ENV: &str = "SMG_MM_ONE_PASS_WIRE";
-
-fn one_pass_wire_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        let on = one_pass_wire_opted_in(std::env::var(ONE_PASS_WIRE_ENV).ok().as_deref());
-        if on {
-            info!(
-                env = ONE_PASS_WIRE_ENV,
-                "the one-pass wire write is opted in: images are preprocessed straight into the workers' shared wire dtype"
-            );
-        }
-        on
-    })
-}
-
-/// The switch's value read as the other `SMG_MM_` switches read theirs:
-/// `1`, `true`, `yes` or `on`, any case, surrounding space ignored; unset or
-/// anything else leaves the opt-in off.
-fn one_pass_wire_opted_in(value: Option<&str>) -> bool {
-    value.is_some_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
 }
 
 fn shared_image_wire_dtype_over(
@@ -883,16 +848,18 @@ mod tests {
         );
     }
 
-    /// Without the opt-in the stages get no wire dtype, whatever the fleet
-    /// agrees on: every request takes the two-pass path. The resolution
-    /// itself still answers, for the opt-in and the tests of its rules. The
-    /// switch's spellings are checked on explicit values; the wrapper is
-    /// checked against the process's own setting, so the test holds whether
-    /// or not the environment it runs in opts in.
+    /// The stages see the fleet's wire dtype by default: the one-pass wire
+    /// write is on unless its switch turns it off, and then they get no
+    /// dtype whatever the fleet agrees on (every request takes the two-pass
+    /// path) while the resolution itself still answers. The default is read
+    /// off the settings' built-in values; the wrapper is checked against the
+    /// process's own setting, so the test holds whether or not the
+    /// environment it runs in switches the write off. The switch's spellings
+    /// are the settings module's tests.
     #[test]
-    fn the_one_pass_wire_write_is_opt_in() {
+    fn the_one_pass_wire_write_is_the_default_and_its_switch_turns_it_off() {
         use crate::{
-            routers::grpc::mode::Mode,
+            routers::grpc::{mode::Mode, multimodal::MultimodalSettings},
             worker::{ConnectionMode, WorkerRegistry},
         };
 
@@ -919,24 +886,11 @@ mod tests {
             Some(EncoderDtype::BFloat16),
             "the fleet agrees on one dtype"
         );
-        for value in [
-            None,
-            Some(""),
-            Some("0"),
-            Some("false"),
-            Some("no"),
-            Some("off"),
-            Some("maybe"),
-        ] {
-            assert!(
-                !one_pass_wire_opted_in(value),
-                "{value:?} leaves the opt-in off"
-            );
-        }
-        for value in ["1", "true", "yes", "on", "TRUE", " On "] {
-            assert!(one_pass_wire_opted_in(Some(value)), "{value:?} opts in");
-        }
-        let expected = if one_pass_wire_enabled() {
+        assert!(
+            MultimodalSettings::default().one_pass_wire.value,
+            "the one-pass wire write is on by default"
+        );
+        let expected = if mm_settings().one_pass_wire.value {
             Some(EncoderDtype::BFloat16)
         } else {
             None
@@ -944,17 +898,17 @@ mod tests {
         assert_eq!(
             mm_shared_image_wire_dtype_over(&registry, "qwen3-vl", pools),
             expected,
-            "the stages see the fleet's wire dtype only with the opt-in"
+            "the stages see the fleet's wire dtype unless the switch turns the one-pass write off"
         );
     }
 
-    /// The dtype is resolved over the legs a mode's request can reach:
+    /// The dtype is resolved over the pools a mode's request can reach:
     /// the regular workers for the regular pipeline, the prefill and decode
-    /// legs for a disaggregated one. A fleet whose legs read another width
+    /// pools for a disaggregated one. A fleet whose pools read another width
     /// than its regular workers keeps the per-destination write (`None`)
-    /// over the union, never a wire for the wrong leg.
+    /// over the union, never a wire for the wrong pool.
     #[test]
-    fn the_wire_dtype_over_a_modes_pools_is_the_legs_the_pixels_can_reach() {
+    fn the_wire_dtype_is_resolved_over_the_pools_a_modes_pixels_can_reach() {
         use crate::{
             routers::grpc::mode::Mode,
             worker::{ConnectionMode, WorkerRegistry},
@@ -962,39 +916,40 @@ mod tests {
 
         let plain = DtypeOverrides::default();
         let registry = WorkerRegistry::new();
-        let leg = |url: &str, worker_type: WorkerType, runtime: RuntimeType| -> Arc<dyn Worker> {
-            Arc::new(
-                BasicWorkerBuilder::new(url)
-                    .model(ModelCard::new("qwen3-vl"))
-                    .worker_type(worker_type)
-                    .connection_mode(ConnectionMode::Grpc)
-                    .runtime_type(runtime)
-                    .health_config(HealthCheckConfig {
-                        disable_health_check: true,
-                        ..Default::default()
-                    })
-                    .build(),
-            )
-        };
+        let worker =
+            |url: &str, worker_type: WorkerType, runtime: RuntimeType| -> Arc<dyn Worker> {
+                Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .model(ModelCard::new("qwen3-vl"))
+                        .worker_type(worker_type)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .runtime_type(runtime)
+                        .health_config(HealthCheckConfig {
+                            disable_health_check: true,
+                            ..Default::default()
+                        })
+                        .build(),
+                )
+            };
         // Regular workers reading bfloat16 (the TokenSpeed default) next to
-        // prefill and decode legs pinned to float32 (SGLang).
+        // prefill and decode workers pinned to float32 (SGLang).
         for worker in [
-            leg(
+            worker(
                 "grpc://regular-1:8000",
                 WorkerType::Regular,
                 RuntimeType::TokenSpeed,
             ),
-            leg(
+            worker(
                 "grpc://regular-2:8000",
                 WorkerType::Regular,
                 RuntimeType::TokenSpeed,
             ),
-            leg(
+            worker(
                 "grpc://prefill-1:8000",
                 WorkerType::Prefill,
                 RuntimeType::Sglang,
             ),
-            leg(
+            worker(
                 "grpc://decode-1:8000",
                 WorkerType::Decode,
                 RuntimeType::Sglang,
@@ -1016,7 +971,7 @@ mod tests {
         assert_eq!(
             over(Mode::EncodePrefillDecode.multimodal_wire_pools()),
             Some(EncoderDtype::Float32),
-            "no encode leg registered: the prefill and decode legs decide"
+            "no encode worker registered: the prefill and decode workers decide"
         );
         assert_eq!(
             over(&[
@@ -1025,7 +980,7 @@ mod tests {
                 RoutingPool::GrpcDecode,
             ]),
             None,
-            "legs that disagree with the regular workers keep the per-destination write"
+            "pools that disagree with the regular workers keep the per-destination write"
         );
         assert_eq!(
             over(&[RoutingPool::GrpcEncode]),

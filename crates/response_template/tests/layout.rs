@@ -39,7 +39,7 @@ use smg_response_template::to_symphony::{
     Transformers,
 };
 use symphony::{
-    grammar::Options,
+    grammar::{GrammarStart, Options},
     shape::{
         self, Arguments, Atom, CallLayout, CallShape, Class, Dialect, End, Layout, Message,
         NameSource, Nested, Pattern, Segment, Slot, Spellings, ValueParser, Words, Written,
@@ -99,11 +99,11 @@ fn the_probe_is_the_one_the_renderings_were_recorded_with() {
     assert_eq!(unread, ["prompt_after_tool"]);
 }
 
-/// A class of Python `regex`'s, as symphony's shape recordings hold it (`word` for `\w`, `space`
-/// for `\s`): the class a compile resolves the escape into.
-fn recorded_class(table: &str) -> Class {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../symphony/tests/fixtures/shape/classes.json");
+/// A class of Python `regex`'s, as bellwether's shape patterns record it (`word` for `\w`,
+/// `space` for `\s`, in `classes.json` under `patterns`): the class a compile resolves the escape
+/// into.
+fn recorded_class(patterns: &Path, table: &str) -> Class {
+    let path = patterns.join("classes.json");
     let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let tables: Value = serde_json::from_str(&text).unwrap();
     let ranges = tables[table].as_array().unwrap().iter().map(|range| {
@@ -141,7 +141,7 @@ fn lit(text: &str) -> Atom {
 /// terminal `<atem:invoke` and a header that names the tool, its close `</atem:invoke>`, and its
 /// parameters `<atem:parameter\b[^>]*?\bname="(?P<key>[^"]+)"[^>]*?>(?P<value>.*?)</atem:parameter>`,
 /// each value read as JSON where it is JSON.
-fn muse() -> Format {
+fn muse(patterns: &Path) -> Format {
     let shape = shape::intern(CallShape {
         header: Pattern(
             [
@@ -183,7 +183,7 @@ fn muse() -> Format {
             },
         },
         trailer: Pattern::default(),
-        word: recorded_class("word"),
+        word: recorded_class(patterns, "word"),
         hold_cap: 8192,
     });
     Format::new("muse glimmer template")
@@ -221,8 +221,8 @@ fn muse() -> Format {
 /// trailer `</function>\s*` and the terminal `</tool_call>`, and its parameters
 /// `<parameter=(?P<key>[^>\n]+)>\s*(?P<value>.*?)\s*</parameter>`, each value its text, typed by the
 /// request's tools.
-fn serve_qwen3_5() -> Format {
-    let space = recorded_class("space");
+fn serve_qwen3_5(patterns: &Path) -> Format {
+    let space = recorded_class(patterns, "space");
     let name = none_of(">\n");
     let shape = shape::intern(CallShape {
         header: Pattern(
@@ -254,7 +254,7 @@ fn serve_qwen3_5() -> Format {
             values: ValueParser::Raw,
         },
         trailer: Pattern([lit("</function>"), run(space, 0, true, None)].into()),
-        word: recorded_class("word"),
+        word: recorded_class(patterns, "word"),
         hold_cap: 8192,
     });
     Format::new("qwen 3.5 serve template")
@@ -386,7 +386,8 @@ fn learned(format: &Format, id: &str, template: &str, setting: &str) -> Result<L
 }
 
 /// That a table with `layout` has a tag for a forced call, a named function, one call and a JSON
-/// answer, with the prompt's thought open and not.
+/// answer, with the prompt's thought open and not, and that every one of them passes the rule the
+/// engines' structural-tag parsers hold a tag to (`Grammar::check`).
 fn every_mode_has_a_tag(format: &Format, layout: Layout) {
     let format = format.clone().with_layout(layout);
     let tools: Vec<Tool> = serde_json::from_value(layout::tools()).unwrap();
@@ -395,18 +396,31 @@ fn every_mode_has_a_tag(format: &Format, layout: Layout) {
             let options = Options {
                 at_least_one,
                 reasoning_open,
+                thought_closed: false,
                 one_call,
+                start: GrammarStart::Unknown,
             };
-            assert!(format.grammar_for(&tools, options).is_some(), "{options:?}");
+            let tag = format
+                .grammar_for(&tools, options)
+                .unwrap_or_else(|| panic!("{options:?}"));
+            tag.check()
+                .unwrap_or_else(|why| panic!("{options:?}: the engines refuse the tag: {why}"));
         }
-        let answer = format.answer_grammar(&json!({"type": "object"}), reasoning_open);
-        assert!(answer.is_some(), "{reasoning_open}");
+        let answer = format
+            .answer_grammar(&json!({"type": "object"}), reasoning_open)
+            .unwrap_or_else(|| panic!("{reasoning_open}"));
+        answer.check().unwrap_or_else(|why| {
+            panic!("thought open {reasoning_open}: the engines refuse the answer grammar: {why}")
+        });
     }
 }
 
 #[test]
 fn muse_glimmers_layout_is_the_one_its_chat_template_renders() {
-    let format = muse();
+    let Some(patterns) = common::patterns() else {
+        return;
+    };
+    let format = muse(&patterns);
     let learned = learned(
         &format,
         "hub/muse-glimmer",
@@ -421,7 +435,10 @@ fn muse_glimmers_layout_is_the_one_its_chat_template_renders() {
 
 #[test]
 fn qwen3_5s_layout_is_the_one_its_chat_template_renders() {
-    let format = serve_qwen3_5();
+    let Some(patterns) = common::patterns() else {
+        return;
+    };
+    let format = serve_qwen3_5(&patterns);
     let on = learned(&format, "serve/qwen3_5", "Qwen/Qwen3.5-9B", "default").unwrap();
     // The prompt opens the thought, so the turn's thought is the prompt's: no thinking first.
     assert!(!on.thinks_first);

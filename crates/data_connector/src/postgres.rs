@@ -619,14 +619,7 @@ impl ConversationStorage for PostgresConversationStorage {
             params.push(val);
         }
 
-        let placeholders: String = (1..=params.len())
-            .map(|i| format!("${i}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "INSERT INTO {table} ({}) VALUES ({placeholders})",
-            col_names.join(", ")
-        );
+        let sql = insert_sql(&table, &col_names);
 
         let client = self
             .store
@@ -877,14 +870,7 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
             params.push(val);
         }
 
-        let placeholders: String = (1..=params.len())
-            .map(|i| format!("${i}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "INSERT INTO {table} ({}) VALUES ({placeholders})",
-            col_names.join(", ")
-        );
+        let sql = insert_sql(&table, &col_names);
 
         let client = self
             .store
@@ -1107,10 +1093,7 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
         conversation_id: &ConversationId,
         item_id: &ConversationItemId,
     ) -> ConversationItemResult<bool> {
-        let sl = &self.store.schema.conversation_item_links;
-        let table = sl.qualified_table(self.store.schema.owner.as_deref());
-        let col_conv = sl.col("conversation_id");
-        let col_item = sl.col("item_id");
+        let (table, col_conv, col_item) = link_table(&self.store.schema);
 
         let sql = format!("SELECT COUNT(*) FROM {table} WHERE {col_conv} = $1 AND {col_item} = $2");
 
@@ -1136,10 +1119,7 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
         conversation_id: &ConversationId,
         item_id: &ConversationItemId,
     ) -> ConversationItemResult<()> {
-        let sl = &self.store.schema.conversation_item_links;
-        let table = sl.qualified_table(self.store.schema.owner.as_deref());
-        let col_conv = sl.col("conversation_id");
-        let col_item = sl.col("item_id");
+        let (table, col_conv, col_item) = link_table(&self.store.schema);
 
         let sql = format!("DELETE FROM {table} WHERE {col_conv} = $1 AND {col_item} = $2");
 
@@ -1570,6 +1550,27 @@ fn param_placeholders(n: usize) -> String {
         .join(", ")
 }
 
+/// `INSERT INTO table (columns) VALUES ($1, ..., $n)`: one placeholder per
+/// column, the binds in the columns' order.
+fn insert_sql(table: &str, col_names: &[&str]) -> String {
+    format!(
+        "INSERT INTO {table} ({}) VALUES ({})",
+        col_names.join(", "),
+        param_placeholders(col_names.len())
+    )
+}
+
+/// The conversation-item link table, qualified, with its conversation and
+/// item columns: the key the link readers filter on.
+fn link_table(schema: &SchemaConfig) -> (String, &str, &str) {
+    let sl = &schema.conversation_item_links;
+    (
+        sl.qualified_table(schema.owner.as_deref()),
+        sl.col("conversation_id"),
+        sl.col("item_id"),
+    )
+}
+
 /// The statement of a link: the row is inserted, or, for an item the
 /// conversation already has, the row under the (conversation, item) key (the
 /// first two columns, the table's primary key) takes the new stamp and the
@@ -1753,6 +1754,13 @@ fn open_predicate(col_raw: &str) -> String {
     )
 }
 
+/// [`open_predicate`] over the schema's object column; none when the schema
+/// skips it: there is no status to check, so the conditional store is a plain
+/// update of the row under the id (every backend of this crate agrees).
+fn open_predicate_for(s: &crate::schema::TableConfig) -> Option<String> {
+    (!s.is_skipped("raw_response")).then(|| open_predicate(s.col("raw_response")))
+}
+
 /// The statement of [`ResponseStorage::store_response_if_open`]: an UPDATE of
 /// every column of the row under the id, applied only while `open` holds
 /// (none: the schema skips the status' column, so the update is plain). The
@@ -1869,7 +1877,7 @@ impl ResponseStorage for PostgresResponseStorage {
         let hook_extra = current_extra_columns().unwrap_or_default();
         let extra_cols: Vec<(&str, Option<String>)> = resolve_extra_column_values(s, &hook_extra);
         let (col_names, params) = write_columns(s, &response, &previous_id, &extra_cols);
-        let open = (!s.is_skipped("raw_response")).then(|| open_predicate(s.col("raw_response")));
+        let open = open_predicate_for(s);
         let sql = update_if_open_sql(&table, &col_names, open.as_deref());
 
         let client = self
@@ -2108,6 +2116,37 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn an_insert_numbers_one_placeholder_per_column() {
+        assert_eq!(
+            insert_sql("conversations", &["id", "created_at", "tenant"]),
+            "INSERT INTO conversations (id, created_at, tenant) VALUES ($1, $2, $3)"
+        );
+    }
+
+    /// The link table is read from the schema: its owner qualifies the
+    /// table, its column overrides rename the key columns.
+    #[test]
+    fn the_link_table_comes_from_the_schema_with_its_key_columns() {
+        let mut schema = SchemaConfig::default();
+        let (table, col_conv, col_item) = link_table(&schema);
+        assert_eq!(
+            (table.as_str(), col_conv, col_item),
+            ("conversation_item_links", "conversation_id", "item_id")
+        );
+
+        schema.owner = Some("app".to_string());
+        schema
+            .conversation_item_links
+            .columns
+            .insert("item_id".to_string(), "item".to_string());
+        let (table, _, col_item) = link_table(&schema);
+        assert_eq!(
+            (table.as_str(), col_item),
+            ("app.\"conversation_item_links\"", "item")
+        );
+    }
 
     /// The replacement's literals are dollar-quoted, so the index expression,
     /// the sweep and the lookup read the same under
@@ -2418,5 +2457,23 @@ mod tests {
         ));
         assert!(!is_stale_statement_state(&SqlState::UNDEFINED_COLUMN, None));
         assert!(!is_stale_statement_state(&SqlState::QUERY_CANCELED, None));
+    }
+
+    #[test]
+    fn a_schema_without_the_object_column_has_no_open_condition() {
+        let mut s = crate::schema::TableConfig::with_table("responses");
+        s.columns
+            .insert("raw_response".to_string(), "payload".to_string());
+        assert_eq!(
+            open_predicate_for(&s).as_deref(),
+            Some(open_predicate("payload").as_str()),
+            "the mapped column is checked"
+        );
+        s.skip_columns.insert("raw_response".to_string());
+        assert_eq!(
+            open_predicate_for(&s),
+            None,
+            "no object column: the conditional store is a plain update"
+        );
     }
 }

@@ -7,8 +7,12 @@
 //! argument events as they arrive: the whitespace before the value is dropped as such, the value's
 //! bytes are fragments for as long as they keep it a JSON prefix (judged by [`Prefix`], so the
 //! fragments keep the promise `ToolCallArguments` makes, exactly as strong as for the
-//! [`Assembler`](super::Assembler)), and from the first byte that does not, the bytes come back as
-//! `Malformed` with `InvalidArguments`. The fragments are the model's own bytes, spacing included.
+//! [`Assembler`](super::Assembler)), and at the first byte that does not, one `Malformed` event of
+//! no bytes with `InvalidArguments` says so, the rest of the value staying the call's own
+//! fragments, as the model wrote them (as `json::fragments` says it for the object readers). The
+//! fragments are the model's own bytes, spacing included,
+//! but for a raw control character inside a string, which JSON forbids and the fragment writes as
+//! its escape ([`Prefix::escaped`]); only `source` keeps the model's byte there.
 //! A word being spelled (`nu`) is held until it is a literal or is refused, which the judge does
 //! from its first letter, so that where the chunks were cut does not decide which of its bytes
 //! were sent.
@@ -29,7 +33,7 @@
 
 use crate::{
     event::{DropReason, Event, Events, MalformedReason, Text},
-    json::{is_complete, Prefix},
+    json::{prefix::json_space, Prefix},
 };
 
 /// What the reader does with a member of the value's top-level object whose value is a string:
@@ -58,11 +62,6 @@ impl Strings for AsWritten {
     }
 }
 
-/// The whitespace JSON allows before a value.
-pub(crate) fn json_space(c: char) -> bool {
-    matches!(c, ' ' | '\t' | '\n' | '\r')
-}
-
 /// The argument events of one call, from the bytes of its arguments value.
 #[derive(Clone, Debug)]
 pub struct Arguments {
@@ -71,7 +70,7 @@ pub struct Arguments {
     value: String,
     /// Whether the value's first byte has arrived.
     started: bool,
-    /// Bytes of `value` accounted for, as fragments or as malformed text.
+    /// Bytes of `value` sent as fragments.
     emitted: usize,
     /// Whether the bytes are still a JSON prefix, judged as they arrive.
     prefix: Prefix,
@@ -79,6 +78,13 @@ pub struct Arguments {
     invalid_from: Option<usize>,
     /// Where the value ended, once it is whole.
     whole: Option<usize>,
+    /// Whether the value ends where its bytes stop being a JSON prefix: the bytes from there on
+    /// are then the caller's ([`Self::refused_tail`]), for a shaped call's trailer to read, rather
+    /// than the call's fragments after the break.
+    ends_where_refused: bool,
+    /// The last character of the whitespace before the value, if any came: what stands before a
+    /// value refused at its first byte ([`Self::refused_tail`]).
+    led_by: Option<char>,
     /// The top-level object's members, as far as holding a string needs them.
     members: Members,
 }
@@ -205,13 +211,50 @@ impl Arguments {
             prefix: Prefix::default(),
             invalid_from: None,
             whole: None,
+            ends_where_refused: false,
+            led_by: None,
             members: Members::default(),
         }
     }
 
-    /// Whether the value's first byte has arrived.
-    pub fn started(&self) -> bool {
-        self.started
+    /// The value ends where its bytes stop being a JSON prefix (see [`Self::refused_tail`]).
+    pub fn ending_where_refused(mut self) -> Self {
+        self.ends_where_refused = true;
+        self
+    }
+
+    /// Whether the bytes stopped being a JSON prefix.
+    #[cfg(test)]
+    pub fn refused(&self) -> bool {
+        self.invalid_from.is_some()
+    }
+
+    /// Whether the value ended where its bytes stopped being a JSON prefix: it ends there
+    /// ([`Self::ending_where_refused`]), and they did.
+    pub fn ended_where_refused(&self) -> bool {
+        self.ends_where_refused && self.invalid_from.is_some()
+    }
+
+    /// Whether the value takes no more bytes: it is whole, or it ended where refused.
+    pub fn over(&self) -> bool {
+        self.whole.is_some() || self.ended_where_refused()
+    }
+
+    /// For a value that ends where refused: the bytes from the refusal on, which the value took
+    /// before the refusal was known (a held word, the rest of the piece), handed back once with
+    /// the character before them (the last of the whitespace before the value, for a value refused
+    /// at its first byte; `None` when nothing came before it), for the caller to read as what
+    /// follows the value; `None` for a value not refused, or whose tail was already taken. `feed`
+    /// takes nothing after this.
+    pub fn refused_tail(&mut self) -> Option<(String, Option<char>)> {
+        let from = self.invalid_from.filter(|_| self.ends_where_refused)?;
+        if from >= self.value.len() && self.emitted >= from {
+            return None;
+        }
+        let tail = self.value.split_off(from);
+        let before = self.value.chars().next_back().or(self.led_by);
+        self.emitted = self.emitted.min(from);
+        Some((tail, before))
     }
 
     /// Whether the value is whole.
@@ -223,7 +266,7 @@ impl Arguments {
     /// holds, and return how many of them the value took: all of them before its end, up to its
     /// end in the piece that carries it, and none once it is whole.
     pub fn feed(&mut self, bytes: &str, strings: &dyn Strings, out: &mut Events) -> usize {
-        if self.whole.is_some() {
+        if self.over() {
             return 0;
         }
         let mut taken = 0;
@@ -231,9 +274,10 @@ impl Arguments {
         if !self.started {
             let value = rest.trim_start_matches(json_space);
             let space = &rest[..rest.len() - value.len()];
-            if !space.is_empty() {
+            if let Some(last) = space.chars().next_back() {
+                self.led_by = Some(last);
                 out.push(Event::Dropped {
-                    text: Text::uncounted(space),
+                    text: Text::uncounted(space.to_owned()),
                     why: DropReason::Whitespace,
                 });
             }
@@ -246,11 +290,12 @@ impl Arguments {
         }
         let before = self.value.len();
         self.value.push_str(rest);
+        let sound_so_far = self.invalid_from.is_none();
         let refused = self.prefix.feed(rest);
-        if let Some(end) = self.prefix.ended() {
-            if self.invalid_from.is_none() && is_complete(&self.value[..end]) {
-                self.whole = Some(end);
-            }
+        // The judge ends none but a value a strict reader takes whole, so the value is whole where
+        // it ended.
+        if self.invalid_from.is_none() {
+            self.whole = self.prefix.ended();
         }
         let end = self.whole.unwrap_or(self.value.len());
         if self.invalid_from.is_none() {
@@ -266,34 +311,74 @@ impl Arguments {
         }
         let mut upto = end;
         if self.invalid_from.is_none() && self.whole.is_none() {
-            let held = [self.prefix.word_start(), self.members.open];
+            // A word being spelled and an escape being read (from its backslash) are held; a
+            // string streams on, as a string parameter would otherwise wait for its closing
+            // quote; a surrogate that breaks inside it is said once at the break, whole and in
+            // pieces alike (`Prefix::held_from`).
+            let held = [self.prefix.held_from(), self.members.open];
             upto = held.into_iter().flatten().fold(end, usize::min);
         }
-        self.emit(upto.max(self.emitted), end, strings, out);
+        // A value that ends where refused keeps the bytes from the refusal on for the caller
+        // (`refused_tail`), instead of sending them on as the call's fragments after the break.
+        let reported = match self.invalid_from {
+            Some(from) if self.ends_where_refused => from.max(self.emitted).min(end),
+            _ => end,
+        };
+        let breaks_here = sound_so_far && self.invalid_from.is_some();
+        self.emit(
+            upto.max(self.emitted).min(reported),
+            reported,
+            breaks_here,
+            strings,
+            out,
+        );
         self.value.truncate(end);
         taken + end - before
     }
 
     /// No more bytes come: a number or a literal the bytes end on is whole now, and a word they
-    /// end on is sent as the prefix it is. Returns whether the value is whole.
+    /// end on is sent as the prefix it is. A value that is no whole one, whether it began (a
+    /// string or a container left open, a word that is no literal's prefix) or no byte of it came
+    /// (the end right after the header that opened the call, whitespace alone), is said to be
+    /// none, by a `Malformed` event of no bytes after its fragments, unless it broke, which was
+    /// said at the break: nothing sent is revised, nothing is made up for what the model never
+    /// finished, and a call whose value never began is not handed over as a whole one with an
+    /// empty string for its arguments. Returns whether the value is whole.
     pub fn finish(&mut self, out: &mut Events) -> bool {
         if self.whole.is_none()
             && self.started
             && self.invalid_from.is_none()
-            && is_complete(&self.value)
+            && self.prefix.whole()
         {
             self.whole = Some(self.value.len());
         }
         let end = self.value.len();
-        self.emit(end, end, &AsWritten, out);
+        self.emit(end, end, false, &AsWritten, out);
+        // A value that broke said so at the break, whether it sent the rest or handed it back
+        // (`ends_where_refused`); one that never broke and is no whole value is said to be none
+        // here.
+        if self.whole.is_none() && self.invalid_from.is_none() {
+            out.push(Event::Malformed {
+                text: Text::default(),
+                why: MalformedReason::UnterminatedRegion,
+            });
+        }
         self.whole.is_some()
     }
 
     /// The value's bytes up to `upto` not yet accounted for, the rest up to `end` held: a fragment
     /// for the part that keeps the value a JSON prefix, a held string that closed written as
-    /// `strings` says, and malformed text for the part after the prefix broke. A held string the
-    /// prefix broke in, or one the bytes end in, is sent as the model wrote it.
-    fn emit(&mut self, upto: usize, end: usize, strings: &dyn Strings, out: &mut Events) {
+    /// `strings` says, the break said once where the prefix broke (`breaks_here`, by a `Malformed`
+    /// event of no bytes), and the part after it as the model wrote it. A held string the prefix
+    /// broke in, or one the bytes end in, is sent as the model wrote it.
+    fn emit(
+        &mut self,
+        upto: usize,
+        end: usize,
+        breaks_here: bool,
+        strings: &dyn Strings,
+        out: &mut Events,
+    ) {
         let valid_end = self.invalid_from.unwrap_or(upto).min(upto);
         let ready = self
             .members
@@ -308,29 +393,38 @@ impl Arguments {
             let typed = strings.typed(&key, raw);
             out.push(Event::ToolCallArguments {
                 index: self.index,
-                json: typed.unwrap_or_else(|| raw.to_string()),
-                source: Text::uncounted(raw),
+                json: typed.unwrap_or_else(|| self.prefix.escaped(start, raw).into_owned()),
+                source: Text::uncounted(raw.to_owned()),
             });
             self.emitted = close;
         }
         self.fragment(valid_end, out);
-        if self.invalid_from.is_some() && self.emitted < end {
+        if breaks_here {
             out.push(Event::Malformed {
-                text: Text::uncounted(&self.value[self.emitted..end]),
+                text: Text::default(),
                 why: MalformedReason::InvalidArguments,
+            });
+        }
+        if self.invalid_from.is_some() && self.emitted < end {
+            let rest = &self.value[self.emitted..end];
+            out.push(Event::ToolCallArguments {
+                index: self.index,
+                json: rest.to_string(),
+                source: Text::uncounted(rest.to_owned()),
             });
             self.emitted = end;
         }
     }
 
-    /// The value's bytes from what was sent up to `upto`, as a fragment of the model's bytes.
+    /// The value's bytes from what was sent up to `upto`, as a fragment of the model's bytes, a
+    /// raw control character inside a string written as its escape.
     fn fragment(&mut self, upto: usize, out: &mut Events) {
         if self.emitted < upto {
             let fresh = &self.value[self.emitted..upto];
             out.push(Event::ToolCallArguments {
                 index: self.index,
-                json: fresh.to_string(),
-                source: Text::uncounted(fresh),
+                json: self.prefix.escaped(self.emitted, fresh).into_owned(),
+                source: Text::uncounted(fresh.to_owned()),
             });
             self.emitted = upto;
         }
@@ -343,7 +437,7 @@ mod tests {
 
     /// The events for `pieces`, what the value took of each, and whether it is whole after the
     /// last piece and after `finish`.
-    fn run(pieces: &[&str]) -> (Vec<Event>, Vec<usize>, bool, bool) {
+    fn run(pieces: &[&str]) -> (Vec<Event<'static>>, Vec<usize>, bool, bool) {
         let mut arguments = Arguments::new(0);
         let mut out = Events::new();
         let taken = pieces
@@ -370,8 +464,8 @@ mod tests {
         events
             .iter()
             .map(|event| match event {
-                Event::ToolCallArguments { source, .. } => source.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
+                Event::ToolCallArguments { source, .. } => &*source.text,
+                Event::Dropped { text, .. } | Event::Malformed { text, .. } => &*text.text,
                 _ => "",
             })
             .collect()
@@ -422,24 +516,39 @@ mod tests {
         assert!(!finished, "a number cut short is not whole");
     }
 
+    /// The fragments sent before the first `Malformed` event, joined; `None` when none came.
+    fn said_before(events: &[Event]) -> Option<String> {
+        let at = events
+            .iter()
+            .position(|event| matches!(event, Event::Malformed { .. }))?;
+        Some(fragments(&events[..at]))
+    }
+
     #[test]
-    fn bytes_that_break_the_prefix_come_back_malformed() {
+    fn bytes_that_break_the_prefix_are_said_to_once_and_stay_the_values_own() {
+        let broke = Event::Malformed {
+            text: Text::default(),
+            why: MalformedReason::InvalidArguments,
+        };
         let (events, taken, whole, finished) = run(&["{\"a\": trux, \"b\": 1}"]);
-        assert_eq!(fragments(&events), "{\"a\": ");
+        assert_eq!(fragments(&events), "{\"a\": trux, \"b\": 1}");
         assert_eq!(
-            events.last(),
-            Some(&Event::Malformed {
-                text: Text::uncounted("trux, \"b\": 1}"),
-                why: MalformedReason::InvalidArguments,
-            }),
+            said_before(&events),
+            Some("{\"a\": ".to_string()),
             "the word is refused from its first letter"
+        );
+        assert_eq!(
+            events.iter().filter(|event| *event == &broke).count(),
+            1,
+            "the break is said once, with no bytes: {events:#?}"
         );
         assert_eq!(taken, [19], "a broken value takes every byte");
         assert!(!whole && !finished);
         let (events, _, _, _) = run(&["{\"a\": t", "rux, \"b\": 1}"]);
+        assert_eq!(fragments(&events), "{\"a\": trux, \"b\": 1}");
         assert_eq!(
-            fragments(&events),
-            "{\"a\": ",
+            said_before(&events),
+            Some("{\"a\": ".to_string()),
             "a word is held until it is decided, so the cut changes nothing"
         );
         assert_eq!(sources(&events), "{\"a\": trux, \"b\": 1}");
@@ -451,7 +560,8 @@ mod tests {
         );
         assert!(!finished);
         let (events, _, whole, _) = run(&["[1}", " more"]);
-        assert_eq!(fragments(&events), "[1");
+        assert_eq!(fragments(&events), "[1} more");
+        assert_eq!(said_before(&events), Some("[1".to_string()));
         assert!(!whole, "an array a brace cut short is not whole");
         assert_eq!(sources(&events), "[1} more");
     }
@@ -470,8 +580,8 @@ mod tests {
         }
     }
 
-    /// The fragments and the malformed text for `pieces`, read with [`HoldsN`].
-    fn held(pieces: &[&str]) -> (String, String) {
+    /// The fragments for `pieces`, read with [`HoldsN`], and how many `Malformed` events came.
+    fn held(pieces: &[&str]) -> (String, usize) {
         let mut arguments = Arguments::new(0);
         let mut out = Events::new();
         for piece in pieces {
@@ -481,33 +591,208 @@ mod tests {
         let events = out.drain();
         let malformed = events
             .iter()
-            .filter_map(|event| match event {
-                Event::Malformed { text, .. } => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect();
+            .filter(|event| matches!(event, Event::Malformed { .. }))
+            .count();
         (fragments(&events), malformed)
+    }
+
+    /// A raw control character inside a string is written as its escape, in a streamed string and
+    /// in a held one the typing could not read (a strict reader refuses the raw character, so the
+    /// model's bytes are written, escaped), and the value is whole where the model closed it.
+    #[test]
+    fn a_raw_control_character_inside_a_string_is_written_as_its_escape() {
+        let text = "{\"s\": \"a\nb\", \"n\": \"5\t\"}";
+        let expected = ("{\"s\": \"a\\nb\", \"n\": \"5\\t\"}".to_string(), 0);
+        assert_eq!(held(&[text]), expected);
+        for cut in (1..text.len()).filter(|&cut| text.is_char_boundary(cut)) {
+            assert_eq!(
+                held(&[&text[..cut], &text[cut..]]),
+                expected,
+                "cut at {cut}"
+            );
+        }
+        let mut arguments = Arguments::new(0);
+        let mut out = Events::new();
+        assert_eq!(
+            arguments.feed("{\"s\": \"a\nb\"} rest", &AsWritten, &mut out),
+            "{\"s\": \"a\nb\"}".len(),
+            "the value is whole at its brace"
+        );
+        assert!(arguments.whole());
+        assert_eq!(fragments(&out.drain()), "{\"s\": \"a\\nb\"}");
+    }
+
+    /// What the partial parser tolerates and a strict reader refuses is refused from the first
+    /// such byte: the fragments before it stand, the break is said there once with no bytes, the
+    /// rest of the value stays the value's own as written, the value is never whole, and the cut
+    /// changes nothing of it.
+    #[test]
+    fn what_a_strict_reader_refuses_is_said_to_at_the_first_such_byte_and_kept_whole() {
+        for (text, expected_fragments) in [
+            (
+                "{\"city\": \"Paris\", \"days\": ,}",
+                "{\"city\": \"Paris\", \"days\": ",
+            ),
+            (
+                "{\"city\": \"Paris\", \"days\": 3, }",
+                "{\"city\": \"Paris\", \"days\": 3, ",
+            ),
+            ("{\"tags\": [,,]}", "{\"tags\": ["),
+            ("{\"city\": \"Pa\\yris\"}", "{\"city\": \"Pa"),
+            ("{\"city\": \"\\u12G4\"}", "{\"city\": \""),
+            ("{\"a\": [1}", "{\"a\": [1"),
+            ("{\"n\": 1.}", "{\"n\": 1."),
+            ("{\"a\":\u{a0}1}", "{\"a\":"),
+            ("{\"flag\": nu}", "{\"flag\": "),
+        ] {
+            let whole = run(&[text]);
+            let pieces: Vec<&str> = text
+                .char_indices()
+                .map(|(i, c)| &text[i..i + c.len_utf8()])
+                .collect();
+            let by_char = run(&pieces);
+            for ((events, taken, fed, finished), how) in
+                [(whole, "whole"), (by_char, "by the character")]
+            {
+                assert_eq!(fragments(&events), text, "{text:?} {how}");
+                assert_eq!(
+                    said_before(&events),
+                    Some(expected_fragments.to_string()),
+                    "{text:?} {how}"
+                );
+                assert_eq!(sources(&events), text, "{text:?} {how}");
+                assert_eq!(
+                    taken.iter().sum::<usize>(),
+                    text.len(),
+                    "{text:?} {how}: a broken value takes every byte"
+                );
+                assert!(!fed && !finished, "{text:?} {how}");
+                let said: Vec<&Event> = events
+                    .iter()
+                    .filter(|event| matches!(event, Event::Malformed { .. }))
+                    .collect();
+                assert_eq!(
+                    said,
+                    [&Event::Malformed {
+                        text: Text::default(),
+                        why: MalformedReason::InvalidArguments,
+                    }],
+                    "{text:?} {how}: the break is said once, with no bytes"
+                );
+            }
+        }
     }
 
     #[test]
     fn a_held_string_is_written_the_same_whichever_piece_breaks_the_value() {
         let text = "{\"s\": \"a\", \"n\": \"5\", x}";
         let whole = held(&[text]);
-        assert_eq!(
-            whole,
-            ("{\"s\": \"a\", \"n\": 5, ".to_string(), "x}".to_string())
-        );
+        assert_eq!(whole, ("{\"s\": \"a\", \"n\": 5, x}".to_string(), 1));
         for cut in (1..text.len()).filter(|&cut| text.is_char_boundary(cut)) {
             assert_eq!(held(&[&text[..cut], &text[cut..]]), whole, "cut at {cut}");
         }
     }
 
+    /// A value that ends where refused takes the piece that breaks it, sends the prefix before
+    /// the break and says the break, in a `Malformed` event of no bytes, and nothing after it:
+    /// the bytes from the break on are handed back once with the character before them, and it
+    /// takes nothing more; its end adds no word. A value refused at the end of a piece has no
+    /// tail.
+    #[test]
+    fn a_value_ending_where_refused_hands_its_tail_back_once() {
+        let mut arguments = Arguments::new(0).ending_where_refused();
+        let mut out = Events::new();
+        assert_eq!(arguments.feed("{\"a\": 1</f>\n", &AsWritten, &mut out), 12);
+        assert!(arguments.refused() && arguments.over() && !arguments.whole());
+        let events = out.drain();
+        assert_eq!(fragments(&events), "{\"a\": 1");
+        assert_eq!(
+            events.last(),
+            Some(&Event::Malformed {
+                text: Text::default(),
+                why: MalformedReason::InvalidArguments,
+            }),
+            "the break is said where it stands: {events:#?}"
+        );
+        assert_eq!(
+            arguments.refused_tail(),
+            Some(("</f>\n".to_string(), Some('1')))
+        );
+        assert_eq!(arguments.refused_tail(), None);
+        assert_eq!(arguments.feed("more", &AsWritten, &mut out), 0);
+        assert!(!arguments.finish(&mut out));
+        assert!(
+            out.drain().is_empty(),
+            "the break was said with the bytes; the end adds nothing"
+        );
+
+        let mut arguments = Arguments::new(0).ending_where_refused();
+        let mut out = Events::new();
+        assert_eq!(arguments.feed("{\"a\": tr", &AsWritten, &mut out), 8);
+        assert!(!arguments.refused(), "a word being spelled is held");
+        assert_eq!(arguments.feed("uex</f>", &AsWritten, &mut out), 7);
+        assert!(arguments.refused());
+        assert_eq!(fragments(&out.drain()), "{\"a\": ");
+        assert_eq!(
+            arguments.refused_tail(),
+            Some(("truex</f>".to_string(), Some(' '))),
+            "the held word comes back with the tail"
+        );
+
+        // Refused at its first byte, the value has no character of its own before the tail: the
+        // last of the whitespace before it stands there, whichever piece it came in, and the
+        // caller knows what came before when none did.
+        let mut arguments = Arguments::new(0).ending_where_refused();
+        let mut out = Events::new();
+        assert_eq!(arguments.feed(" \nEND", &AsWritten, &mut out), 5);
+        assert!(arguments.ended_where_refused());
+        assert_eq!(fragments(&out.drain()), "");
+        assert_eq!(
+            arguments.refused_tail(),
+            Some(("END".to_string(), Some('\n')))
+        );
+        let mut arguments = Arguments::new(0).ending_where_refused();
+        assert_eq!(arguments.feed(" ", &AsWritten, &mut out), 1);
+        assert_eq!(arguments.feed("END", &AsWritten, &mut out), 3);
+        assert_eq!(
+            arguments.refused_tail(),
+            Some(("END".to_string(), Some(' ')))
+        );
+        let mut arguments = Arguments::new(0).ending_where_refused();
+        assert_eq!(arguments.feed("END", &AsWritten, &mut out), 3);
+        assert_eq!(arguments.refused_tail(), Some(("END".to_string(), None)));
+
+        let mut plain = Arguments::new(0);
+        let mut out = Events::new();
+        assert_eq!(plain.feed("{\"a\": 1</f>", &AsWritten, &mut out), 11);
+        assert!(
+            plain.refused() && !plain.over() && !plain.ended_where_refused(),
+            "a plain value keeps the rest as its own"
+        );
+        assert_eq!(plain.refused_tail(), None);
+    }
+
+    /// Whitespace alone, or nothing at all, is no value: the end says so, by the one `Malformed`
+    /// event of no bytes a value cut short gets, so that a call whose arguments never began is
+    /// not handed over as whole with an empty string for them.
     #[test]
     fn whitespace_alone_is_no_value() {
+        let none = Event::Malformed {
+            text: Text::default(),
+            why: MalformedReason::UnterminatedRegion,
+        };
         let (events, taken, whole, finished) = run(&[" \t", "\r\n"]);
         assert_eq!(taken, [2, 2]);
         assert!(!whole && !finished);
         assert!(fragments(&events).is_empty());
         assert_eq!(sources(&events), " \t\r\n");
+        assert_eq!(events.last(), Some(&none), "{events:#?}");
+        let (events, taken, whole, finished) = run(&[]);
+        assert!(taken.is_empty() && !whole && !finished);
+        assert_eq!(
+            events,
+            [none],
+            "no byte came, and the end still says the value is none"
+        );
     }
 }

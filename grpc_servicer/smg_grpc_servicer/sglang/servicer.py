@@ -6,12 +6,12 @@ for orchestration without tokenization.
 """
 
 import asyncio
-import hashlib
 import json
 import logging
 import os
 import time
 from collections.abc import AsyncIterator
+from contextlib import aclosing
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -46,6 +46,8 @@ from sglang.utils import get_exception_traceback
 from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 from smg_grpc_proto.generated import common_pb2
 
+from smg_grpc_servicer.engine_status import abort_for_constraint_failure
+from smg_grpc_servicer.health_probe import await_probe
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
 from smg_grpc_servicer.sglang.kv_events import subscribe_kv_events
@@ -61,13 +63,19 @@ from smg_grpc_servicer.sglang.request_manager import (
 )
 from smg_grpc_servicer.sglang.utils import (
     abort_code_from_output,
+    grammar_abort,
     scheduler_abort,
     to_token_id_array,
 )
 from smg_grpc_servicer.tensor_wire import tensor_from_parts
-from smg_grpc_servicer.tokenizer_bundle import CHUNK_SIZE, build_tokenizer_zip
+from smg_grpc_servicer.tokenizer_bundle import tokenizer_bundle, tokenizer_chunks
 
-from ..constrained_decoding import grammar_start_labels, sglang_constrained_decoding_start
+from ..constrained_decoding import (
+    grammar_backend_entry,
+    grammar_start_labels,
+    sglang_constrained_decoding_start,
+    sglang_grammar_backend,
+)
 from ..mm_item_limits import MM_ITEM_LIMITS_KEY, sglang_item_limits
 from ..pd_pairing import pairing_protocol_from_env
 
@@ -124,6 +132,13 @@ def _compute_aggregate_protobuf(
         avg_token_usage=round(sum(load.token_usage for load in loads) / n, 4),
         avg_throughput=round(sum(load.gen_throughput for load in loads) / n, 2),
         avg_utilization=round(sum(load.utilization for load in loads) / n, 4),
+    )
+
+
+def _scheduler_abort_detail(finish_reason: dict) -> str:
+    """The engine's own account of an abort, for the constraint-failure status."""
+    return (
+        f"the scheduler aborted the request: {finish_reason.get('message') or 'no reason reported'}"
     )
 
 
@@ -229,6 +244,13 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                                 abort_code_from_output(batch_output),
                                 batch_output["error"],
                             )
+                        elif (grammar := grammar_abort(batch_output)) is not None:
+                            # The one abort the scheduler attributes to the
+                            # request's grammar (named before its status: a PD
+                            # decode side stamps a 500 on it too).
+                            await abort_for_constraint_failure(
+                                context, _scheduler_abort_detail(grammar)
+                            )
                         elif (aborted := scheduler_abort(batch_output)) is not None:
                             # The scheduler's own abort, with its status: the
                             # caller's error or the worker's, never a completion.
@@ -245,6 +267,16 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                         await context.abort(
                             abort_code_from_output(output),
                             output["error"],
+                        )
+                    elif (grammar := grammar_abort(output)) is not None:
+                        # The one abort the scheduler itself attributes to the
+                        # request's grammar (the plugin's name on its finish):
+                        # the constraint-failure status every wire shares,
+                        # never a `Complete(finish_reason = "abort")` a client
+                        # reads as an empty success. Named before its status:
+                        # a PD decode side stamps a 500 on it too.
+                        await abort_for_constraint_failure(
+                            context, _scheduler_abort_detail(grammar)
                         )
                     elif (aborted := scheduler_abort(output)) is not None:
                         # The scheduler's own abort, with its status (a 400 for
@@ -325,6 +357,12 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         """
         Check the health of the inference server by sending a special request to generate one token.
         Similar to HTTP server's /health endpoint.
+
+        The wait is :func:`await_probe`'s: any scheduler push after the probe
+        started, or the probe's own output, is healthy (a scheduler that aborts
+        the probe answers with a push, which counts); a probe whose submission
+        fails, the send to the scheduler raising, is unhealthy at once; neither
+        within ``HEALTH_CHECK_TIMEOUT`` is unhealthy at the deadline.
         """
         rid = f"HEALTH_CHECK_{time.time()}"
         logger.info(f"Receive health check request: {rid}")
@@ -378,34 +416,45 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         # Submit health check request
         async def run_health_check():
             try:
-                async for _ in self.request_manager.generate_request(
-                    obj=health_req,
-                    request_id=rid,
-                ):
-                    # Got at least one response, server is healthy
-                    return True
+                # The probe leaves the stream at its first output. Closing the
+                # stream on the way out releases the probe's request state
+                # here, in the probe's own task, rather than whenever the
+                # garbage collector finalizes the abandoned stream.
+                async with aclosing(
+                    self.request_manager.generate_request(obj=health_req, request_id=rid)
+                ) as outputs:
+                    async for _ in outputs:
+                        # Got at least one response, server is healthy
+                        return True
             except Exception as e:
                 logger.warning(f"Health check failed: {e}")
                 return False
             return False
 
+        started = time.time()
         task = asyncio.create_task(run_health_check())
 
         try:
-            # Wait for response with timeout
-            tic = time.time()
-            while time.time() < tic + HEALTH_CHECK_TIMEOUT:
-                await asyncio.sleep(1)
-                # Check if we got a response from scheduler
-                if self.request_manager.last_receive_tstamp > tic:
-                    return sglang_scheduler_pb2.HealthCheckResponse(
-                        healthy=True, message="Health check passed"
-                    )
-
-            # Timeout - server not responding
-            logger.warning(f"Health check timeout after {HEALTH_CHECK_TIMEOUT}s")
+            verdict = await await_probe(
+                task,
+                started=started,
+                last_receive=lambda: self.request_manager.last_receive_tstamp,
+                timeout=HEALTH_CHECK_TIMEOUT,
+            )
+            if verdict:
+                return sglang_scheduler_pb2.HealthCheckResponse(
+                    healthy=True, message="Health check passed"
+                )
+            if verdict is None:
+                # Neither a push nor the probe's verdict within the deadline.
+                logger.warning(f"Health check timeout after {HEALTH_CHECK_TIMEOUT}s")
+                return sglang_scheduler_pb2.HealthCheckResponse(
+                    healthy=False, message=f"Health check timeout after {HEALTH_CHECK_TIMEOUT}s"
+                )
+            # The probe failed (logged where it did): the answer is now, not
+            # at the deadline.
             return sglang_scheduler_pb2.HealthCheckResponse(
-                healthy=False, message=f"Health check timeout after {HEALTH_CHECK_TIMEOUT}s"
+                healthy=False, message="Health check probe failed"
             )
         finally:
             # The RPC may be cancelled before a scheduler response or the timeout.
@@ -553,6 +602,9 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 self.server_args, sglang_constrained_decoding_start(self.server_args)
             )
         )
+        # The grammar backend the scheduler runs, resolved (the raw argument
+        # is None unless set), under the same key the Rust servicer reads.
+        grammar_backend_entry(serializable_args, sglang_grammar_backend(self.server_args))
         # The gateway reads this worker's running window (its PD admission
         # bound, its share of the fleet's capacity) from `max_running_requests`
         # here, which is None unless the operator set the flag: the scheduler
@@ -809,15 +861,15 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             )
         tokenizer_dir = Path(tokenizer_path)
 
-        # Build ZIP archive in memory
+        # Reading and compressing the tokenizer directory is file I/O and CPU
+        # measured in hundreds of milliseconds: the shared bundle builds it in
+        # a worker thread, once, and the scheduler keeps answering everything
+        # else (streams, health checks, aborts) meanwhile.
         try:
-            zip_buffer = build_tokenizer_zip(tokenizer_dir)
+            zip_data, sha256 = await tokenizer_bundle(tokenizer_dir)
         except Exception as e:
             logger.error(f"Failed to build tokenizer ZIP: {e}\n{get_exception_traceback()}")
             await context.abort(grpc.StatusCode.INTERNAL, str(e))
-
-        zip_data = zip_buffer.getbuffer()
-        sha256 = hashlib.sha256(zip_data).hexdigest()
 
         logger.info(
             "Streaming tokenizer bundle: %d bytes, sha256=%s",
@@ -825,17 +877,8 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             sha256,
         )
 
-        # Stream chunks; SHA-256 only on the final chunk
-        offset = 0
-        total = len(zip_data)
-        while offset < total:
-            end = min(offset + CHUNK_SIZE, total)
-            is_last = end == total
-            yield common_pb2.GetTokenizerChunk(
-                data=bytes(zip_data[offset:end]),
-                sha256=sha256 if is_last else "",
-            )
-            offset = end
+        for chunk in tokenizer_chunks(zip_data, sha256):
+            yield chunk
 
     async def SubscribeKvEvents(
         self,

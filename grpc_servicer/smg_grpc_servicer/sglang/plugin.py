@@ -1,5 +1,5 @@
-"""smg's SGLang plugin: ``--servicer-impl`` on SGLang's server parser,
-defined by this package.
+"""smg's SGLang plugin: ``--servicer-impl`` and the ``--metrics-*`` flags on
+SGLang's server parser, defined by this package.
 
 SGLang's launchers (``sglang serve``, ``python -m sglang.launch_server``)
 load the ``sglang.srt.plugins`` entry points before they parse the command
@@ -22,10 +22,11 @@ import os
 from typing import Any
 
 # Loaded in every SGLang process: nothing heavier than the package init here.
-from smg_grpc_servicer.sglang import SERVICER_IMPL_ENV
+from smg_grpc_servicer import metrics_flag, servicer_impl_flag
+from smg_grpc_servicer.sglang import METRICS_HOST_ENV, METRICS_PORT_ENV, SERVICER_IMPL_ENV
 
-SERVICER_IMPL_FLAG = "--servicer-impl"
-SERVICER_IMPL_CHOICES = ("python", "rust")
+SERVICER_IMPL_FLAG = servicer_impl_flag.SERVICER_IMPL_FLAG
+SERVICER_IMPL_CHOICES = servicer_impl_flag.IMPLS
 # SGLang's parser builder; the flag joins each parser after it ran.
 ADD_CLI_ARGS = "sglang.srt.server_args.ServerArgs.add_cli_args"
 
@@ -35,6 +36,12 @@ class _State:
 
     def __init__(self) -> None:
         self.parsed: str | None = None
+
+    def forget_parse(self) -> None:
+        """A new parser is a new parse: the choice an earlier parser in this
+        process remembered is dropped, so a parse without the flag falls
+        through to the environment."""
+        self.parsed = None
 
 
 _state = _State()
@@ -71,32 +78,39 @@ def add_servicer_impl_argument(parser: argparse.ArgumentParser) -> bool:
     ``prepare_server_args``): the choice an earlier parser in this process
     remembered is dropped, so a parse without the flag falls through to the
     environment."""
-    actions = parser._option_string_actions  # noqa: SLF001 — argparse's registry of option strings
-    if SERVICER_IMPL_FLAG in actions:
-        return False
-    _state.parsed = None
-    parser.add_argument(
-        SERVICER_IMPL_FLAG,
-        dest="servicer_impl",
+    return servicer_impl_flag.add_servicer_impl_argument(
+        parser,
         action=_ServicerImplAction,
-        choices=list(SERVICER_IMPL_CHOICES),
-        default=None,
+        on_add=_state.forget_parse,
         help=(
             "Which implementation serves the gRPC contract under --grpc-mode: the Python "
             "servicer (default) or the Rust one (smg.servicer.SglangGrpcServer, with the "
             f"scheduler headless). Unset falls back to ${SERVICER_IMPL_ENV}."
         ),
     )
-    return True
+
+
+def add_metrics_arguments(parser: argparse.ArgumentParser) -> bool:
+    """Add ``--metrics-port`` and ``--metrics-host`` (the Rust servicer's
+    Prometheus endpoint) to a parser that lacks them; returns whether they
+    were added. Their values travel as the variables the actions export:
+    SGLang's ``ServerArgs`` keeps only its own fields."""
+    return metrics_flag.add_metrics_arguments(
+        parser,
+        port_env=METRICS_PORT_ENV,
+        host_env=METRICS_HOST_ENV,
+        server_class="smg.servicer.SglangGrpcServer",
+    )
 
 
 def after_add_cli_args(result: Any, *args: Any, **kwargs: Any) -> None:
-    """AFTER ``ServerArgs.add_cli_args``: the flag joins the parser SGLang
-    just filled, so it is there for ``--help`` and for the parse. Leaves the
-    hooked method's result alone."""
+    """AFTER ``ServerArgs.add_cli_args``: the flags join the parser SGLang
+    just filled, so they are there for ``--help`` and for the parse. Leaves
+    the hooked method's result alone."""
     for candidate in (*args, *kwargs.values()):
         if isinstance(candidate, argparse.ArgumentParser):
             add_servicer_impl_argument(candidate)
+            add_metrics_arguments(candidate)
             break
     return None
 

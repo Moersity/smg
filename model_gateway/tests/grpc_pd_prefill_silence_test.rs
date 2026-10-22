@@ -1,9 +1,9 @@
-//! A disaggregated prefill leg that produces nothing is given up on within
+//! A disaggregated prefill side that produces nothing is given up on within
 //! its silence bound, on both dispatch shapes, instead of holding the request
 //! (and the decode room admission claimed for it) until the request's own
 //! timeout: the attempt answers 504 `prefill_worker_silent`, the prefill
 //! worker is charged one `timeout` on the worker-error family, the decode
-//! leg is never asked to serve what the prefill never produced, and with
+//! side is never asked to serve what the prefill never produced, and with
 //! another prefill worker available the request is retried there, never on
 //! the silent one again.
 //!
@@ -20,19 +20,39 @@
 //! gateway without the bound fails the case instead of hanging it.
 //!
 //! A prefill that answers late is another matter: on the parallel shape a
-//! leg's first response also waits for the decode side to admit it, so a
-//! worker that keeps answering legs one by one is backed up, not frozen.
-//! Two cases queue the legs at the mock engine's gate (one every 1.2 s,
+//! prefill side's first response also waits for the decode side to admit it, so a
+//! worker that keeps answering calls one by one is backed up, not frozen.
+//! Two cases queue the calls at the mock engine's gate (one every 1.2 s,
 //! five at once: the last answers well past the bound) and expect every
 //! request answered and nothing charged to the prefill worker. One more
-//! lets the call of a leg given up on fail late, and expects the worker
-//! charged once, at the verdict.
+//! lets a call given up on fail late, and expects the worker
+//! charged once, at the verdict. One more sends a burst of long prompts to
+//! a prefill worker that has answered nothing yet and whose first answer
+//! comes past the first side's bound (a cold engine, or a decode side that
+//! admits the burst late), then one every turn: the worker's silence counts
+//! from the burst, which has the time its backlog takes, so every request
+//! is answered.
 //!
-//! The decode leg of the sequential shape has a bound of its own, counted
-//! from its dispatch once the prefill leg has answered: a handoff that
+//! A prefill engine may also answer an engine step after its handoff (a
+//! TokenSpeed prefill worker answers once it has polled the transfer's
+//! success, after its next forward), and the decode side's first output is
+//! the handoff. Two cases send a burst, after a warm-up, to a prefill worker
+//! that answers its first burst call past the bound and then one every turn,
+//! while each decode side shows its handoff before the bound: in the
+//! dispatch phase (the calls return with their first message, as the Python
+//! servicers send them) and in the first-response phase (the streams return
+//! at once, as the Rust servicers send them). Every request is answered in
+//! full (the decode side's first chunk, read ahead as the handoff, reaches
+//! its client once) and nothing is charged. Two more freeze the prefill after
+//! its handoff, or let its engine step after the handoff outlast the bound,
+//! and expect the side given up on a bound after the handoff: a handoff
+//! stands in for an answer for one bound, as an answer does.
+//!
+//! The decode side of the sequential shape has a bound of its own, counted
+//! from its dispatch once the prefill side has answered: a handoff that
 //! waits on a prefill engine that stalled right after answering, or a
-//! decode engine that never schedules the leg, holds the request past the
-//! prefill leg's bound otherwise. Two cases hold the decode call's headers
+//! decode engine that never schedules the side, holds the request past the
+//! prefill side's bound otherwise. Two cases hold the decode call's headers
 //! or return an empty stream after a prefill that answered at once, and
 //! expect 504 `decode_worker_silent` within the bound, one `timeout` on the
 //! decode worker and nothing on the prefill.
@@ -49,30 +69,28 @@ use std::{
     time::{Duration, Instant},
 };
 
+use common::grpc_harness::{
+    build_grpc_router, grpc_router_config, grpc_worker, serve_canned_worker, serve_engine, Canned,
+};
 use futures::future::join_all;
-use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
 use metrics_exporter_prometheus::PrometheusBuilder;
-use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
+use openai_protocol::model_card::ModelCard;
 use proto::generate_response::Response as GenResp;
 use smg::{
-    config::{RouterConfig, RoutingMode},
     middleware::TenantRequestMeta,
-    routers::{RouterFactory, RouterTrait},
+    routers::RouterTrait,
     tenant::TenantKey,
     worker::{
         circuit_breaker::{CircuitBreakerConfig, CircuitState},
-        BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType,
+        RuntimeType, Worker, WorkerType,
     },
 };
 use smg_grpc_client::{
     common_proto as grpc_common, tokenspeed_scheduler::tokenspeed_proto as ts, vllm_proto as proto,
 };
-use tokio::{
-    net::TcpListener,
-    sync::{mpsc, oneshot},
-};
-use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
-use tonic::{transport::Server, Request, Response, Status};
+use tokio::sync::{mpsc, oneshot};
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::{Request, Response, Status};
 use ts::token_speed_scheduler_server::{TokenSpeedScheduler, TokenSpeedSchedulerServer};
 
 const MODEL: &str = "pd-prefill-silence-test-model";
@@ -83,18 +101,32 @@ const OUTPUT_TOKENS: u32 = 3;
 const BOUND: Duration = Duration::from_secs(3);
 /// Scheduling slack for a loaded machine, on top of the bound.
 const SLACK: Duration = Duration::from_secs(3);
-/// Longer than any case: a gateway that does not bound the leg's silence
+/// Longer than any case: a gateway that does not bound the side's silence
 /// fails the case here instead of hanging it for the request timeout.
 const CASE_CAP: Duration = Duration::from_secs(30);
 /// The delay of a mock that must never answer within a case.
 const FOREVER: Duration = Duration::from_secs(3_600);
-/// How often a queued engine's gate lets a leg through: five legs at once
+/// How often a queued engine's gate lets a call through: five calls at once
 /// put the last one well past the bound, with an answer every turn.
 const TURN: Duration = Duration::from_millis(1_200);
-/// How many legs queue at once in the queued cases.
-const QUEUED_LEGS: usize = 5;
+/// How many prefill calls queue at once in the queued cases.
+const QUEUED_CALLS: usize = 5;
 /// How long after the bound a held call fails, in the late-failure case.
 const LATE: Duration = Duration::from_secs(2);
+/// How long after its first call a cold engine answers it, in the
+/// cold-burst case: past the first side's bound, inside the time the
+/// burst's backlog takes at the cold prior.
+const COLD_START: Duration = Duration::from_secs(5);
+/// The prompt of each cold-burst request, in tokens (the mock tokenizer's
+/// `Hello` is one): the five of them are ten seconds of prefill at the
+/// cold prior of 10k tokens/s.
+const LONG_PROMPT_TOKENS: usize = 20_000;
+/// How long after its dispatch a decode side shows the prefill's handoff,
+/// in the handoff cases: inside the bound.
+const HANDOFF: Duration = Duration::from_millis(2_500);
+/// How long after a burst the prefill answers its first call, in the
+/// handoff cases: past the bound, an engine step after the handoff.
+const LATE_ANSWER: Duration = Duration::from_secs(4);
 
 type GenerateTx = mpsc::Sender<Result<proto::GenerateResponse, Status>>;
 
@@ -107,27 +139,30 @@ enum Behaviour {
     EmptyStream,
     /// Tokens and a completion after the delay, the stream returned at once.
     Answer(Duration),
-    /// The call returns its stream when the leg's turn comes at the engine's
-    /// gate (one leg every `TURN`), the tokens at once after that.
+    /// The call returns its stream when its turn comes at the engine's
+    /// gate (one call every `TURN`), the tokens at once after that.
     Queued,
     /// The call holds its headers for the delay, then fails.
     HoldHeadersThenFail(Duration),
 }
 
-/// A gate that lets one leg through every turn: legs queue in arrival order,
+/// A gate that lets one call through every turn: calls queue in arrival order,
 /// as they do in front of a decode side that pre-allocates for one at a time.
 #[derive(Clone, Default)]
 struct Gate {
     next: Arc<tokio::sync::Mutex<Option<tokio::time::Instant>>>,
+    /// How long after the first call its turn comes: zero for an engine that
+    /// answers its first call at once.
+    first_turn_after: Duration,
 }
 
 impl Gate {
-    /// Wait for this leg's turn.
+    /// Wait for this call's turn.
     async fn turn(&self) {
         let at = {
             let mut next = self.next.lock().await;
             let now = tokio::time::Instant::now();
-            let at = next.map_or(now, |next| next.max(now));
+            let at = next.map_or(now + self.first_turn_after, |next| next.max(now));
             *next = Some(at + TURN);
             at
         };
@@ -334,7 +369,7 @@ fn ts_complete(request_id: &str) -> ts::GenerateResponse {
     }
 }
 
-/// Feed one parallel-dispatch generate stream once the leg's turn at `gate`
+/// Feed one parallel-dispatch generate stream once the call's turn at `gate`
 /// comes: the tokens, then the completion.
 #[expect(
     clippy::disallowed_methods,
@@ -356,7 +391,7 @@ fn produce_at_turn(
     });
 }
 
-/// Hold a parallel-dispatch generate stream open with nothing on it: a leg
+/// Hold a parallel-dispatch generate stream open with nothing on it: a call
 /// whose first response never comes.
 #[expect(
     clippy::disallowed_methods,
@@ -390,25 +425,30 @@ fn produce_then_stall(tx: mpsc::Sender<Result<ts::GenerateResponse, Status>>, re
 /// What a parallel-dispatch mock engine does with its generate calls.
 #[derive(Clone, Copy)]
 enum ParallelShape {
-    /// Every leg's first chunk waits for its turn at the engine's gate.
+    /// Every call's first chunk waits for its turn at the engine's gate.
     Queued,
     /// The first call is answered at once; every later call's stream stays
-    /// empty for good (a prefill whose legs wait on a stalled decode side).
+    /// empty for good (a prefill worker whose calls wait on a stalled decode side).
     AnswerFirstThenHold,
     /// The first call is answered at once; every later call never returns
     /// its stream (a servicer that sends its headers with the first message,
-    /// in front of a prefill whose legs wait on a stalled decode side).
+    /// in front of a prefill worker whose calls wait on a stalled decode side).
     AnswerFirstThenHoldHeaders,
     /// Every call streams its tokens at once and then stalls without a
     /// completion (a decode engine that stopped mid-stream).
     StreamThenStall,
+    /// The first call is answered at once; every later call's first chunk
+    /// comes at its turn at the engine's gate (`queued`) or at the gate's
+    /// first turn after the call, with its headers when `headers_held` (a
+    /// servicer that sends them with the first message).
+    AnswerFirstThenLate { queued: bool, headers_held: bool },
 }
 
 /// A parallel-dispatch mock engine (the TokenSpeed proto, as the mock-worker
 /// crate's worker speaks it): the generate call returns its stream at once,
 /// and what follows on it is the engine's [`ParallelShape`]: queued, the
-/// leg's first chunk waits for its turn at the engine's gate (one leg every
-/// `TURN`: the decode side admitting the pair's legs one by one), then the
+/// call's first chunk waits for its turn at the engine's gate (one call every
+/// `TURN`: the decode side admitting the calls one by one), then the
 /// tokens and the completion follow. Counts its generate calls.
 #[derive(Clone)]
 struct QueuedEngine {
@@ -450,6 +490,28 @@ impl TokenSpeedScheduler for QueuedEngine {
                 drop(tx);
             }
             ParallelShape::StreamThenStall => produce_then_stall(tx, request_id),
+            ParallelShape::AnswerFirstThenLate { .. } if call == 1 => {
+                produce_at_turn(tx, Gate::default(), request_id);
+            }
+            ParallelShape::AnswerFirstThenLate {
+                queued,
+                headers_held,
+            } => {
+                let gate = if queued {
+                    self.gate.clone()
+                } else {
+                    Gate {
+                        first_turn_after: self.gate.first_turn_after,
+                        ..Gate::default()
+                    }
+                };
+                if headers_held {
+                    gate.turn().await;
+                    produce_at_turn(tx, Gate::default(), request_id);
+                } else {
+                    produce_at_turn(tx, gate, request_id);
+                }
+            }
         }
         Ok(Response::new(ReceiverStream::new(rx)))
     }
@@ -533,91 +595,69 @@ impl TokenSpeedScheduler for QueuedEngine {
 
 /// Serve a queued parallel-dispatch mock engine in-process; returns its port
 /// and the engine (for its call count).
-#[expect(
-    clippy::expect_used,
-    clippy::disallowed_methods,
-    reason = "test helper - panicking on failure is intentional; the spawned \
-              mock server task is fire-and-forget for the test process's lifetime"
-)]
 async fn start_queued_grpc_worker(shape: ParallelShape) -> (u16, QueuedEngine) {
     let engine = QueuedEngine {
         gate: Gate::default(),
         shape,
         calls: Arc::new(AtomicUsize::new(0)),
     };
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind queued mock engine");
-    let port = listener
-        .local_addr()
-        .expect("queued mock engine address")
-        .port();
-    tokio::spawn(
-        Server::builder()
-            .add_service(TokenSpeedSchedulerServer::new(engine.clone()))
-            .serve_with_incoming(TcpListenerStream::new(listener)),
-    );
+    let port = serve_engine(TokenSpeedSchedulerServer::new(engine.clone())).await;
+    (port, engine)
+}
+
+/// [`start_queued_grpc_worker`] for an engine that answers its first call
+/// `cold` after it arrives, and one call every turn after that.
+async fn start_cold_queued_grpc_worker(cold: Duration) -> (u16, QueuedEngine) {
+    let engine = QueuedEngine {
+        gate: Gate {
+            first_turn_after: cold,
+            ..Gate::default()
+        },
+        shape: ParallelShape::Queued,
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let port = serve_engine(TokenSpeedSchedulerServer::new(engine.clone())).await;
+    (port, engine)
+}
+
+/// [`start_queued_grpc_worker`] for [`ParallelShape::AnswerFirstThenLate`],
+/// whose gate's first turn comes `first_turn_after` the call that waits on
+/// it first.
+async fn start_late_grpc_worker(
+    queued: bool,
+    headers_held: bool,
+    first_turn_after: Duration,
+) -> (u16, QueuedEngine) {
+    let engine = QueuedEngine {
+        gate: Gate {
+            first_turn_after,
+            ..Gate::default()
+        },
+        shape: ParallelShape::AnswerFirstThenLate {
+            queued,
+            headers_held,
+        },
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let port = serve_engine(TokenSpeedSchedulerServer::new(engine.clone())).await;
     (port, engine)
 }
 
 /// Serve a sequential-dispatch mock engine in-process; returns its port.
-#[expect(
-    clippy::expect_used,
-    clippy::disallowed_methods,
-    reason = "test helper - panicking on failure is intentional; the spawned \
-              mock server task is fire-and-forget for the test process's lifetime"
-)]
 async fn start_mock_engine(engine: Engine) -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind mock engine");
-    let port = listener.local_addr().expect("mock engine address").port();
-    tokio::spawn(
-        Server::builder()
-            .add_service(proto::vllm_engine_server::VllmEngineServer::new(engine))
-            .serve_with_incoming(TcpListenerStream::new(listener)),
-    );
-    port
+    serve_engine(proto::vllm_engine_server::VllmEngineServer::new(engine)).await
 }
 
 /// Serve the mock-worker crate's canned worker in-process (a parallel-dispatch
 /// runtime once registered as one): one up-front `delay` before its stream is
 /// returned, then `OUTPUT_TOKENS` tokens; returns its port.
-#[expect(
-    clippy::expect_used,
-    clippy::disallowed_methods,
-    reason = "test helper - panicking on failure is intentional; the spawned \
-              mock server task is fire-and-forget for the test process's lifetime"
-)]
 async fn start_mock_grpc_worker(delay: Duration) -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind mock gRPC worker");
-    let port = listener
-        .local_addr()
-        .expect("mock gRPC worker address")
-        .port();
-    let cfg = Arc::new(mock_worker::config::Config {
-        admin_port: None,
-        context_length: 32768,
-        host: "127.0.0.1".to_string(),
-        http_base_port: 0,
-        http_count: 0,
-        grpc_base_port: port,
-        grpc_count: 1,
-        zmq_handshake: None,
-        zmq_count: 0,
-        zmq_start_index: 0,
-        model_id: MODEL.to_string(),
-        tokenizer_path: MODEL.to_string(),
+    serve_canned_worker(Canned {
+        model: MODEL,
         gen_delay: delay,
         output_tokens: OUTPUT_TOKENS,
-        realistic: false,
-        engine: mock_worker::engine::EngineParams::default(),
-        ..mock_worker::config::Config::default()
-    });
-    tokio::spawn(mock_worker::grpc::serve_with_listener(cfg, listener));
-    port
+    })
+    .await
 }
 
 /// A parallel-dispatch mock engine (the TokenSpeed proto) that accepts every
@@ -728,101 +768,44 @@ impl TokenSpeedScheduler for CutEngine {
 }
 
 /// Serve a [`CutEngine`] in-process; returns its port.
-#[expect(
-    clippy::expect_used,
-    clippy::disallowed_methods,
-    reason = "test helper - panicking on failure is intentional; the spawned \
-              mock server task is fire-and-forget for the test process's lifetime"
-)]
 async fn start_cut_grpc_worker() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind cut mock engine");
-    let port = listener
-        .local_addr()
-        .expect("cut mock engine address")
-        .port();
-    tokio::spawn(
-        Server::builder()
-            .add_service(TokenSpeedSchedulerServer::new(CutEngine))
-            .serve_with_incoming(TcpListenerStream::new(listener)),
-    );
-    port
+    serve_engine(TokenSpeedSchedulerServer::new(CutEngine)).await
 }
 
-/// A PD gRPC router over the given legs, registered as `runtime` (which picks
-/// the dispatch shape), with round-robin leg policies so the first request
-/// goes to the first registered worker of each leg.
-async fn build_pd_router(legs: &[(u16, WorkerType)], runtime: RuntimeType) -> Box<dyn RouterTrait> {
-    build_pd_router_with(legs, runtime, CircuitBreakerConfig::default())
+/// A PD gRPC router over the given workers, registered as `runtime` (which picks
+/// the dispatch shape), with round-robin role policies so the first request
+/// goes to the first registered worker of each role.
+async fn build_pd_router(
+    workers: &[(u16, WorkerType)],
+    runtime: RuntimeType,
+) -> Box<dyn RouterTrait> {
+    build_pd_router_with(workers, runtime, CircuitBreakerConfig::default())
         .await
         .0
 }
 
 /// [`build_pd_router`] with every worker's circuit breaker configured as
 /// `breaker`; the registered workers come back with the router.
-#[expect(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    reason = "test helper - panicking on failure is intentional"
-)]
 async fn build_pd_router_with(
-    legs: &[(u16, WorkerType)],
+    endpoints: &[(u16, WorkerType)],
     runtime: RuntimeType,
     breaker: CircuitBreakerConfig,
 ) -> (Box<dyn RouterTrait>, Vec<Arc<dyn Worker>>) {
-    let mut config = RouterConfig::builder()
-        .mode(RoutingMode::PrefillDecode {
-            prefill_urls: vec![],
-            decode_urls: vec![],
-            prefill_policy: None,
-            decode_policy: None,
-        })
-        .grpc_connection()
+    let config = grpc_router_config()
+        .prefill_decode_mode(vec![], vec![])
         .round_robin_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(1024 * 1024)
         .build_unchecked();
-    config.health_check.disable_health_check = true;
-
-    let tokenizer_registry = Arc::new(TokenizerRegistry::new());
-    let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
-    tokenizer_registry
-        .load(
-            "tokenizer-id",
-            MODEL,
-            "test",
-            || async move { Ok(tokenizer) },
-        )
-        .await
-        .unwrap();
-    let app_context =
-        common::create_test_context_with_tokenizer_registry(config, tokenizer_registry).await;
-    let mut workers = Vec::with_capacity(legs.len());
-    for (port, worker_type) in legs {
-        let worker: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
-                .worker_type(*worker_type)
-                .connection_mode(ConnectionMode::Grpc)
-                .runtime_type(runtime)
-                .model(ModelCard::new(MODEL))
-                .circuit_breaker_config(breaker.clone())
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
-                .build(),
-        );
-        app_context
-            .worker_registry
-            .register(Arc::clone(&worker))
-            .unwrap();
-        workers.push(worker);
-    }
-    let router = RouterFactory::create_router(&app_context)
-        .await
-        .expect("PD gRPC router should build");
+    let workers: Vec<Arc<dyn Worker>> = endpoints
+        .iter()
+        .map(|&(port, worker_type)| {
+            Arc::new(
+                grpc_worker(port, worker_type, runtime, ModelCard::new(MODEL))
+                    .circuit_breaker_config(breaker.clone())
+                    .build(),
+            ) as Arc<dyn Worker>
+        })
+        .collect();
+    let router = build_grpc_router(config, MODEL, workers.clone()).await;
     (router, workers)
 }
 
@@ -871,6 +854,40 @@ async fn one_chat(
     (status, body, started.elapsed())
 }
 
+/// One streaming chat through `router` whose prompt is
+/// [`LONG_PROMPT_TOKENS`] long: its status, body and duration.
+#[expect(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+async fn one_long_streaming_chat(router: &dyn RouterTrait) -> (http::StatusCode, String, Duration) {
+    let request = serde_json::from_value(serde_json::json!({
+        "model": MODEL,
+        "messages": [{"role": "user", "content": "Hello ".repeat(LONG_PROMPT_TOKENS)}],
+        "max_tokens": 8,
+        "stream": true,
+    }))
+    .unwrap();
+    let started = Instant::now();
+    let response =
+        tokio::time::timeout(CASE_CAP, router.route_chat(None, &tenant(), request, MODEL))
+            .await
+            .expect(
+                "the request must be answered within the case cap, not held to the request timeout",
+            );
+    let status = response.status();
+    let bytes = tokio::time::timeout(
+        CASE_CAP,
+        axum::body::to_bytes(response.into_body(), 1 << 20),
+    )
+    .await
+    .expect("the response body must end within the case cap")
+    .expect("response body");
+    let body = String::from_utf8(bytes.to_vec()).expect("utf-8 body");
+    (status, body, started.elapsed())
+}
+
 /// `n` streaming chats through `router` at once.
 async fn concurrent_streaming_chats(
     router: &dyn RouterTrait,
@@ -879,8 +896,28 @@ async fn concurrent_streaming_chats(
     join_all((0..n).map(|_| one_streaming_chat(router))).await
 }
 
+/// The text a streamed chat's content deltas add up to; an event that does
+/// not parse, or reports an error, fails the case.
+#[expect(
+    clippy::unwrap_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+fn streamed_text(body: &str) -> String {
+    let events = body.lines().filter_map(|line| line.strip_prefix("data: "));
+    events
+        .filter(|data| *data != "[DONE]")
+        .map(|data| serde_json::from_str::<serde_json::Value>(data).unwrap())
+        .inspect(|event| assert!(event.get("error").is_none(), "{event}"))
+        .filter_map(|event| {
+            event["choices"][0]["delta"]["content"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
 /// Every chat answered in full, and the slowest of them later than the
-/// bound (a case whose legs never waited past the bound proves nothing),
+/// bound (a case whose calls never waited past the bound proves nothing),
 /// though within the turns its queue needed.
 fn assert_all_answered_past_the_bound(answers: &[(http::StatusCode, String, Duration)]) {
     for (status, body, elapsed) in answers {
@@ -894,10 +931,10 @@ fn assert_all_answered_past_the_bound(answers: &[(http::StatusCode, String, Dura
         .unwrap_or_default();
     assert!(
         slowest >= BOUND,
-        "the last leg's turn comes past the bound: {slowest:?}"
+        "the last call's turn comes past the bound: {slowest:?}"
     );
     assert!(
-        slowest < TURN * u32::try_from(QUEUED_LEGS).unwrap_or(u32::MAX) + SLACK,
+        slowest < TURN * u32::try_from(QUEUED_CALLS).unwrap_or(u32::MAX) + SLACK,
         "answered once its turn came: {slowest:?}"
     );
 }
@@ -941,7 +978,7 @@ fn worker_errors(rendered: &str, worker_type: &str, error_type: &str) -> f64 {
         .sum()
 }
 
-/// What a given-up-on request looks like: a 504 under the leg's own code,
+/// What a given-up-on request looks like: a 504 under the side's own code,
 /// answered within the bound plus slack.
 fn assert_given_up_on(status: http::StatusCode, body: &str, elapsed: Duration) {
     assert_eq!(status, http::StatusCode::GATEWAY_TIMEOUT, "{body}");
@@ -952,8 +989,8 @@ fn assert_given_up_on(status: http::StatusCode, body: &str, elapsed: Duration) {
     );
 }
 
-/// What a request given up on at its decode leg looks like: a 504 under the
-/// decode leg's own code, answered within the bound plus slack.
+/// What a request given up on at its decode side looks like: a 504 under the
+/// decode side's own code, answered within the bound plus slack.
 fn assert_decode_given_up_on(status: http::StatusCode, body: &str, elapsed: Duration) {
     assert_eq!(status, http::StatusCode::GATEWAY_TIMEOUT, "{body}");
     assert!(body.contains("decode_worker_silent"), "{body}");
@@ -966,7 +1003,7 @@ fn assert_decode_given_up_on(status: http::StatusCode, body: &str, elapsed: Dura
 /// Sequential dispatch, the prefill answers at once and the decode call
 /// never returns its stream (a servicer that flushes headers with the first
 /// message, in front of a handoff that waits on a prefill engine that
-/// stalled right after answering): given up on at the decode leg's bound,
+/// stalled right after answering): given up on at the decode side's bound,
 /// counted as the decode worker's timeout, nothing charged to the prefill.
 #[test]
 fn a_sequential_decode_that_returns_no_stream_after_the_prefill_answered_is_given_up_on_within_the_bound(
@@ -1044,13 +1081,13 @@ fn a_sequential_decode_whose_stream_stays_empty_after_the_prefill_answered_is_gi
     );
 }
 
-/// Sequential dispatch, a non-streaming request: the decode leg's first item
+/// Sequential dispatch, a non-streaming request: the decode side's first item
 /// is its whole generation (the servicers send nothing of a non-streaming
 /// request before it finishes), no first-token signal, so the bound does not
 /// apply; a decode that answers past the bound still completes, and nothing
 /// is charged to either worker.
 #[test]
-fn a_non_streaming_request_is_not_bound_by_the_decode_legs_first_token() {
+fn a_non_streaming_request_is_not_bound_by_the_decode_sides_first_token() {
     let prefill = Engine::new(Behaviour::Answer(Duration::ZERO));
     let decode = Engine::new(Behaviour::Answer(BOUND + Duration::from_secs(1)));
     let (prefill_calls, decode_calls) = (prefill.clone(), decode.clone());
@@ -1077,7 +1114,7 @@ fn a_non_streaming_request_is_not_bound_by_the_decode_legs_first_token() {
     assert_eq!(
         worker_errors(&rendered, "decode", "timeout"),
         0.0,
-        "no verdict on a non-streaming leg:\n{rendered}"
+        "no verdict on a non-streaming side:\n{rendered}"
     );
     assert_eq!(worker_errors(&rendered, "prefill", "timeout"), 0.0);
 }
@@ -1112,7 +1149,7 @@ fn a_sequential_prefill_that_returns_no_stream_is_given_up_on_within_the_bound()
     assert_eq!(
         decode_calls.calls(),
         0,
-        "the decode leg was never dispatched"
+        "the decode side was never dispatched"
     );
     assert_eq!(
         worker_errors(&rendered, "prefill", "timeout"),
@@ -1155,7 +1192,7 @@ fn a_sequential_prefill_whose_stream_stays_empty_is_given_up_on_within_the_bound
     assert_eq!(
         decode_calls.calls(),
         0,
-        "the decode leg was never dispatched"
+        "the decode side was never dispatched"
     );
     assert_eq!(
         worker_errors(&rendered, "prefill", "timeout"),
@@ -1164,8 +1201,8 @@ fn a_sequential_prefill_whose_stream_stays_empty_is_given_up_on_within_the_bound
     );
 }
 
-/// Parallel dispatch (both legs sent together), the prefill never returns
-/// its stream: given up on at the bound; the decode leg, dispatched with it,
+/// Parallel dispatch (both sides sent together), the prefill never returns
+/// its stream: given up on at the bound; the decode side, dispatched with it,
 /// is dropped with the attempt. Two such requests are two consecutive
 /// failures of the prefill worker's circuit breaker (its dispatch is not
 /// sampled as a success first), so a breaker set to two opens; the decode
@@ -1210,17 +1247,17 @@ fn a_parallel_prefill_that_returns_no_stream_is_given_up_on_within_the_bound() {
     assert_eq!(
         worker_errors(&rendered, "decode", "backend_error"),
         0.0,
-        "the decode leg did nothing wrong:\n{rendered}"
+        "the decode side did nothing wrong:\n{rendered}"
     );
 }
 
-/// Parallel dispatch, a prefill whose legs queue at the engine's gate (the
-/// decode side admitting them one by one): the later legs' first responses
-/// come well past the bound, but the worker answers a leg every turn, so
+/// Parallel dispatch, a prefill worker whose calls queue at the engine's gate (the
+/// decode side admitting them one by one): the later calls' first responses
+/// come well past the bound, but the worker answers a call every turn, so
 /// none is given up on. Every request is answered, nothing is charged to the
 /// prefill worker, and its breaker (set to two) stays closed.
 #[test]
-fn a_parallel_prefill_whose_legs_queue_behind_the_decode_side_is_not_given_up_on() {
+fn a_parallel_prefill_whose_calls_queue_behind_the_decode_side_is_not_given_up_on() {
     let rendered = render_after(|| async {
         let (prefill_port, prefill) = start_queued_grpc_worker(ParallelShape::Queued).await;
         let decode_port = start_mock_grpc_worker(Duration::ZERO).await;
@@ -1236,9 +1273,9 @@ fn a_parallel_prefill_whose_legs_queue_behind_the_decode_side_is_not_given_up_on
             },
         )
         .await;
-        let answers = concurrent_streaming_chats(router.as_ref(), QUEUED_LEGS).await;
+        let answers = concurrent_streaming_chats(router.as_ref(), QUEUED_CALLS).await;
         assert_all_answered_past_the_bound(&answers);
-        assert_eq!(prefill.calls(), QUEUED_LEGS, "each leg dispatched once");
+        assert_eq!(prefill.calls(), QUEUED_CALLS, "each call dispatched once");
         assert_eq!(
             workers[0].circuit_breaker_state(),
             CircuitState::Closed,
@@ -1248,15 +1285,191 @@ fn a_parallel_prefill_whose_legs_queue_behind_the_decode_side_is_not_given_up_on
     assert_eq!(
         worker_errors(&rendered, "prefill", "timeout"),
         0.0,
-        "no leg was given up on:\n{rendered}"
+        "no call was given up on:\n{rendered}"
     );
 }
 
+/// Parallel dispatch, a burst of long prompts on a prefill worker that has
+/// answered nothing yet, whose engine answers its first call past the first
+/// side's bound (a cold engine, or a decode side admitting the burst late)
+/// and then one call every turn. The worker's silence counts from the burst,
+/// and the burst's backlog (ten seconds at the cold prior) is the time it
+/// may take, so no side is given up on: every request is answered, nothing
+/// is charged to the prefill worker, and its breaker stays closed. Judged
+/// by each side's own bound and a worker that "never answered", the sides
+/// would be given up on one after another, each before its call's turn.
+#[test]
+fn a_cold_burst_of_long_prompts_answered_past_the_bound_is_not_given_up_on() {
+    let rendered = render_after(|| async {
+        let (prefill_port, prefill) = start_cold_queued_grpc_worker(COLD_START).await;
+        let decode_port = start_mock_grpc_worker(Duration::ZERO).await;
+        let (router, workers) = build_pd_router_with(
+            &[
+                (prefill_port, WorkerType::Prefill),
+                (decode_port, WorkerType::Decode),
+            ],
+            RuntimeType::TokenSpeed,
+            CircuitBreakerConfig {
+                failure_threshold: 2,
+                ..Default::default()
+            },
+        )
+        .await;
+        let answers =
+            join_all((0..QUEUED_CALLS).map(|_| one_long_streaming_chat(router.as_ref()))).await;
+        for (status, body, elapsed) in &answers {
+            assert_eq!(*status, http::StatusCode::OK, "{body} ({elapsed:?})");
+            assert!(body.contains("data: [DONE]"), "{body}");
+        }
+        let first = answers
+            .iter()
+            .map(|(_, _, elapsed)| *elapsed)
+            .min()
+            .unwrap_or_default();
+        assert!(
+            first >= COLD_START,
+            "the first answer comes past the bound: {first:?}"
+        );
+        assert_eq!(prefill.calls(), QUEUED_CALLS, "each call dispatched once");
+        assert_eq!(
+            workers[0].circuit_breaker_state(),
+            CircuitState::Closed,
+            "a cold, backed-up prefill is not a failing one"
+        );
+    });
+    assert_eq!(
+        worker_errors(&rendered, "prefill", "timeout"),
+        0.0,
+        "no call was given up on:\n{rendered}"
+    );
+}
+
+/// The PD router of the handoff cases over a prefill and a decode worker,
+/// every breaker set to one; the workers come back with it.
+async fn build_handoff_router(
+    prefill: u16,
+    decode: u16,
+) -> (Box<dyn RouterTrait>, Vec<Arc<dyn Worker>>) {
+    let breaker = CircuitBreakerConfig {
+        failure_threshold: 1,
+        ..Default::default()
+    };
+    let endpoints = [(prefill, WorkerType::Prefill), (decode, WorkerType::Decode)];
+    let (router, workers) =
+        build_pd_router_with(&endpoints, RuntimeType::TokenSpeed, breaker).await;
+    let (status, body, _) = one_streaming_chat(router.as_ref()).await;
+    assert_eq!(status, http::StatusCode::OK, "the warm-up answers: {body}");
+    (router, workers)
+}
+
+/// Parallel dispatch, the incident's shape: after a warm-up, a burst of
+/// short prompts on a prefill worker that answers its first burst call at
+/// [`LATE_ANSWER`], past the bound, and one every turn after it, while each
+/// decode side shows the handoff at [`HANDOFF`], inside it. The handoff is
+/// the worker's sign of life: every request is answered, nothing is charged
+/// to the prefill worker and its breaker stays closed. Without it, the
+/// worker answered nothing for the bound and the burst's run nothing for its
+/// small backlog, and every side was given up on at the bound.
+/// `headers_held` picks the phase the sides wait in: their calls return with
+/// the first message, or their streams at once. Each decode side's first
+/// chunk, read ahead as the handoff, reaches its client once, in its place.
+fn handoff_burst_case(headers_held: bool) {
+    let rendered = render_after(|| async {
+        let (prefill_port, prefill) = start_late_grpc_worker(true, headers_held, LATE_ANSWER).await;
+        let (decode_port, _) = start_late_grpc_worker(false, headers_held, HANDOFF).await;
+        let (router, workers) = build_handoff_router(prefill_port, decode_port).await;
+        let answers = concurrent_streaming_chats(router.as_ref(), QUEUED_CALLS).await;
+        for (status, body, elapsed) in &answers {
+            assert_eq!(*status, http::StatusCode::OK, "{body} ({elapsed:?})");
+            assert!(body.contains("data: [DONE]"), "{body}");
+            assert_eq!(streamed_text(body), "Hello world test", "{body}");
+        }
+        let slowest = answers
+            .iter()
+            .map(|(_, _, elapsed)| *elapsed)
+            .max()
+            .unwrap_or_default();
+        let turns = TURN * u32::try_from(QUEUED_CALLS - 1).unwrap_or(u32::MAX);
+        assert!(
+            slowest >= LATE_ANSWER && slowest < LATE_ANSWER + turns + SLACK,
+            "answered at its turn: {slowest:?}"
+        );
+        assert_eq!(
+            prefill.calls(),
+            1 + QUEUED_CALLS,
+            "each call dispatched once"
+        );
+        assert_eq!(workers[0].circuit_breaker_state(), CircuitState::Closed);
+    });
+    assert_eq!(
+        worker_errors(&rendered, "prefill", "timeout"),
+        0.0,
+        "no side was given up on:\n{rendered}"
+    );
+}
+
+#[test]
+fn a_burst_on_a_parallel_prefill_that_answers_an_engine_step_after_its_handoff_is_not_given_up_on()
+{
+    handoff_burst_case(true);
+}
+
+#[test]
+fn a_burst_on_a_parallel_prefill_whose_streams_return_at_once_is_not_given_up_on_either() {
+    handoff_burst_case(false);
+}
+
+/// Parallel dispatch, a prefill worker silent after its handoff: the second
+/// request's decode side shows the handoff at [`HANDOFF`] and its prefill
+/// call returns `answer_after` its dispatch, a bound or more after the
+/// handoff. A handoff stands in for an answer for one bound, as an answer
+/// does: the side is given up on a bound after it, 504
+/// `prefill_worker_silent`, one `timeout` on the prefill worker and nothing
+/// on the decode worker.
+fn silent_after_its_handoff_case(answer_after: Duration) {
+    let rendered = render_after(|| async {
+        let (prefill_port, _) = start_late_grpc_worker(true, true, answer_after).await;
+        let (decode_port, _) = start_late_grpc_worker(false, false, HANDOFF).await;
+        let (router, workers) = build_handoff_router(prefill_port, decode_port).await;
+        let (status, body, elapsed) = one_streaming_chat(router.as_ref()).await;
+        assert_eq!(status, http::StatusCode::GATEWAY_TIMEOUT, "{body}");
+        assert!(body.contains("prefill_worker_silent"), "{body}");
+        assert!(
+            elapsed >= HANDOFF + BOUND && elapsed < HANDOFF + BOUND + SLACK,
+            "given up on a bound after the handoff: {elapsed:?}"
+        );
+        assert_eq!(workers[1].circuit_breaker_state(), CircuitState::Closed);
+    });
+    assert_eq!(
+        worker_errors(&rendered, "prefill", "timeout"),
+        1.0,
+        "{rendered}"
+    );
+    assert_eq!(
+        worker_errors(&rendered, "decode", "backend_error"),
+        0.0,
+        "{rendered}"
+    );
+}
+
+#[test]
+fn a_parallel_prefill_frozen_after_its_handoff_is_given_up_on_a_bound_after_it() {
+    silent_after_its_handoff_case(FOREVER);
+}
+
+/// The limit of the handoff's credit: an engine step after the handoff that
+/// outlasts the bound is given up on as a freeze is (the answer comes only
+/// past the verdict's window), as one before the handoff is.
+#[test]
+fn a_parallel_prefill_whose_step_after_its_handoff_outlasts_the_bound_is_given_up_on_too() {
+    silent_after_its_handoff_case(HANDOFF + BOUND + SLACK);
+}
+
 /// Parallel dispatch, the decode worker stalls mid-stream: the first
-/// request's decode leg streams its tokens and then stops without a
-/// completion (its stream stays open); the second request's prefill leg,
+/// request's decode side streams its tokens and then stops without a
+/// completion (its stream stays open); the second request's prefill side,
 /// dispatched while the decode holds that stream, produces nothing (on this
-/// shape a prefill leg's first response waits for the decode side). At the
+/// shape a prefill side's first response waits for the decode side). At the
 /// prefill's bound the gateway reads the decode partner: a worker holding a
 /// stream it had been producing for and quiet for the bound takes the
 /// verdict. The second request is answered 504 `decode_worker_silent` at
@@ -1306,7 +1519,7 @@ fn a_parallel_prefill_waiting_on_a_decode_that_stalled_mid_stream_is_charged_to_
             elapsed >= BOUND && elapsed < BOUND + SLACK,
             "given up on at the bound ({BOUND:?}), not before and not much after: {elapsed:?}"
         );
-        assert_eq!(prefill.calls(), 2, "both prefill legs were dispatched");
+        assert_eq!(prefill.calls(), 2, "both prefill calls were dispatched");
         assert_eq!(
             workers[0].circuit_breaker_state(),
             CircuitState::Closed,
@@ -1333,7 +1546,7 @@ fn a_parallel_prefill_waiting_on_a_decode_that_stalled_mid_stream_is_charged_to_
 /// The same stall, met in the prefill's dispatch phase: the prefill's second
 /// call never returns its stream (its servicer sends the headers with the
 /// first message), while the decode's call had returned at once, so both
-/// legs' outcomes are judged together once the prefill's bound passes. The
+/// calls' outcomes are judged together once the prefill's bound passes. The
 /// verdict is still the decode's: 504 `decode_worker_silent`, the decode's
 /// breaker (set to one) open, the prefill's closed, the timeout on the
 /// decode.
@@ -1377,7 +1590,7 @@ fn a_parallel_prefill_held_in_its_dispatch_by_a_stalled_decode_is_charged_to_the
             elapsed >= BOUND && elapsed < BOUND + SLACK,
             "given up on at the bound: {elapsed:?}"
         );
-        assert_eq!(prefill.calls(), 2, "both prefill legs were dispatched");
+        assert_eq!(prefill.calls(), 2, "both prefill calls were dispatched");
         assert_eq!(
             workers[1].circuit_breaker_state(),
             CircuitState::Open,
@@ -1402,10 +1615,10 @@ fn a_parallel_prefill_held_in_its_dispatch_by_a_stalled_decode_is_charged_to_the
 }
 
 /// Sequential dispatch, the same queue in front of the prefill call (its
-/// headers held until the leg's turn): no leg is given up on, every request
+/// headers held until the call's turn): no call is given up on, every request
 /// is answered by the decode, nothing is charged to the prefill worker.
 #[test]
-fn a_sequential_prefill_whose_legs_queue_is_not_given_up_on() {
+fn a_sequential_prefill_whose_calls_queue_is_not_given_up_on() {
     let prefill = Engine::new(Behaviour::Queued);
     let decode = Engine::new(Behaviour::Answer(Duration::ZERO));
     let (prefill_calls, decode_calls) = (prefill.clone(), decode.clone());
@@ -1424,7 +1637,7 @@ fn a_sequential_prefill_whose_legs_queue_is_not_given_up_on() {
             },
         )
         .await;
-        // The legs are booked on the prefill worker at their dispatch, while
+        // The requests are booked on the prefill worker at their dispatch, while
         // their calls are still held at the gate: sampled through the run,
         // the backlog shows them waiting (a booking at the call's return
         // would show nothing: the span from the call's return to the first
@@ -1444,14 +1657,14 @@ fn a_sequential_prefill_whose_legs_queue_is_not_given_up_on() {
             }
         };
         let chats = async {
-            let answers = concurrent_streaming_chats(router.as_ref(), QUEUED_LEGS).await;
+            let answers = concurrent_streaming_chats(router.as_ref(), QUEUED_CALLS).await;
             done.store(true, Ordering::Release);
             answers
         };
         let (answers, largest_backlog) = tokio::join!(chats, sampler);
         assert!(
             largest_backlog > Duration::ZERO,
-            "the held legs are pending prefill on their worker from the dispatch"
+            "the held requests are pending prefill on their worker from the dispatch"
         );
         assert_all_answered_past_the_bound(&answers);
         assert_eq!(
@@ -1462,18 +1675,18 @@ fn a_sequential_prefill_whose_legs_queue_is_not_given_up_on() {
     });
     assert_eq!(
         prefill_calls.calls(),
-        QUEUED_LEGS,
-        "each leg dispatched once"
+        QUEUED_CALLS,
+        "each call dispatched once"
     );
     assert_eq!(
         decode_calls.calls(),
-        QUEUED_LEGS,
+        QUEUED_CALLS,
         "every request reached its decode"
     );
     assert_eq!(
         worker_errors(&rendered, "prefill", "timeout"),
         0.0,
-        "no leg was given up on:\n{rendered}"
+        "no call was given up on:\n{rendered}"
     );
 }
 
@@ -1482,7 +1695,7 @@ fn a_sequential_prefill_whose_legs_queue_is_not_given_up_on() {
 /// failure of the call it gave up on is not a second breaker failure (the
 /// breaker, set to two, stays closed) and not a `backend_error`.
 #[test]
-fn the_late_failure_of_a_leg_given_up_on_is_not_charged_again() {
+fn the_late_failure_of_a_call_given_up_on_is_not_charged_again() {
     let prefill = Engine::new(Behaviour::HoldHeadersThenFail(BOUND + LATE));
     let decode = Engine::new(Behaviour::Answer(Duration::ZERO));
     let prefill_calls = prefill.clone();
@@ -1581,14 +1794,14 @@ fn the_request_is_retried_on_another_prefill_worker_and_never_on_the_silent_one_
     );
 }
 
-/// Parallel dispatch, a decode worker that accepts every leg and fails its
+/// Parallel dispatch, a decode worker that accepts every call and fails its
 /// stream before any token: each request is one failure of that worker, so
 /// two failed requests open its breaker (set to two), as they do on any
-/// other worker. The leg's dispatch used to be sampled as a success the
-/// moment its stream was returned, a success the leg had not earned, and the
+/// other worker. The call's dispatch used to be sampled as a success the
+/// moment its stream was returned, a success the call had not earned, and the
 /// failure that followed never built a streak: a decode worker that failed
 /// every request kept its breaker closed. The prefill worker, which answered
-/// every leg, keeps its breaker closed.
+/// every call, keeps its breaker closed.
 #[test]
 fn a_decode_worker_that_fails_every_stream_it_accepted_opens_its_breaker() {
     let rendered = render_after(|| async {
@@ -1610,7 +1823,7 @@ fn a_decode_worker_that_fails_every_stream_it_accepted_opens_its_breaker() {
             let (status, body, _) = one_streaming_chat(router.as_ref()).await;
             assert!(
                 status.is_server_error() || body.contains("error"),
-                "the request fails on its decode leg: {status} {body}"
+                "the request fails on its decode side: {status} {body}"
             );
         }
         assert_eq!(
@@ -1621,7 +1834,7 @@ fn a_decode_worker_that_fails_every_stream_it_accepted_opens_its_breaker() {
         assert_eq!(
             workers[0].circuit_breaker_state(),
             CircuitState::Closed,
-            "the prefill worker answered every leg"
+            "the prefill worker answered every call"
         );
     });
     assert!(
@@ -1630,11 +1843,11 @@ fn a_decode_worker_that_fails_every_stream_it_accepted_opens_its_breaker() {
     );
 }
 
-/// The success a decode leg does earn is still sampled, at its first
+/// The success a decode side does earn is still sampled, at its first
 /// response: a failure before it is forgiven by a request the decode served,
 /// so the next failure leaves a breaker set to two closed.
 #[test]
-fn a_decode_leg_that_answers_earns_its_workers_breaker_success_at_its_first_response() {
+fn a_decode_side_that_answers_earns_its_workers_breaker_success_at_its_first_response() {
     render_after(|| async {
         let prefill_port = start_mock_grpc_worker(Duration::ZERO).await;
         let decode_port = start_mock_grpc_worker(Duration::ZERO).await;

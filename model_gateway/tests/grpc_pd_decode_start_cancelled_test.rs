@@ -1,14 +1,14 @@
-//! A disaggregated decode leg whose start the worker's side cancelled (its
+//! A disaggregated decode call whose start the worker's side cancelled (its
 //! connection closed under the call: a worker dying as the request arrived)
 //! is a failure of that worker, not a rejection of the request: with another
 //! decode worker available the request is retried there and answered in
 //! full, the cancelled worker is charged a backend error, and nothing counts
 //! as a validation error; with no other decode worker the client reads a
-//! 502 under the leg's own code, never a 400 it would take for its own
+//! 502 under the side's own code, never a 400 it would take for its own
 //! mistake and not retry.
 //!
 //! The mock engines speak the vLLM proto (sequential dispatch): the prefill
-//! leg completes, one decode leg cancels every call before its stream.
+//! side completes, one decode worker cancels every call before its stream.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -22,21 +22,19 @@ use std::{
     time::Duration,
 };
 
-use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
+use common::grpc_harness::{build_grpc_router, grpc_router_config, grpc_workers, serve_engine};
 use metrics_exporter_prometheus::PrometheusBuilder;
-use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
 use proto::generate_response::Response as GenResp;
 use smg::{
-    config::{RouterConfig, RoutingMode},
     middleware::TenantRequestMeta,
-    routers::{RouterFactory, RouterTrait},
+    routers::RouterTrait,
     tenant::TenantKey,
-    worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType},
+    worker::{RuntimeType, WorkerType},
 };
 use smg_grpc_client::vllm_proto as proto;
-use tokio::{net::TcpListener, sync::mpsc};
-use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
-use tonic::{transport::Server, Request, Response, Status};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::{Request, Response, Status};
 
 const MODEL: &str = "pd-decode-start-cancelled-test-model";
 /// Tokens an engine that completes produces; ids 1..=3 are in the mock
@@ -214,77 +212,22 @@ impl proto::vllm_engine_server::VllmEngine for Engine {
 }
 
 /// Serve a mock engine in-process; returns its port.
-#[expect(
-    clippy::expect_used,
-    clippy::disallowed_methods,
-    reason = "test helper - panicking on failure is intentional; the spawned \
-              mock server task is fire-and-forget for the test process's lifetime"
-)]
 async fn start_mock_engine(engine: Engine) -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind mock engine");
-    let port = listener.local_addr().expect("mock engine address").port();
-    tokio::spawn(
-        Server::builder()
-            .add_service(proto::vllm_engine_server::VllmEngineServer::new(engine))
-            .serve_with_incoming(TcpListenerStream::new(listener)),
-    );
-    port
+    serve_engine(proto::vllm_engine_server::VllmEngineServer::new(engine)).await
 }
 
-/// A PD gRPC router over the given legs (sequential dispatch).
-#[expect(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    reason = "test helper - panicking on failure is intentional"
-)]
-async fn build_pd_router(legs: &[(u16, WorkerType)]) -> Box<dyn RouterTrait> {
-    let mut config = RouterConfig::builder()
-        .mode(RoutingMode::PrefillDecode {
-            prefill_urls: vec![],
-            decode_urls: vec![],
-            prefill_policy: None,
-            decode_policy: None,
-        })
-        .grpc_connection()
+/// A PD gRPC router over the given workers (sequential dispatch).
+async fn build_pd_router(workers: &[(u16, WorkerType)]) -> Box<dyn RouterTrait> {
+    let config = grpc_router_config()
+        .prefill_decode_mode(vec![], vec![])
         .round_robin_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(1024 * 1024)
         .build_unchecked();
-    config.health_check.disable_health_check = true;
-    let tokenizer_registry = Arc::new(TokenizerRegistry::new());
-    let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
-    tokenizer_registry
-        .load(
-            "tokenizer-id",
-            MODEL,
-            "test",
-            || async move { Ok(tokenizer) },
-        )
-        .await
-        .unwrap();
-    let app_context =
-        common::create_test_context_with_tokenizer_registry(config, tokenizer_registry).await;
-    for (port, worker_type) in legs {
-        let worker: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
-                .worker_type(*worker_type)
-                .connection_mode(ConnectionMode::Grpc)
-                .runtime_type(RuntimeType::Vllm)
-                .model(ModelCard::new(MODEL))
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
-                .build(),
-        );
-        app_context.worker_registry.register(worker).unwrap();
-    }
-    RouterFactory::create_router(&app_context)
-        .await
-        .expect("PD gRPC router should build")
+    build_grpc_router(
+        config,
+        MODEL,
+        grpc_workers(workers, RuntimeType::Vllm, MODEL),
+    )
+    .await
 }
 
 fn tenant() -> TenantRequestMeta {
@@ -383,7 +326,7 @@ fn router_errors(rendered: &str, error_type: &str) -> f64 {
     )
 }
 
-/// The first decode worker cancels the leg's start; the request is retried
+/// The first decode worker cancels the side's start; the request is retried
 /// on the second and answered in full. The cancelled worker is charged one
 /// backend error and never asked again; nothing counts as a validation
 /// error.
@@ -437,7 +380,7 @@ fn a_decode_start_the_worker_cancelled_is_retried_on_another_decode_worker() {
 }
 
 /// With no other decode worker, the cancelled start reaches the client as
-/// an upstream failure under the leg's own code: a 502 it may retry, never a
+/// an upstream failure under the side's own code: a 502 it may retry, never a
 /// 400 it would take for its own mistake.
 #[test]
 fn a_decode_start_the_worker_cancelled_with_no_other_worker_is_a_502_not_a_400() {

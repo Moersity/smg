@@ -12,10 +12,11 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use llm_multimodal::{
-    configure_parallelism, data_url::data_url_payload_bytes, registry::modality_limit_override,
-    vision::PreProcessorConfig, FrameSampling, MediaConnector, MediaConnectorConfig,
-    MediaConnectorError, MediaContentPart, MediaFault, Modality, ModelMetadata, ModelRegistry,
-    MultiModalError, Parallelism, TransparencyPolicy, VisionProcessorRegistry, POOL_THREADS_ENV,
+    configure_parallelism, data_url::data_url_payload_bytes, jpeg_turbo::TurboJpegPolicy,
+    registry::modality_limit_override, vision::PreProcessorConfig, FrameSampling, MediaConnector,
+    MediaConnectorConfig, MediaConnectorError, MediaContentPart, MediaErrorCode, MediaFault,
+    Modality, ModelMetadata, ModelRegistry, MultiModalError, Parallelism, TransparencyPolicy,
+    VisionProcessorRegistry, POOL_THREADS_ENV,
 };
 use llm_tokenizer::TokenizerTrait;
 use openai_protocol::worker::MmProcessingMode;
@@ -26,7 +27,8 @@ use super::{
     assemble::{assemble_vllm_batches_with, VllmAssembly},
     capability::runtime_reads_format,
     config::{MultimodalComponents, MultimodalConfigRegistry, MultimodalModelConfig},
-    mm_settings,
+    encoder_budget::ItemOverEncoderBudget,
+    media_verdict, mm_settings,
     pixel_cache::pixel_cache_with_budget,
     plan::{prepare_placeholder_tokens, validate_rendered_media_anchors, MediaPlan},
     process::process_multimodal_plan,
@@ -100,6 +102,20 @@ pub struct WorkerMediaSettings {
     /// samples as the pipeline expects. Refused at construction for a spec
     /// that samples the way the loader does (see `loader_rule_conflict`).
     pub video_loader_rule: Option<String>,
+    /// The engine's encoder budget: the most feature tokens it can place for
+    /// one media item (vLLM's encoder-cache budget, the "budget of N tokens"
+    /// of its start-up line); `None` when the launcher could not tell. An
+    /// item above it is refused before it reaches the engine, which would
+    /// never schedule it (see `super::encoder_budget`).
+    pub encoder_budget: Option<usize>,
+    /// What the pipeline does when libjpeg-turbo cannot be loaded, as the
+    /// launcher resolved it: `Require` refuses to construct the pipeline, so
+    /// the servicer does not start, rather than serve the fallback decoder's
+    /// pixels. `None` leaves it to `SMG_MM_TURBOJPEG`, read as the router
+    /// reads it, strictly (an unreadable value refuses the pipeline, never
+    /// passes as the default), for a launcher without the setting or one
+    /// that was not given it.
+    pub turbojpeg: Option<TurboJpegPolicy>,
 }
 
 /// Whether the engine's loader rule the launcher reported (`video.fps`, a
@@ -251,8 +267,8 @@ pub struct WorkerMediaItem {
 
 /// What the pipeline produced: the prompt with its anchors expanded, the
 /// request's multimodal batches (the first is `mm_inputs`, the rest
-/// `extra_mm_inputs`), and, when asked, the identity a PD prefill leg returns
-/// so the decode leg is served without pixels.
+/// `extra_mm_inputs`), and, when asked, the identity a PD prefill side returns
+/// so the decode side is served without pixels.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkerMediaOutput {
     pub prompt_token_ids: Vec<u32>,
@@ -270,11 +286,14 @@ pub enum WorkerMediaError {
     /// The media the request names failed, by whose fault (see
     /// [`WorkerMediaFault`]): the request's own (a host that cannot be
     /// resolved or refuses the connection, its 4xx, a payload that is not the
-    /// media it claims to be) or its host's for now (a fetch that ran out of
-    /// its budget, a 5xx, a broken transfer). Neither is this worker's.
+    /// media it claims to be or is over a size cap) or its host's for now (a
+    /// fetch that ran out of its budget, a 5xx, a broken transfer). Neither
+    /// is this worker's; the Router answers a 400 for either under `code`.
     #[error("{message}")]
     Media {
         fault: WorkerMediaFault,
+        /// How the public API names the failure (see [`MediaErrorCode`]).
+        code: MediaErrorCode,
         message: String,
     },
     /// This worker's own: a pipeline failure, a decode task that died, a
@@ -341,6 +360,7 @@ pub struct WorkerMediaPipeline {
     pixel_format: PixelFormat,
     max_item_bytes: Option<usize>,
     item_limits: HashMap<Modality, ItemLimit>,
+    encoder_budget: Option<usize>,
 }
 
 impl WorkerMediaPipeline {
@@ -368,6 +388,14 @@ impl WorkerMediaPipeline {
             }
         }
         super::report_jpeg_decoder();
+        // The launcher's policy, else `SMG_MM_TURBOJPEG` read strictly: the
+        // lazily resolved process settings would read an unreadable value as
+        // the default, the one misreading this policy must not have.
+        let turbojpeg = match settings.turbojpeg {
+            Some(policy) => policy,
+            None => super::settings::turbojpeg_policy_from_env()?,
+        };
+        super::enforce_jpeg_decoder_policy(turbojpeg)?;
         let config_registry = Arc::new(MultimodalConfigRegistry::new());
         let loaded = config_registry
             .get_or_load(CONFIG_KEY, &settings.model_dir)
@@ -454,7 +482,7 @@ impl WorkerMediaPipeline {
             "media fetch policy for worker-side processing"
         );
         let connector = build_with(
-            || crate::http_client::client_builder().timeout(Duration::from_secs(30)),
+            || crate::clients::http_client_builder().timeout(Duration::from_secs(30)),
             false,
             "media HTTP client",
             |client| MediaConnector::new(client, connector_config.clone()),
@@ -493,6 +521,7 @@ impl WorkerMediaPipeline {
             pixel_format: settings.pixel_format,
             max_item_bytes: settings.max_item_bytes,
             item_limits,
+            encoder_budget: settings.encoder_budget,
         })
     }
 
@@ -526,6 +555,11 @@ impl WorkerMediaPipeline {
     /// The engine's video frame budget the pipeline samples under, if known.
     pub fn video_frame_budget(&self) -> Option<usize> {
         self.components.video_frame_budget
+    }
+
+    /// The engine's encoder budget the pipeline holds each item to, if known.
+    pub fn encoder_budget(&self) -> Option<usize> {
+        self.encoder_budget
     }
 
     /// Process one request's references against its prompt, which carries
@@ -579,6 +613,7 @@ impl WorkerMediaPipeline {
             &self.model_dir,
             self.assembly.image_wire_dtype(),
             TransparencyPolicy::CompositeOverWhite,
+            self.encoder_budget,
         )
         .await
         .map_err(classify)?;
@@ -700,25 +735,34 @@ fn apply_processor_kwargs(
 
 /// Whose fault a pipeline failure is, from the typed error in its chain: a
 /// fetch or decode failure is the media's, by the connector's own reading of
-/// it (the request's, or its host's for now); a bad part or a prompt the
-/// anchors do not fit the caller's; anything else ours.
+/// it (the request's, or its host's for now) and under the connector's code
+/// (the verdict the router-side pipeline answers directly, see
+/// `multimodal::processing_failed_response`); a bad part or a prompt the
+/// anchors do not fit or an item above the engine's encoder budget the
+/// caller's; anything else ours.
 fn classify(error: anyhow::Error) -> WorkerMediaError {
     let message = format!("{error:#}");
-    for cause in error.chain() {
-        if let Some(fetch) = cause.downcast_ref::<MediaConnectorError>() {
-            return classify_fetch(fetch, message);
+    if error
+        .chain()
+        .any(|cause| cause.downcast_ref::<ItemOverEncoderBudget>().is_some())
+    {
+        return WorkerMediaError::Invalid(message);
+    }
+    if let Some(fetch) = media_verdict(&error) {
+        return classify_fetch(fetch, message);
+    }
+    match error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<MultiModalError>())
+    {
+        Some(MultiModalError::UnsupportedContent(_) | MultiModalError::Validation(_)) => {
+            WorkerMediaError::Invalid(message)
         }
-        if let Some(media) = cause.downcast_ref::<MultiModalError>() {
-            return match media {
-                MultiModalError::Media(fetch) => classify_fetch(fetch, message),
-                MultiModalError::Join(_) => WorkerMediaError::Internal(message),
-                MultiModalError::UnsupportedContent(_) | MultiModalError::Validation(_) => {
-                    WorkerMediaError::Invalid(message)
-                }
-            };
+        // A tracker task that died, or nothing typed at all.
+        Some(MultiModalError::Join(_) | MultiModalError::Media(_)) | None => {
+            WorkerMediaError::Internal(message)
         }
     }
-    WorkerMediaError::Internal(message)
 }
 
 fn classify_fetch(error: &MediaConnectorError, message: String) -> WorkerMediaError {
@@ -727,7 +771,11 @@ fn classify_fetch(error: &MediaConnectorError, message: String) -> WorkerMediaEr
         MediaFault::Transient => WorkerMediaFault::Transient,
         MediaFault::Internal => return WorkerMediaError::Internal(message),
     };
-    WorkerMediaError::Media { fault, message }
+    WorkerMediaError::Media {
+        fault,
+        code: error.code(),
+        message,
+    }
 }
 
 #[cfg(test)]
@@ -845,6 +893,8 @@ mod tests {
             video_fetch_timeout: Duration::from_secs(1),
             video_frame_budget: None,
             video_loader_rule: None,
+            encoder_budget: Some(192_000),
+            turbojpeg: None,
         };
         let pipeline = WorkerMediaPipeline::new(settings, Arc::new(MockTokenizer::new()))
             .await
@@ -853,6 +903,8 @@ mod tests {
             pipeline.item_limits_summary(),
             "image=1 (the engine's --limit-mm-per-prompt)"
         );
+        // The engine's encoder budget reaches the pipeline as given.
+        assert_eq!(pipeline.encoder_budget(), Some(192_000));
 
         let error = pipeline
             .process(vec![1, 2, 3], &image_items(9), false)
@@ -875,6 +927,85 @@ mod tests {
         assert!(!error.to_string().contains("limit of"), "{error}");
         std::fs::remove_file(config).unwrap();
         std::fs::remove_dir(dir).unwrap();
+    }
+
+    /// End to end on a pipeline, against the engine's encoder budget: an
+    /// image the llava processor turns into 576 feature tokens is refused
+    /// against a budget of 575, one token under it, with both numbers in the
+    /// message, and admitted through the whole pipeline against a budget of
+    /// 576, exactly at it (the admitted path is the one it was).
+    #[tokio::test]
+    async fn pipeline_refuses_an_item_above_the_engines_encoder_budget() {
+        const PIXEL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+        // The processor registry resolves the family from the model id.
+        let dir = tempfile::Builder::new()
+            .prefix("llava-1.5-")
+            .tempdir()
+            .unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_type": "llava", "image_token_index": 32000}"#,
+        )
+        .unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        let settings = |encoder_budget| WorkerMediaSettings {
+            model_dir: path.clone(),
+            model_id: path.clone(),
+            served_model_name: None,
+            pixel_format: PixelFormat::Normalized,
+            encoder_dtype: "float32".to_string(),
+            processor_kwargs: serde_json::Map::new(),
+            max_items: None,
+            engine_item_limits: HashMap::new(),
+            max_item_bytes: None,
+            allowed_domains: None,
+            fetch_timeout: Duration::from_secs(1),
+            video_fetch_timeout: Duration::from_secs(1),
+            video_frame_budget: None,
+            video_loader_rule: None,
+            encoder_budget,
+            turbojpeg: None,
+        };
+        let tokenizer = || Arc::new(MockTokenizer::new().with_tokens(&[("<image>", 32000)]));
+        let items = vec![WorkerMediaItem {
+            modality: Modality::Image,
+            url: PIXEL.to_string(),
+        }];
+
+        let pipeline = WorkerMediaPipeline::new(settings(Some(575)), tokenizer())
+            .await
+            .unwrap();
+        let error = pipeline
+            .process(vec![1, 32000, 2], &items, false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                WorkerMediaError::Invalid(message)
+                    if message.contains("image item 1 of 1 is 576 feature tokens")
+                        && message.contains("575-token encoder budget")
+            ),
+            "{error}"
+        );
+
+        let pipeline = WorkerMediaPipeline::new(settings(Some(576)), tokenizer())
+            .await
+            .unwrap();
+        let output = pipeline
+            .process(vec![1, 32000, 2], &items, false)
+            .await
+            .unwrap();
+        assert_eq!(output.prompt_token_ids.len(), 2 + 576);
+        assert_eq!(
+            output
+                .prompt_token_ids
+                .iter()
+                .filter(|&&id| id == 32000)
+                .count(),
+            576
+        );
+        assert_eq!(output.batches.len(), 1);
     }
 
     /// The inline payload cap sizes a `data:` URL by the shared rule: the
@@ -909,6 +1040,8 @@ mod tests {
             video_fetch_timeout: Duration::from_secs(1),
             video_frame_budget: None,
             video_loader_rule: None,
+            encoder_budget: None,
+            turbojpeg: None,
         };
         let pipeline = WorkerMediaPipeline::new(settings, Arc::new(MockTokenizer::new()))
             .await
@@ -956,10 +1089,11 @@ mod tests {
     }
 
     /// A fetch that ran out of its budget is the media host's fault for now,
-    /// a reference the request got wrong the request's, neither the worker's;
-    /// a scratch file that failed on this side and a decoder this side cannot
-    /// start are the worker's own, as is a failure with no connector error in
-    /// its chain.
+    /// a reference the request got wrong the request's, neither the worker's,
+    /// both fetch failures to the client; a clip over the decoded-size cap is
+    /// the request's own under the size code; a scratch file that failed on
+    /// this side and a decoder this side cannot start are the worker's own,
+    /// as is a failure with no connector error in its chain.
     #[test]
     fn fetch_failures_are_classified_by_fault() {
         let timeout = anyhow::Error::new(MultiModalError::Media(MediaConnectorError::Timeout {
@@ -971,6 +1105,7 @@ mod tests {
             classify(timeout),
             WorkerMediaError::Media {
                 fault: WorkerMediaFault::Transient,
+                code: MediaErrorCode::FetchFailed,
                 ..
             }
         ));
@@ -979,6 +1114,24 @@ mod tests {
             classify(scheme),
             WorkerMediaError::Media {
                 fault: WorkerMediaFault::Client,
+                code: MediaErrorCode::FetchFailed,
+                ..
+            }
+        ));
+        let over_cap = anyhow::Error::new(MultiModalError::Media(
+            MediaConnectorError::DecodedTooLarge {
+                media: "video RGB",
+                bytes: 2_208_384_000,
+                limit: 1_073_741_824,
+                knob: "SMG_VIDEO_MAX_DECODED_BYTES",
+            },
+        ))
+        .context("Failed to finalize multimodal tracker");
+        assert!(matches!(
+            classify(over_cap),
+            WorkerMediaError::Media {
+                fault: WorkerMediaFault::Client,
+                code: MediaErrorCode::TooLarge,
                 ..
             }
         ));
@@ -996,6 +1149,23 @@ mod tests {
         assert!(matches!(classify(decoder), WorkerMediaError::Internal(_)));
         let other = anyhow::anyhow!("preprocess failed");
         assert!(matches!(classify(other), WorkerMediaError::Internal(_)));
+        // An item above the engine's encoder budget is the caller's, with the
+        // item's size and the budget in the message, at any depth of the chain.
+        let over_budget = anyhow::Error::new(ItemOverEncoderBudget {
+            modality: Modality::Video,
+            position: 1,
+            count: 1,
+            feature_tokens: 192_001,
+            sampled_frames: Some(900),
+            budget: 192_000,
+        })
+        .context("Failed to process the plan");
+        assert!(matches!(
+            classify(over_budget),
+            WorkerMediaError::Invalid(message)
+                if message.contains("192001 feature tokens (900 sampled frames)")
+                    && message.contains("192000-token encoder budget")
+        ));
     }
 }
 
@@ -1090,6 +1260,8 @@ mod unsupported_model_tests {
             video_fetch_timeout: Duration::from_secs(1),
             video_frame_budget: None,
             video_loader_rule: None,
+            encoder_budget: None,
+            turbojpeg: None,
         };
         let error = WorkerMediaPipeline::new(settings, Arc::new(MockTokenizer::default()))
             .await
@@ -1128,6 +1300,8 @@ mod unsupported_model_tests {
             video_fetch_timeout: Duration::from_secs(1),
             video_frame_budget: None,
             video_loader_rule: None,
+            encoder_budget: None,
+            turbojpeg: None,
         };
         let error = WorkerMediaPipeline::new(settings, Arc::new(MockTokenizer::default()))
             .await
@@ -1168,6 +1342,8 @@ mod unsupported_model_tests {
             video_fetch_timeout: Duration::from_secs(1),
             video_frame_budget: None,
             video_loader_rule: None,
+            encoder_budget: None,
+            turbojpeg: None,
         };
         let message = unsupported_model_message(
             &settings,

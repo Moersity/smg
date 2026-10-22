@@ -1,7 +1,5 @@
 use std::collections::HashMap;
 
-use serde_json::{json, Value};
-
 use crate::{
     encoder_inputs::PreprocessedEncoderInputs,
     registry::{
@@ -54,7 +52,11 @@ impl ModelProcessorSpec for KimiK3VisionSpec {
                 .is_some_and(|mt| mt == "kimi_k3")
     }
 
-    /// The reference renders content parts positionally.
+    /// The reference renders content parts positionally, so a string
+    /// template of the family gets the media parts where the request put
+    /// them. The family's own renderer takes the parts and places them
+    /// itself, whatever this says, and its profile wins over any template,
+    /// so this is read only for a model of the family served without it.
     fn media_part_order(&self) -> MediaPartOrder {
         MediaPartOrder::Authored
     }
@@ -72,10 +74,6 @@ impl ModelProcessorSpec for KimiK3VisionSpec {
         _metadata: &ModelMetadata,
     ) -> RegistryResult<HashMap<Modality, usize>> {
         Ok(HashMap::from([(Modality::Image, 10)]))
-    }
-
-    fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
-        Ok(json!({}))
     }
 
     fn prompt_replacements(

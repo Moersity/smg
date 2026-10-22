@@ -42,11 +42,13 @@ mod tests {
 
     use super::*;
     use crate::{
+        adapt::chat,
         engine::Engine,
-        event::{Event, Events, Text},
+        event::{Event, Events},
         input::{EngineFinish, Input},
         parser::Parser,
-        tagged::Declared,
+        testing::{arguments_of, bytes, content, drive, reasoning},
+        Declared,
     };
 
     fn declared() -> Declared {
@@ -76,95 +78,56 @@ mod tests {
         "<|tool_call>call:play{artist:<|\"|>Maroon 5<|\"|>,n:15}<tool_call|>Two songs, then."
     );
 
-    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
-        let mut parser = Engine::new(gemma4(), declared());
-        let mut out = Events::new();
-        parser
-            .feed(
-                Input::Prompt {
-                    token_ids: &[],
-                    text: prompt,
-                },
-                &mut out,
-            )
-            .expect("prompt");
-        for piece in pieces {
-            parser
-                .feed(
-                    Input::Delta {
-                        token_ids: &[],
-                        text: piece,
-                        spans: &[],
-                    },
-                    &mut out,
-                )
-                .expect("delta");
-        }
-        parser
-            .feed(
-                Input::End {
-                    finish: EngineFinish::Stop,
-                },
-                &mut out,
-            )
-            .expect("end");
-        out.drain()
-    }
-
-    fn bytes(events: &[Event]) -> String {
-        events
-            .iter()
-            .map(|e| match e {
-                Event::Content(t) | Event::Reasoning(t) => t.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
-                Event::ToolCallStart { source, .. }
-                | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => source.text.as_str(),
-                Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
-            })
-            .collect()
-    }
-
-    fn arguments_of(events: &[Event], call: u32) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::ToolCallArguments { index, json, .. } if *index == call => {
-                    Some(json.as_str())
-                }
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn content(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Content(Text { text, .. }) => Some(text.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn reasoning(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Reasoning(Text { text, .. }) => Some(text.as_str()),
-                _ => None,
-            })
-            .collect()
+    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event<'static>> {
+        drive(&mut Engine::new(gemma4(), declared()), prompt, pieces)
     }
 
     fn malformed(events: &[Event]) -> Vec<String> {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Malformed { text, .. } => Some(text.text.clone()),
+                Event::Malformed { text, .. } => Some(text.text.to_string()),
                 _ => None,
             })
             .collect()
+    }
+
+    /// Prose after the call's object, before its closing marker: the chat message's content and
+    /// the stream's deltas are the model's words with the spaces between them, whole, at every
+    /// cut and one character at a time alike; the call keeps its arguments.
+    #[test]
+    fn text_after_the_object_reaches_the_client_as_the_model_wrote_it() {
+        let output = "<|tool_call>call:play{artist:<|\"|>Maroon 5<|\"|>} please note this and that <tool_call|>";
+        let prose = "please note this and that";
+        let shown = |events: &[Event]| chat::message(0, events).message.content;
+        let streamed = |events: &[Event]| -> String {
+            chat::deltas(0, events)
+                .into_iter()
+                .filter_map(|choice| choice.delta.content)
+                .collect()
+        };
+        let whole = run(PROMPT, &[output]);
+        assert_eq!(bytes(&whole), output);
+        assert_eq!(arguments_of(&whole, 0), r#"{"artist": "Maroon 5"}"#);
+        assert_eq!(
+            malformed(&whole),
+            ["please", " note", " this", " and", " that"]
+        );
+        assert_eq!(shown(&whole).as_deref(), Some(prose));
+        assert_eq!(streamed(&whole), prose);
+        for cut in (1..output.len()).filter(|&cut| output.is_char_boundary(cut)) {
+            let events = run(PROMPT, &[&output[..cut], &output[cut..]]);
+            assert_eq!(bytes(&events), output, "cut at {cut}");
+            assert_eq!(shown(&events).as_deref(), Some(prose), "cut at {cut}");
+            assert_eq!(streamed(&events), prose, "cut at {cut}");
+        }
+        let pieces: Vec<&str> = output
+            .char_indices()
+            .map(|(at, c)| &output[at..at + c.len_utf8()])
+            .collect();
+        let events = run(PROMPT, &pieces);
+        assert_eq!(shown(&events).as_deref(), Some(prose));
+        assert_eq!(streamed(&events), prose);
     }
 
     #[test]
@@ -235,7 +198,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stream_cut_inside_a_call_closes_the_object_for_the_client_and_ends_the_call() {
+    fn a_stream_cut_inside_a_string_leaves_it_open_says_so_and_ends_the_call() {
         let mut parser = Engine::new(gemma4(), declared());
         let mut out = Events::new();
         parser
@@ -266,9 +229,16 @@ mod tests {
             )
             .expect("end");
         let events = out.drain();
-        assert_eq!(arguments_of(&events, 0), r#"{"artist": "Tay"}"#);
-        assert!(events.iter().any(
-            |event| matches!(event, Event::ToolCallEnd { source, .. } if source.text.is_empty())
+        // Nothing is made up for the string the end cut: the fragments stand, and the one word
+        // of no bytes before the call's end says that the arguments are no whole value.
+        assert_eq!(arguments_of(&events, 0), r#"{"artist": "Tay"#);
+        let ended = events
+            .iter()
+            .position(|event| matches!(event, Event::ToolCallEnd { source, .. } if source.text.is_empty()))
+            .expect("the call ends");
+        assert!(matches!(
+            &events[ended - 1],
+            Event::Malformed { text, .. } if text.text.is_empty()
         ));
     }
 

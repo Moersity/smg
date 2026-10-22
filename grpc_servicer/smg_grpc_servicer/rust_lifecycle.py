@@ -1,8 +1,11 @@
 """The Python-owned lifecycle around a Rust servicer, shared by the engine
 launchers: the servicer switch (which implementation serves the process, from
 the launcher's flag or the engine's variable), the launcher's knobs, the
-KV-events default (the engine's publisher on unless the launcher or its
-variable says otherwise), a free port and socket directory for the handshake,
+KV-events default (the engine's publisher on, at a free port, unless the
+launcher or its variable says otherwise, or the engine says its publisher
+cannot serve the model, and its log lines; the Python servicer's entry points
+apply the same rule), a free port and socket directory
+for the handshake,
 the engine as a ``Popen``-shaped handle (one spawned headless engine, the
 engine cores a manager started from this process, or the scheduler processes
 this process started itself), its termination, the supervision loop that
@@ -18,12 +21,14 @@ import asyncio
 import contextlib
 import dataclasses
 import faulthandler
+import functools
 import glob
 import importlib
 import logging
 import math
 import multiprocessing
 import os
+import random
 import signal
 import socket
 import subprocess
@@ -32,7 +37,25 @@ import time
 from collections.abc import Callable, Mapping, MutableMapping
 from typing import Any
 
-from smg_grpc_servicer.hostport import host_port
+from smg_grpc_servicer.hostport import host_port, loopback_target
+
+# The switch's flag and choices live with the plugins' registration (stdlib
+# only); re-exported here as this module's documented values.
+from smg_grpc_servicer.metrics_flag import METRICS_PORT_FLAG
+from smg_grpc_servicer.servicer_impl_flag import (  # noqa: F401
+    IMPLS,
+    SERVICER_IMPL_FLAG,
+)
+from smg_grpc_servicer.warmup import (
+    WarmupInputs,
+    WarmupPlan,
+    WarmupReport,
+    WarmupSetting,
+    WarmupWire,
+    parse_setting,
+    plan_for,
+    run_warmup,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +77,19 @@ DEFAULT_STARTUP_TIMEOUT_SECS = 1800.0
 # over half an hour to load on a cold start; four hours leaves room for the
 # storage path. 0 lifts the ceiling.
 DEFAULT_STARTUP_CEILING_SECS = 4 * 3600.0
+# Bound on the connected engine's silence: how long it may hold requests in
+# flight, in total since its last output, with nothing pending prefill, before
+# the Rust server treats it as dead and fails them (the crate's default). The
+# prompt tokens pending prefill extend it at ``DEFAULT_PREFILL_TOKENS_PER_SEC``:
+# a wire that says nothing until a prompt's first token is silent through a
+# whole prefill, and a batch of long prompts prefills for longer than any fixed
+# bound.
+DEFAULT_SILENCE_TIMEOUT_SECS = 300.0
+# The prefill rate the silence bound allows the engine, in tokens per second: a
+# bound on how slowly a healthy engine may prefill (500 s per million pending
+# prompt tokens on top of the window; the crate's default), not an estimate of
+# how fast it does. 0 allows nothing.
+DEFAULT_PREFILL_TOKENS_PER_SEC = 2000
 _POLL_SECS = 0.5
 # Grace a scheduler process this process started gets between SIGTERM and
 # SIGKILL at shutdown, and how long the kill is waited for.
@@ -160,6 +196,30 @@ def env_float(
     return value
 
 
+def env_int(
+    name: str,
+    default: int,
+    *,
+    environ: Mapping[str, str] | None = None,
+    minimum: int | None = None,
+) -> int:
+    """``int(environ[name])``, ``default`` when the variable is unset or
+    empty. A value that is not a whole number, or below ``minimum``, is a
+    :class:`ServicerConfigError` naming the variable: a fraction is refused
+    rather than rounded, so ``0.5`` does not become a silent ``0``."""
+    source = os.environ if environ is None else environ
+    raw = source.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ServicerConfigError(f"{name}={raw!r} is not a whole number") from None
+    if minimum is not None and value < minimum:
+        raise ServicerConfigError(f"{name}={raw!r} must be at least {minimum}")
+    return value
+
+
 def env_port(name: str, *, environ: Mapping[str, str] | None = None) -> int | None:
     """A TCP port from ``environ[name]``, 1 to 65535; ``None`` when the
     variable is unset, empty or 0 (the caller picks a free port). Anything
@@ -177,6 +237,82 @@ def env_port(name: str, *, environ: Mapping[str, str] | None = None) -> int | No
     if not 1 <= value <= 65535:
         raise ServicerConfigError(f"{name}={raw!r} must be between 1 and 65535")
     return value
+
+
+def metrics_port(
+    args: Any, env_name: str, *, environ: Mapping[str, str] | None = None
+) -> int | None:
+    """The port the Rust servicer serves Prometheus metrics on, or ``None``
+    for no endpoint: ``--metrics-port`` when the launcher's namespace carries
+    it (``args.metrics_port``), else ``environ[env_name]``, else none. The
+    flag's action exports its value under the variable on every launcher, so
+    a launcher whose namespace keeps only the engine's own fields reads the
+    flag through the variable too. 0 binds an ephemeral port (tests); any
+    other value outside 1 to 65535 is a :class:`ServicerConfigError` naming
+    the flag and the variable."""
+    source = os.environ if environ is None else environ
+    value = getattr(args, "metrics_port", None) if args is not None else None
+    origin = METRICS_PORT_FLAG
+    if value is None:
+        raw = source.get(env_name)
+        if raw is None or not raw.strip():
+            return None
+        origin = env_name
+        try:
+            value = int(raw)
+        except ValueError:
+            raise ServicerConfigError(f"{env_name}={raw!r} is not a port number") from None
+    if not 0 <= int(value) <= 65535:
+        raise ServicerConfigError(f"{origin}={value!r} must be a port between 0 and 65535")
+    return int(value)
+
+
+def metrics_bind_address(
+    args: Any,
+    *,
+    port_env: str,
+    host_env: str,
+    environ: Mapping[str, str] | None = None,
+) -> str | None:
+    """Where the Rust servicer serves ``GET /metrics``, as ``host:port`` (an
+    IPv6 host bracketed), or ``None`` for no endpoint: the port from
+    :func:`metrics_port`; the host from ``--metrics-host``
+    (``args.metrics_host``), else ``environ[host_env]``, else the gRPC
+    listener's host (``args.host``; every interface when unset, as the gRPC
+    bind). A metrics port equal to the gRPC port (``args.port``) is a
+    :class:`ServicerConfigError`: the listener could not bind beside the
+    gRPC one, and the error belongs before the engine starts."""
+    source = os.environ if environ is None else environ
+    port = metrics_port(args, port_env, environ=source)
+    if port is None:
+        return None
+    grpc_port = int(getattr(args, "port", 0) or 0)
+    if port and port == grpc_port:
+        raise ServicerConfigError(
+            f"{METRICS_PORT_FLAG}={port} is the gRPC port: the metrics listener needs a port "
+            f"of its own (or 0 for an ephemeral one)"
+        )
+    host = getattr(args, "metrics_host", None) if args is not None else None
+    if not host:
+        host = source.get(host_env) or None
+    if not host:
+        host = getattr(args, "host", None) or "0.0.0.0"
+    return host_port(host, port)
+
+
+def check_metrics_port_needs_rust(
+    impl: str, args: Any, env_name: str, *, environ: Mapping[str, str] | None = None
+) -> None:
+    """A metrics port given (the flag or its variable) with the Python
+    servicer selected is a :class:`ServicerConfigError`: the Python servicer
+    exposes no metrics endpoint, and a port nobody will serve is a
+    misconfiguration best refused before the engine starts."""
+    if impl == "rust" or metrics_port(args, env_name, environ=environ) is None:
+        return
+    raise ServicerConfigError(
+        f"{METRICS_PORT_FLAG} (or {env_name}) needs {SERVICER_IMPL_FLAG} rust: the Python "
+        "servicer exposes no metrics endpoint"
+    )
 
 
 def free_port() -> int:
@@ -219,6 +355,8 @@ class LauncherKnobs:
     drain_secs: float
     startup_timeout_secs: float
     startup_ceiling_secs: float
+    silence_timeout_secs: float
+    prefill_tokens_per_sec: int
     socket_dir: str
 
 
@@ -228,16 +366,20 @@ def read_launcher_knobs(
     drain_secs_env: str,
     startup_timeout_secs_env: str,
     startup_ceiling_secs_env: str,
+    silence_timeout_secs_env: str,
+    prefill_tokens_per_sec_env: str,
     socket_dir: str | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> LauncherKnobs:
     """Every knob of a Rust-servicer launcher at once, each failure a
     :class:`ServicerConfigError` naming its variable: the handshake port (1 to
     65535, or a free one), the drain on a signal (0 s or more), the startup
-    silence bound (above 0 s), the startup ceiling (0 lifts it), the IPC socket
-    directory (``socket_dir``, else ``$SMG_ZMQ_SOCKET_DIR``, else the
-    default; created). Nothing is read later: a bad value is refused before
-    the gRPC port is bound and before the engine starts."""
+    silence bound (above 0 s), the startup ceiling (0 lifts it), the connected
+    engine's silence bound (above 0 s) and the prefill rate it allows (0 or
+    more tokens per second; 0 allows nothing), the IPC socket directory
+    (``socket_dir``, else ``$SMG_ZMQ_SOCKET_DIR``, else the default; created).
+    Nothing is read later: a bad value is refused before the gRPC port is
+    bound and before the engine starts."""
     return LauncherKnobs(
         handshake_port=env_port(handshake_port_env, environ=environ),
         drain_secs=env_float(drain_secs_env, DEFAULT_DRAIN_SECS, environ=environ, minimum=0.0),
@@ -250,10 +392,39 @@ def read_launcher_knobs(
         startup_ceiling_secs=env_float(
             startup_ceiling_secs_env, DEFAULT_STARTUP_CEILING_SECS, environ=environ, minimum=0.0
         ),
+        silence_timeout_secs=env_float(
+            silence_timeout_secs_env, DEFAULT_SILENCE_TIMEOUT_SECS, environ=environ, positive=True
+        ),
+        prefill_tokens_per_sec=env_int(
+            prefill_tokens_per_sec_env, DEFAULT_PREFILL_TOKENS_PER_SEC, environ=environ, minimum=0
+        ),
         socket_dir=prepare_socket_dir(
             default_socket_dir(environ) if socket_dir is None else socket_dir
         ),
     )
+
+
+def read_warmup_setting(name: str, *, environ: Mapping[str, str] | None = None) -> WarmupSetting:
+    """The planned warm-up's setting from ``environ[name]``
+    (:func:`smg_grpc_servicer.warmup.parse_setting`); a value the knob does
+    not take is a :class:`ServicerConfigError` naming the variable, found with
+    the other knobs before the engine starts. A launcher without such a
+    variable (an empty ``name``) runs none."""
+    if not name:
+        return WarmupSetting(False)
+    source = os.environ if environ is None else environ
+    try:
+        return parse_setting(source.get(name), name=name)
+    except ValueError as error:
+        raise ServicerConfigError(str(error)) from None
+
+
+def servicer_loopback(address: str) -> str:
+    """The target to dial the Rust server's own listener from this process:
+    its bound ``host:port`` (a bracketed IPv6 literal included) with a
+    wildcard host mapped to its loopback address."""
+    host, _, port = address.rpartition(":")
+    return loopback_target(host, int(port))
 
 
 def configuration_exit(error: ServicerConfigError, log: logging.Logger = logger) -> SystemExit:
@@ -268,7 +439,6 @@ def configuration_exit(error: ServicerConfigError, log: logging.Logger = logger)
 # The servicer switch: which implementation serves this process
 # ---------------------------------------------------------------------------
 
-IMPLS = ("python", "rust")
 # Where the implementation choice came from, for the startup log line.
 SOURCE_FLAG = "flag"
 SOURCE_ENV = "env"
@@ -317,14 +487,119 @@ def servicer_switch(
 # that keep the engine's KV event publisher off when the launcher was given no
 # --kv-events-config.
 KV_EVENTS_OFF_VALUES = ("0", "false", "no", "off")
+# How many base ports are tried before the servicer gives up on a block of
+# consecutive free ports for a data-parallel engine's publishers.
+KV_EVENTS_PORT_ATTEMPTS = 32
+# The publishers' ports are drawn from below the OS's ephemeral range (whose
+# low bound ``ip_local_port_range`` gives, 32768 by default), since the
+# outbound connections the engine opens while it loads (its weights, a
+# rendezvous, a client) draw their source ports from that range and could
+# take a port picked there before the engine binds it; and from above the
+# well-known ports and the engines' own fixed default (5557).
+KV_EVENTS_PORT_FLOOR = 10000
+KV_EVENTS_PORT_RANGE_FILE = "/proc/sys/net/ipv4/ip_local_port_range"
+_port_draw = random.SystemRandom()
+
+
+# Linux's default low bound of the ephemeral port range, taken when the OS does
+# not state one.
+DEFAULT_EPHEMERAL_LOW = 32768
+
+
+def _ephemeral_low(range_file: str = KV_EVENTS_PORT_RANGE_FILE) -> int:
+    """The low bound of the OS's ephemeral port range, as ``range_file``
+    (``ip_local_port_range``) states it, whatever it is; Linux's default when it
+    cannot be read or is garbled."""
+    try:
+        with open(range_file, encoding="utf-8") as f:
+            low = int(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return DEFAULT_EPHEMERAL_LOW
+    return low if 1 <= low <= 65536 else DEFAULT_EPHEMERAL_LOW
+
+
+@functools.cache
+def _warn_inside_ephemeral_range(low: int) -> None:
+    """Said once per process: the OS's ephemeral range starts at or below the
+    floor the ports are drawn from, so the draw comes from inside it."""
+    logger.warning(
+        "the default KV event publisher's port is drawn from inside this host's ephemeral port "
+        "range (ip_local_port_range starts at %d, at or below %d): an outbound connection the "
+        "engine opens while its model loads could take the port before the engine binds it; "
+        "pass --kv-events-config to pin the endpoint",
+        low,
+        KV_EVENTS_PORT_FLOOR,
+    )
+
+
+def _bindable(port: int) -> bool:
+    """Whether a listener could bind ``port`` on every interface right now, the
+    way the engines' ZMQ publishers bind theirs (``SO_REUSEADDR`` set, as
+    libzmq sets it): a port another listener holds is not."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("", port))
+        except OSError:
+            return False
+    return True
+
+
+def free_kv_events_endpoint(ranks: int = 1) -> str:
+    """``tcp://*:<port>`` for the engine's default KV-event publisher: a port
+    drawn at random from below the OS's ephemeral range (``KV_EVENTS_PORT_FLOOR``
+    up to ``ip_local_port_range``'s low bound), found free on every interface
+    with the ``ranks - 1`` ports after it (rank ``r`` of a data-parallel engine
+    publishes on ``port + r``, and the relay dials the same), drawn again until
+    a block is.
+
+    Every engine's own configuration defaults the endpoint to the same fixed
+    port, so two engines on one host, or an engine started next to a publisher
+    an earlier job left behind, failed at the engine's bind with "Address
+    already in use". The engine binds its port only after its model loaded,
+    minutes later, and meanwhile opens outbound connections (its weights, a
+    rendezvous, a client) whose source ports the OS draws from its ephemeral
+    range: a port picked there could be taken by one of them in that window,
+    so the draw stays below the range, where only another listener could take
+    it. A host whose range starts at or below the floor (one tuned for many
+    outbound connections, ``1024 65535``) leaves no room below it: the draw
+    then comes from the floor up to Linux's default low bound, inside the
+    host's range, said once in a warning that names the knob, since refusing
+    to start would be worse than the small race, which the engines' fixed
+    default had on such a host too. Two servicers starting at the same moment
+    could draw the same base, with the odds of one draw among more than twenty
+    thousand ports; that, as before, is caught at the engine's bind, which
+    names the port.
+    """
+    ranks = max(int(ranks), 1)
+    low = _ephemeral_low()
+    if low - ranks < KV_EVENTS_PORT_FLOOR:
+        _warn_inside_ephemeral_range(low)
+        low = DEFAULT_EPHEMERAL_LOW
+    ceiling = low - ranks
+    if ceiling < KV_EVENTS_PORT_FLOOR:
+        raise ServicerConfigError(
+            f"no room for {ranks} consecutive KV event publisher ports between "
+            f"{KV_EVENTS_PORT_FLOOR} and {low}; pass --kv-events-config with an endpoint"
+        )
+    for _ in range(KV_EVENTS_PORT_ATTEMPTS):
+        base = _port_draw.randrange(KV_EVENTS_PORT_FLOOR, ceiling + 1)
+        if all(_bindable(base + rank) for rank in range(ranks)):
+            return f"tcp://*:{base}"
+    raise ServicerConfigError(
+        f"no block of {ranks} consecutive free ports for the KV event publishers after "
+        f"{KV_EVENTS_PORT_ATTEMPTS} draws; pass --kv-events-config with an endpoint"
+    )
 
 
 def apply_kv_events_default(
     target: Any,
-    default: Any,
+    default: Callable[[str], Any],
     *,
     env_name: str,
     environ: Mapping[str, str] | None = None,
+    ranks: int = 1,
+    unless: Callable[[], str | None] | None = None,
 ) -> Any | None:
     """Turn the engine's KV event publisher on when the launcher was given no
     ``--kv-events-config``; returns the configuration applied, or ``None``.
@@ -334,14 +609,23 @@ def apply_kv_events_default(
     names its ZMQ publisher: a launcher without it got a router that routed
     blind, with one WARN per worker as the only trace. Under the Rust servicer
     ``target`` (the parsed launcher namespace or the engine's server args,
-    whichever the engine builds its configuration from) gets ``default`` (the
-    engine's ZMQ-publisher configuration, or a callable building it) as its
-    ``kv_events_config`` before the facts and the engine are built from it, so
-    publisher and relay agree. An explicit configuration, anything but ``None``
-    or an empty string, is kept as given, off included; ``env_name`` set to
-    one of ``KV_EVENTS_OFF_VALUES`` keeps the publisher off without one; a
-    ``target`` that cannot be written (frozen server args) is left as it is,
-    with a warning.
+    whichever the engine builds its configuration from) gets the configuration
+    ``default`` builds for the publisher's endpoint (``default(endpoint)``: the
+    engine's ZMQ-publisher configuration, in whichever form the engine takes
+    it) as its ``kv_events_config`` before the facts and the engine are built
+    from it, so publisher and relay agree. The endpoint is a free port's,
+    below the OS's ephemeral range (:func:`free_kv_events_endpoint`, one port
+    per data-parallel rank of the ``ranks``), never the engines' shared fixed
+    default: a second engine on the host, or a publisher another process left
+    behind, no longer costs the engine its start. An explicit configuration, anything but ``None`` or an
+    empty string, is kept as given, its endpoint and off included; ``env_name``
+    set to one of ``KV_EVENTS_OFF_VALUES`` keeps the publisher off without one;
+    a ``target`` that cannot be written (frozen server args) is left as it is,
+    with a warning. ``unless`` is the engine's own word on whether its
+    publisher can serve the model this process loads: a reason it cannot, or
+    ``None``; it is asked only once a default would otherwise apply, and a
+    reason keeps the publisher off, said once with what turns it on, before
+    any port is drawn.
     """
     source = os.environ if environ is None else environ
     given = getattr(target, "kv_events_config", None)
@@ -349,7 +633,15 @@ def apply_kv_events_default(
         return None
     if str(source.get(env_name, "")).strip().lower() in KV_EVENTS_OFF_VALUES:
         return None
-    config = default() if callable(default) else default
+    reason = unless() if unless is not None else None
+    if reason:
+        logger.info(
+            "KV event publishing left off: %s; pass --kv-events-config to turn the publisher "
+            "on anyway",
+            reason,
+        )
+        return None
+    config = default(free_kv_events_endpoint(ranks))
     try:
         target.kv_events_config = config
     except AttributeError:  # frozen server args: left as they are
@@ -359,6 +651,21 @@ def apply_kv_events_default(
         )
         return None
     return config
+
+
+def announce_kv_events_default(engine: str, env_name: str, log: logging.Logger = logger) -> None:
+    """The line an operator reads once :func:`apply_kv_events_default` turned
+    the publisher on, the same under either servicer implementation: what is
+    on and where (a port found free on this host, :func:`free_kv_events_endpoint`),
+    and the two ways to decide otherwise (``engine`` is the engine's name in
+    the line, ``env_name`` its opt-out variable)."""
+    log.info(
+        "KV event publishing enabled: no --kv-events-config was given, so %s's ZMQ "
+        "publisher is on at a port found free on this host and SubscribeKvEvents relays "
+        "it; pass --kv-events-config to name the endpoint, or set %s=0 to leave it off",
+        engine,
+        env_name,
+    )
 
 
 # How long a servicer that decided to exit over its engine may spend in the
@@ -420,12 +727,26 @@ class EngineProcess:
     re-parented and would keep the GPU. So the engine's descendants are
     tracked while it runs, and a kill, or the cleanup after it exited on its
     own, reaches every one that is still the process it was.
+
+    The descendants are recorded from a pass over ``/proc`` when the handle
+    is built (the engine's children at its spawn, before anything else runs),
+    when the engine counts as started (:func:`supervise`, once the server
+    reports it connected: its workers are spawned by then), before it is
+    signalled, and every :data:`TRACK_INTERVAL_SECS` in between. What no
+    pass recovers is a worker spawned after one and orphaned before the
+    next, by a core that exits within the interval: an orphan leaves the
+    engine's lineage the moment its parent exits.
     """
 
-    def __init__(self, process: Any):
+    def __init__(self, process: Any, *, tree: ProcessTree | None = None):
         self._process = process
         self._descendants: dict[int, str] = {}  # pid -> start time, against PID reuse
         self._tracked_at = 0.0
+        # Tracked from the spawn: the children the engine has when its handle
+        # is built are recorded before the first poll (``tree`` is the pass a
+        # group of engines shares), so a core that exits before that poll
+        # leaves none of them behind untracked.
+        self.track(tree)
 
     @property
     def pid(self) -> int | None:
@@ -437,14 +758,18 @@ class EngineProcess:
             self.track()
         return code
 
-    def track(self) -> None:
-        """Record the engine's current descendants (one pass over ``/proc``)."""
+    def track(self, tree: ProcessTree | None = None) -> None:
+        """Record the engine's current descendants, from ``tree`` (the pass
+        over ``/proc`` a group shares between its engines) or from one pass of
+        its own."""
         pid = self.pid
         if pid is None:
             return
+        if tree is None:
+            tree = ProcessTree()
         self._tracked_at = time.monotonic()
-        for child in _descendants(pid):
-            start = _start_time(child)
+        for child in tree.descendants(pid):
+            start = tree.start_time(child)
             if start is not None:
                 self._descendants[child] = start
 
@@ -488,15 +813,17 @@ class EngineProcessGroup:
 
     Every process is tracked as an :class:`EngineProcess`, so the workers an
     engine core spawns (its TP ranks) are reaped the same way when a core is
-    killed or exits on its own. ``terminate`` goes through the manager, which
-    signals the cores and force-kills what is still alive after the grace
-    period; it runs once. ``kill`` reaches the processes directly.
+    killed or exits on its own; a pass over ``/proc`` the group takes is one
+    for all of them. ``terminate`` goes through the manager, which signals
+    the cores and force-kills what is still alive after the grace period; it
+    runs once. ``kill`` reaches the processes directly.
     """
 
     def __init__(self, manager: Any, *, shutdown_timeout: float | None = None):
         self._manager = manager
         self._shutdown_timeout = shutdown_timeout
-        self._engines = [EngineProcess(process) for process in manager.processes]
+        tree = ProcessTree()
+        self._engines = [EngineProcess(process, tree=tree) for process in manager.processes]
         self._exit_code: int | None = None
         self._shut_down = False
 
@@ -521,7 +848,12 @@ class EngineProcessGroup:
             code = next((code for code in codes if code is not None), None)
             if code is not None:
                 self._exit_code = code
-        if self._exit_code is not None and None in codes:
+        if self._exit_code is not None and None in codes and not self._shut_down:
+            # The cores still alive are shut down over their descendants as of
+            # now, not as of the interval's last pass, as an explicit
+            # ``terminate`` does: a worker one of them spawned since is what
+            # the cleanup after the shutdown must reach.
+            self.track()
             self._shutdown()
         return self._exit_code
 
@@ -533,8 +865,10 @@ class EngineProcessGroup:
             self._exit_code = code
 
     def track(self) -> None:
+        """Record every core's descendants, from one pass over ``/proc``."""
+        tree = ProcessTree()
         for engine in self._engines:
-            engine.track()
+            engine.track(tree)
 
     def terminate(self) -> None:
         self.track()
@@ -728,27 +1062,46 @@ def on_fault_signal(target: Any, *signals: int, what: str) -> bool:
     return True
 
 
-def _descendants(pid: int) -> list[int]:
-    """Every live descendant of ``pid``, from one pass over ``/proc`` (the
-    per-task ``children`` files are not available on every kernel)."""
-    parent_of: dict[int, int] = {}
-    for entry in os.listdir("/proc"):
-        if not entry.isdigit():
-            continue
+class ProcessTree:
+    """Every live process's parent and start time, from one pass over
+    ``/proc`` (the per-task ``children`` files are not available on every
+    kernel), queried for the descendants of any number of pids: a group of
+    engines takes one pass, not one per engine."""
+
+    def __init__(self) -> None:
+        self._start: dict[int, str] = {}
+        self._children: dict[int, list[int]] = {}
         try:
-            with open(f"/proc/{entry}/stat") as handle:
-                parent_of[int(entry)] = int(handle.read().rsplit(")", 1)[1].split()[1])
-        except (OSError, ValueError, IndexError):
-            continue
-    found: list[int] = []
-    pending = [pid]
-    while pending:
-        parent = pending.pop()
-        for child, child_parent in parent_of.items():
-            if child_parent == parent and child not in found:
-                found.append(child)
-                pending.append(child)
-    return found
+            entries = os.listdir("/proc")
+        except OSError:  # no procfs: nothing can be tracked, nothing is
+            entries = []
+        for entry in entries:
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/stat") as handle:
+                    fields = handle.read().rsplit(")", 1)[1].split()
+                parent, start = int(fields[1]), fields[19]
+            except (OSError, ValueError, IndexError):
+                continue
+            self._start[int(entry)] = start
+            self._children.setdefault(parent, []).append(int(entry))
+
+    def descendants(self, pid: int) -> list[int]:
+        """Every live descendant of ``pid`` at the pass."""
+        found: list[int] = []
+        pending = [pid]
+        while pending:
+            for child in self._children.get(pending.pop(), ()):
+                if child not in found:
+                    found.append(child)
+                    pending.append(child)
+        return found
+
+    def start_time(self, pid: int) -> str | None:
+        """``pid``'s start time at the pass; ``None`` for a pid the pass did
+        not see."""
+        return self._start.get(pid)
 
 
 def _start_time(pid: int) -> str | None:
@@ -820,6 +1173,65 @@ def terminate_engine(engine: Any, timeout: float = ENGINE_TERMINATE_SECS) -> Non
         )
 
 
+async def drain_server(server: Any, engine: Any, timeout: float, poll_secs: float) -> bool:
+    """Wait at most ``timeout`` for admitted requests; false means a failure.
+
+    Older bindings without a count retain their bounded grace period.
+    Health/admission must already have been closed by ``set_serving(False)``.
+    A zero timeout checks the final status without waiting for requests.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    logger.info("Draining for up to %.1fs before stopping", timeout)
+    while True:
+        if server.last_error or not server.running:
+            logger.error("Rust servicer failed during drain")
+            return False
+        rc = engine.poll()
+        if rc is not None:
+            if rc == 0:
+                logger.info("Engine exited cleanly during drain")
+                return True
+            logger.error("Engine exited with code %s during drain", rc)
+            return False
+        active = getattr(server, "active_requests", None)
+        if active == 0:
+            logger.info("Drain complete; no requests remain")
+            return True
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            logger.info("Drain deadline reached; active requests: %s", active)
+            return True
+        await asyncio.sleep(min(poll_secs, remaining))
+
+
+def hold_readiness(server: Any, ready: bool) -> None:
+    """Hold (``False``) or release (``True``) the server's health answer
+    alone, admission left open, so the servicer's own requests still reach
+    the engine while readiness is held (the planned warm-up runs over the
+    server's own port): ``set_ready`` where the server has it. ``set_serving``
+    is the drain switch (it closes admission as well, and would refuse the
+    warm-up's requests); a server without ``set_ready`` is an older binding
+    whose ``set_serving`` flipped health alone, and that is what it gets."""
+    setter = getattr(server, "set_ready", None)
+    if setter is None:
+        setter = server.set_serving
+    setter(ready)
+
+
+def _warmup_over(server: Any, task: asyncio.Task) -> None:
+    """The planned warm-up's task ended: the servicer is SERVING either way.
+    The engine connected and answers; a warm-up that failed is an error line
+    for the operator, not a worker kept out of rotation."""
+    try:
+        report = task.result()
+    except Exception:
+        logger.exception("The planned warm-up failed; the servicer is SERVING without it")
+    else:
+        logger.info("Warm-up over (%s); the servicer is SERVING", report.summary())
+    hold_readiness(server, True)
+
+
 async def supervise(
     server: Any,
     engine: Any,
@@ -828,6 +1240,7 @@ async def supervise(
     stop_timeout: float = SERVER_STOP_SECS,
     stop_event: asyncio.Event | None = None,
     poll_secs: float = _POLL_SECS,
+    warmup: Callable[[], WarmupReport] | None = None,
 ) -> int:
     """Run until a shutdown signal, an engine exit, or a server failure.
 
@@ -835,25 +1248,49 @@ async def supervise(
     process alive is reported to a server that takes such reports
     (``note_engine_alive``), so the server's startup bound counts silence
     from a living engine rather than time since the last handshake message.
+    An engine that tracks its workers (``track``) gets one pass when the
+    server first reports it connected, its start and its spawning over.
+
+    A ``warmup`` (the planned warm-up over the servicer's own port, blocking;
+    the caller held the server's health at NOT_SERVING with
+    :func:`hold_readiness`, admission open) runs on a thread the moment the
+    engine connected, with the engine polled meanwhile; the health flips to
+    SERVING when it returned, whatever it returned.
 
     Signals drain: health flips to NOT_SERVING at once (the Router stops
-    routing here), in-flight streams get ``drain_secs`` to finish with the
+    routing here), in-flight streams get up to ``drain_secs`` to finish with the
     engine still up, then the server stops and the engine is terminated.
     Returns the process exit code.
     """
     loop = asyncio.get_running_loop()
     note_engine_alive = getattr(server, "note_engine_alive", None)
+    track = getattr(engine, "track", None)
     if stop_event is None:
         stop_event = asyncio.Event()
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, stop_event.set)
     exit_code = 0
     announced_ready = False
+    warming: asyncio.Task | None = None
     try:
         while not stop_event.is_set():
             if not announced_ready and server.engine_ready:
                 announced_ready = True
-                logger.info("Engine connected; the servicer is SERVING")
+                # The engine's start is over, and with it the spawning of its
+                # workers: one pass records them all before the servicer
+                # counts as serving, whatever the interval's passes saw.
+                if track is not None:
+                    track()
+                if warmup is None:
+                    logger.info("Engine connected; the servicer is SERVING")
+                else:
+                    logger.info(
+                        "Engine connected; the planned warm-up runs before the servicer is SERVING"
+                    )
+                    warming = asyncio.create_task(asyncio.to_thread(warmup))
+            if warming is not None and warming.done():
+                _warmup_over(server, warming)
+                warming = None
             error = server.last_error
             if error or not server.running:
                 logger.error("Rust servicer cannot serve: %s", error or "server exited")
@@ -872,11 +1309,19 @@ async def supervise(
                 pass
     finally:
         mark_not_serving(server)
-        if stop_event.is_set() and drain_secs > 0 and engine.poll() is None:
-            logger.info("Draining for %.1fs before stopping", drain_secs)
-            await asyncio.sleep(drain_secs)
-        await stop_server(server, stop_timeout)
-        terminate_engine(engine)
+        if warming is not None and not warming.done():
+            # The stop below cancels the streams the warm-up's thread waits
+            # on; the task itself is let go.
+            warming.cancel()
+        try:
+            if stop_event.is_set():
+                if not await drain_server(server, engine, drain_secs, poll_secs):
+                    exit_code = 1
+        finally:
+            try:
+                await stop_server(server, stop_timeout)
+            finally:
+                terminate_engine(engine)
     return exit_code
 
 
@@ -916,13 +1361,45 @@ class RustLauncher:
     drain_secs_env: str
     startup_timeout_secs_env: str
     startup_ceiling_secs_env: str
+    silence_timeout_secs_env: str
+    prefill_tokens_per_sec_env: str
     kv_events_env: str
+    # The metrics endpoint's variables (the fallbacks of --metrics-port and
+    # --metrics-host; see :func:`metrics_bind_address`).
+    metrics_port_env: str
+    metrics_host_env: str
     # What the servicer loses without a local tokenizer directory, for the warning.
     without_tokenizer: str
+    # The planned warm-up's knob (:mod:`smg_grpc_servicer.warmup`); a launcher
+    # that names none runs no warm-up.
+    warmup_env: str = ""
 
     def prepare(self, args: Any) -> None:
         """Engine-specific set-up after the knobs are read and the binding is
         imported, before the first log line (nothing by default)."""
+
+    def warmup_inputs(self, args: Any, facts: Mapping[str, Any]) -> WarmupInputs | None:
+        """What the planned warm-up is planned from: the engine's running
+        window, admission step, context and vocabulary, off its configuration
+        and the facts; ``None`` when this engine or model takes none
+        (nothing by default)."""
+        return None
+
+    def warmup_wire(self, target: str) -> WarmupWire:
+        """The wire the planned warm-up drives the engine through: this
+        servicer's own listener at ``target`` (a loopback ``host:port``), so
+        the pass covers the same path a client's request takes."""
+        raise NotImplementedError
+
+    def run_warmup(self, plan: WarmupPlan, setting: WarmupSetting, server: Any) -> WarmupReport:
+        """The planned warm-up over the servicer's own port (blocking:
+        ``supervise`` runs it on a thread once the engine connected)."""
+        wire = self.warmup_wire(servicer_loopback(server.address))
+        try:
+            return run_warmup(plan, wire, budget_secs=setting.budget_secs)
+        finally:
+            with contextlib.suppress(Exception):
+                wire.close()
 
     def kv_events_default(self, args: Any) -> Any | None:
         """Turn the engine's KV event publisher on when the launcher was given
@@ -946,6 +1423,20 @@ class RustLauncher:
         own server does then)."""
         host = getattr(args, "host", None) or "0.0.0.0"
         return host_port(host, int(getattr(args, "port", 0) or 0))
+
+    def metrics_bind_address(
+        self, args: Any, environ: Mapping[str, str] | None = None
+    ) -> str | None:
+        """Where the Rust server serves Prometheus metrics, or ``None`` for no
+        endpoint (:func:`metrics_bind_address` with this launcher's
+        variables): ``--metrics-port``, else the variable, else none; the
+        host from ``--metrics-host``, its variable, else the gRPC host."""
+        return metrics_bind_address(
+            args,
+            port_env=self.metrics_port_env,
+            host_env=self.metrics_host_env,
+            environ=environ,
+        )
 
     def server_extras(self, args: Any, tokenizer_dir: str | None) -> dict[str, Any]:
         """Further keyword arguments of the Rust server (none by default)."""
@@ -984,9 +1475,10 @@ class RustLauncher:
     def announce(
         self, server: Any, knobs: LauncherKnobs, handshake_port: int, engine_count: int
     ) -> None:
-        """The two lines an operator reads at the start: where the server
-        listens and what dials its handshake, and the startup bounds with the
-        variables that set them."""
+        """The three lines an operator reads at the start: where the server
+        listens and what dials its handshake, the startup bounds with the
+        variables that set them, and the connected engine's silence bound with
+        its prefill allowance."""
         logger.info(
             "Rust %s servicer listening on %s (%s handshake tcp://127.0.0.1:%d, %d %s(s))",
             self.engine,
@@ -996,8 +1488,11 @@ class RustLauncher:
             engine_count,
             self.counted,
         )
+        metrics_address = getattr(server, "metrics_address", None)
+        if metrics_address:
+            logger.info("Prometheus metrics on http://%s/metrics", metrics_address)
         logger.info(
-            "%s startup bounds: %.0fs without a sign of life (%s), ceiling %s (%s); "
+            "%s startup bounds: %gs without a sign of life (%s), ceiling %s (%s); "
             "the handshake waits while the %s process is alive",
             self.started.capitalize(),
             knobs.startup_timeout_secs,
@@ -1005,6 +1500,15 @@ class RustLauncher:
             f"{knobs.startup_ceiling_secs:.0f}s" if knobs.startup_ceiling_secs else "none",
             self.startup_ceiling_secs_env,
             self.started,
+        )
+        logger.info(
+            "%s silence bound once connected: %gs without an output while requests are in "
+            "flight (%s), plus the prompt pending prefill at %d tokens/s (%s)",
+            self.started.capitalize(),
+            knobs.silence_timeout_secs,
+            self.silence_timeout_secs_env,
+            knobs.prefill_tokens_per_sec,
+            self.prefill_tokens_per_sec_env,
         )
 
     async def serve(self, args: Any) -> int:
@@ -1017,24 +1521,28 @@ class RustLauncher:
             drain_secs_env=self.drain_secs_env,
             startup_timeout_secs_env=self.startup_timeout_secs_env,
             startup_ceiling_secs_env=self.startup_ceiling_secs_env,
+            silence_timeout_secs_env=self.silence_timeout_secs_env,
+            prefill_tokens_per_sec_env=self.prefill_tokens_per_sec_env,
             socket_dir=default_socket_dir(),
         )
+        warmup_setting = read_warmup_setting(self.warmup_env)
         servicer = importlib.import_module("smg.servicer")
         self.prepare(args)
         servicer.init_servicer_tracing()
         if self.kv_events_default(args) is not None:
-            logger.info(
-                "KV event publishing enabled: no --kv-events-config was given, so %s's ZMQ "
-                "publisher is on with its default endpoint and SubscribeKvEvents relays it; pass "
-                "--kv-events-config to configure it, or set %s=0 to leave it off",
-                self.engine,
-                self.kv_events_env,
-            )
+            announce_kv_events_default(self.engine, self.kv_events_env)
         facts = self.facts(args)
         engine_count = facts["data_parallel_size"]
         tokenizer_dir = self.tokenizer_dir(args)
         self.announce_capabilities(facts, tokenizer_dir)
+        plan = None
+        if self.warmup_env:
+            plan = plan_for(warmup_setting, self.warmup_inputs(args, facts), knob=self.warmup_env)
         handshake_port = knobs.handshake_port or free_port()
+        # The metrics endpoint, resolved and checked before the port is
+        # bound and the engine starts (a clash with the gRPC port is refused
+        # here, not by a bind after the engine loaded).
+        metrics_bind_address = self.metrics_bind_address(args)
         server = getattr(servicer, self.server_class)(
             bind_address=self.bind_address(args),
             # Per process, not per requested port: `--port 0` launchers would
@@ -1045,10 +1553,21 @@ class RustLauncher:
             tokenizer_dir=tokenizer_dir,
             engine_startup_timeout_secs=knobs.startup_timeout_secs,
             engine_startup_ceiling_secs=knobs.startup_ceiling_secs,
+            engine_silence_timeout_secs=knobs.silence_timeout_secs,
+            engine_prefill_tokens_per_sec=knobs.prefill_tokens_per_sec,
+            metrics_bind_address=metrics_bind_address,
             **self.server_extras(args, tokenizer_dir),
             **facts,
         )
+        supervision: dict[str, Any] = {}
+        if plan is not None:
+            # Readiness is held from the first probe: the health flips to
+            # SERVING once the warm-up ran over the connected engine
+            # (``supervise``), not when the engine connects. Admission stays
+            # open: the warm-up's own requests must reach the engine.
+            hold_readiness(server, False)
+            supervision["warmup"] = functools.partial(self.run_warmup, plan, warmup_setting, server)
         self.announce(server, knobs, handshake_port, engine_count)
         engine = await launch_or_stop(server, lambda: self.launch(args, handshake_port, facts))
         self.launched(engine)
-        return await supervise(server, engine, drain_secs=knobs.drain_secs)
+        return await supervise(server, engine, drain_secs=knobs.drain_secs, **supervision)

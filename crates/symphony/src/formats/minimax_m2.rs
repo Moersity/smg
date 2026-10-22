@@ -62,10 +62,10 @@ mod tests {
     use super::*;
     use crate::{
         engine::Engine,
-        event::{DropReason, Event, Events, Text},
-        input::{EngineFinish, Input},
-        parser::Parser,
-        tagged::Declared,
+        event::{DropReason, Event, MalformedReason, Text},
+        input::EngineFinish,
+        testing::{arguments_of, bytes, content, drive, drive_to, reasoning},
+        Declared,
     };
 
     fn declared() -> Declared {
@@ -97,90 +97,13 @@ mod tests {
         "</invoke>\n</minimax:tool_call>"
     );
 
-    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
-        let mut parser = Engine::new(minimax_m2(), declared());
-        let mut out = Events::new();
-        parser
-            .feed(
-                Input::Prompt {
-                    token_ids: &[],
-                    text: prompt,
-                },
-                &mut out,
-            )
-            .expect("prompt");
-        for piece in pieces {
-            parser
-                .feed(
-                    Input::Delta {
-                        token_ids: &[],
-                        text: piece,
-                        spans: &[],
-                    },
-                    &mut out,
-                )
-                .expect("delta");
-        }
-        parser
-            .feed(
-                Input::End {
-                    finish: EngineFinish::Stop,
-                },
-                &mut out,
-            )
-            .expect("end");
-        out.drain()
+    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event<'static>> {
+        drive(&mut Engine::new(minimax_m2(), declared()), prompt, pieces)
     }
 
-    fn bytes(events: &[Event]) -> String {
-        events
-            .iter()
-            .map(|e| match e {
-                Event::Content(t) | Event::Reasoning(t) => t.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
-                Event::ToolCallStart { source, .. }
-                | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => source.text.as_str(),
-                Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
-            })
-            .collect()
-    }
-
-    fn arguments_of(events: &[Event], call: u32) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::ToolCallArguments { index, json, .. } if *index == call => {
-                    Some(json.as_str())
-                }
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn content(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Content(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn reasoning(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Reasoning(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn dropped(text: &str) -> Event {
+    fn dropped(text: &str) -> Event<'static> {
         Event::Dropped {
-            text: Text::uncounted(text),
+            text: Text::uncounted(text.to_owned()),
             why: DropReason::Wrapper,
         }
     }
@@ -201,9 +124,9 @@ mod tests {
             ]
         );
         assert_eq!(reasoning(&events), "The user asks about Paris.\n");
-        // The newlines between the thought and the block are content; the block's own are
-        // wrapping.
-        assert_eq!(content(&events), "\n\n\n");
+        // The newlines between the thought and the block are the template's spacing, dropped
+        // when the block's opener came; the block's own are wrapping.
+        assert_eq!(content(&events), "");
         assert_eq!(
             events[5..8],
             [
@@ -281,13 +204,26 @@ mod tests {
             "\n</think>\n\n\n<minimax:tool_call>\n<invoke name=\"get_weat",
             "her\">\n<parameter name=\"city\">Par",
         ];
-        let events = run(PROMPT, &pieces);
+        let events = drive_to(
+            &mut Engine::new(minimax_m2(), declared()),
+            PROMPT,
+            &pieces,
+            EngineFinish::Length,
+        );
         assert_eq!(bytes(&events), pieces.concat());
         assert_eq!(arguments_of(&events, 0), r#"{"city": "Par"#);
         assert!(matches!(
             events.last(),
             Some(Event::Finish { tool_calls: 1, .. })
         ));
+        // The model's own end of output there closes the string and the object, and says so.
+        let stopped = run(PROMPT, &pieces);
+        assert_eq!(bytes(&stopped), pieces.concat());
+        assert_eq!(arguments_of(&stopped, 0), r#"{"city": "Par"}"#);
+        assert!(stopped.iter().any(|event| matches!(
+            event,
+            Event::Malformed { text, why: MalformedReason::OpenAtTheStop } if text.text.is_empty()
+        )));
     }
 
     #[test]

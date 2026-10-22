@@ -27,7 +27,7 @@ use std::{
     mem::size_of,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     },
 };
 
@@ -392,7 +392,10 @@ pub struct L1Cache {
     /// Key: Blake3 hash of bytes[0..boundary]
     /// Value: Cached token IDs for that prefix
     shards: Vec<Arc<DashMap<Blake3Hash, CachedPrefix>>>,
-    /// Maximum memory in bytes
+    /// Serializes admission, eviction and clear; busy writers skip caching.
+    admission: Mutex<()>,
+    /// Maximum retained-entry charge (boundary bytes plus token bytes).
+    /// Excludes map/Arc overhead and allocations still held by readers.
     max_memory: usize,
     /// Current memory usage estimate
     current_memory: AtomicU64,
@@ -414,6 +417,7 @@ impl L1Cache {
 
         Self {
             shards,
+            admission: Mutex::new(()),
             max_memory,
             current_memory: AtomicU64::new(0),
             hits: AtomicU64::new(0),
@@ -630,7 +634,7 @@ impl L1Cache {
             frame.map_or_else(Vec::new, |frame| frame.prepended().to_vec());
         let head = running_tokens.len();
         let mut last: Option<Seed> = None;
-        let mut entries_to_insert = Vec::with_capacity(seeds.len());
+        let mut prefix_lengths = Vec::with_capacity(seeds.len());
         for &seed in seeds {
             // The first segment is the start of the input; every later segment
             // is encoded after the special token that ends the boundary before
@@ -649,22 +653,16 @@ impl L1Cache {
                 )?,
             }
 
-            // Convert current tokens to Arc<[TokenIdType]> for sharing
-            let prefix_tokens: Arc<[TokenIdType]> = running_tokens[head..].into();
-
-            // Size = text bytes + token storage
-            let size_bytes = seed.end + prefix_tokens.len() * size_of::<TokenIdType>();
-
-            entries_to_insert.push((seed.digest, prefix_tokens, size_bytes));
+            prefix_lengths.push(running_tokens.len());
 
             last = Some(seed);
         }
 
-        if entries_to_insert.is_empty() {
-            return Ok(running_tokens);
+        // Keep only offsets until every segment is known to splice exactly.
+        // Copy each admitted prefix directly from the completed running buffer.
+        for (seed, end) in seeds.iter().zip(prefix_lengths) {
+            self.insert_prefix(seed.digest, seed.end, &running_tokens[head..end]);
         }
-
-        self.store_entries(entries_to_insert);
 
         Ok(running_tokens)
     }
@@ -675,59 +673,51 @@ impl L1Cache {
         self.fallbacks.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Cache one cumulative prefix ending at `boundary_pos`.
+    /// Cache one cumulative prefix ending at `boundary_pos`, only if it fits.
+    /// Admission never waits for another writer. Reserve space before copying
+    /// tokens; lookups may keep evicted Arcs alive outside this retained budget.
     pub(super) fn insert_prefix(
         &self,
         hash_bytes: Blake3Hash,
         boundary_pos: usize,
         tokens: &[TokenIdType],
     ) {
-        let prefix_tokens: Arc<[TokenIdType]> = tokens.into();
-        let size_bytes = boundary_pos + prefix_tokens.len() * size_of::<TokenIdType>();
-        self.store_entries(vec![(hash_bytes, prefix_tokens, size_bytes)]);
-    }
-
-    /// Insert entries, evicting first if the memory limit requires it.
-    fn store_entries(&self, entries: Vec<(Blake3Hash, Arc<[TokenIdType]>, usize)>) {
-        let total_size_needed: usize = entries.iter().map(|(_, _, size)| size).sum();
-
-        // Evict if necessary
+        let Some(size_bytes) = tokens
+            .len()
+            .checked_mul(size_of::<TokenIdType>())
+            .and_then(|bytes| boundary_pos.checked_add(bytes))
+        else {
+            return;
+        };
+        if self.max_memory == 0 || size_bytes > self.max_memory {
+            return;
+        }
+        let Ok(_admission) = self.admission.try_lock() else {
+            return;
+        };
+        let shard_idx = hash_bytes[0] as usize % NUM_SHARDS;
+        // An existing hash already represents the same prefix. Avoid copying
+        // or evicting it merely because another miss encoded it concurrently.
+        if let Some(cached) = self.shards[shard_idx].get(&hash_bytes) {
+            cached.last_accessed.store(
+                self.access_counter.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            return;
+        }
         let current = self.current_memory.load(Ordering::Relaxed) as usize;
-        if current + total_size_needed > self.max_memory {
-            self.evict_lru(total_size_needed);
+        let available = self.max_memory - current;
+        if size_bytes > available {
+            self.evict_lru(size_bytes - available);
         }
-
-        // Insert all entries, accounting for replaced entries in memory tracking
-        let current_timestamp = self.access_counter.load(Ordering::Relaxed);
-        for (hash_bytes, prefix_tokens, size_bytes) in entries {
-            let shard_idx = hash_bytes[0] as usize % NUM_SHARDS;
-
-            let cached = CachedPrefix {
-                tokens: prefix_tokens,
-                last_accessed: Arc::new(AtomicU64::new(current_timestamp)),
-                size_bytes,
-            };
-
-            if let Some(old) = self.shards[shard_idx].insert(hash_bytes, cached) {
-                // Replaced an existing entry — adjust delta only.
-                // Note: the counter update is not atomic with the shard insert, so
-                // concurrent replacements of the same key can briefly skew the
-                // counter. This is benign — eviction is best-effort and the drift
-                // is bounded to a single entry's size per race.
-                let old_size = old.size_bytes as u64;
-                let new_size = size_bytes as u64;
-                if new_size >= old_size {
-                    self.current_memory
-                        .fetch_add(new_size - old_size, Ordering::Relaxed);
-                } else {
-                    self.current_memory
-                        .fetch_sub(old_size - new_size, Ordering::Relaxed);
-                }
-            } else {
-                self.current_memory
-                    .fetch_add(size_bytes as u64, Ordering::Relaxed);
-            }
-        }
+        let cached = CachedPrefix {
+            tokens: tokens.into(),
+            last_accessed: Arc::new(AtomicU64::new(self.access_counter.load(Ordering::Relaxed))),
+            size_bytes,
+        };
+        self.shards[shard_idx].insert(hash_bytes, cached);
+        self.current_memory
+            .fetch_add(size_bytes as u64, Ordering::Relaxed);
     }
 
     /// Evict least recently used entries using approximate LRU via random sampling
@@ -742,6 +732,7 @@ impl L1Cache {
     ///
     /// The approximation is excellent in practice - sampling 32 entries from a large cache
     /// gives high probability of finding very old entries.
+    /// Caller holds admission, so removals and accounting cannot race writers or clear.
     fn evict_lru(&self, space_needed: usize) {
         const SAMPLE_SIZE: usize = 32; // Number of entries to sample per eviction round
         let mut freed = 0usize;
@@ -818,8 +809,12 @@ impl L1Cache {
         }
     }
 
-    /// Clear the cache
+    /// Clear retained entries and counters while excluding cache writers.
     pub fn clear(&self) {
+        let _admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         for shard in &self.shards {
             shard.clear();
         }
@@ -839,14 +834,116 @@ pub struct L1CacheStats {
     /// hits or misses they started as.
     pub fallbacks: u64,
     pub entries: usize,
+    /// Retained-entry charge, bounded by the configured limit. This estimate
+    /// excludes container overhead and evicted tokens still held by readers.
     pub memory_bytes: usize,
     pub hit_rate: f64,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{SpecialTokenBoundaries, SpecialTokenFrame};
+    use super::{
+        super::test_encoders::{SplittingEncoder, Tail},
+        SpecialTokenBoundaries, SpecialTokenFrame,
+    };
     use crate::*;
+
+    /// Oversized prefixes must be rejected without displacing useful entries.
+    #[test]
+    fn budget_rejects_oversized_prefix() {
+        let cache = L1Cache::new(128);
+        cache.insert_prefix([1; 32], 8, &[1; 8]);
+        cache.insert_prefix([2; 32], 100, &[2; 100]);
+        assert_eq!(cache.stats().entries, 1);
+        assert_eq!(cache.stats().memory_bytes, 40);
+    }
+
+    /// A disabled cache must retain no entries, including empty prefixes.
+    #[test]
+    fn budget_zero_retains_nothing() {
+        let cache = L1Cache::new(0);
+        cache.insert_prefix([1; 32], 1, &[1]);
+        cache.insert_prefix([2; 32], 0, &[]);
+        assert!(cache.is_empty());
+        assert_eq!(cache.stats().memory_bytes, 0);
+    }
+
+    /// Many cumulative prefixes must fit the budget without changing encoding.
+    #[test]
+    fn budget_many_boundaries_preserves_encoding() {
+        let input = format!("{}tail", "abcdef<|im_end|>".repeat(15000));
+        for flag in [false, true] {
+            let cache = L1Cache::new(4096);
+            let encoded = cache
+                .populate_and_encode(&input, &bos_tokenizer(), &SPECIALS, flag)
+                .unwrap();
+            assert_eq!(
+                encoded.token_ids(),
+                bos_tokenizer().encode(&input, flag).unwrap().token_ids()
+            );
+            assert!(cache.stats().memory_bytes <= 4096);
+        }
+    }
+
+    /// Contending admissions skip allocation rather than waiting for the writer.
+    #[test]
+    fn budget_busy_writer_skips_insertion() {
+        let cache = L1Cache::new(1024);
+        let _guard = cache.admission.lock().unwrap();
+        cache.insert_prefix([0; 32], 4, &[1; 4]);
+        assert!(cache.is_empty());
+    }
+
+    /// Concurrent admissions and clears preserve the retained accounting.
+    #[test]
+    fn budget_concurrent_admission_and_clear() {
+        use std::sync::{Arc, Barrier};
+        let cache = Arc::new(L1Cache::new(4096));
+        let barrier = Arc::new(Barrier::new(9));
+        std::thread::scope(|scope| {
+            for worker in 0..8u8 {
+                let cache = &cache;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for i in 0..1000u32 {
+                        let mut key = [worker; 32];
+                        key[1..5].copy_from_slice(&i.to_le_bytes());
+                        cache.insert_prefix(key, 128, &[1; 128]);
+                        assert!(cache.stats().memory_bytes <= 4096);
+                    }
+                });
+            }
+            barrier.wait();
+            for _ in 0..1000 {
+                cache.clear();
+            }
+        });
+        let retained: usize = cache
+            .shards
+            .iter()
+            .flat_map(|s| s.iter().map(|e| e.size_bytes).collect::<Vec<_>>())
+            .sum();
+        assert_eq!(cache.stats().memory_bytes, retained);
+        assert!(retained <= 4096);
+        cache.clear();
+        assert_eq!(cache.stats().memory_bytes, 0);
+        assert!(cache.is_empty());
+    }
+
+    /// Eviction releases cache accounting, while a reader can still own its Arc.
+    #[test]
+    fn budget_evicted_reader_keeps_valid_tokens() {
+        let cache = L1Cache::new(40);
+        cache.insert_prefix([1; 32], 8, &[1; 8]);
+        let held = cache.shards[1].get(&[1; 32]).unwrap().tokens.clone();
+        cache.insert_prefix([2; 32], 8, &[2; 8]);
+        assert_eq!(cache.stats().memory_bytes, 40);
+        assert_eq!(&*held, &[1; 8]);
+        cache.clear();
+        assert_eq!(cache.stats().memory_bytes, 0);
+        assert_eq!(&*held, &[1; 8]);
+    }
 
     /// The special tokens of the test encoders below: atomic (one id each),
     /// extracted leftmost-longest as a BPE tokenizer's added vocabulary does
@@ -862,37 +959,11 @@ mod tests {
     /// Encoder with the atomic [`SPECIALS`] (ids 1000 and up) and one id per
     /// byte otherwise; a sentinel BOS when `add_special_tokens` is set, so the
     /// same text yields different tokens per flag.
-    struct BosTokenizer;
+    fn bos_tokenizer() -> SplittingEncoder {
+        SplittingEncoder::new(SPECIALS, 1000).with_bos(BOS_ID)
+    }
 
     const BOS_ID: TokenIdType = 99;
-
-    impl Encoder for BosTokenizer {
-        fn encode(&self, input: &str, add_special_tokens: bool) -> Result<Encoding> {
-            let matcher = aho_corasick::AhoCorasickBuilder::new()
-                .match_kind(aho_corasick::MatchKind::LeftmostLongest)
-                .build(SPECIALS)
-                .unwrap();
-            let mut ids: Vec<TokenIdType> = Vec::new();
-            if add_special_tokens {
-                ids.push(BOS_ID);
-            }
-            let mut last = 0;
-            for found in matcher.find_iter(input) {
-                ids.extend(input[last..found.start()].bytes().map(TokenIdType::from));
-                ids.push(1000 + found.pattern().as_u32());
-                last = found.end();
-            }
-            ids.extend(input[last..].bytes().map(TokenIdType::from));
-            Ok(Encoding::Plain(ids))
-        }
-
-        fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>> {
-            inputs
-                .iter()
-                .map(|i| self.encode(i, add_special_tokens))
-                .collect()
-        }
-    }
 
     /// The byte offsets of a matcher's boundaries.
     fn ends(boundaries: Vec<(usize, usize)>) -> Vec<usize> {
@@ -903,7 +974,7 @@ mod tests {
     fn test_basic_prefix_match() {
         let cache = L1Cache::new(1024 * 1024);
         let special_tokens = &["<|im_start|>", "<|im_end|>"];
-        let tokenizer = BosTokenizer;
+        let tokenizer = bos_tokenizer();
 
         // Realistic ChatML template with special tokens
         let input1 = "<|im_start|>system\nYou are a helpful assistant that provides clear and detailed responses.<|im_end|><|im_start|>user\nHello there! How are you doing today?<|im_end|>";
@@ -931,7 +1002,7 @@ mod tests {
     fn test_short_input_with_boundaries() {
         let cache = L1Cache::new(1024 * 1024);
         let special_tokens = &["<|im_start|>", "<|im_end|>"];
-        let tokenizer = BosTokenizer;
+        let tokenizer = bos_tokenizer();
 
         // Short input with special tokens
         let input = "<|im_start|>user\nHi<|im_end|>";
@@ -952,7 +1023,7 @@ mod tests {
     fn test_longest_match() {
         let cache = L1Cache::new(1024 * 1024);
         let special_tokens = &["<|im_start|>", "<|im_end|>"];
-        let tokenizer = BosTokenizer;
+        let tokenizer = bos_tokenizer();
 
         // Create multi-turn conversation with multiple special token boundaries (~400 bytes)
         let input = "<|im_start|>system\nYou are a helpful AI assistant that provides detailed and accurate responses.<|im_end|><|im_start|>user\nHello there! How are you today? Can you help me understand how tokenization works in language models?<|im_end|><|im_start|>assistant\nI'm doing well, thank you! I'd be happy to explain tokenization. Tokenization is the process of breaking text into smaller units called tokens.<|im_end|>";
@@ -979,7 +1050,7 @@ mod tests {
     fn test_stats() {
         let cache = L1Cache::new(1024 * 1024);
         let special_tokens = &["<|im_start|>", "<|im_end|>"];
-        let tokenizer = BosTokenizer;
+        let tokenizer = bos_tokenizer();
 
         // ChatML input with special tokens
         let input = "<|im_start|>system\nYou are a helpful assistant that provides detailed answers.<|im_end|><|im_start|>user\nHello there! How are you today?<|im_end|>";
@@ -1001,7 +1072,7 @@ mod tests {
     fn test_clear() {
         let cache = L1Cache::new(1024 * 1024);
         let special_tokens = &["<|im_start|>", "<|im_end|>"];
-        let tokenizer = BosTokenizer;
+        let tokenizer = bos_tokenizer();
 
         // ChatML input with special tokens
         let input = "<|im_start|>system\nYou are a helpful assistant that provides clear and detailed responses.<|im_end|><|im_start|>user\nHello there!<|im_end|>";
@@ -1024,7 +1095,7 @@ mod tests {
         // Create a small cache (5KB) to trigger eviction
         let cache = L1Cache::new(5 * 1024);
         let special_tokens = &["<|im_start|>", "<|im_end|>", "<|eot_id|>"];
-        let tokenizer = BosTokenizer;
+        let tokenizer = bos_tokenizer();
 
         // Insert first conversation
         let input1 = "<|im_start|>system\nYou are a helpful assistant specialized in mathematics.<|im_end|><|im_start|>user\nCan you explain calculus to me?<|im_end|><|im_start|>assistant\nCertainly! Calculus is a branch of mathematics that studies continuous change.<|im_end|><|eot_id|>";
@@ -1078,7 +1149,7 @@ mod tests {
             let cache_clone = cache.clone();
             let st_clone = special_tokens_arc.clone();
             handles.push(thread::spawn(move || {
-                let tokenizer = BosTokenizer;
+                let tokenizer = bos_tokenizer();
                 let special_tokens: Vec<&str> = st_clone.iter().map(|s| s.as_str()).collect();
 
                 // Each thread uses a unique user message to avoid hash collisions
@@ -1143,7 +1214,7 @@ mod tests {
     fn test_add_special_tokens_separates_keys() {
         let cache = L1Cache::new(1024 * 1024);
         let special_tokens = &["<|im_start|>", "<|im_end|>"];
-        let tokenizer = BosTokenizer;
+        let tokenizer = bos_tokenizer();
         let input = "<|im_start|>system\nhi<|im_end|><|im_start|>user\nq<|im_end|>";
 
         // Insert the same input under both flags.
@@ -1172,7 +1243,7 @@ mod tests {
     fn test_opposite_flag_does_not_collide() {
         let cache = L1Cache::new(1024 * 1024);
         let special_tokens = &["<|im_start|>", "<|im_end|>"];
-        let tokenizer = BosTokenizer;
+        let tokenizer = bos_tokenizer();
         let input = "<|im_start|>system\nhi<|im_end|><|im_start|>user\nq<|im_end|>";
 
         // Only the `true` flag is populated.
@@ -1330,34 +1401,11 @@ mod tests {
 
     /// Encoder with the special `/think` and the longer, non-special added
     /// token `</think>` that contains it, both atomic.
-    struct ThinkTokens;
-
-    impl Encoder for ThinkTokens {
-        fn encode(&self, input: &str, _add_special_tokens: bool) -> Result<Encoding> {
-            let matcher = aho_corasick::AhoCorasickBuilder::new()
-                .match_kind(aho_corasick::MatchKind::LeftmostLongest)
-                .build(["/think", "</think>", "<|im_end|>"])
-                .unwrap();
-            let mut ids: Vec<TokenIdType> = Vec::new();
-            let mut last = 0;
-            for found in matcher.find_iter(input) {
-                ids.extend(input[last..found.start()].bytes().map(TokenIdType::from));
-                ids.push(1000 + found.pattern().as_u32());
-                last = found.end();
-            }
-            ids.extend(input[last..].bytes().map(TokenIdType::from));
-            Ok(Encoding::Plain(ids))
-        }
-
-        fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>> {
-            inputs
-                .iter()
-                .map(|i| self.encode(i, add_special_tokens))
-                .collect()
-        }
+    fn think_tokens() -> SplittingEncoder {
+        SplittingEncoder::new(["/think", "</think>", "<|im_end|>"], 1000)
     }
 
-    /// Encoder like [`ThinkTokens`], but `</think>` is a special token the
+    /// Encoder like [`think_tokens`]'s, but `</think>` is a special token the
     /// encoder extracts only at the end of its input (so the self-check
     /// drops it), while `/think` is extracted anywhere.
     struct ThinkTokensEndOnly;
@@ -1413,7 +1461,7 @@ mod tests {
         let matcher = SpecialTokenBoundaries::for_encoder(
             &["/think", "<|im_end|>"],
             &["b /t", "zz"],
-            &ThinkTokens,
+            &think_tokens(),
         );
         // Declared as an added token, `b /t` begins before the `/think` after
         // `b ` and wins the leftmost match: that `/think` is text. `zz` can
@@ -1430,31 +1478,8 @@ mod tests {
 
     /// Encoder with the atomic special tokens `STOP` and `QQ` and the atomic
     /// added tokens `kSTO`, `mQQk`, `nm` and `Pp`, extracted leftmost-longest.
-    struct ChainedTokens;
-
-    impl Encoder for ChainedTokens {
-        fn encode(&self, input: &str, _add_special_tokens: bool) -> Result<Encoding> {
-            let matcher = aho_corasick::AhoCorasickBuilder::new()
-                .match_kind(aho_corasick::MatchKind::LeftmostLongest)
-                .build(["STOP", "QQ", "kSTO", "mQQk", "nm", "Pp"])
-                .unwrap();
-            let mut ids: Vec<TokenIdType> = Vec::new();
-            let mut last = 0;
-            for found in matcher.find_iter(input) {
-                ids.extend(input[last..found.start()].bytes().map(TokenIdType::from));
-                ids.push(1000 + found.pattern().as_u32());
-                last = found.end();
-            }
-            ids.extend(input[last..].bytes().map(TokenIdType::from));
-            Ok(Encoding::Plain(ids))
-        }
-
-        fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>> {
-            inputs
-                .iter()
-                .map(|i| self.encode(i, add_special_tokens))
-                .collect()
-        }
+    fn chained_tokens() -> SplittingEncoder {
+        SplittingEncoder::new(["STOP", "QQ", "kSTO", "mQQk", "nm", "Pp"], 1000)
     }
 
     #[test]
@@ -1462,7 +1487,7 @@ mod tests {
         let matcher = SpecialTokenBoundaries::for_encoder(
             &["STOP", "QQ"],
             &["kSTO", "mQQk", "nm", "Pp"],
-            &ChainedTokens,
+            &chained_tokens(),
         );
         // `kSTO` and `mQQk` can take a special token's place; `nm` can take
         // `mQQk`'s. On `nmQQkSTOPping` the tokenizer extracts `nm`, `QQ`,
@@ -1484,7 +1509,7 @@ mod tests {
         let matcher = SpecialTokenBoundaries::for_encoder(
             &["/think", "<|im_end|>"],
             &["</think>"],
-            &ThinkTokens,
+            &think_tokens(),
         );
         // `</think>` is extracted whole by the tokenizer: the `/think` inside
         // it is no boundary; a `/think` on its own still is.
@@ -1495,7 +1520,7 @@ mod tests {
         let without = SpecialTokenBoundaries::for_encoder::<_, &str, _>(
             &["/think", "<|im_end|>"],
             &[],
-            &ThinkTokens,
+            &think_tokens(),
         );
         assert_eq!(
             ends(without.find("a</think>b /think c<|im_end|>d")),
@@ -1509,7 +1534,7 @@ mod tests {
 
         let cache = L1Cache::new(1024 * 1024);
         let special_tokens = &["<|im_start|>", "<|im_end|>"];
-        let tokenizer = BosTokenizer;
+        let tokenizer = bos_tokenizer();
 
         let input = "<|im_start|>system\nYou are a helpful assistant.<|im_end|><|im_start|>user\nWhat is 2+2?<|im_end|>";
         cache
@@ -1535,32 +1560,17 @@ mod tests {
     /// Encoder with one id per byte and, when `add_special_tokens` is set,
     /// the input's length as a trailing id: what the flag adds depends on
     /// the text.
-    struct LengthTail;
-
-    impl Encoder for LengthTail {
-        fn encode(&self, input: &str, add_special_tokens: bool) -> Result<Encoding> {
-            let mut ids: Vec<TokenIdType> = input.bytes().map(TokenIdType::from).collect();
-            if add_special_tokens {
-                ids.push(TokenIdType::try_from(input.len()).unwrap_or(TokenIdType::MAX));
-            }
-            Ok(Encoding::Plain(ids))
-        }
-
-        fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>> {
-            inputs
-                .iter()
-                .map(|i| self.encode(i, add_special_tokens))
-                .collect()
-        }
+    fn length_tail() -> SplittingEncoder {
+        SplittingEncoder::new(Vec::<&str>::new(), 1000).with_tail(Tail::TextLength)
     }
 
     #[test]
     fn the_frame_probe_reads_what_the_flag_adds() {
-        let frame = SpecialTokenFrame::probe(&BosTokenizer).expect("a constant frame");
+        let frame = SpecialTokenFrame::probe(&bos_tokenizer()).expect("a constant frame");
         assert_eq!(frame.prepended(), &[BOS_ID]);
         assert_eq!(frame.appended(), &[] as &[TokenIdType]);
         assert_eq!(
-            SpecialTokenFrame::probe(&LengthTail),
+            SpecialTokenFrame::probe(&length_tail()),
             None,
             "a text-dependent addition is no frame"
         );
@@ -1569,7 +1579,7 @@ mod tests {
     #[test]
     fn test_populate_and_encode_matches_uncached_and_seeds_cache() {
         let special_tokens = &["<|im_start|>", "<|im_end|>"];
-        let tokenizer = BosTokenizer;
+        let tokenizer = bos_tokenizer();
         let input = "<|im_start|>system\nhi<|im_end|><|im_start|>user\nquery<|im_end|>";
 
         for add_special_tokens in [false, true] {

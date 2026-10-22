@@ -123,10 +123,15 @@ fn check_media_counts(
     Ok(())
 }
 
-/// Ordering of media and text parts when rendering a multipart message.
+/// Where a message's media parts go relative to its text when the chat
+/// template takes one string per message and so cannot place them itself. A
+/// template that takes content parts places them itself and always gets them
+/// in the request's order, as the serving engine's own server hands them to
+/// such a template; this order does not apply to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaPartOrder {
-    /// Emit media parts before text (the serving engine's `interleave_mm_strings=false` order).
+    /// Emit media parts before text (the serving engine's placement for a
+    /// string-content template).
     MediaFirst,
     /// Keep parts in request order; part order is protocol-visible.
     Authored,
@@ -251,9 +256,11 @@ pub trait ModelProcessorSpec: Send + Sync {
         None
     }
 
-    /// Ordering of media/text parts this model's chat template expects. Most
-    /// models use the serving engine's media-first order; families whose template renders
-    /// parts positionally override to `Authored`.
+    /// Where this model's media parts go relative to its text when its
+    /// template takes one string per message (see [`MediaPartOrder`]): the
+    /// serving engine's media-first order by default; a family whose string
+    /// renderer is positional overrides to `Authored`. A template that takes
+    /// content parts gets them in the request's order whatever this says.
     fn media_part_order(&self) -> MediaPartOrder {
         MediaPartOrder::MediaFirst
     }
@@ -346,8 +353,6 @@ pub trait ModelProcessorSpec: Send + Sync {
                 .or_else(|| modality_limit_override(modality))
         })
     }
-
-    fn processor_kwargs(&self, metadata: &ModelMetadata) -> RegistryResult<Value>;
 
     /// Build the audio preprocessor for this model, if it supports audio.
     ///
@@ -482,10 +487,24 @@ pub trait ModelProcessorSpec: Send + Sync {
         None
     }
 
+    /// [`Self::default_video_sample_fps`] given the video preprocessor config
+    /// the checkpoint ships, for a family whose reference reads the rate from
+    /// it; the default ignores the config.
+    fn default_video_sample_fps_with(&self, _config: Option<&PreProcessorConfig>) -> Option<f32> {
+        self.default_video_sample_fps()
+    }
+
     /// Where a video's sampled frames sit: evenly spread, or one per interval
     /// from the start with the last frame kept, as the model's reference does.
     fn video_frame_sampling(&self) -> FrameSampling {
         FrameSampling::Even
+    }
+
+    /// [`Self::video_frame_sampling`] given the video preprocessor config the
+    /// checkpoint ships, for a family whose reference reads its frame budget
+    /// or grouping from it; the default ignores the config.
+    fn video_frame_sampling_with(&self, _config: Option<&PreProcessorConfig>) -> FrameSampling {
+        self.video_frame_sampling()
     }
 }
 
@@ -563,10 +582,6 @@ mod tests {
             _metadata: &ModelMetadata,
         ) -> RegistryResult<HashMap<Modality, usize>> {
             Ok(HashMap::from([(Modality::Image, 2), (Modality::Audio, 1)]))
-        }
-
-        fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
-            Ok(json!({}))
         }
 
         fn prompt_replacements(
@@ -863,10 +878,6 @@ mod tests {
             _metadata: &ModelMetadata,
         ) -> RegistryResult<HashMap<Modality, usize>> {
             Ok(HashMap::from([(Modality::Image, 1), (Modality::Video, 1)]))
-        }
-
-        fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
-            Ok(json!({}))
         }
 
         fn prompt_replacements(

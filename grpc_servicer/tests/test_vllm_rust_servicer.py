@@ -448,11 +448,31 @@ def test_smg_media_options_follow_the_engine_config(tmp_path, monkeypatch):
         "max_inflight": 3,
         "max_items": 2,
         "engine_item_limits": None,
+        "engine_encoder_budget": None,
         "max_item_bytes": 10,
         "video_frame_budget": None,
         "video_loader_rule": None,
+        "turbojpeg": None,
         "source": "flag",
     }
+    # The engine's encoder budget rides along as the launcher derived it (0,
+    # an engine that could not tell, leaves the pipeline without one).
+    assert (
+        rust.smg_media_options(config, settings, str(tmp_path), encoder_budget=192000)[
+            "engine_encoder_budget"
+        ]
+        == 192000
+    )
+    assert (
+        rust.smg_media_options(config, settings, str(tmp_path), encoder_budget=0)[
+            "engine_encoder_budget"
+        ]
+        is None
+    )
+    # A policy the launcher was given travels; one it was not given is left
+    # to the pipeline's own SMG_MM_TURBOJPEG (None above).
+    required = MmSettings(processor="smg", turbojpeg="require").resolve(env={})
+    assert rust.smg_media_options(config, required, str(tmp_path))["turbojpeg"] == "require"
     # The engine's own per-prompt limits ride along for the pipeline to enforce.
     config.model_config.multimodal_config = SimpleNamespace(
         mm_device_do_normalize=True,
@@ -526,14 +546,115 @@ def test_smg_media_options_follow_the_engine_config(tmp_path, monkeypatch):
     # An engine that normalizes on the CPU takes normalized pixels in its dtype.
     config.model_config.multimodal_config = SimpleNamespace(mm_device_do_normalize=False)
     assert rust.smg_media_options(config, settings, None)["raw_pixels"] is False
-    # The engine's processor kwargs ride along, less where its own processor runs.
-    config.model_config.mm_processor_kwargs = {"max_pixels": 1000, "device": "cuda"}
+    # The engine's processor kwargs ride along from its multimodal section,
+    # where the engine keeps them, less where its own processor runs.
+    config.model_config.multimodal_config.mm_processor_kwargs = {
+        "max_pixels": 1000,
+        "device": "cuda",
+    }
     assert (
         rust.smg_media_options(config, settings, None)["processor_kwargs_json"]
         == '{"max_pixels": 1000}'
     )
     # A text model takes no media: the mode is ignored, as the Python processors ignore it.
     assert rust.smg_media_options(_config(), settings, None) is None
+
+
+@dataclasses.dataclass
+class _EngineModelConfig:
+    """The engine's layout of the processor kwargs: ``mm_processor_kwargs`` is
+    an init-only field whose value ``__post_init__`` moves into the multimodal
+    section; the attribute on the instance reads as the class default, None,
+    whatever the launcher was given."""
+
+    model: str = "org/m"
+    dtype: str = "torch.bfloat16"
+    is_multimodal_model: bool = True
+    mm_processor_kwargs: dataclasses.InitVar[dict | None] = None
+    multimodal_config: SimpleNamespace | None = None
+
+    def __post_init__(self, mm_processor_kwargs):
+        self.multimodal_config = SimpleNamespace(
+            mm_device_do_normalize=True, mm_processor_kwargs=mm_processor_kwargs
+        )
+
+    def get_multimodal_config(self):
+        return self.multimodal_config
+
+
+def _engine_config(**kwargs):
+    return SimpleNamespace(
+        model_config=_EngineModelConfig(**kwargs),
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+    )
+
+
+def test_smg_media_options_carry_the_processor_kwargs_from_where_the_engine_keeps_them(
+    tmp_path, monkeypatch
+):
+    """The pipeline's options are built from an engine-shaped config: the
+    kwargs the launcher was given (`--mm-processor-kwargs`) are in the
+    multimodal section, the model config's own attribute reads None, and the
+    options object the binding builds the pipeline from carries them."""
+    from smg_grpc_servicer.vllm import mm_processor
+    from smg_grpc_servicer.vllm.mm_processor import MmSettings
+
+    monkeypatch.setattr(mm_processor, "vllm_default_video_frames", lambda: None)
+    monkeypatch.delenv("VLLM_VIDEO_LOADER_BACKEND", raising=False)
+    monkeypatch.delenv(mm_processor.ENV_MAX_VIDEO_FRAMES, raising=False)
+    settings = MmSettings(processor="smg", max_inflight=3, max_items=2, max_item_bytes=10).resolve(
+        env={}
+    )
+    given = {"max_pixels": 100_000, "do_resize": False, "device": "cuda"}
+    config = _engine_config(mm_processor_kwargs=given)
+    assert config.model_config.mm_processor_kwargs is None, "the init-only field reads None"
+    options = rust.smg_media_options(config, settings, str(tmp_path))
+    assert options == {
+        "model_dir": str(tmp_path),
+        "model_id": "org/m",
+        "raw_pixels": True,
+        "encoder_dtype": "bfloat16",
+        "processor_kwargs_json": '{"do_resize": false, "max_pixels": 100000}',
+        "max_inflight": 3,
+        "max_items": 2,
+        "engine_item_limits": None,
+        "engine_encoder_budget": None,
+        "max_item_bytes": 10,
+        "video_frame_budget": None,
+        "video_loader_rule": None,
+        "turbojpeg": None,
+        "source": "flag",
+    }
+    assert json.loads(options["processor_kwargs_json"]) == {
+        "do_resize": False,
+        "max_pixels": 100000,
+    }
+    assert config.model_config.multimodal_config.mm_processor_kwargs == given, "read, not edited"
+    # A launch without the flag sends none: the pipeline runs the family's defaults.
+    bare = rust.smg_media_options(_engine_config(), settings, str(tmp_path))
+    assert bare["processor_kwargs_json"] is None
+    # The engine's processor device alone is no override of the pipeline.
+    device_only = rust.smg_media_options(
+        _engine_config(mm_processor_kwargs={"device": "cuda"}), settings, str(tmp_path)
+    )
+    assert device_only["processor_kwargs_json"] is None
+
+
+def test_server_extras_hand_the_binding_the_engines_processor_kwargs(tmp_path, monkeypatch):
+    """From the launcher's namespace to the keyword the Rust server takes: the
+    `smg` processor's options carry the engine's kwargs for the binding to lay
+    over the preprocessor configs."""
+    from smg_grpc_servicer.vllm import mm_processor
+
+    monkeypatch.setattr(mm_processor, "vllm_default_video_frames", lambda: None)
+    for name in ("PROCESSOR", "MAX_INFLIGHT", "MAX_ITEM_BYTES", "MAX_ITEMS"):
+        monkeypatch.delenv(f"SMG_VLLM_MM_{name}", raising=False)
+    launcher = rust.VllmLauncher()
+    launcher.vllm_config = _engine_config(mm_processor_kwargs={"max_pixels": 100_000})
+    extras = launcher.server_extras(argparse.Namespace(mm_processor="smg"), str(tmp_path))
+    assert extras["media_processor"] is None
+    assert extras["smg_media_processor"]["processor_kwargs_json"] == '{"max_pixels": 100000}'
+    assert extras["smg_media_processor"]["source"] == "flag"
 
 
 def test_model_info_advertises_device_side_normalization():
@@ -556,6 +677,13 @@ def test_model_info_advertises_the_engines_item_limits():
         ),
     )
     assert rust.model_info_from_config(config)["mm_item_limits"] == "image=8,video=2"
+
+
+def test_model_info_advertises_the_engines_encoder_budget():
+    # A text model has none; a budget the launcher derived is advertised as given.
+    assert rust.model_info_from_config(_config())["mm_encoder_budget"] == 0
+    config = _config(is_multimodal_model=True)
+    assert rust.model_info_from_config(config, encoder_budget=192000)["mm_encoder_budget"] == 192000
 
 
 def test_model_info_carries_where_the_engine_starts_a_grammar():
@@ -650,6 +778,43 @@ def test_model_info_carries_the_pooler_config():
     config = _config(pooler_config=SimpleNamespace(use_activation=None, dimensions=None))
     info = rust.model_info_from_config(config)
     assert info["pooler_use_activation"] is None and info["pooler_dimensions"] is None
+
+
+def test_model_info_projects_a_multi_connector_onto_the_child_that_moves_the_kv():
+    """The Rust servicer reports the connector the launcher hands it, so the
+    launcher hands it the wrapper's mover: the one P2P child whatever rides
+    along, else the one store child; the child's engine id when it names one,
+    the parent's otherwise."""
+    config = _config()
+    config.kv_transfer_config = SimpleNamespace(
+        kv_connector="MultiConnector",
+        kv_role="kv_producer",
+        engine_id="eng-a",
+        kv_connector_extra_config={
+            "connectors": [
+                {"kv_connector": "MooncakeStoreConnector"},
+                {"kv_connector": "NixlConnector", "engine_id": "child-engine"},
+            ]
+        },
+    )
+    info = rust.model_info_from_config(config)
+    assert (info["kv_connector"], info["kv_role"], info["kv_engine_id"]) == (
+        "NixlConnector",
+        "kv_producer",
+        "child-engine",
+    )
+    config.kv_transfer_config.kv_connector_extra_config = {
+        "connectors": [
+            {"kv_connector": "OffloadingConnector"},
+            {"kv_connector": "MooncakeStoreConnector"},
+        ]
+    }
+    info = rust.model_info_from_config(config)
+    assert (info["kv_connector"], info["kv_role"], info["kv_engine_id"]) == (
+        "MooncakeStoreConnector",
+        "kv_producer",
+        "eng-a",
+    )
 
 
 def test_model_info_reports_the_pd_identity_and_pairing_facts():
@@ -880,6 +1045,13 @@ def test_launch_headless_engine_spawns_a_fresh_interpreter(monkeypatch):
     assert engine.pid == 7
 
 
+# The fake cores' pids lie above the kernel's PID_MAX_LIMIT (2^22): never a
+# live process on the test host, so the process-tree passes over the fakes
+# (at construction, on poll, before a kill) find nothing real to record, and
+# nothing real is signalled when a fake group is killed.
+_FAKE_CORE_PID = 4_194_304 + 1000
+
+
 class _FakeCore:
     """A `multiprocessing`-shaped engine-core process the fake manager started."""
 
@@ -910,7 +1082,9 @@ class _FakeManager:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
         self.started_in = os.getpid()
-        self.processes = [_FakeCore(1000 + i) for i in range(kwargs["local_engine_count"])]
+        self.processes = [
+            _FakeCore(_FAKE_CORE_PID + i) for i in range(kwargs["local_engine_count"])
+        ]
         self.events: list[str] = []
         _FakeManager.instances.append(self)
 
@@ -1014,7 +1188,11 @@ def test_launch_engine_cores_builds_the_manager_in_this_process_as_run_headless_
     ((config_args, usage_context, headless),) = recorded["configs"]
     assert config_args is ns and usage_context == 1 and headless is True
     assert ns.headless is True and ns.data_parallel_rpc_port == 24321
-    assert engine.pids == [1000, 1001] and engine.pid == 1000 and engine.poll() is None
+    assert (
+        engine.pids == [_FAKE_CORE_PID, _FAKE_CORE_PID + 1]
+        and engine.pid == _FAKE_CORE_PID
+        and engine.poll() is None
+    )
 
 
 @pytest.mark.parametrize(
@@ -1136,6 +1314,51 @@ def test_serve_rust_constructs_the_server_with_keywords_the_binding_takes(monkey
     signature.bind(**kwargs)
 
 
+def test_serve_rust_holds_readiness_for_the_planned_warm_up(monkeypatch, tmp_path):
+    """With a warm-up planned (the default knob, a generation model whose
+    resolved config carries a running window and an admission step), the
+    server's readiness is held before the engine cores start through the
+    health-only setter (admission stays open for the pass's own requests; the
+    drain switch is never touched) and the supervisor is handed the pass,
+    which flips SERVING when it ran; with the knob off, neither happens."""
+    config = _config()
+    config.scheduler_config = SimpleNamespace(max_num_seqs=8, max_num_batched_tokens=512)
+    engine_args = SimpleNamespace(
+        create_engine_config=lambda usage_context: config, disable_log_stats=False
+    )
+    _stub_frontend_args(monkeypatch)
+    _stub_engine_exceptions(monkeypatch)
+    _install(
+        monkeypatch,
+        "vllm.engine.arg_utils",
+        AsyncEngineArgs=SimpleNamespace(from_cli_args=lambda args: engine_args),
+    )
+    _install(monkeypatch, "vllm.usage.usage_lib", UsageContext=SimpleNamespace(OPENAI_API_SERVER=1))
+    _install_fake_servicer(monkeypatch, FakeServer)
+    monkeypatch.setattr(rust, "launch_engine_cores", lambda ns: FakeEngine())
+    monkeypatch.setattr(rust, "resolve_tokenizer_dir", lambda *a, **k: str(tmp_path))
+    monkeypatch.setattr(rust_lifecycle, "free_port", lambda: 24321)
+    monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(tmp_path))
+    recorded: dict = {}
+
+    async def fake_supervise(server, engine, *, drain_secs, **kwargs):
+        recorded["server"], recorded["supervise_kwargs"] = server, kwargs
+        return 0
+
+    monkeypatch.setattr(rust_lifecycle, "supervise", fake_supervise)
+    args = argparse.Namespace(
+        model_tag="org/m", model="org/m", grpc=True, host=None, port=50051, max_model_len=4096
+    )
+    assert asyncio.run(rust.serve_rust(args)) == 0
+    assert recorded["server"].events == ["ready:False"]
+    assert callable(recorded["supervise_kwargs"]["warmup"])
+
+    monkeypatch.setenv(rust.WARMUP_ENV, "off")
+    assert asyncio.run(rust.serve_rust(args)) == 0
+    assert recorded["server"].events == []
+    assert recorded["supervise_kwargs"] == {}
+
+
 # ---------------------------------------------------------------------------
 # Lifecycle
 # ---------------------------------------------------------------------------
@@ -1156,6 +1379,9 @@ class FakeServer:
 
     def set_serving(self, serving: bool) -> None:
         self.events.append(f"serving:{serving}")
+
+    def set_ready(self, ready: bool) -> None:
+        self.events.append(f"ready:{ready}")
 
     def stop(self, timeout: float) -> None:
         self.events.append(f"stop:{timeout}")
@@ -1286,7 +1512,7 @@ def test_supervise_terminates_the_engine_cores_through_the_manager_on_a_signal()
 def test_engine_process_group_is_popen_shaped():
     manager = _FakeManager(local_engine_count=2)
     engine = rust_lifecycle.EngineProcessGroup(manager)
-    assert engine.pid == 1000 and engine.pids == [1000, 1001]
+    assert engine.pid == _FAKE_CORE_PID and engine.pids == [_FAKE_CORE_PID, _FAKE_CORE_PID + 1]
     assert engine.poll() is None and manager.events == []
     with pytest.raises(subprocess.TimeoutExpired):
         engine.wait(timeout=0.1)
@@ -1302,23 +1528,40 @@ def _signals(core: _FakeCore) -> list[str]:
     return [event for event in core.events if not event.startswith("join")]
 
 
-def test_configure_logging_gives_the_package_a_handler(monkeypatch):
+def test_configure_logging_gives_the_package_a_handler(monkeypatch, capsys):
+    """No handler anywhere (vLLM configured none, no launcher of its own did):
+    the Rust path's lifecycle lines get a plain stderr handler, and what the
+    package logged before (the plugin's parse step) comes out through it first."""
     import logging
+
+    from smg_grpc_servicer.vllm import attach_vllm_logging
 
     root = logging.getLogger()
     pkg = logging.getLogger("smg_grpc_servicer")
     monkeypatch.setattr(root, "handlers", [])
     monkeypatch.setattr(pkg, "handlers", [])
     monkeypatch.setattr(logging.getLogger("vllm"), "handlers", [])
-    rust.configure_logging()
-    assert root.handlers or pkg.handlers
+    monkeypatch.delenv("VLLM_LOGGING_LEVEL", raising=False)
+    level_before = root.level
+    try:
+        assert attach_vllm_logging() is False  # the hold, as at the parse
+        logging.getLogger("smg_grpc_servicer.vllm.capture_cap").info(
+            "CUDA-graph capture cap: held until a handler exists"
+        )
+        rust.configure_logging()
+        assert root.handlers
+        assert pkg.handlers == []  # the hold is over
+        logging.getLogger("smg_grpc_servicer.vllm.rust").info("listening")
+    finally:
+        root.setLevel(level_before)
+    err = capsys.readouterr().err
+    assert err.index("CUDA-graph capture cap: held until a handler exists") < err.index("listening")
 
 
-# vLLM's own default for its ZMQ publisher's endpoint. `default_kv_events_config`
-# leaves it to vLLM: absent from the JSON form, the dataclass default in the typed one.
+# vLLM's own default for its ZMQ publisher's endpoint: one fixed port, which
+# the Rust path no longer leaves in place (a second engine on the host, or a
+# publisher a process left behind, held it, and the engine died at its bind).
 KV_EVENTS_ENDPOINT = "tcp://*:5557"
-# What vLLM sees of the configuration the Rust path applies: the publisher on.
-KV_EVENTS_ON = (True, "zmq", KV_EVENTS_ENDPOINT)
 
 
 def _kv_events(config):
@@ -1328,39 +1571,58 @@ def _kv_events(config):
     unit-test job without an engine), or vLLM's own ``KVEventsConfig`` when it
     is (the engine-gated job, where the engine args hold the typed form)."""
     if isinstance(config, dict):
-        config = SimpleNamespace(**{"endpoint": KV_EVENTS_ENDPOINT, **config})
+        config = SimpleNamespace(**config)
     return config.enable_kv_cache_events, config.publisher, config.endpoint
+
+
+def _publisher_port(config) -> int:
+    """The port of the publisher the Rust path turned on: a free one of this
+    host, never vLLM's fixed default."""
+    enabled, publisher, endpoint = _kv_events(config)
+    assert (enabled, publisher) == (True, "zmq")
+    assert endpoint.startswith("tcp://*:") and endpoint != KV_EVENTS_ENDPOINT
+    port = int(endpoint.rpartition(":")[2])
+    assert rust_lifecycle._bindable(port)
+    return port
 
 
 def test_kv_event_publishing_is_on_by_default_under_the_rust_servicer(monkeypatch):
     """A launcher without --kv-events-config left vLLM publishing nothing and
     the router's cache-aware routing blind (smg-lab #1): the Rust path turns
-    the ZMQ publisher on itself unless told otherwise."""
+    the ZMQ publisher on itself unless told otherwise, at a free port of this
+    host (one per data-parallel engine) rather than vLLM's fixed default."""
     # Nothing given: the typed form when vllm.config is importable, else the
     # JSON form the parser takes; what vLLM sees is the same.
     args = argparse.Namespace(model="org/m")
     applied = rust.default_kv_events_config(args, environ={})
-    assert _kv_events(applied) == KV_EVENTS_ON
+    _publisher_port(applied)
     assert args.kv_events_config is applied
     args = argparse.Namespace(model="org/m", kv_events_config=None)
-    assert _kv_events(rust.default_kv_events_config(args, environ={})) == KV_EVENTS_ON
+    _publisher_port(rust.default_kv_events_config(args, environ={}))
+    # Three data-parallel engines publish on three consecutive ports: all free.
+    args = argparse.Namespace(model="org/m", data_parallel_size=3)
+    base = _publisher_port(rust.default_kv_events_config(args, environ={}))
+    assert all(rust_lifecycle._bindable(base + rank) for rank in range(3))
     # The opt-out.
     for value in ("0", "false", "No", " off "):
         args = argparse.Namespace(model="org/m", kv_events_config=None)
         assert rust.default_kv_events_config(args, environ={rust.KV_EVENTS_ENV: value}) is None
         assert args.kv_events_config is None
     args = argparse.Namespace(model="org/m")
-    applied = rust.default_kv_events_config(args, environ={rust.KV_EVENTS_ENV: "1"})
-    assert _kv_events(applied) == KV_EVENTS_ON
-    # An explicit configuration is kept as given, off included.
-    given = SimpleNamespace(enable_kv_cache_events=False, publisher="null")
-    args = argparse.Namespace(model="org/m", kv_events_config=given)
-    assert rust.default_kv_events_config(args, environ={}) is None
-    assert args.kv_events_config is given
+    _publisher_port(rust.default_kv_events_config(args, environ={rust.KV_EVENTS_ENV: "1"}))
+    # An explicit configuration is kept as given: off, and one that names the
+    # fixed default endpoint, which is then the operator's.
+    for given in (
+        SimpleNamespace(enable_kv_cache_events=False, publisher="null"),
+        SimpleNamespace(enable_kv_cache_events=True, publisher="zmq", endpoint=KV_EVENTS_ENDPOINT),
+    ):
+        args = argparse.Namespace(model="org/m", kv_events_config=given)
+        assert rust.default_kv_events_config(args, environ={}) is None
+        assert args.kv_events_config is given
 
     # vLLM's own dataclass once vllm.config is importable, in vLLM 0.31's
-    # shape: the typed form carries the same two settings and leaves the rest
-    # (the endpoint among them) at vLLM's defaults.
+    # shape: the typed form carries the two settings and the endpoint, and
+    # leaves the rest at vLLM's defaults.
     @dataclasses.dataclass
     class KVEventsConfig:
         enable_kv_cache_events: bool = False
@@ -1379,8 +1641,11 @@ def test_kv_event_publishing_is_on_by_default_under_the_rust_servicer(monkeypatc
     _install(monkeypatch, "vllm.config", KVEventsConfig=KVEventsConfig)
     args = argparse.Namespace(model="org/m")
     applied = rust.default_kv_events_config(args, environ={})
-    assert isinstance(applied, KVEventsConfig) and _kv_events(applied) == KV_EVENTS_ON
-    assert applied == KVEventsConfig(enable_kv_cache_events=True, publisher="zmq")
+    assert isinstance(applied, KVEventsConfig)
+    _publisher_port(applied)
+    assert applied == KVEventsConfig(
+        enable_kv_cache_events=True, publisher="zmq", endpoint=applied.endpoint
+    )
     assert args.kv_events_config is applied
 
 
@@ -1460,6 +1725,8 @@ def test_serve_rust_wires_the_server_the_engine_and_the_supervisor(monkeypatch, 
     assert kwargs["tokenizer_dir"] == str(tmp_path)
     assert kwargs["engine_startup_timeout_secs"] == rust_lifecycle.DEFAULT_STARTUP_TIMEOUT_SECS
     assert kwargs["engine_startup_ceiling_secs"] == rust_lifecycle.DEFAULT_STARTUP_CEILING_SECS
+    assert kwargs["engine_silence_timeout_secs"] == rust_lifecycle.DEFAULT_SILENCE_TIMEOUT_SECS
+    assert kwargs["engine_prefill_tokens_per_sec"] == rust_lifecycle.DEFAULT_PREFILL_TOKENS_PER_SEC
     assert kwargs["served_model_name"] == "served-a"
     assert kwargs["eos_token_ids"] == [151645, 151643, 7]
     assert kwargs["kv_connector"] == ""
@@ -1472,10 +1739,10 @@ def test_serve_rust_wires_the_server_the_engine_and_the_supervisor(monkeypatch, 
     assert ns.data_parallel_rpc_port == 24321
     assert ns.data_parallel_size == 2 and ns.data_parallel_size_local == 2
     # No --kv-events-config was given: the engine args and the engine cores
-    # both see the publisher on, in whichever form vllm.config's presence
-    # decides (the typed one in the engine-gated job).
-    assert _kv_events(recorded["engine_args_from"].kv_events_config) == KV_EVENTS_ON
-    assert _kv_events(ns.kv_events_config) == KV_EVENTS_ON
+    # both see the publisher on at the same free port, in whichever form
+    # vllm.config's presence decides (the typed one in the engine-gated job).
+    port = _publisher_port(recorded["engine_args_from"].kv_events_config)
+    assert _publisher_port(ns.kv_events_config) == port
 
 
 # ── the knobs are validated before the bind (smg-lab #292) ─────────────────────
@@ -1549,3 +1816,174 @@ def test_the_switch_answers_a_configuration_error_with_exit_code_2(monkeypatch, 
         asyncio.run(switched(argparse.Namespace(servicer_impl="rust")))
     assert raised.value.code == 2 and calls == []
     assert "SMG_VLLM_SERVICER_DRAIN_SECS='abc' is not a number" in caplog.text
+
+
+def test_the_switch_refuses_the_rust_pipeline_before_the_python_launcher_builds_the_engine(
+    monkeypatch, caplog
+):
+    """`--mm-processor smg` on the Python servicer: the servicer's own refusal
+    comes after the engine is built and the model loaded (a crash loop under a
+    restart policy, a full load per turn); the switch refuses it first, from
+    the flags and the environment, with the servicer's message, one ERROR line
+    and exit code 2, and the launcher's coroutine never runs."""
+    import logging
+
+    from smg_grpc_servicer.vllm import launcher_switch
+    from smg_grpc_servicer.vllm.mm_processor import SMG_MODE_REFUSAL
+
+    monkeypatch.delenv("SMG_VLLM_MM_PROCESSOR", raising=False)
+    calls = []
+
+    async def serve_grpc(args):
+        calls.append(args)
+        return "python ran"
+
+    switched = launcher_switch.with_servicer_switch(serve_grpc)
+    caplog.set_level(logging.ERROR)
+    # The flag form.
+    with pytest.raises(SystemExit) as raised:
+        asyncio.run(switched(argparse.Namespace(servicer_impl="python", mm_processor="smg")))
+    assert raised.value.code == 2 and calls == []
+    assert SMG_MODE_REFUSAL in caplog.text
+    # The environment form, on a launcher without the flag.
+    monkeypatch.setenv("SMG_VLLM_MM_PROCESSOR", "smg")
+    with pytest.raises(SystemExit) as raised:
+        asyncio.run(switched(argparse.Namespace(servicer_impl="python")))
+    assert raised.value.code == 2 and calls == []
+    # Any other `--mm-*` value the servicer would refuse is refused here too.
+    with pytest.raises(SystemExit) as raised:
+        asyncio.run(switched(argparse.Namespace(servicer_impl="python", mm_max_inflight=0)))
+    assert raised.value.code == 2 and calls == []
+    assert "--mm-max-inflight=0 must be positive" in caplog.text
+    # A mode the Python servicer serves runs the launcher's coroutine; the flag
+    # wins over an exported `smg`.
+    inprocess = argparse.Namespace(servicer_impl="python", mm_processor="inprocess")
+    assert asyncio.run(switched(inprocess)) == "python ran" and calls == [inprocess]
+    # The Rust path serves `smg`: not refused there.
+    rust_calls = []
+
+    async def fake_serve_rust(args):
+        rust_calls.append(args)
+        return 0
+
+    monkeypatch.setattr(rust, "serve_rust", fake_serve_rust)
+    smg_on_rust = argparse.Namespace(servicer_impl="rust", mm_processor="smg")
+    with pytest.raises(SystemExit) as raised:
+        asyncio.run(switched(smg_on_rust))
+    assert raised.value.code == 0 and rust_calls == [smg_on_rust] and calls == [inprocess]
+
+
+def test_require_python_media_mode_is_the_servicers_refusal_as_a_configuration_error():
+    with pytest.raises(rust_lifecycle.ServicerConfigError, match="Rust servicer") as refused:
+        rust.require_python_media_mode(argparse.Namespace(mm_processor="smg"), environ={})
+    from smg_grpc_servicer.vllm.mm_processor import SMG_MODE_REFUSAL
+
+    assert str(refused.value) == SMG_MODE_REFUSAL
+    with pytest.raises(rust_lifecycle.ServicerConfigError, match="Rust servicer"):
+        rust.require_python_media_mode(None, environ={"SMG_VLLM_MM_PROCESSOR": "smg"})
+    assert rust.require_python_media_mode(argparse.Namespace(), environ={}) == "off"
+    assert rust.require_python_media_mode(None, environ={"SMG_VLLM_MM_PROCESSOR": "redis"}) == (
+        "redis"
+    )
+    # A launcher namespace without the flags (no plugin loaded) reads the environment.
+    assert rust.require_python_media_mode(argparse.Namespace(model="org/m"), environ={}) == "off"
+
+
+def test_the_switch_refuses_a_host_with_no_free_publisher_port_as_the_rust_path_does(
+    monkeypatch, caplog
+):
+    """The default's endpoint is a port found free on the host; a host with no
+    free block of them is a configuration error, and the switch answers it as
+    the Rust path does: one ERROR line naming the knob and exit code 2, and
+    the launcher's coroutine never runs, not a traceback out of it."""
+    import logging
+
+    from smg_grpc_servicer.vllm import launcher_switch
+
+    monkeypatch.delenv(rust.SERVICER_IMPL_ENV, raising=False)
+    monkeypatch.delenv(rust.KV_EVENTS_ENV, raising=False)
+    refusal = "no block of 1 consecutive free ports for the KV event publishers"
+
+    def no_block(ranks=1):
+        raise rust_lifecycle.ServicerConfigError(
+            f"{refusal} after 64 draws; pass --kv-events-config with an endpoint"
+        )
+
+    monkeypatch.setattr(rust_lifecycle, "free_kv_events_endpoint", no_block)
+    served = []
+
+    async def serve_grpc(args):
+        served.append(args)
+
+    switched = launcher_switch.with_servicer_switch(serve_grpc)
+    caplog.set_level(logging.ERROR)
+    with pytest.raises(SystemExit) as raised:
+        asyncio.run(
+            switched(argparse.Namespace(servicer_impl=None, model="org/m", kv_events_config=None))
+        )
+    assert raised.value.code == 2 and served == []
+    assert refusal in caplog.text and "--kv-events-config" in caplog.text
+
+
+def test_the_switch_turns_the_kv_event_publisher_on_for_the_python_servicer_too(
+    monkeypatch, caplog
+):
+    """A launcher without --kv-events-config left vLLM publishing nothing under
+    the Python servicer, while the Rust path turned the publisher on by itself:
+    the switch applies the same default to the namespace before the launcher's
+    own serve_grpc builds the engine from it, with the same opt-out and the
+    same log line, and hands a Rust-path namespace over as parsed (that path
+    applies its own)."""
+    import logging
+
+    from smg_grpc_servicer.vllm import launcher_switch
+
+    served = []
+
+    async def serve_grpc(args):
+        served.append(args)
+
+    switched = launcher_switch.with_servicer_switch(serve_grpc)
+    monkeypatch.delenv(rust.SERVICER_IMPL_ENV, raising=False)
+    monkeypatch.delenv(rust.KV_EVENTS_ENV, raising=False)
+    # Nothing given: the launcher builds the engine from a namespace with the
+    # publisher on (in whichever form the engine takes it: the typed one once
+    # vllm.config is importable, the JSON form otherwise), and the operator
+    # reads why and how to decide otherwise.
+    args = argparse.Namespace(servicer_impl=None, model="org/m", kv_events_config=None)
+    with caplog.at_level(logging.INFO):
+        asyncio.run(switched(args))
+    assert served == [args]
+    _publisher_port(args.kv_events_config)
+    assert (
+        "KV event publishing enabled: no --kv-events-config was given, so vLLM's ZMQ "
+        "publisher is on at a port found free on this host and SubscribeKvEvents relays "
+        f"it; pass --kv-events-config to name the endpoint, or set {rust.KV_EVENTS_ENV}=0 to leave it off"
+    ) in caplog.text
+    # The opt-out: the namespace reaches the launcher as parsed, and nothing is said.
+    caplog.clear()
+    monkeypatch.setenv(rust.KV_EVENTS_ENV, "off")
+    args = argparse.Namespace(servicer_impl=None, model="org/m", kv_events_config=None)
+    with caplog.at_level(logging.INFO):
+        asyncio.run(switched(args))
+    assert served[-1] is args and args.kv_events_config is None
+    assert "KV event publishing" not in caplog.text
+    # An explicit configuration is kept as given, off included.
+    monkeypatch.delenv(rust.KV_EVENTS_ENV)
+    given = {"enable_kv_cache_events": False, "publisher": "null"}
+    args = argparse.Namespace(servicer_impl=None, model="org/m", kv_events_config=given)
+    asyncio.run(switched(args))
+    assert served[-1] is args and args.kv_events_config is given
+    # The Rust path: its launcher applies the default itself, so the switch
+    # hands the namespace over as parsed.
+    handed = []
+
+    async def serve_rust(args):
+        handed.append(args.kv_events_config)
+        return 0
+
+    monkeypatch.setattr(rust, "serve_rust", serve_rust)
+    args = argparse.Namespace(servicer_impl="rust", model="org/m", kv_events_config=None)
+    with pytest.raises(SystemExit):
+        asyncio.run(switched(args))
+    assert handed == [None] and served[-1] is not args

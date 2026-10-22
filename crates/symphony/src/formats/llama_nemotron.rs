@@ -5,11 +5,14 @@
 //! merge of the Nano write this. The Super template has the thought: `/no_think` in the system
 //! prompt makes it close one in the prompt (`<think>\n\n</think>\n\n`), the request's
 //! `enable_thinking` changes nothing, and an assistant message's content is rendered from its
-//! `</think>` on. The Nano and DLER templates have no thought. Nemotron Ultra keeps Llama 3.1's
-//! own template, a bare `{"name": …, "parameters": …}` object, and Nemotron 3 writes
-//! Qwen3-Coder's tags: other syntaxes, other tables. Recorded as
-//! `llama-3-3-nemotron-super-49b-v1-5`, `llama-3.1-nemotron-nano-8b-v1` and
-//! `dler-llama-nemotron-8b-merge-research`.
+//! `</think>` on. The Nano and DLER templates have no thought. The Super 49B v1 and Ultra 253B v1
+//! templates render no call and no thought at all (an assistant message is kept from its
+//! `</think>` on): the model writes `<think>` itself, and the vendor's tool parser for both reads
+//! this list, so they read with this table. The Ultra's CPT checkpoint keeps Llama 3.1's own
+//! template, a bare `{"name": …, "parameters": …}` object, and Nemotron 3 writes Qwen3-Coder's
+//! tags: other syntaxes, other tables. Recorded as `llama-3-3-nemotron-super-49b-v1-5`,
+//! `llama-3.1-nemotron-nano-8b-v1`, `dler-llama-nemotron-8b-merge-research` and, content alone,
+//! `llama-3-1-nemotron-ultra-253b-v1`.
 //!
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
 
@@ -38,100 +41,40 @@ mod tests {
     use super::*;
     use crate::{
         engine::Engine,
-        event::{DropReason, Event, Events, FinishReason},
-        input::{EngineFinish, Input},
-        parser::Parser,
-        tagged::Declared,
+        event::{DropReason, Event, FinishReason, MalformedReason, Text},
+        testing::{arguments_of, bytes, calls, content, drive, reasoning},
+        Declared,
     };
 
     /// The generation prompt's tail: the assistant header, and nothing more.
     const PROMPT: &str = "<|start_header_id|>assistant<|end_header_id|>\n\n";
 
-    fn run(prompt: &str, output: &str) -> Vec<Event> {
-        let mut parser = Engine::new(llama_nemotron(), Declared::default());
-        let mut out = Events::new();
-        parser
-            .feed(
-                Input::Prompt {
-                    token_ids: &[],
-                    text: prompt,
-                },
-                &mut out,
-            )
-            .expect("prompt");
-        parser
-            .feed(
-                Input::Delta {
-                    token_ids: &[],
-                    text: output,
-                    spans: &[],
-                },
-                &mut out,
-            )
-            .expect("delta");
-        parser
-            .feed(
-                Input::End {
-                    finish: EngineFinish::Stop,
-                },
-                &mut out,
-            )
-            .expect("end");
-        out.drain()
+    fn run(prompt: &str, output: &str) -> Vec<Event<'static>> {
+        drive(
+            &mut Engine::new(llama_nemotron(), Declared::default()),
+            prompt,
+            &[output],
+        )
     }
 
-    fn calls(events: &[Event]) -> Vec<(String, String)> {
-        let mut calls: Vec<(String, String)> = Vec::new();
-        for event in events {
-            match event {
-                Event::ToolCallStart { name, .. } => calls.push((name.clone(), String::new())),
-                Event::ToolCallArguments { json, .. } => {
-                    calls.last_mut().expect("a call started").1.push_str(json);
-                }
-                _ => {}
-            }
-        }
-        calls
-    }
-
-    fn content(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Content(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn reasoning(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Reasoning(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn dropped(events: &[Event]) -> Vec<&str> {
+    fn dropped<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
         events
             .iter()
             .filter_map(|event| match event {
                 Event::Dropped {
                     text,
                     why: DropReason::Wrapper,
-                } => Some(text.text.as_str()),
+                } => Some(&*text.text),
                 _ => None,
             })
             .collect()
     }
 
-    fn malformed(events: &[Event]) -> Vec<&str> {
+    fn malformed<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Malformed { text, .. } => Some(text.text.as_str()),
+                Event::Malformed { text, .. } => Some(&*text.text),
                 _ => None,
             })
             .collect()
@@ -289,11 +232,103 @@ mod tests {
             "<TOOLCALL>[{\"name\": \"get_stock_price\", \"arguments\": {}}] tail</TOOLCALL>",
         );
         assert_eq!(calls(&events).len(), 1);
-        assert_eq!(malformed(&events), ["tail"]);
-        assert_eq!(
-            dropped(&events),
-            ["<TOOLCALL>", "[", "]", " ", "</TOOLCALL>"]
+        // The text after the list takes the whitespace before it: once text follows, every byte
+        // after the `]` is the model's.
+        assert_eq!(malformed(&events), [" tail"]);
+        assert_eq!(dropped(&events), ["<TOOLCALL>", "[", "]", "</TOOLCALL>"]);
+    }
+
+    /// A call whose arguments are not JSON (an expression where a number was due) is not cut at
+    /// the bad token with the rest of the block leaking into content: the call carries the
+    /// arguments exactly as the model wrote them, one `Malformed { InvalidArguments }` event of
+    /// no bytes says where they stopped being JSON, the content stays empty, and the stream of
+    /// small pieces says the same as the whole. A block the model closes with one bracket too
+    /// many keeps its whole call; the residue is reported as a block without a complete call.
+    #[test]
+    fn arguments_that_are_not_json_stay_the_calls_own_and_are_said_to_be_no_json() {
+        let block = "<TOOLCALL>[{\"name\": \"plot_sine_wave\", \"arguments\": {\"start_range\": 0, \"end_range\": 2.0 * Math.PI, \"frequency\": 5}}]</TOOLCALL>";
+        let arguments = "{\"start_range\": 0, \"end_range\": 2.0 * Math.PI, \"frequency\": 5}";
+        let per_char: Vec<&str> = block
+            .char_indices()
+            .map(|(i, c)| &block[i..i + c.len_utf8()])
+            .collect();
+        let whole = run(PROMPT, block);
+        let streamed = drive(
+            &mut Engine::new(llama_nemotron(), Declared::default()),
+            PROMPT,
+            &per_char,
         );
+        for (how, events) in [("whole", &whole), ("per character", &streamed)] {
+            assert_eq!(
+                calls(events),
+                [("plot_sine_wave".to_string(), arguments.to_string())],
+                "{how}: the call carries the arguments as written"
+            );
+            assert_eq!(
+                content(events),
+                "",
+                "{how}: nothing of the block leaks into content"
+            );
+            let said: Vec<&Event> = events
+                .iter()
+                .filter(|event| matches!(event, Event::Malformed { .. }))
+                .collect();
+            assert_eq!(
+                said,
+                [&Event::Malformed {
+                    text: Text::default(),
+                    why: MalformedReason::InvalidArguments,
+                }],
+                "{how}: the break is said once, with no bytes"
+            );
+            let (break_at, end_at) = (
+                events
+                    .iter()
+                    .position(|event| matches!(event, Event::Malformed { .. }))
+                    .expect("the break"),
+                events
+                    .iter()
+                    .position(|event| matches!(event, Event::ToolCallEnd { .. }))
+                    .expect("the end"),
+            );
+            assert!(
+                break_at < end_at,
+                "{how}: the break comes before the call's end"
+            );
+            assert_eq!(
+                arguments_of(&events[..break_at], 0),
+                "{\"start_range\": 0, \"end_range\": 2.0 ",
+                "{how}: the fragments before the break are the JSON prefix a strict reader takes"
+            );
+            assert_eq!(finish(events), (FinishReason::Stop, 1), "{how}");
+            assert_eq!(
+                dropped(events),
+                ["<TOOLCALL>", "[", "]", "</TOOLCALL>"],
+                "{how}"
+            );
+            assert_eq!(bytes(events), block, "{how}: every byte in one event");
+        }
+        // One bracket too many after a whole call: the call stands, the residue is reported.
+        let events = run(
+            PROMPT,
+            "<TOOLCALL>[{\"name\": \"get_strategy\", \"arguments\": {\"game\": \"chess\"}]}]</TOOLCALL>",
+        );
+        assert_eq!(
+            calls(&events),
+            [(
+                "get_strategy".to_string(),
+                "{\"game\": \"chess\"}".to_string()
+            )]
+        );
+        assert_eq!(malformed(&events), ["]}]"]);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Malformed {
+                why: MalformedReason::BlockWithoutACompleteCall,
+                ..
+            }
+        )));
+        assert_eq!(content(&events), "");
     }
 
     #[test]

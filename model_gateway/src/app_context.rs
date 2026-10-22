@@ -18,7 +18,7 @@ use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{debug, info, warn};
 
 use crate::{
-    config::{KvIndexKind, ParserChoice, RouterConfig},
+    config::{ParserChoice, RouterConfig},
     middleware::{AuthConfig, TokenBucket},
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
@@ -31,13 +31,14 @@ use crate::{
         grpc::{
             multimodal::MultimodalConfigRegistry,
             regular::symphony::{check_names, named_table},
-            utils::Names,
+            utils::{Names, ALIASES},
         },
     },
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
     worker::{
-        http_client::build_client, liveness, KvEventMonitor, PrefillAdmission,
-        WorkerHttpClientCache, WorkerMonitor, WorkerRegistry, WorkerService,
+        http_client::{build_client, connect_timeout_secs_below, DEFAULT_CONNECT_TIMEOUT_SECS},
+        liveness, KvEventMonitor, PrefillAdmission, WorkerHttpClientCache, WorkerMonitor,
+        WorkerRegistry, WorkerService,
     },
     workflow::{JobQueue, TokenizerLoadFailures, WorkflowEngines},
 };
@@ -157,6 +158,18 @@ pub(crate) const DEFAULT_INFLIGHT_FLOOR: usize = 4096;
 pub(crate) fn default_max_concurrent_requests() -> usize {
     let cores = std::thread::available_parallelism().map_or(1, usize::from);
     (cores * DEFAULT_INFLIGHT_PER_CORE).max(DEFAULT_INFLIGHT_FLOOR)
+}
+
+/// The admission bound `max_concurrent_requests` resolves to: none when
+/// admission control is off (0), the host-derived default when unset (-1),
+/// the value otherwise. The one place the sentinels are read, for the
+/// admission bucket and for the start-up checks that compare with it.
+pub(crate) fn effective_max_concurrent_requests(configured: i32) -> Option<usize> {
+    match configured {
+        0 => None,
+        n if n < 0 => Some(default_max_concurrent_requests()),
+        n => usize::try_from(n).ok(),
+    }
 }
 
 pub struct AppContextBuilder {
@@ -413,6 +426,12 @@ impl AppContextBuilder {
         let router_config = self
             .router_config
             .ok_or(AppContextBuildError::MissingField("router_config"))?;
+        // The configuration's liveness budgets (the stall, wedge and stale
+        // thresholds and the warm-up slice, see `worker::liveness`) take
+        // effect for every context built from it, the server's and a test's
+        // alike, here and nowhere else. They are process-wide and the first
+        // call wins, so the first context built in a process sets them.
+        liveness::configure_from(&router_config);
         let configured_reasoning_parser = router_config.reasoning_parser.clone();
         let configured_tool_parser = router_config.tool_call_parser.clone();
 
@@ -424,15 +443,12 @@ impl AppContextBuilder {
             tool: configured_tool_parser.clone(),
             reasoning: configured_reasoning_parser.clone(),
         };
-        let legacy_tool = match (&names.tool, &self.tool_parser_factory) {
-            (Some(name), Some(factory)) => factory.has_parser(name),
-            _ => true,
-        };
-        let legacy_reasoning = match (&names.reasoning, &self.reasoning_parser_factory) {
-            (Some(name), Some(factory)) => factory.registry().has_parser(name),
-            _ => true,
-        };
-        if let Err(why) = check_names(router_config.parser, &names, legacy_tool, legacy_reasoning) {
+        if let Err(why) = check_names(
+            router_config.parser,
+            &names,
+            self.tool_parser_factory.as_ref(),
+            self.reasoning_parser_factory.as_ref(),
+        ) {
             let listed = |names: Option<Vec<String>>| names.unwrap_or_default().join(", ");
             let legacy_tool_parsers =
                 listed(self.tool_parser_factory.as_ref().map(|f| f.list_parsers()));
@@ -445,15 +461,20 @@ impl AppContextBuilder {
                 .iter()
                 .map(|table| table.name())
                 .collect();
+            // The other names a table answers to: the legacy names that read a table's format,
+            // and the names no other list has, a launcher's for a family whose table has no
+            // older parser and an engine's exact name for a table.
+            let symphony_aliases: Vec<&str> = ALIASES.iter().map(|(alias, _)| *alias).collect();
             tracing::error!(
                 tool_call_parser = ?names.tool,
                 reasoning_parser = ?names.reasoning,
                 legacy_tool_parsers = %legacy_tool_parsers,
                 legacy_reasoning_parsers = %legacy_reasoning_parsers,
                 symphony_tables = %symphony_tables.join(", "),
+                symphony_aliases = %symphony_aliases.join(", "),
                 "Unknown parser name"
             );
-            return Err(AppContextBuildError::InvalidConfig(why));
+            return Err(AppContextBuildError::InvalidConfig(why.into()));
         }
         if router_config.parser == ParserChoice::Symphony
             && names.tool.is_some()
@@ -462,10 +483,13 @@ impl AppContextBuilder {
             tracing::warn!(
                 tool_call_parser = ?names.tool,
                 reasoning_parser = ?names.reasoning,
-                "The configured tool-call parser name selects no Symphony table, so every model \
-                 is read by the legacy parsers under --parser symphony; a table's name, or a \
-                 legacy name that reads a table's format (qwen, qwen_xml, ...), reads with that \
-                 table"
+                "The configured tool-call parser name selects no Symphony table, so under \
+                 --parser symphony every model the registry does not know is read by the legacy \
+                 parsers (the registry's table reads the models it knows, a worker's own labels \
+                 aside); a table's name, a legacy name that reads a table's format (qwen, \
+                 qwen_xml, ...), a launcher's name for a family whose table has no older \
+                 parser (muse), or an engine's exact name for a table (llama4_pythonic), reads \
+                 those models with that table"
             );
         }
 
@@ -660,11 +684,19 @@ impl AppContextBuilder {
         }
 
         let make_builder = || {
-            let mut client_builder = crate::http_client::client_builder()
+            let mut client_builder = crate::clients::http_client_builder()
                 .pool_idle_timeout(pool_idle_timeout)
                 .pool_max_idle_per_host(500)
                 .timeout(Duration::from_secs(timeout_secs))
-                .connect_timeout(Duration::from_secs(10))
+                // Below the request timeout, as the worker clients keep it
+                // (`worker::http_client::connect_timeout_secs_below`): a dark
+                // external host fails as a connect timeout, not as the
+                // request's own (except under a 1 s request timeout, where the
+                // two timers race).
+                .connect_timeout(Duration::from_secs(connect_timeout_secs_below(
+                    DEFAULT_CONNECT_TIMEOUT_SECS,
+                    timeout_secs,
+                )))
                 .tcp_nodelay(true)
                 .tcp_keepalive(Some(Duration::from_secs(30)));
             // Force rustls backend when TLS is configured
@@ -690,23 +722,21 @@ impl AppContextBuilder {
     /// and the unset value (-1) takes the host-derived default so an
     /// overloaded router sheds instead of queueing without bound.
     fn maybe_rate_limiter(mut self, config: &RouterConfig) -> Self {
-        let capacity = match config.max_concurrent_requests {
-            0 => {
+        let capacity = match effective_max_concurrent_requests(config.max_concurrent_requests) {
+            None => {
                 info!(
                     "Admission bound disabled (max_concurrent_requests = 0): in-flight requests are unbounded"
                 );
                 self.rate_limiter = None;
                 return self;
             }
-            n if n < 0 => {
-                let bound = default_max_concurrent_requests();
+            Some(bound) if config.max_concurrent_requests < 0 => {
                 info!(
                     "Admission bound: at most {bound} in-flight requests (default: {DEFAULT_INFLIGHT_PER_CORE} per available core, at least {DEFAULT_INFLIGHT_FLOOR}; --max-concurrent-requests overrides it, 0 disables it)"
                 );
                 bound
             }
-            n => {
-                let bound = n as usize;
+            Some(bound) => {
                 info!(
                     "Admission bound: at most {bound} in-flight requests (max_concurrent_requests)"
                 );
@@ -832,19 +862,6 @@ impl AppContextBuilder {
         if let Some(registry) = self.worker_registry.as_ref() {
             registry.set_overload_shed(config.worker_overload_shed);
         }
-        // Progress-based liveness thresholds (see `worker::liveness`).
-        liveness::configure(
-            Duration::from_secs(config.worker_stall_secs),
-            Duration::from_secs(config.worker_wedge_secs),
-            Duration::from_secs(config.worker_stale_secs),
-        );
-        liveness::configure_warmup(liveness::Warmup {
-            secs: Duration::from_secs(config.worker_warmup_secs),
-            share: config.worker_warmup_share,
-            blocks: config.worker_warmup_blocks,
-            thin_ratio: config.worker_warmup_thin_ratio,
-            divert_every: config.worker_warmup_divert_every,
-        });
         // PD dispatch waits here, not in the decode engine's queue, when the
         // pair's running window is full.
         pd_admission::set_pd_admission_wait_secs(config.pd_admission_wait_secs);
@@ -935,26 +952,28 @@ impl AppContextBuilder {
                 _ => false,
             };
 
-        if is_cache_aware {
-            let monitor = Arc::new(KvEventMonitor::with_kind(config.kv_index, None));
-            debug!(
-                kv_index = config.kv_index.as_str(),
-                "Created KV event monitor for event-driven cache-aware routing"
+        if config.kv_index.is_some() {
+            warn!(
+                "--kv-index is deprecated: the chain index is the only KV index; the flag goes \
+                 in a later release"
             );
+        }
+        if is_cache_aware {
+            let monitor = Arc::new(KvEventMonitor::new());
+            debug!("Created KV event monitor for event-driven cache-aware routing");
             // The load records on the event streams are polls of the worker.
             if let Some(worker_monitor) = &self.worker_monitor {
                 monitor.set_load_sink(worker_monitor);
             }
-            if KvIndexKind::deprecated_alias_used() {
-                warn!("--kv-index run is the deprecated spelling of --kv-index chain");
+            if config.kv_indexer_ttl_secs.is_some_and(|ttl| ttl > 0)
+                || config.kv_indexer_max_entries.is_some_and(|max| max > 0)
+            {
+                warn!(
+                    "--kv-indexer-ttl-secs and --kv-indexer-max-entries are ignored: the chain \
+                     index has no prune, it holds what the engines report and shrinks with \
+                     their removals"
+                );
             }
-
-            // Optional indexer bounding: prune entries by last-touch TTL and/or
-            // capacity ceiling. Both default off (unbounded, prior behavior).
-            monitor.start_prune_task(
-                config.kv_indexer_ttl_secs.unwrap_or(0),
-                config.kv_indexer_max_entries.unwrap_or(0),
-            );
             monitor.start_stats_task();
 
             // Inject monitor into PolicyRegistry — propagates to default_policy
@@ -1235,6 +1254,8 @@ mod tests {
             cache_boundaries: Vec::new(),
             selection_policy: None,
             selection_accounting_ttl_ms: 0,
+            balance_prefix_margin_tokens: 0,
+            balance_uncached_credit: false,
         });
         let builder = AppContextBuilder::new()
             .with_client(&config, 5)
@@ -1280,6 +1301,8 @@ mod tests {
             cache_boundaries: Vec::new(),
             selection_policy: None,
             selection_accounting_ttl_ms: 0,
+            balance_prefix_margin_tokens: 0,
+            balance_uncached_credit: false,
         }));
     }
 
@@ -1305,6 +1328,8 @@ mod tests {
             cache_boundaries: Vec::new(),
             selection_policy: None,
             selection_accounting_ttl_ms: 0,
+            balance_prefix_margin_tokens: 0,
+            balance_uncached_credit: false,
         };
 
         let mut config = config_with_policy(PolicyConfig::Random);
@@ -1517,5 +1542,22 @@ policy:
         assert_eq!(selected.selected.url(), second.url());
         drop(selected);
         drop(occupied);
+    }
+}
+
+#[cfg(test)]
+mod effective_max_concurrent_requests_tests {
+    use super::{default_max_concurrent_requests, effective_max_concurrent_requests};
+
+    /// The three readings of `max_concurrent_requests`, pinned in one place
+    /// for the admission bucket and the start-up checks alike.
+    #[test]
+    fn the_sentinels_resolve_to_off_the_default_and_the_value() {
+        assert_eq!(effective_max_concurrent_requests(0), None);
+        assert_eq!(
+            effective_max_concurrent_requests(-1),
+            Some(default_max_concurrent_requests())
+        );
+        assert_eq!(effective_max_concurrent_requests(7), Some(7));
     }
 }

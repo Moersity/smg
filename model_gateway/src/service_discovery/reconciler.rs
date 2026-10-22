@@ -41,7 +41,7 @@ pub const DISCOVERY_LABEL_PREFIX: &str = "smg.ai/discovery-";
 pub const DISCOVERY_PROVIDER_LABEL: &str = "smg.ai/discovery-provider";
 /// The provider's stable identity for the worker instance.
 pub const DISCOVERY_ID_LABEL: &str = "smg.ai/discovery-id";
-/// BLAKE3 fingerprint of the [`DiscoveredWorker`] it was registered from. A
+/// BLAKE3 fingerprint of the `DiscoveredWorker` it was registered from. A
 /// change to it updates the worker in place.
 pub const DISCOVERY_SPEC_HASH_LABEL: &str = "smg.ai/discovery-spec-hash";
 
@@ -948,15 +948,15 @@ mod tests {
         .await;
     }
 
-    /// A prefill leg discovered without a bootstrap annotation carries no
+    /// A prefill worker discovered without a bootstrap annotation carries no
     /// bootstrap port into its spec and is handed the default port on the
-    /// request path (here a vLLM leg on the Mooncake connector, as the
+    /// request path (here a vLLM worker on the Mooncake connector, as the
     /// provider reports it). Registered, it is probed on that default port:
     /// with nothing listening there, the failed probe is counted like a
     /// registered port's.
     #[tokio::test]
-    async fn a_discovered_prefill_leg_without_a_bootstrap_annotation_is_probed_on_the_default_port()
-    {
+    async fn a_discovered_prefill_worker_without_a_bootstrap_annotation_is_probed_on_the_default_port(
+    ) {
         use std::{
             net::{SocketAddr, TcpStream},
             sync::Arc,
@@ -991,7 +991,7 @@ mod tests {
         };
         let mut spec = build_worker_spec(&worker, DiscoveryKind::Kubernetes, &app_context);
         assert_eq!(spec.bootstrap_port, None, "no annotation, no port");
-        // The runtime the leg's engine reports when the registration detects it.
+        // The runtime the worker's engine reports when the registration detects it.
         spec.runtime_type = RuntimeType::Vllm;
 
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
@@ -1005,7 +1005,7 @@ mod tests {
         );
         data.worker_kind = Some(WorkerKind::Local);
         data.connection_mode = Some(ConnectionMode::Http);
-        data.http_client_handle = Some(Arc::new(crate::http_client::client()));
+        data.http_client_handle = Some(Arc::new(crate::clients::http_client()));
         let mut ctx = WorkflowContext::new(WorkflowInstanceId::new(), data);
         assert_eq!(
             CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),

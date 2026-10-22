@@ -16,9 +16,11 @@ pub mod common_proto {
 pub mod abort_on_drop;
 pub mod channel;
 pub mod codec;
+pub mod constraint_failure;
 pub mod engine_load;
 pub mod media_fault;
 pub mod mlx_engine;
+mod request_fields;
 pub mod sglang_scheduler;
 pub mod tokenizer_bundle;
 pub mod tokenspeed_encoder;
@@ -34,10 +36,13 @@ pub use channel::{
     connect_channel, connect_channel_with_timeout, is_transport_failure, normalize_grpc_endpoint,
     DEFAULT_CONNECT_TIMEOUT,
 };
+pub use constraint_failure::{
+    constraint_failed_status, is_constraint_failure, CONSTRAINT_FAILED_METADATA_KEY,
+};
 /// The HTTP/2 layer under the channels, re-exported for callers that build
 /// or classify the transport faults [`is_transport_failure`] recognises.
 pub use h2;
-pub use media_fault::WorkerMediaFault;
+pub use media_fault::{media_code, stamp_media_code, WorkerMediaFault, MEDIA_CODE_METADATA_KEY};
 pub use mlx_engine::{proto as mlx_proto, MlxEngineClient};
 pub use sglang_scheduler::{
     proto as sglang_proto, SglangGenerateRequestOptions, SglangSchedulerClient,
@@ -278,18 +283,24 @@ impl TraceInjector for NoopTraceInjector {
 pub type BoxedTraceInjector = Arc<dyn TraceInjector>;
 
 /// Generates the boilerplate that every engine client shares: the two
-/// `connect` constructors, `with_trace_injector`, and the three "standard"
-/// RPCs (`health_check`, `get_model_info`, `get_server_info`) whose
-/// request/response types are uniform across the generated proto crates.
+/// `connect` constructors, `with_trace_injector`, `generate` (the streaming
+/// call whose response aborts the request when dropped), and the three
+/// "standard" RPCs (`health_check`, `get_model_info`, `get_server_info`)
+/// whose request/response types are uniform across the generated proto
+/// crates.
 ///
-/// `$proto_client` is the fully-qualified path of the generated tonic
-/// client type (which `Self` wraps). `$display_name` is the human-readable
-/// name used in the connect log line.
+/// `$proto` is the invoking module's generated proto module (`proto`, or
+/// another name), where `GenerateRequest`, `HealthCheckRequest` and the
+/// other request types are read from. `$proto_client` is the fully-qualified
+/// path of the generated tonic client type (which `Self` wraps).
+/// `$display_name` is the human-readable name used in the connect log line.
+/// The invoking module defines the `AbortOnDropStream` alias `generate`
+/// returns (`crate::AbortOnDropStream<$proto::GenerateResponse, Self>`).
 ///
 /// Each engine's `impl` block invokes this once and then adds engine-
-/// specific RPCs (`generate`, `embed`, etc.) below.
+/// specific RPCs (`abort_request`, `embed`, etc.) below.
 macro_rules! impl_engine_client_basics {
-    ($proto_client:path, $display_name:literal) => {
+    ($proto:ident, $proto_client:path, $display_name:literal) => {
         /// Create a new client and connect to the backend.
         pub async fn connect(
             endpoint: &str,
@@ -326,10 +337,32 @@ macro_rules! impl_engine_client_basics {
             self
         }
 
+        /// Submit a generation request; the returned stream aborts the request
+        /// when it is dropped before `mark_completed()`, so a client that goes
+        /// away mid-stream does not leave the engine generating.
+        pub async fn generate(
+            &self,
+            req: $proto::GenerateRequest,
+        ) -> Result<AbortOnDropStream, tonic::Status> {
+            let request_id = req.request_id.clone();
+            let mut client = self.client.clone();
+            let mut request = tonic::Request::new(req);
+            // W3C trace context into the gRPC metadata for distributed tracing.
+            if let Err(e) = self.trace_injector.inject(request.metadata_mut()) {
+                tracing::warn!("Failed to inject trace context: {}", e);
+            }
+            let response = client.generate(request).await?;
+            Ok(AbortOnDropStream::new(
+                response.into_inner(),
+                request_id,
+                self.clone(),
+            ))
+        }
+
         /// Perform a health check.
-        pub async fn health_check(&self) -> Result<proto::HealthCheckResponse, tonic::Status> {
+        pub async fn health_check(&self) -> Result<$proto::HealthCheckResponse, tonic::Status> {
             tracing::debug!("Sending health check request");
-            let request = tonic::Request::new(proto::HealthCheckRequest {});
+            let request = tonic::Request::new($proto::HealthCheckRequest {});
             let mut client = self.client.clone();
             let response = client.health_check(request).await?;
             tracing::debug!("Health check response received");
@@ -337,9 +370,9 @@ macro_rules! impl_engine_client_basics {
         }
 
         /// Get model information.
-        pub async fn get_model_info(&self) -> Result<proto::GetModelInfoResponse, tonic::Status> {
+        pub async fn get_model_info(&self) -> Result<$proto::GetModelInfoResponse, tonic::Status> {
             tracing::debug!("Requesting model info");
-            let request = tonic::Request::new(proto::GetModelInfoRequest {});
+            let request = tonic::Request::new($proto::GetModelInfoRequest {});
             let mut client = self.client.clone();
             let response = client.get_model_info(request).await?;
             tracing::debug!("Model info response received");
@@ -347,9 +380,11 @@ macro_rules! impl_engine_client_basics {
         }
 
         /// Get server information.
-        pub async fn get_server_info(&self) -> Result<proto::GetServerInfoResponse, tonic::Status> {
+        pub async fn get_server_info(
+            &self,
+        ) -> Result<$proto::GetServerInfoResponse, tonic::Status> {
             tracing::debug!("Requesting server info");
-            let request = tonic::Request::new(proto::GetServerInfoRequest {});
+            let request = tonic::Request::new($proto::GetServerInfoRequest {});
             let mut client = self.client.clone();
             let response = client.get_server_info(request).await?;
             tracing::debug!("Server info response received");
@@ -358,3 +393,24 @@ macro_rules! impl_engine_client_basics {
     };
 }
 pub(crate) use impl_engine_client_basics;
+
+/// The abort-on-drop hook of a client whose `abort_request` takes a reason:
+/// a dropped stream aborts with "Stream dropped".
+macro_rules! impl_abort_for_drop_with_reason {
+    ($client:ty) => {
+        impl $crate::AbortOnDropClient for $client {
+            fn abort_for_drop(
+                self,
+                request_id: String,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<(), tonic::Status>> + Send>,
+            > {
+                Box::pin(async move {
+                    self.abort_request(request_id, "Stream dropped".to_string())
+                        .await
+                })
+            }
+        }
+    };
+}
+pub(crate) use impl_abort_for_drop_with_reason;
