@@ -210,6 +210,16 @@ impl WorkerLoadManager {
         self.dp_cached_loads.write().remove(url);
     }
 
+    /// Invalidate only the virtual worker's rank after a successful poll omits it.
+    fn remove_rank(&self, url: &str, rank: usize) {
+        let Ok(rank) = isize::try_from(rank) else {
+            return;
+        };
+        if let Some(loads) = self.dp_cached_loads.write().get_mut(url) {
+            loads.remove(&rank);
+        }
+    }
+
     /// Drop every cached DP load entry. Used by `WorkerMonitor` during
     /// `stop_all_groups` and lag-recovery rebuilds so the cache cannot
     /// hand out stale per-rank loads after a full reconcile.
@@ -1041,8 +1051,8 @@ impl WorkerMonitor {
     /// is memoized, so the extra attempt costs one 404 per worker, once.
     ///
     /// Engine responses are scoped to the virtual worker's DP rank, if any.
-    /// Gateway fleet rollups retain their worker annotations. Returns
-    /// `None` on failure so the caller records the load as unavailable (`-1`).
+    /// Gateway fleet rollups retain their worker annotations. An empty response
+    /// means a successful poll omitted this rank; `None` means a failed poll.
     ///
     /// `native_loads_memo` is the shared probe memo, or `None` for callers
     /// with no monitor to borrow it from (they simply always discover).
@@ -1081,8 +1091,10 @@ impl WorkerMonitor {
             // A native response with a missing rank is unavailable, not a
             // reason to substitute the backend-wide Prometheus average.
             return match path {
-                NativeLoadsPath::Engine => load.for_dp_rank(worker.dp_rank()),
-                NativeLoadsPath::Gateway => (!load.loads.is_empty()).then_some(load),
+                NativeLoadsPath::Engine => {
+                    Some(load.for_dp_rank(worker.dp_rank()).unwrap_or_default())
+                }
+                NativeLoadsPath::Gateway => Some(load),
             };
         }
 
@@ -1121,10 +1133,26 @@ impl WorkerMonitor {
             return NativeLoads::Inconclusive;
         }
 
-        match resp.json::<WorkerLoadResponse>().await {
+        // WorkerLoadResponse defaults missing fields for compatibility. Native
+        // route discovery must require an explicit loads array so an unrelated
+        // JSON response is not mistaken for an authoritative empty snapshot.
+        #[derive(serde::Deserialize)]
+        struct NativeResponse {
+            loads: Vec<SchedulerLoadSnapshot>,
+            #[serde(flatten)]
+            response: WorkerLoadResponse,
+        }
+
+        match resp.json::<NativeResponse>().await {
             // An empty native snapshot is still authoritative: no rank has
             // telemetry yet. Do not turn it into an aggregate fallback.
-            Ok(response) => NativeLoads::Available(response),
+            Ok(NativeResponse {
+                loads,
+                mut response,
+            }) => {
+                response.loads = loads;
+                NativeLoads::Available(response)
+            }
             // A 200 that is not a load response means something else is
             // mounted here; that is as definitive as a 404.
             Err(_) => NativeLoads::Absent,
@@ -1219,8 +1247,8 @@ impl WorkerMonitor {
     }
 
     /// Fetch load via the backend client's `GetLoads` (gRPC RPC or the ZMQ
-    /// engine's pushed scheduler stats). Returns `None` on missing client,
-    /// error, or empty `loads` array.
+    /// engine's pushed scheduler stats). Returns `None` on missing client or
+    /// error, and an empty response when a successful poll omits this rank.
     pub(crate) async fn fetch_backend_load(worker: &Arc<dyn Worker>) -> Option<WorkerLoadResponse> {
         let backend_client = match worker.get_backend_client().await {
             Ok(Some(client)) => client,
@@ -1241,7 +1269,7 @@ impl WorkerMonitor {
         match tokio::time::timeout(LOAD_POLL_DEADLINE, backend_client.get_loads()).await {
             Ok(Ok(load)) => {
                 liveness::on_contact(worker);
-                load.for_dp_rank(worker.dp_rank())
+                Some(load.for_dp_rank(worker.dp_rank()).unwrap_or_default())
             }
             Ok(Err(e)) => {
                 debug!("backend GetLoads failed for {}: {e}", worker.url());
@@ -1555,8 +1583,23 @@ async fn poll_group_once(
         // on a request path, against the worker's effective thresholds
         // (resolved at registration). A failed fetch means no fresh
         // signal, which clears the flag — absent means no opinion.
-        monitor.apply_overload_verdict(&worker, response.as_ref(), "poll");
+        monitor.apply_overload_verdict(
+            &worker,
+            response.as_ref().filter(|load| !load.loads.is_empty()),
+            "poll",
+        );
         if let Some(mut load) = response {
+            // A successful native poll can retract a rank. A failed poll
+            // leaves the last-known DP cache alone; an explicit omission must
+            // not keep that rank selectable or be published as an idle load.
+            if load.loads.is_empty() {
+                if let Some(rank) = worker.dp_rank() {
+                    monitor.worker_load_manager.remove_rank(&url, rank);
+                } else {
+                    monitor.worker_load_manager.remove_worker(&url);
+                }
+                continue;
+            }
             load.sampled_at = Some(Instant::now());
             // A worker polled because a rank's records went quiet
             // (`fallback`) takes the poll's figures for the ranks that
@@ -3450,7 +3493,9 @@ mod native_loads_tests {
             for _ in 0..2 {
                 assert!(WorkerMonitor::fetch_http_load(&worker, Some(&memo))
                     .await
-                    .is_none());
+                    .expect("successful native poll")
+                    .loads
+                    .is_empty());
             }
             assert_eq!(stub.probes.load(Ordering::SeqCst), 2);
             assert_eq!(stub.gateway_probes.load(Ordering::SeqCst), 1);
@@ -3524,17 +3569,25 @@ mod native_loads_tests {
     }
 
     #[tokio::test]
+    /// Unrelated JSON and malformed load fields cannot suppress metrics fallback.
     async fn non_load_body_on_200_is_treated_as_absent() {
-        let stub = spawn_engine(StatusCode::OK, "<html>nope</html>").await;
-        let worker = vllm_worker(&stub.url);
-        let memo = DashMap::new();
+        for body in [
+            "<html>nope</html>",
+            "{}",
+            r#"{"status":"ok"}"#,
+            r#"{"loads":null}"#,
+        ] {
+            let stub = spawn_engine(StatusCode::OK, body).await;
+            let worker = vllm_worker(&stub.url);
+            let memo = DashMap::new();
 
-        WorkerMonitor::fetch_http_load(&worker, Some(&memo))
-            .await
-            .expect("metrics fallback");
+            WorkerMonitor::fetch_http_load(&worker, Some(&memo))
+                .await
+                .expect("metrics fallback");
 
-        let hit = memo.get(worker.url()).map(|hit| *hit).expect("memo entry");
-        assert!(hit.is_absent(NativeLoadsPath::Engine));
+            let hit = memo.get(worker.url()).map(|hit| *hit).expect("memo entry");
+            assert!(hit.is_absent(NativeLoadsPath::Engine));
+        }
     }
 
     #[tokio::test]
@@ -3548,7 +3601,9 @@ mod native_loads_tests {
         for _ in 0..2 {
             assert!(WorkerMonitor::fetch_http_load(&worker, Some(&memo))
                 .await
-                .is_none());
+                .expect("successful native poll")
+                .loads
+                .is_empty());
         }
 
         let hit = memo.get(worker.url()).map(|hit| *hit).expect("memo entry");
@@ -3646,6 +3701,54 @@ mod native_loads_tests {
             stub.gateway_query.lock().clone(),
             Some("model=meta-llama%2FLlama-3.1-8B".to_string())
         );
+    }
+
+    /// An omitted virtual rank is evicted; another cached rank and failed polls survive.
+    #[tokio::test]
+    async fn successful_missing_rank_evicts_only_that_rank_from_the_dp_cache() {
+        for (status, body, missing) in [
+            (StatusCode::OK, NATIVE_BODY, true),
+            (StatusCode::OK, r#"{"loads":[]}"#, true),
+            (StatusCode::SERVICE_UNAVAILABLE, "unavailable", false),
+        ] {
+            let stub = spawn_engine(status, body).await;
+            let (registry, monitor) = monitor_with_policy(PolicyConfig::RoundRobin);
+            let url = if missing {
+                stub.url.clone()
+            } else {
+                // Reserve then release an address with no server: every probe fails.
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                format!("http://{}", listener.local_addr().unwrap())
+            };
+            let worker = vllm_dp_worker(&url, 1, 2);
+            worker.set_status(WorkerStatus::Ready);
+            registry.register(Arc::clone(&worker)).unwrap();
+            // Simulate a previously cached backend-wide snapshot under this URL.
+            monitor
+                .worker_load_manager
+                .update_dp_loads(&HashMap::from([(
+                    worker.url().to_string(),
+                    HashMap::from([(0, 100), (1, 200)]),
+                )]));
+            let key = WorkerGroupKey {
+                model_id: "a".to_string(),
+                worker_type: WorkerType::Regular,
+                connection_mode: ConnectionMode::Http,
+            };
+            poll_group_once(&monitor, &key, Duration::from_secs(10), Instant::now()).await;
+            let cached = monitor.worker_load_manager.dp_cached_loads.read();
+            let ranks = cached.get(worker.url()).expect("other cached rank remains");
+            assert_eq!(ranks.get(&0), Some(&100));
+            assert_eq!(ranks.get(&1), if missing { None } else { Some(&200) });
+            drop(cached);
+            assert!(monitor.load_state.snapshot().get(worker.url()).is_none());
+            assert_eq!(
+                monitor
+                    .worker_load_manager
+                    .select_and_increment_lowest_dp_load(worker.as_ref(), 1),
+                if missing { None } else { Some(1) },
+            );
+        }
     }
 
     /// The tick's fallback poll of a worker whose stream went quiet on one
