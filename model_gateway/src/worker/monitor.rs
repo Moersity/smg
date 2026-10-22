@@ -575,13 +575,13 @@ impl WorkerMonitor {
         worker.note_load_record();
         // The poll decision reads the receipt, not the sample's age: a record
         // that arrives is a stream that works, whatever the engine's clock.
+        let mut pushed = self.pushed_ranks.lock();
         self.pushed_at
             .lock()
             .entry(url.clone())
             .or_default()
             .insert(dp_rank, received_at);
         let response = {
-            let mut pushed = self.pushed_ranks.lock();
             let ranks = pushed.entry(url.clone()).or_default();
             let previous = ranks.get(&dp_rank).cloned().unwrap_or_default();
             // What a poll would have put in the rank's entry, with the
@@ -628,6 +628,7 @@ impl WorkerMonitor {
         self.pending_pushed
             .lock()
             .insert(url, (Arc::clone(worker), response));
+        drop(pushed);
         self.start_pushed_flusher();
         self.pushed_notify.notify_one();
     }
@@ -689,7 +690,7 @@ impl WorkerMonitor {
             return;
         }
         // Both tables held together so a record landing between the two
-        // reads is not undone; nothing else takes both at once.
+        // reads is not undone; pushes and retractions use the same lock order.
         let mut pushed = self.pushed_ranks.lock();
         let Some(ranks) = pushed.get_mut(url) else {
             return;
@@ -705,6 +706,34 @@ impl WorkerMonitor {
             }
             if let Some(slot) = ranks.get_mut(&entry.dp_rank) {
                 *slot = entry.clone();
+            }
+        }
+    }
+
+    /// Retract pre-poll pushed ranks after an authoritative empty response.
+    /// Records received since the poll began remain available for the next push.
+    fn retract_pushed_load(&self, url: &str, rank: Option<usize>, polled_at: Instant) {
+        let mut pushed = self.pushed_ranks.lock();
+        let mut receipts = self.pushed_at.lock();
+        let Some(times) = receipts.get_mut(url) else {
+            return;
+        };
+        times.retain(|&dp_rank, at| {
+            rank.is_some_and(|rank| usize::try_from(dp_rank) != Ok(rank)) || *at >= polled_at
+        });
+        if let Some(ranks) = pushed.get_mut(url) {
+            ranks.retain(|dp_rank, _| times.contains_key(dp_rank));
+        }
+        let mut pending = self.pending_pushed.lock();
+        if let Some((_, response)) = pending.get_mut(url) {
+            let response = Arc::make_mut(response);
+            response
+                .loads
+                .retain(|load| times.contains_key(&load.dp_rank));
+            response.dp_rank_count = i32::try_from(response.loads.len()).unwrap_or(i32::MAX);
+            response.aggregate = None;
+            if response.loads.is_empty() {
+                pending.remove(url);
             }
         }
     }
@@ -738,6 +767,7 @@ impl WorkerMonitor {
 
     /// Publish every pushed report that accumulated since the last flush.
     pub(crate) fn flush_pushed(&self) {
+        let _pushed = self.pushed_ranks.lock();
         let pending: Vec<PushedReport> = self
             .pending_pushed
             .lock()
@@ -1096,6 +1126,11 @@ impl WorkerMonitor {
                 }
                 NativeLoadsPath::Gateway => Some(load),
             };
+        }
+
+        // Backend-wide gauges cannot be attributed to a virtual DP worker.
+        if worker.dp_rank().is_some() {
+            return None;
         }
 
         match worker.metadata().spec.runtime_type {
@@ -1593,6 +1628,7 @@ async fn poll_group_once(
             // leaves the last-known DP cache alone; an explicit omission must
             // not keep that rank selectable or be published as an idle load.
             if load.loads.is_empty() {
+                monitor.retract_pushed_load(&url, worker.dp_rank(), now);
                 if let Some(rank) = worker.dp_rank() {
                     monitor.worker_load_manager.remove_rank(&url, rank);
                 } else {
@@ -3710,17 +3746,11 @@ mod native_loads_tests {
             (StatusCode::OK, NATIVE_BODY, true),
             (StatusCode::OK, r#"{"loads":[]}"#, true),
             (StatusCode::SERVICE_UNAVAILABLE, "unavailable", false),
+            (StatusCode::NOT_FOUND, "", false),
         ] {
             let stub = spawn_engine(status, body).await;
             let (registry, monitor) = monitor_with_policy(PolicyConfig::RoundRobin);
-            let url = if missing {
-                stub.url.clone()
-            } else {
-                // Reserve then release an address with no server: every probe fails.
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                format!("http://{}", listener.local_addr().unwrap())
-            };
-            let worker = vllm_dp_worker(&url, 1, 2);
+            let worker = vllm_dp_worker(&stub.url, 1, 2);
             worker.set_status(WorkerStatus::Ready);
             registry.register(Arc::clone(&worker)).unwrap();
             // Simulate a previously cached backend-wide snapshot under this URL.
@@ -3748,6 +3778,76 @@ mod native_loads_tests {
                     .select_and_increment_lowest_dp_load(worker.as_ref(), 1),
                 if missing { None } else { Some(1) },
             );
+        }
+    }
+
+    /// Empty polls retract old ranks without discarding concurrent stream records.
+    #[tokio::test]
+    async fn empty_poll_does_not_resurrect_stale_pushed_ranks() {
+        for fresh_offset in [None, Some(Duration::ZERO), Some(Duration::from_millis(1))] {
+            let stub = spawn_engine(StatusCode::OK, r#"{"loads":[]}"#).await;
+            let (registry, monitor) = monitor_with_policy(PolicyConfig::RoundRobin);
+            let worker = vllm_worker(&stub.url);
+            worker.set_status(WorkerStatus::Ready);
+            registry.register(Arc::clone(&worker)).unwrap();
+            let interval = Duration::from_secs(10);
+            let t0 = Instant::now();
+            let polled_at = t0 + interval;
+            for rank in 0..2 {
+                monitor.apply_pushed_load(&worker, rank, &EngineLoad::default(), t0);
+            }
+            let absolute = WorkerLoadResponse {
+                loads: (0..2)
+                    .map(|dp_rank| SchedulerLoadSnapshot {
+                        dp_rank,
+                        num_used_tokens: 100,
+                        max_total_num_tokens: 1000,
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            };
+            monitor.apply_polled_load(worker.url(), &absolute, t0 + Duration::from_secs(1));
+            if let Some(offset) = fresh_offset {
+                monitor.apply_pushed_load(&worker, 1, &EngineLoad::default(), polled_at + offset);
+            }
+            let key = WorkerGroupKey {
+                model_id: "a".to_string(),
+                worker_type: WorkerType::Regular,
+                connection_mode: ConnectionMode::Http,
+            };
+            poll_group_once(&monitor, &key, interval, polled_at).await;
+            monitor.flush_pushed();
+            let snapshot = monitor.load_state.snapshot();
+            if let Some(report) = snapshot.get(worker.url()) {
+                assert!(fresh_offset.is_some());
+                assert_eq!(report.loads.len(), 1);
+                assert_eq!(report.loads[0].dp_rank, 1);
+            }
+            assert_eq!(
+                monitor.pushed_at.lock()[worker.url()].contains_key(&1),
+                fresh_offset.is_some()
+            );
+            monitor.apply_pushed_load(
+                &worker,
+                0,
+                &EngineLoad::default(),
+                polled_at + Duration::from_secs(1),
+            );
+            monitor.flush_pushed();
+            let snapshot = monitor.load_state.snapshot();
+            let report = snapshot.get(worker.url()).unwrap();
+            assert_eq!(
+                report.loads.len(),
+                if fresh_offset.is_some() { 2 } else { 1 }
+            );
+            if fresh_offset.is_none() {
+                assert_eq!(report.loads[0].dp_rank, 0);
+                let cached = monitor.worker_load_manager.dp_cached_loads.read();
+                assert!(cached
+                    .get(worker.url())
+                    .is_none_or(|ranks| !ranks.contains_key(&1)));
+            }
         }
     }
 
