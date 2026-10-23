@@ -391,11 +391,11 @@ mod tests {
         .unwrap();
         components.config_registry.insert(
             "tok".to_string(),
-            Arc::new(MultimodalModelConfig {
-                config: serde_json::json!({"model_type": "llava", "image_token_index": 32000}),
-                preprocessor_config: PreProcessorConfig::default(),
-                video_preprocessor_config: None,
-            }),
+            Arc::new(MultimodalModelConfig::new(
+                serde_json::json!({"model_type": "llava", "image_token_index": 32000}),
+                PreProcessorConfig::default(),
+                None,
+            )),
         );
         let tokenizer = MockTokenizer::new();
         let plan = image_urls(2);

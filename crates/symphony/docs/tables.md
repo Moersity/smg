@@ -493,6 +493,11 @@ render no tool call at all. What the table says beyond the others:
   at every cut; bellwether's hand-written sets record them for the family once its recorder has a
   rule for call ids (the template requires one of nine letters or digits, and a corpus case's
   calls carry none).
+- **A request with tools takes a template an operator supplies.** A checkpoint whose own chat
+  template renders no tool call (Mistral Small 3 and 3.1, Devstral Small 2505) never shows the
+  model the request's tools through it, so such a request is served through a template that
+  renders them, handed to the gateway as `--chat-template`; the engine's own HTTP server has the
+  same limit, and its example template for the family writes the list the table reads.
 - **7B v0.3's template writes a space before the assistant's text** (`[/INST] Hello!</s>`), and
   none before `[TOOL_CALLS]`; the table reads the space as the model's bytes, as the v13 table
   reads what its template writes around the content, and the module tests expect it. Whether
@@ -593,15 +598,29 @@ list and nothing after it; no thought. What the table says beyond the others:
   declares reads by its text, a number or a word as what it is and anything else as the string.
   The text between the quotes is the value's characters as they are: the template decodes no
   escape, so a backslash and an `r` in a value stay those two characters (the recorded patches
-  are full of them), and the table reads them so. A value the model writes bare (`days=3`,
-  `detailed=False`, `city='Paris'`), the spelling its model card and the family's parsers take,
-  reads as Python's, a single-quoted string with its escapes. The structural tags write Python's
-  values, the spelling the model is told to write.
-- **A quote inside a quoted value is the template's loss.** The template does not escape a `"`
-  inside a string it quotes, so the bytes it writes for such a value cannot be read back by any
-  reader, this one included; the recorded sets hold a few such cases (five in a hundred thousand
-  of Scout's), and the corpus replay counts them apart, by the reference that holds the quote,
-  rather than against the table. A string that holds a newline or a backslash reads as written.
+  are full of them), and the table reads them so; a backslash before the closing quote is the
+  value's last character, not an escape, so a value that ends in one (`command="dir C:\"`, as
+  the recorded benchmark sets write it) closes at its quote, whole and at every cut. One
+  reading is kept from the model's side: a `"` right after a backslash is the model's own
+  escaped quote (`size="5\" screen"`, which the family's own readers decode) unless `,` or `)`
+  follows it, whitespace aside, so such a value reads whole with its backslash kept, and only a
+  quote the value's end follows closes it. A value the
+  model writes bare (`days=3`, `detailed=False`, `city='Paris'`), the spelling its model card and
+  the family's parsers take, reads as Python's, a single-quoted string with its escapes. The
+  structural tags write Python's values, the spelling the model is told to write.
+- **A quote inside a quoted value is ambiguous.** The template does not escape a `"` inside a
+  string it quotes, so the bytes it writes for such a value do not say where the value ends; a
+  list or an object between the quotes is Python's repr, which quotes an element, or a key, that
+  holds an apostrophe with `"`, so a nested apostrophe raises the same question. The table reads
+  the value whole when the quotes inside it pair up and nothing between the two of a pair would
+  end or reopen the value in the reader's eyes: no `,` or `)`, no `'` and no opening bracket (the
+  recorded cases are written so: a word in quotes, a JSON object, a command line); it cannot
+  otherwise, since the bytes alone do not say which reading the model meant. The recorded sets
+  hold a few such cases (five in a hundred thousand of Scout's under the `"` form alone; the
+  apostrophe form was not counted), the recorder refuses the class at record time, and the corpus
+  replay counts the ones recorded before that apart, by the reference that holds the quote (a `"`
+  at any depth, a `'` below the top level, the keys of a nested object included), rather than
+  against the table. A string that holds a newline or a backslash reads as written.
 - **`<|python_start|>` and `<|python_end|>` are wrapping wherever they stand.** The family's
   earlier template wrote a tool turn's content between them, and the model may write them around
   its code or its list; the table ignores both terminals, so the text between them reads as what

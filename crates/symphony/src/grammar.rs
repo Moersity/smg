@@ -205,7 +205,7 @@ impl Grammar {
     /// else tells the parser where the tag stops and the free text or the next tag begins
     /// (xgrammar's analyzer: "When the content is unlimited, at least one end string must be
     /// non-empty"). The tests hold every registry table's forced, `auto` and answer grammar to it
-    /// (`tests/forced_tag.rs`) and the tags of the layouts learned from the recorded templates (the
+    /// (`tests/parser/forced_tag.rs`) and the tags of the layouts learned from the recorded templates (the
     /// template tests), so a tag the engines would refuse fails there and not at a request; the
     /// request path sends the grammar as derived. `Err` names the tag's begin.
     pub fn check(&self) -> Result<(), String> {
@@ -742,7 +742,7 @@ impl Format {
     /// either way; so is xLAM's list, whose table has no thought. With the thought left to the
     /// model (the turn's own state opens it and closes an empty one: MiniMax M3), the tag admits
     /// the thought, or the bare close, or nothing, before the calls, since a forced call is
-    /// written at once ([`Self::led`]). The tag for any number of calls:
+    /// written at once (`Self::led`). The tag for any number of calls:
     /// [`Self::grammar_for`] with these two and [`Options::one_call`] unset.
     pub fn grammar(
         &self,
@@ -925,7 +925,7 @@ impl Format {
     /// the prompt opens no thought, the tag admits the thought first, closed and the next message
     /// opened, with the way into the answer owed after it, and leaves the way in optional without
     /// the thought unless the engine starts the grammar at the first token
-    /// ([`Self::thought_message`]).
+    /// (`Self::thought_message`).
     pub fn answer_grammar(&self, schema: &Value, reasoning_open: bool) -> Option<Grammar> {
         self.answer_grammar_for(schema, reasoning_open, GrammarStart::Unknown)
     }
@@ -933,7 +933,7 @@ impl Format {
     /// [`Self::answer_grammar`] for an engine whose grammar starts at `start`: an engine that
     /// starts after its reasoning parser has seen the thought's close gets the schema alone, as
     /// the answer begins where its grammar does; one that starts at the first token gets the
-    /// thought, closed, before the schema ([`Self::led`]); one that does not say gets the schema
+    /// thought, closed, before the schema (`Self::led`); one that does not say gets the schema
     /// alone as well, its own constraint applied where it starts, and engines of either kind
     /// ([`GrammarStart::Either`]) keep the prefix a forced call takes, loosely, since no one tag
     /// fits both.

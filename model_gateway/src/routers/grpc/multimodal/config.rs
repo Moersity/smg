@@ -1,13 +1,14 @@
 //! Multimodal model configuration: the shared config-file registry and the
-//! per-router component bundle (media connector + processor/model registries).
+//! per-router component bundle (media connector + model registry).
 
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{collections::HashMap, fmt, path::Path, sync::Arc};
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use llm_multimodal::{
-    MediaConnector, MediaConnectorConfig, Modality, ModelRegistry, PreProcessorConfig,
-    VisionProcessorRegistry,
+    registry::{ModelRegistryError, RegistryResult},
+    MediaConnector, MediaConnectorConfig, Modality, ModelProcessorSpec, ModelRegistry,
+    PreProcessorConfig, VisionPreProcessor,
 };
 use openai_protocol::worker::MmProcessingMode;
 use tracing::{debug, warn};
@@ -15,12 +16,13 @@ use tracing::{debug, warn};
 use super::{
     inflight::MultimodalInflight,
     pixel_cache::{pixel_cache_with_budget, PixelCache},
+    process::preprocessor_config_for,
     settings::MultimodalSettings,
 };
 use crate::worker::http_client::build_with;
 
 /// Cached model configuration files loaded from the tokenizer directory.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct MultimodalModelConfig {
     /// Model config.json (HuggingFace format)
     pub config: serde_json::Value,
@@ -28,6 +30,122 @@ pub(crate) struct MultimodalModelConfig {
     pub preprocessor_config: PreProcessorConfig,
     /// Video-specific preprocessor config, when provided by the model repo.
     pub video_preprocessor_config: Option<PreProcessorConfig>,
+    /// The vision processors built from these configs, by the name of the
+    /// spec that built them (see [`Self::vision_processors`]).
+    vision_processors: DashMap<&'static str, Arc<VisionProcessors>>,
+}
+
+impl MultimodalModelConfig {
+    pub(crate) fn new(
+        config: serde_json::Value,
+        preprocessor_config: PreProcessorConfig,
+        video_preprocessor_config: Option<PreProcessorConfig>,
+    ) -> Self {
+        Self {
+            config,
+            preprocessor_config,
+            video_preprocessor_config,
+            vision_processors: DashMap::new(),
+        }
+    }
+
+    /// The vision processors `spec` builds from these configs: built by the
+    /// first request that needs them and shared by every later one, so each
+    /// processor resolves the configs once per loaded model rather than once
+    /// per request.
+    pub(crate) fn vision_processors(&self, spec: &dyn ModelProcessorSpec) -> Arc<VisionProcessors> {
+        self.vision_processors
+            .entry(spec.name())
+            .or_insert_with(|| Arc::new(VisionProcessors::build(spec, self)))
+            .clone()
+    }
+
+    /// These configs with `processors` standing for what `spec` would build.
+    #[cfg(test)]
+    pub(crate) fn with_vision_processors(
+        self,
+        spec: &'static str,
+        processors: VisionProcessors,
+    ) -> Self {
+        self.vision_processors.insert(spec, Arc::new(processors));
+        self
+    }
+}
+
+/// The vision processors one spec builds from a model's configs: the image
+/// processor from the image preprocessor config, the video processor from the
+/// video one, or the error the spec reported building either.
+pub(crate) struct VisionProcessors {
+    spec: &'static str,
+    image: RegistryResult<Arc<dyn VisionPreProcessor>>,
+    video: RegistryResult<Arc<dyn VisionPreProcessor>>,
+}
+
+impl VisionProcessors {
+    fn build(spec: &dyn ModelProcessorSpec, model_config: &MultimodalModelConfig) -> Self {
+        let build = |modality| {
+            spec.vision_processor(
+                &model_config.config,
+                preprocessor_config_for(model_config, modality),
+                modality,
+            )
+            .map(Arc::from)
+        };
+        Self {
+            spec: spec.name(),
+            image: build(Modality::Image),
+            video: build(Modality::Video),
+        }
+    }
+
+    /// One processor standing for both of a spec's, for tests that observe
+    /// its calls.
+    #[cfg(test)]
+    pub(crate) fn of(spec: &'static str, processor: Arc<dyn VisionPreProcessor>) -> Self {
+        Self {
+            spec,
+            image: Ok(processor.clone()),
+            video: Ok(processor),
+        }
+    }
+
+    /// The image processor, or why the spec has none.
+    pub(crate) fn image(&self) -> Result<&Arc<dyn VisionPreProcessor>> {
+        self.processor(&self.image, Modality::Image)
+    }
+
+    /// The video processor, or why the spec has none.
+    pub(crate) fn video(&self) -> Result<&Arc<dyn VisionPreProcessor>> {
+        self.processor(&self.video, Modality::Video)
+    }
+
+    fn processor<'a>(
+        &self,
+        built: &'a RegistryResult<Arc<dyn VisionPreProcessor>>,
+        modality: Modality,
+    ) -> Result<&'a Arc<dyn VisionPreProcessor>> {
+        built.as_ref().map_err(|error| {
+            anyhow::anyhow!(
+                "The {modality} processor of model spec {} cannot be built: {error}",
+                self.spec
+            )
+        })
+    }
+}
+
+impl fmt::Debug for VisionProcessors {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn name(
+            built: &RegistryResult<Arc<dyn VisionPreProcessor>>,
+        ) -> Result<&'static str, &ModelRegistryError> {
+            built.as_ref().map(|processor| processor.model_name())
+        }
+        f.debug_struct("VisionProcessors")
+            .field("spec", &self.spec)
+            .field("image", &name(&self.image))
+            .field("video", &name(&self.video))
+            .finish()
+    }
 }
 
 /// Shared cache of multimodal model configuration files keyed by tokenizer UUID.
@@ -108,11 +226,11 @@ impl MultimodalConfigRegistry {
         });
         let video_preprocessor_config = load_video_preprocessor_config(&base_dir);
 
-        let model_config = Arc::new(MultimodalModelConfig {
+        let model_config = Arc::new(MultimodalModelConfig::new(
             config,
             preprocessor_config,
             video_preprocessor_config,
-        });
+        ));
 
         self.configs
             .insert(tokenizer_id.to_string(), model_config.clone());
@@ -279,7 +397,6 @@ fn with_feature_extractor_section(
 /// Shared multimodal components injected at router creation time.
 pub(crate) struct MultimodalComponents {
     pub media_connector: Arc<MediaConnector>,
-    pub vision_processor_registry: Arc<VisionProcessorRegistry>,
     pub model_registry: Arc<ModelRegistry>,
     /// Shared reference to the app-level multimodal config cache.
     pub config_registry: Arc<MultimodalConfigRegistry>,
@@ -371,7 +488,6 @@ impl MultimodalComponents {
 
         Ok(Self {
             media_connector: Arc::new(media_connector),
-            vision_processor_registry: Arc::new(VisionProcessorRegistry::with_defaults()),
             model_registry: Arc::new(ModelRegistry::default()),
             config_registry,
             pixel_cache: pixel_cache_with_budget(settings.pixel_cache_mb.value),
@@ -570,14 +686,12 @@ mod tests {
     #[tokio::test]
     async fn registry_remove_drops_cached_entry() {
         let reg = MultimodalConfigRegistry::new();
-        let cfg = Arc::new(MultimodalModelConfig {
-            config: serde_json::json!({"model_type":"phi3_v"}),
-            preprocessor_config: PreProcessorConfig::from_json(
-                r#"{"image_processor_type":"Phi3VImageProcessor"}"#,
-            )
-            .unwrap(),
-            video_preprocessor_config: None,
-        });
+        let cfg = Arc::new(MultimodalModelConfig::new(
+            serde_json::json!({"model_type":"phi3_v"}),
+            PreProcessorConfig::from_json(r#"{"image_processor_type":"Phi3VImageProcessor"}"#)
+                .unwrap(),
+            None,
+        ));
         reg.insert("tok-uuid-rm".to_string(), cfg.clone());
         assert!(reg.get("tok-uuid-rm").is_some());
 
@@ -594,14 +708,12 @@ mod tests {
         // consulting `tokenizer_source` (which in IGW points to an
         // unreachable worker-only path).
         let reg = MultimodalConfigRegistry::new();
-        let cfg = Arc::new(MultimodalModelConfig {
-            config: serde_json::json!({"model_type":"phi3_v"}),
-            preprocessor_config: PreProcessorConfig::from_json(
-                r#"{"image_processor_type":"Phi3VImageProcessor"}"#,
-            )
-            .unwrap(),
-            video_preprocessor_config: None,
-        });
+        let cfg = Arc::new(MultimodalModelConfig::new(
+            serde_json::json!({"model_type":"phi3_v"}),
+            PreProcessorConfig::from_json(r#"{"image_processor_type":"Phi3VImageProcessor"}"#)
+                .unwrap(),
+            None,
+        ));
         reg.insert("tok-uuid-3".to_string(), cfg.clone());
 
         let bad_source = "/nonexistent/worker-only/path-that-would-fail";

@@ -16,7 +16,7 @@ use llm_multimodal::{
     registry::modality_limit_override, vision::PreProcessorConfig, FrameSampling, MediaConnector,
     MediaConnectorConfig, MediaConnectorError, MediaContentPart, MediaErrorCode, MediaFault,
     Modality, ModelMetadata, ModelRegistry, MultiModalError, Parallelism, TransparencyPolicy,
-    VisionProcessorRegistry, POOL_THREADS_ENV,
+    POOL_THREADS_ENV,
 };
 use llm_tokenizer::TokenizerTrait;
 use openai_protocol::worker::MmProcessingMode;
@@ -409,7 +409,7 @@ impl WorkerMediaPipeline {
             None => loaded,
         };
         let model_registry = Arc::new(ModelRegistry::default());
-        let (spec_name, spec_limits, video_sampling) = {
+        let (spec_name, spec_limits, video_sampling, vision_processors) = {
             let adapter = RegistryTokenizer(tokenizer.as_ref());
             let metadata = ModelMetadata {
                 model_id: &settings.model_id,
@@ -432,7 +432,12 @@ impl WorkerMediaPipeline {
             let limits = spec.modality_limits(&metadata).map_err(|error| {
                 anyhow::anyhow!("reading the {} spec's media limits: {error}", spec.name())
             })?;
-            (spec.name(), limits, spec.video_frame_sampling())
+            (
+                spec.name(),
+                limits,
+                spec.video_frame_sampling(),
+                loaded.vision_processors(spec),
+            )
         };
         let item_limits = effective_item_limits(
             &spec_limits,
@@ -449,12 +454,22 @@ impl WorkerMediaPipeline {
                 anyhow::bail!(message);
             }
         }
-        let vision_processor_registry = Arc::new(VisionProcessorRegistry::with_defaults());
+        // The processors of the modalities the pipeline serves are built here,
+        // so a preprocessor config they cannot serve stops the engine's start
+        // rather than failing its requests.
+        if item_limits
+            .get(&Modality::Image)
+            .is_some_and(|limit| limit.limit > 0)
+        {
+            vision_processors.image()?;
+        }
+        if serves_video(&item_limits) {
+            vision_processors.video()?;
+        }
         if settings.pixel_format == PixelFormat::RawU8 {
-            let model_type = loaded.config.get("model_type").and_then(|v| v.as_str());
-            let emits_pixel_bytes = vision_processor_registry
-                .find(&settings.model_id, model_type)
-                .is_some_and(|processor| processor.emits_pixel_bytes());
+            let emits_pixel_bytes = vision_processors
+                .image()
+                .is_ok_and(|processor| processor.emits_pixel_bytes());
             anyhow::ensure!(
                 emits_pixel_bytes,
                 "the {spec_name} processor produces normalized floats, not the raw pixels an \
@@ -491,7 +506,6 @@ impl WorkerMediaPipeline {
         .context("building the media connector")?;
         let components = MultimodalComponents {
             media_connector: Arc::new(connector),
-            vision_processor_registry,
             model_registry,
             config_registry,
             pixel_cache: pixel_cache_with_budget(mm_settings().pixel_cache_mb.value),
@@ -723,14 +737,15 @@ fn apply_processor_kwargs(
         serde_json::from_value(value)
             .context("mm_processor_kwargs do not fit the preprocessor config")
     };
-    let mut overridden = loaded.clone();
-    overridden.preprocessor_config = overlay(&loaded.preprocessor_config)?;
-    overridden.video_preprocessor_config = loaded
-        .video_preprocessor_config
-        .as_ref()
-        .map(overlay)
-        .transpose()?;
-    Ok(Some(overridden))
+    Ok(Some(MultimodalModelConfig::new(
+        loaded.config.clone(),
+        overlay(&loaded.preprocessor_config)?,
+        loaded
+            .video_preprocessor_config
+            .as_ref()
+            .map(overlay)
+            .transpose()?,
+    )))
 }
 
 /// Whose fault a pipeline failure is, from the typed error in its chain: a
@@ -1182,14 +1197,14 @@ mod processor_kwargs_tests {
 
     #[test]
     fn processor_kwargs_lay_over_every_preprocessor_config() {
-        let loaded = MultimodalModelConfig {
-            config: serde_json::json!({"model_type": "qwen3_vl"}),
-            preprocessor_config: PreProcessorConfig {
+        let loaded = MultimodalModelConfig::new(
+            serde_json::json!({"model_type": "qwen3_vl"}),
+            PreProcessorConfig {
                 max_pixels: Some(10),
                 ..Default::default()
             },
-            video_preprocessor_config: Some(PreProcessorConfig::default()),
-        };
+            Some(PreProcessorConfig::default()),
+        );
         assert!(apply_processor_kwargs(&loaded, &serde_json::Map::new())
             .unwrap()
             .is_none());
@@ -1212,11 +1227,11 @@ mod processor_kwargs_tests {
     /// for would silently change the pixels; it is refused by name.
     #[test]
     fn unknown_processor_kwargs_are_refused_by_name() {
-        let loaded = MultimodalModelConfig {
-            config: serde_json::json!({"model_type": "qwen3_vl"}),
-            preprocessor_config: PreProcessorConfig::default(),
-            video_preprocessor_config: None,
-        };
+        let loaded = MultimodalModelConfig::new(
+            serde_json::json!({"model_type": "qwen3_vl"}),
+            PreProcessorConfig::default(),
+            None,
+        );
         let error = apply_processor_kwargs(
             &loaded,
             &kwargs(serde_json::json!({"fps": 2, "max_pixels": 1, "num_frames": 8})),

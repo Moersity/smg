@@ -493,11 +493,11 @@ fn try_load_multimodal_config(tokenizer_dir: &std::path::Path) -> Option<Multimo
     });
     let video_preprocessor_config = load_video_preprocessor_config(tokenizer_dir);
 
-    Some(MultimodalModelConfig {
+    Some(MultimodalModelConfig::new(
         config,
         preprocessor_config,
         video_preprocessor_config,
-    })
+    ))
 }
 
 /// Fetch a tokenizer from a healthy gRPC worker when local loading fails.

@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     convert::Infallible,
     error::Error as _,
     future::Future,
@@ -941,29 +942,11 @@ impl Router {
             bool_to_static_str(is_stream),
         );
 
-        // Finalize router metrics for an early error that never reached an
-        // upstream worker (model_not_found, dp_aware_not_supported, no
-        // available workers, build failure). Without this, pre-send failures
-        // silently disappear from router_upstream_responses / router_error.
-        let record_pre_send_error = |response: &Response| {
-            let rstatus = response.status();
-            Metrics::record_router_upstream_response(
-                metrics_labels::ROUTER_HTTP,
-                rstatus.as_u16(),
-                extract_error_code_from_response(response),
-            );
-            // Response-aware: a terminal shed carries a retryable status but
-            // must still count as a router error.
-            if !is_retryable_response(response) {
-                Metrics::record_router_error(
-                    metrics_labels::ROUTER_HTTP,
-                    metrics_labels::BACKEND_REGULAR,
-                    metrics_labels::CONNECTION_HTTP,
-                    model_label,
-                    endpoint,
-                    error_type_for_response(response),
-                );
-            }
+        // The finalizers of the request's router metrics: one runs at every
+        // exit below.
+        let outcome = RouteOutcome {
+            model_label: Cow::Borrowed(model_label),
+            endpoint,
         };
 
         // Multipart transcription can't route through `worker.prepare_request`,
@@ -980,7 +963,7 @@ impl Router {
                 model_id,
                 error::model_not_found(model_id),
             );
-            record_pre_send_error(&resp);
+            outcome.pre_send_error(&resp);
             return resp;
         }
         let non_dp_workers: Vec<Arc<dyn Worker>> = all_workers
@@ -993,7 +976,7 @@ impl Router {
                 "dp_aware_not_supported",
                 "/v1/audio/transcriptions does not yet support DP-aware workers",
             );
-            record_pre_send_error(&resp);
+            outcome.pre_send_error(&resp);
             return resp;
         }
         let Some(worker) = placement::select_from(
@@ -1036,7 +1019,7 @@ impl Router {
                 }
             };
             let resp = self.report_refusal("Router::route_multipart_transcription", model_id, resp);
-            record_pre_send_error(&resp);
+            outcome.pre_send_error(&resp);
             return resp;
         };
 
@@ -1049,7 +1032,7 @@ impl Router {
             model_id,
             self.worker_registry.overload_shed_enabled(),
         ) {
-            record_pre_send_error(&resp);
+            outcome.pre_send_error(&resp);
             return resp;
         }
 
@@ -1069,7 +1052,7 @@ impl Router {
             Ok(f) => f,
             Err(e) => {
                 let resp = error::bad_request("multipart_build_failed", e);
-                record_pre_send_error(&resp);
+                outcome.pre_send_error(&resp);
                 return resp;
             }
         };
@@ -1096,34 +1079,7 @@ impl Router {
                     e
                 );
                 let err_resp = convert_reqwest_error(e);
-                let err_status = err_resp.status();
-                // Feed the synthetic status into the worker circuit breaker
-                // and worker-error metric; transport failures (timeouts,
-                // connect errors) must be visible to health tracking so the
-                // same bad worker isn't picked repeatedly.
-                worker.record_outcome(err_status.as_u16());
-                if err_status.is_server_error() {
-                    Metrics::record_worker_error(
-                        metrics_labels::WORKER_REGULAR,
-                        metrics_labels::CONNECTION_HTTP,
-                        error_type_from_status(err_status),
-                    );
-                }
-                Metrics::record_router_upstream_response(
-                    metrics_labels::ROUTER_HTTP,
-                    err_status.as_u16(),
-                    extract_error_code_from_response(&err_resp),
-                );
-                // Mirror route_typed_request: a send failure must still bump
-                // the terminal router_error counter, not just upstream_response.
-                Metrics::record_router_error(
-                    metrics_labels::ROUTER_HTTP,
-                    metrics_labels::BACKEND_REGULAR,
-                    metrics_labels::CONNECTION_HTTP,
-                    model_label,
-                    endpoint,
-                    error_type_from_status(err_status),
-                );
+                outcome.send_failure(worker.as_ref(), &err_resp);
                 return err_resp;
             }
         };
@@ -1135,187 +1091,19 @@ impl Router {
 
         events::RequestReceivedEvent {}.emit();
 
-        let response = if is_stream {
-            // Preserve the upstream content-type verbatim. A `stream=true`
-            // hint from the client doesn't guarantee the worker actually
-            // streams — whisper backends may ignore it and return a normal
-            // JSON body (success or 4xx error). Don't relabel non-SSE
-            // responses as SSE; leave that judgment to whatever the worker
-            // set.
-            let mut response_headers = header_utils::preserve_response_headers(res.headers());
-            header_utils::insert_routed_worker_id(&mut response_headers, worker.url());
-            let stream = res.bytes_stream();
-            // Bounded channel applies backpressure: if the downstream client
-            // is slow, the upstream relay awaits on `send` rather than piling
-            // chunks in memory.
-            const STREAM_RELAY_BUFFER: usize = 32;
-            let (tx, rx) = mpsc::channel::<Result<Bytes, String>>(STREAM_RELAY_BUFFER);
-            // Attribute worker-level and router-level outcomes to the actual
-            // stream completion from inside the relay task: a mid-stream error
-            // after a 2xx header, or a non-streaming 5xx header returned under
-            // `stream=true`, must be visible to circuit-breaker + worker-error
-            // + router-error metrics. Recording only at header time would mis-
-            // classify those.
-            let worker_for_stream = worker.clone();
-            let stream_header_status = status;
-            let stream_model_id = model_label.to_string();
-            let stream_endpoint = endpoint;
-            let stream_start = start;
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "fire-and-forget stream relay; gateway shutdown need not wait for individual stream forwarding"
-            )]
-            tokio::spawn(async move {
-                let mut stream = stream;
-                let mut stream_failed = false;
-                let mut client_disconnected = false;
-                loop {
-                    tokio::select! {
-                        chunk = stream.next() => match chunk {
-                            // An upstream body can yield a zero-length chunk (the
-                            // chunked-encoding terminator surfaces as one). Forwarded,
-                            // hyper's h2 server sends it as an empty non-END_STREAM
-                            // DATA frame, and h2 >= 0.4.16 clients count those per
-                            // connection (never reset) and close the connection with
-                            // ENHANCE_YOUR_CALM after 100 — i.e. after ~100 streamed
-                            // responses on one client connection. Carry no bytes, send
-                            // no frame.
-                            Some(Ok(bytes)) if bytes.is_empty() => {}
-                            Some(Ok(bytes)) => {
-                                if tx.send(Ok(bytes)).await.is_err() {
-                                    client_disconnected = true;
-                                    break;
-                                }
-                            }
-                            Some(Err(e)) => {
-                                stream_failed = true;
-                                let _ = tx.send(Err(format!("Stream error: {e}"))).await;
-                                break;
-                            }
-                            None => break,
-                        },
-                        // Client gone with no chunk in flight (long prefill,
-                        // stalled upstream): break so the reqwest stream drops,
-                        // closing the upstream connection and letting the
-                        // engine abort generation.
-                        () = tx.closed() => {
-                            client_disconnected = true;
-                            break;
-                        }
-                    }
-                }
-                // Effective status = BAD_GATEWAY if the relay failed, else the
-                // worker's header status. Covers both "5xx header returned
-                // while stream=true" and "200 header then mid-stream break".
-                let effective_status = if stream_failed {
-                    StatusCode::BAD_GATEWAY
-                } else {
-                    stream_header_status
-                };
-                worker_for_stream.record_outcome(effective_status.as_u16());
-                if effective_status.is_server_error() {
-                    Metrics::record_worker_error(
-                        metrics_labels::WORKER_REGULAR,
-                        metrics_labels::CONNECTION_HTTP,
-                        error_type_from_status(effective_status),
-                    );
-                }
-                // A client disconnect gets no terminal router metric: it is
-                // neither a completed request (duration) nor a router or
-                // worker failure (error). Worker-level attribution above
-                // still applies — the header status is a worker fact.
-                if client_disconnected {
-                    return;
-                }
-                if effective_status.is_success() {
-                    Metrics::record_router_duration(
-                        metrics_labels::ROUTER_HTTP,
-                        metrics_labels::BACKEND_REGULAR,
-                        metrics_labels::CONNECTION_HTTP,
-                        &stream_model_id,
-                        stream_endpoint,
-                        stream_start.elapsed(),
-                    );
-                } else {
-                    Metrics::record_router_error(
-                        metrics_labels::ROUTER_HTTP,
-                        metrics_labels::BACKEND_REGULAR,
-                        metrics_labels::CONNECTION_HTTP,
-                        &stream_model_id,
-                        stream_endpoint,
-                        error_type_from_status(effective_status),
-                    );
-                }
-            });
-            // The load guard rides in the body's own stream: released when
-            // the body is dropped, at its end or when the client leaves.
-            let body = Body::from_stream(GuardedStream::new(ReceiverStream::new(rx), load_guard));
-            let mut response = Response::new(body);
-            *response.status_mut() = status;
-            *response.headers_mut() = response_headers;
-            response
+        if is_stream {
+            relay_transcription_stream(res, status, &worker, load_guard, outcome, start)
         } else {
-            let response_headers = header_utils::preserve_response_headers(res.headers());
-            // The same capped read as every typed route's buffered answer: a
-            // body above the ingress payload limit is a misbehaving worker
-            // and ends as a 502 before memory grows, and the request's own
-            // timeout ends the request as it does before the head.
-            let mut response = match Self::read_worker_body_capped(
-                res.bytes_stream(),
+            buffer_transcription_response(
+                res,
+                status,
+                worker.as_ref(),
                 self.max_payload_size,
+                &outcome,
+                start,
             )
             .await
-            {
-                Ok(body) => {
-                    let mut response = Response::new(Body::from(body));
-                    *response.status_mut() = status;
-                    *response.headers_mut() = response_headers;
-                    response
-                }
-                Err(error_response) => error_response,
-            };
-            // The routed worker's id on the error answers too, as the typed
-            // routes' buffered arm sets it.
-            header_utils::insert_routed_worker_id(response.headers_mut(), worker.url());
-            response
-        };
-
-        // Non-streaming: classify metrics off the final response the client
-        // will actually see. A body-read failure can rewrite a 2xx upstream
-        // into a local 5xx, and we want the circuit breaker + metrics to see
-        // that. Streaming outcomes are owned by the relay task above.
-        if !is_stream {
-            let final_status = response.status();
-            worker.record_outcome(final_status.as_u16());
-            if final_status.is_server_error() {
-                Metrics::record_worker_error(
-                    metrics_labels::WORKER_REGULAR,
-                    metrics_labels::CONNECTION_HTTP,
-                    error_type_from_status(final_status),
-                );
-            }
-            if final_status.is_success() {
-                Metrics::record_router_duration(
-                    metrics_labels::ROUTER_HTTP,
-                    metrics_labels::BACKEND_REGULAR,
-                    metrics_labels::CONNECTION_HTTP,
-                    model_label,
-                    endpoint,
-                    start.elapsed(),
-                );
-            } else {
-                Metrics::record_router_error(
-                    metrics_labels::ROUTER_HTTP,
-                    metrics_labels::BACKEND_REGULAR,
-                    metrics_labels::CONNECTION_HTTP,
-                    model_label,
-                    endpoint,
-                    error_type_from_status(final_status),
-                );
-            }
         }
-
-        response
     }
 
     /// Buffer a worker response body, capped at `limit` bytes; a larger body
@@ -1734,6 +1522,255 @@ fn build_transcription_form(
     }
 
     Ok(form)
+}
+
+/// The terminal accounting of one multipart transcription request: the
+/// labels its router metrics carry and the finalizers that write them, one
+/// per way the request ends. The typed route keeps its own inline
+/// accounting, shaped by its retry policy.
+struct RouteOutcome<'a> {
+    model_label: Cow<'a, str>,
+    endpoint: &'static str,
+}
+
+impl RouteOutcome<'_> {
+    /// Finalize router metrics for an early error that never reached an
+    /// upstream worker (model_not_found, dp_aware_not_supported, no
+    /// available workers, build failure). Without this, pre-send failures
+    /// silently disappear from router_upstream_responses / router_error.
+    fn pre_send_error(&self, response: &Response) {
+        let rstatus = response.status();
+        Metrics::record_router_upstream_response(
+            metrics_labels::ROUTER_HTTP,
+            rstatus.as_u16(),
+            extract_error_code_from_response(response),
+        );
+        // Response-aware: a terminal shed carries a retryable status but
+        // must still count as a router error.
+        if !is_retryable_response(response) {
+            Metrics::record_router_error(
+                metrics_labels::ROUTER_HTTP,
+                metrics_labels::BACKEND_REGULAR,
+                metrics_labels::CONNECTION_HTTP,
+                &self.model_label,
+                self.endpoint,
+                error_type_for_response(response),
+            );
+        }
+    }
+
+    /// A request the worker never answered. Its synthetic status feeds the
+    /// worker circuit breaker and worker-error metric (transport failures,
+    /// timeouts and connect errors must be visible to health tracking so the
+    /// same bad worker isn't picked repeatedly), then the upstream-response
+    /// counter and, as on `route_typed_request`, the terminal router_error
+    /// counter.
+    fn send_failure(&self, worker: &dyn Worker, err_resp: &Response) {
+        let err_status = err_resp.status();
+        worker_outcome(worker, err_status);
+        Metrics::record_router_upstream_response(
+            metrics_labels::ROUTER_HTTP,
+            err_status.as_u16(),
+            extract_error_code_from_response(err_resp),
+        );
+        Metrics::record_router_error(
+            metrics_labels::ROUTER_HTTP,
+            metrics_labels::BACKEND_REGULAR,
+            metrics_labels::CONNECTION_HTTP,
+            &self.model_label,
+            self.endpoint,
+            error_type_from_status(err_status),
+        );
+    }
+
+    /// The router's terminal metric of an answered request: its duration on
+    /// a success, else the error class of its status.
+    fn answered(&self, status: StatusCode, start: Instant) {
+        if status.is_success() {
+            Metrics::record_router_duration(
+                metrics_labels::ROUTER_HTTP,
+                metrics_labels::BACKEND_REGULAR,
+                metrics_labels::CONNECTION_HTTP,
+                &self.model_label,
+                self.endpoint,
+                start.elapsed(),
+            );
+        } else {
+            Metrics::record_router_error(
+                metrics_labels::ROUTER_HTTP,
+                metrics_labels::BACKEND_REGULAR,
+                metrics_labels::CONNECTION_HTTP,
+                &self.model_label,
+                self.endpoint,
+                error_type_from_status(status),
+            );
+        }
+    }
+
+    /// The same labels, owned: what the stream relay's task carries.
+    fn into_owned(self) -> RouteOutcome<'static> {
+        RouteOutcome {
+            model_label: Cow::Owned(self.model_label.into_owned()),
+            endpoint: self.endpoint,
+        }
+    }
+}
+
+/// The worker's side of a request's outcome: the status feeds its circuit
+/// breaker, and a server error the worker-error metric.
+fn worker_outcome(worker: &dyn Worker, status: StatusCode) {
+    worker.record_outcome(status.as_u16());
+    if status.is_server_error() {
+        Metrics::record_worker_error(
+            metrics_labels::WORKER_REGULAR,
+            metrics_labels::CONNECTION_HTTP,
+            error_type_from_status(status),
+        );
+    }
+}
+
+/// Relays a streamed transcription body to the client; the worker's and the
+/// router's outcome is attributed when the stream ends, by the relay task.
+fn relay_transcription_stream(
+    res: reqwest::Response,
+    status: StatusCode,
+    worker: &Arc<dyn Worker>,
+    load_guard: WorkerLoadGuard,
+    outcome: RouteOutcome<'_>,
+    start: Instant,
+) -> Response {
+    // Preserve the upstream content-type verbatim. A `stream=true`
+    // hint from the client doesn't guarantee the worker actually
+    // streams — whisper backends may ignore it and return a normal
+    // JSON body (success or 4xx error). Don't relabel non-SSE
+    // responses as SSE; leave that judgment to whatever the worker
+    // set.
+    let mut response_headers = header_utils::preserve_response_headers(res.headers());
+    header_utils::insert_routed_worker_id(&mut response_headers, worker.url());
+    let stream = res.bytes_stream();
+    // Bounded channel applies backpressure: if the downstream client
+    // is slow, the upstream relay awaits on `send` rather than piling
+    // chunks in memory.
+    const STREAM_RELAY_BUFFER: usize = 32;
+    let (tx, rx) = mpsc::channel::<Result<Bytes, String>>(STREAM_RELAY_BUFFER);
+    // Attribute worker-level and router-level outcomes to the actual
+    // stream completion from inside the relay task: a mid-stream error
+    // after a 2xx header, or a non-streaming 5xx header returned under
+    // `stream=true`, must be visible to circuit-breaker + worker-error
+    // + router-error metrics. Recording only at header time would mis-
+    // classify those.
+    let worker_for_stream = worker.clone();
+    let stream_header_status = status;
+    let outcome = outcome.into_owned();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "fire-and-forget stream relay; gateway shutdown need not wait for individual stream forwarding"
+    )]
+    tokio::spawn(async move {
+        let mut stream = stream;
+        let mut stream_failed = false;
+        let mut client_disconnected = false;
+        loop {
+            tokio::select! {
+                chunk = stream.next() => match chunk {
+                    // An upstream body can yield a zero-length chunk (the
+                    // chunked-encoding terminator surfaces as one). Forwarded,
+                    // hyper's h2 server sends it as an empty non-END_STREAM
+                    // DATA frame, and h2 >= 0.4.16 clients count those per
+                    // connection (never reset) and close the connection with
+                    // ENHANCE_YOUR_CALM after 100 — i.e. after ~100 streamed
+                    // responses on one client connection. Carry no bytes, send
+                    // no frame.
+                    Some(Ok(bytes)) if bytes.is_empty() => {}
+                    Some(Ok(bytes)) => {
+                        if tx.send(Ok(bytes)).await.is_err() {
+                            client_disconnected = true;
+                            break;
+                        }
+                    }
+                    Some(Err(e)) => {
+                        stream_failed = true;
+                        let _ = tx.send(Err(format!("Stream error: {e}"))).await;
+                        break;
+                    }
+                    None => break,
+                },
+                // Client gone with no chunk in flight (long prefill,
+                // stalled upstream): break so the reqwest stream drops,
+                // closing the upstream connection and letting the
+                // engine abort generation.
+                () = tx.closed() => {
+                    client_disconnected = true;
+                    break;
+                }
+            }
+        }
+        // Effective status = BAD_GATEWAY if the relay failed, else the
+        // worker's header status. Covers both "5xx header returned
+        // while stream=true" and "200 header then mid-stream break".
+        let effective_status = if stream_failed {
+            StatusCode::BAD_GATEWAY
+        } else {
+            stream_header_status
+        };
+        worker_outcome(worker_for_stream.as_ref(), effective_status);
+        // A client disconnect gets no terminal router metric: it is
+        // neither a completed request (duration) nor a router or
+        // worker failure (error). Worker-level attribution above
+        // still applies — the header status is a worker fact.
+        if client_disconnected {
+            return;
+        }
+        outcome.answered(effective_status, start);
+    });
+    // The load guard rides in the body's own stream: released when
+    // the body is dropped, at its end or when the client leaves.
+    let body = Body::from_stream(GuardedStream::new(ReceiverStream::new(rx), load_guard));
+    let mut response = Response::new(body);
+    *response.status_mut() = status;
+    *response.headers_mut() = response_headers;
+    response
+}
+
+/// Buffers a transcription body, read under the ingress payload cap; the
+/// worker's and the router's outcome is attributed from the response the
+/// client sees.
+async fn buffer_transcription_response(
+    res: reqwest::Response,
+    status: StatusCode,
+    worker: &dyn Worker,
+    max_payload_size: usize,
+    outcome: &RouteOutcome<'_>,
+    start: Instant,
+) -> Response {
+    let response_headers = header_utils::preserve_response_headers(res.headers());
+    // The same capped read as every typed route's buffered answer: a
+    // body above the ingress payload limit is a misbehaving worker
+    // and ends as a 502 before memory grows, and the request's own
+    // timeout ends the request as it does before the head.
+    let mut response =
+        match Router::read_worker_body_capped(res.bytes_stream(), max_payload_size).await {
+            Ok(body) => {
+                let mut response = Response::new(Body::from(body));
+                *response.status_mut() = status;
+                *response.headers_mut() = response_headers;
+                response
+            }
+            Err(error_response) => error_response,
+        };
+    // The routed worker's id on the error answers too, as the typed
+    // routes' buffered arm sets it.
+    header_utils::insert_routed_worker_id(response.headers_mut(), worker.url());
+
+    // Non-streaming: classify metrics off the final response the client
+    // will actually see. A body-read failure can rewrite a 2xx upstream
+    // into a local 5xx, and we want the circuit breaker + metrics to see
+    // that. Streaming outcomes are owned by `relay_transcription_stream`.
+    let final_status = response.status();
+    worker_outcome(worker, final_status);
+    outcome.answered(final_status, start);
+
+    response
 }
 
 /// True for transport failures surfaced without any response: no upstream
