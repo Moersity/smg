@@ -1420,7 +1420,6 @@ impl ChatDecode {
                 .get_mut(&index)
                 .map(TextStopScanner::flush)
                 .filter(|s| !s.is_empty()),
-            is_final: false,
         };
         if flushed.analysis_delta.is_some() || flushed.final_delta.is_some() {
             HarmonyStreamingProcessor::emit_chunk_delta(
@@ -1516,6 +1515,7 @@ impl ChatDecode {
                 .map(|t| t.duration_since(self.start_time)),
             generation_duration: self.start_time.elapsed(),
             input_tokens: Some(counts.prompt as u64),
+            cached_tokens: Some(u64::from(counts.cached)),
             output_tokens: counts.completion as u64,
         });
 

@@ -131,6 +131,17 @@ pub trait IncrementalDecoder: Send + Sync {
     /// the token only extends a multi-byte character or is skipped).
     fn step(&mut self, token_id: TokenIdType) -> Result<String>;
 
+    /// Feed one token; appends the text that became final with it to `out`
+    /// and says whether there was any (none when the token only extends a
+    /// multi-byte character or is skipped). The default goes through
+    /// [`step`](Self::step); a decoder that has the text at hand appends it
+    /// without a string of its own per token.
+    fn step_into(&mut self, token_id: TokenIdType, out: &mut String) -> Result<bool> {
+        let text = self.step(token_id)?;
+        out.push_str(&text);
+        Ok(!text.is_empty())
+    }
+
     /// Forget all state, as for a new stream.
     fn reset(&mut self);
 }
@@ -333,6 +344,20 @@ pub trait Tokenizer: Encoder + Decoder {
     /// Get the content format expected by the chat template.
     fn chat_template_content_format(&self) -> ChatTemplateContentFormat {
         ChatTemplateContentFormat::default()
+    }
+
+    /// The content format of the template a request renders through, by
+    /// whether the request declares tools: a checkpoint can ship one template
+    /// for requests with tools and another for those without (see
+    /// `ChatTemplateState::content_format_for_tools`), and the request's
+    /// message content takes the shape of the one that renders it. The
+    /// default template's format for a tokenizer with one template.
+    fn chat_template_content_format_for_request(
+        &self,
+        has_tools: bool,
+    ) -> ChatTemplateContentFormat {
+        let _ = has_tools;
+        self.chat_template_content_format()
     }
 
     /// Get the thinking toggle support for this template.

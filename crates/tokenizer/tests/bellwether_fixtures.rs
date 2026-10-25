@@ -84,7 +84,8 @@ use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::Value;
 
 use crate::common::hub_fetch::{
-    cached_download, fetch, rate_limit_wait, RATE_LIMITED_TRIES, RATE_LIMIT_WINDOW,
+    answered, cached_download, fetch, rate_limit_wait, RATE_LIMITED_TRIES, RATE_LIMIT_WINDOW,
+    TRANSPORT_ERROR_RETRIES, TRANSPORT_ERROR_WAIT,
 };
 
 mod common;
@@ -105,24 +106,43 @@ const SHOWN: usize = 20;
 /// The fixture kinds this test reads, each a directory of sets beside a
 /// model's manifest.
 const KINDS: [&str; 2] = ["render", "parse"];
+/// The set bellwether records by hand for every model, whose cases carry
+/// names of their own (`no-generation-prompt`) where a benchmark set's are
+/// numbered (`gsm8k-17`): the tree holds it for every model, so a case name's
+/// entry is stale when it is not among the cases.
+const HAND_WRITTEN_SET: &str = "common";
 /// How a file Git LFS has not fetched begins: the pointer stands where the
 /// content would be.
 const LFS_POINTER: &[u8] = b"version https://git-lfs.github.com/spec/v1";
 
-/// The reason of the render sets recorded from a Llama-class checkpoint's
-/// `tokenizer.json` read as a file, where the loader now runs the reference
-/// class's pipeline (see `huggingface::HuggingFaceTokenizer::llama_class_pipeline`).
-const LEGACY_FILE_PIPELINE: &str = "render ids recorded with the checkpoint's legacy file pipeline (a word marker after every special token, a normalized marker matched only behind a space, which it takes); the loader encodes such a checkpoint as its reference class does since the Llama-class pipeline change; to be re-recorded with the class backend";
+/// The reason of the render sets of a Llama-class checkpoint whose
+/// `tokenizer.json` keeps the legacy pipeline: the reference's ids were
+/// recorded from that file read as it is, the engines' tokenizer class
+/// rebuilds the pipeline, and the loader follows the class (see
+/// `huggingface::HuggingFaceTokenizer::llama_class_pipeline`). The gateway's
+/// render-parity harness lists the same sets under the same reason.
+const LEGACY_FILE_PIPELINE: &str = "the render ids of this Llama-class checkpoint were recorded from its raw tokenizer.json read by `tokenizers` (the file's legacy pipeline, the ids transformers 4.x gave by taking the file as is: a word marker after every special token, a marker token missed after a newline or a letter); transformers 5.17.0, the version the engines run, rebuilds the class's pipeline (no normalizer, a Metaspace pre-tokenizer) and the loader matches it since smg-project/smg#4248, so the reference's ids differ from the engine's at the special tokens and the markers while the text is equal; every render case of the model, until the sets are re-recorded with the class (smg-project/bellwether#210), when this entry heals and the run asks for its removal";
 
 /// Cases known to differ from the reference, each with the reason and where
-/// it is tracked: a fixture id, `<slug>/render/<name>` or `<slug>/parse/<name>`,
-/// or a prefix ending in `*`, which stands for every case whose id begins
-/// with what is before it (`<slug>/render/*` for a model's whole render side,
-/// `<slug>/render/mgsm-th-*` for one of its sets). A prefix is for a cause
-/// that covers a model or a set wholesale, a reference recorded with another
-/// pre-tokenizer for instance, and is held to the rule an id is: the run
-/// fails when no loaded case under it differs any more, and when no loaded
-/// case is under it at all.
+/// it is tracked: a fixture id, `<slug>/render/<name>` or `<slug>/parse/<name>`;
+/// a prefix ending in `*`, which stands for every case whose id begins with
+/// what is before it (`<slug>/render/*` for a model's whole render side,
+/// `<slug>/render/mgsm-th-*` for one of its sets); or a suffix beginning with
+/// `*`, which stands for the case of that name of every model
+/// (`*/parse/content-with-marker-in-code-fence`); or a set by its file,
+/// `<slug>/<kind>/<set>.jsonl`, for a benchmark set whole (its case ids need
+/// not begin with its name). A prefix is for a cause that covers a model or a
+/// family of sets wholesale, a reference
+/// recorded with another pre-tokenizer for instance, a suffix for one that
+/// covers a hand-written case across the models, and each is held to the rule
+/// an id is: the run fails when no loaded case under it
+/// differs any more (a differing case counts for the entry of its own id, else
+/// for the one entry that covers it and for none when several do, so an entry
+/// does not outlive its cause on the cases another entry names), and when
+/// the tree holds its set and no loaded case is
+/// under it; the entries of a benchmark set the tree omits (`bellwether unpack
+/// --sample-sets` writes every Nth) are left alone, an id of one of its cases
+/// among them.
 const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
     ("nanbeige4-3b-thinking-2510/render/*", LEGACY_FILE_PIPELINE),
     ("nanbeige4-3b-thinking-2511/render/*", LEGACY_FILE_PIPELINE),
@@ -140,23 +160,204 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
 /// is tracked, so the run compares the others: an unlisted model that does
 /// not load fails the run, and so does a listed one whose tokenizer loads
 /// now, so the list cannot rot.
-const KNOWN_UNLOADED: &[(&str, &str)] = &[];
+const KNOWN_UNLOADED: &[(&str, &str)] = &[
+    (
+        "c4ai-command-a-03-2025",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "c4ai-command-r-v01",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "command-a-reasoning-08-2025",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "functiongemma-270m-it",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "gemma-1.1-2b-it",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "gemma-2-2b-it",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "gemma-3-12b-it-qat-q4-0-unquantized",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "gemma-3-1b-it",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "gemma-3-1b-it-qat-q4-0-unquantized",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "gemma-3-270m-it",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "gemma-3-4b-it",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "gemma-3n-e2b-it",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "llama-3.2-11b-vision-instruct",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "llama-3.2-1b-instruct",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "llama-4-maverick-17b-128e-instruct",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "llama-4-scout-17b-16e",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "llama-4-scout-17b-16e-instruct",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "llama-guard-3-1b",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "llama-guard-4-12b",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "medgemma-27b-it",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "skywork-or1-32b-preview",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+];
 
-/// The reason `known` lists for `id`: the entry that is the id itself, else
-/// the first prefix entry the id begins with; none when the id is not listed.
-fn known_reason<'a>(known: &BTreeMap<&'a str, &'a str>, id: &str) -> Option<&'a str> {
+/// The reason `known` lists for the case `id` of the set `set`: the entry
+/// that is the id itself, else the first entry that covers it; none when the
+/// case is not listed.
+fn known_reason<'a>(known: &BTreeMap<&'a str, &'a str>, id: &str, set: &str) -> Option<&'a str> {
     known.get(id).copied().or_else(|| {
         known
             .iter()
-            .find(|(entry, _)| prefix_of(entry).is_some_and(|prefix| id.starts_with(prefix)))
+            .find(|(entry, _)| Listed::of(entry).covers(id, set))
             .map(|(_, reason)| *reason)
     })
 }
 
-/// What a prefix entry stands for: the part before its trailing `*`; none for
-/// an entry that is one fixture id.
-fn prefix_of(entry: &str) -> Option<&str> {
-    entry.strip_suffix('*')
+/// The entry of `known` a differing case `id` of the set `set` counts for
+/// when the list is held to its rule: the entry that is the id itself, else
+/// the one entry that covers it; none when the case is not listed, and none
+/// when two or more entries cover it, since such a case differs for either
+/// entry's cause and must keep neither alive (a model whose whole render side
+/// is listed has its `no-generation-prompt` case under the case-name entry as
+/// well: the header the gateway appends and the model's own cause both stand
+/// in it, so it says nothing about which of the two causes is gone).
+fn counting_entry<'a>(known: &BTreeMap<&'a str, &'a str>, id: &str, set: &str) -> Option<&'a str> {
+    if let Some((entry, _)) = known.get_key_value(id) {
+        return Some(*entry);
+    }
+    let mut covering = known
+        .keys()
+        .copied()
+        .filter(|entry| Listed::of(entry).covers(id, set));
+    let first = covering.next()?;
+    covering.next().is_none().then_some(first)
+}
+
+/// What an entry of the list stands for: one fixture id; a prefix, the part
+/// before its trailing `*`, for a cause that covers a model or a family of
+/// sets wholesale; a set, named by its file `<slug>/<kind>/<set>.jsonl`, for a
+/// cause that covers a benchmark set, whose case ids need not begin with its
+/// name; or a suffix, the part after its leading `*`, for a cause that covers
+/// one case of every model (`*/render/no-generation-prompt`).
+#[derive(Clone, Copy)]
+enum Listed<'e> {
+    Id(&'e str),
+    Prefix(&'e str),
+    Set(&'e str),
+    Suffix(&'e str),
+}
+
+impl<'e> Listed<'e> {
+    fn of(entry: &'e str) -> Self {
+        if let Some(set) = entry.strip_suffix(".jsonl") {
+            Self::Set(set)
+        } else if let Some(prefix) = entry.strip_suffix('*') {
+            Self::Prefix(prefix)
+        } else if let Some(suffix) = entry.strip_prefix('*') {
+            Self::Suffix(suffix)
+        } else {
+            Self::Id(entry)
+        }
+    }
+
+    /// Whether the entry lists the case `id` of the set `set`
+    /// (`<slug>/<kind>/<set>`).
+    fn covers(self, id: &str, set: &str) -> bool {
+        match self {
+            Self::Id(entry) => id == entry,
+            Self::Prefix(prefix) => id.starts_with(prefix),
+            Self::Set(entry) => set == entry,
+            Self::Suffix(suffix) => id.ends_with(suffix),
+        }
+    }
 }
 
 /// `fixtures/<slug>/manifest.toml`: the model and the revision its fixtures
@@ -346,6 +547,10 @@ impl Output<'_> {
 struct Report {
     /// `<slug>/<kind>` of each kind whose sets were read.
     loaded_dirs: BTreeSet<String>,
+    /// `<slug>/<kind>/<set>` of each set read.
+    sets_read: BTreeSet<String>,
+    /// The set of each case that differs, by id.
+    set_of_difference: BTreeMap<String, String>,
     /// The id of every case compared.
     seen: BTreeSet<String>,
     /// Why each case that differs from the reference differs, by id.
@@ -362,19 +567,27 @@ struct Report {
     shown: Shown,
 }
 
+/// One case compared: its id, its set (`<slug>/<kind>/<set>`) and how many
+/// ids it carries.
+struct CaseRead<'s> {
+    id: String,
+    set: &'s str,
+    ids: usize,
+}
+
 impl Report {
     /// Count one compared case into `tally`, and keep its difference if it
     /// has one, written to `lines` as it is found, with its reason when it is
     /// listed; an unlisted one is counted into the shown ones too.
     fn record(
         &mut self,
-        id: String,
+        case: CaseRead<'_>,
         outcome: Result<(), String>,
-        ids: usize,
         tally: &mut Tally,
         known: &BTreeMap<&str, &str>,
         lines: &mut String,
     ) {
+        let CaseRead { id, set, ids } = case;
         assert!(
             self.seen.insert(id.clone()),
             "{id}: recorded more than once"
@@ -385,20 +598,28 @@ impl Report {
             tally.differ += 1;
             let line = format!("  differs {id}: {why}\n");
             lines.push_str(&line);
-            match known_reason(known, &id) {
+            match known_reason(known, &id, set) {
                 Some(reason) => {
                     tally.listed += 1;
                     lines.push_str(&format!("          known: {reason}\n"));
                 }
                 None => self.shown.unlisted(&line),
             }
+            self.set_of_difference.insert(id.clone(), set.to_string());
             self.differences.insert(id, why);
         }
+    }
+
+    /// The set of a differing case, `<slug>/<kind>/<set>`.
+    fn set_of(&self, id: &str) -> &str {
+        self.set_of_difference.get(id).map_or("", String::as_str)
     }
 
     /// Take in what one model's comparison reported.
     fn merge(&mut self, other: Report) {
         self.loaded_dirs.extend(other.loaded_dirs);
+        self.sets_read.extend(other.sets_read);
+        self.set_of_difference.extend(other.set_of_difference);
         for id in other.seen {
             assert!(
                 self.seen.insert(id.clone()),
@@ -467,7 +688,7 @@ impl Report {
         let unexpected: Vec<(&str, &str)> = self
             .differences
             .iter()
-            .filter(|(id, _)| known_reason(known, id).is_none())
+            .filter(|(id, _)| known_reason(known, id, self.set_of(id)).is_none())
             .map(|(id, why)| (id.as_str(), why.as_str()))
             .collect();
         if !unexpected.is_empty() {
@@ -510,51 +731,99 @@ impl Report {
         failures
     }
 
-    /// Whether a compared case's id begins with `prefix`.
-    fn seen_under(&self, prefix: &str) -> bool {
-        self.seen
-            .range::<str, _>((Bound::Included(prefix), Bound::Unbounded))
-            .next()
-            .is_some_and(|id| id.starts_with(prefix))
-    }
-
-    /// Whether a differing case's id begins with `prefix`.
-    fn differs_under(&self, prefix: &str) -> bool {
-        self.differences
-            .range::<str, _>((Bound::Included(prefix), Bound::Unbounded))
-            .next()
-            .is_some_and(|(id, _)| id.starts_with(prefix))
+    /// Whether a compared case is one `listed` covers: the id itself, one
+    /// under its prefix, one of its set, or one that ends with its suffix.
+    fn seen_listed(&self, listed: Listed<'_>) -> bool {
+        match listed {
+            Listed::Id(id) => self.seen.contains(id),
+            Listed::Set(set) => self.sets_read.contains(set),
+            Listed::Prefix(prefix) => self
+                .seen
+                .range::<str, _>((Bound::Included(prefix), Bound::Unbounded))
+                .next()
+                .is_some_and(|id| id.starts_with(prefix)),
+            Listed::Suffix(suffix) => self.seen.iter().any(|id| id.ends_with(suffix)),
+        }
     }
 
     /// The entries of `known` whose compared cases all match the reference
-    /// now.
+    /// now: the entries no differing case counts for ([`counting_entry`]: a
+    /// case with an entry of its own id counts for that entry, otherwise for
+    /// the one entry that covers it and for none when several do), so that a
+    /// prefix heals once every case under it that no other entry names
+    /// matches, and a case-name entry heals once its case matches on every
+    /// model that has no whole-side entry, whatever the whole-side models'
+    /// cases do; an entry is live while one differing case counts for it.
     fn healed<'k>(&self, known: &BTreeMap<&'k str, &'k str>) -> Vec<&'k str> {
+        let live: BTreeSet<&str> = self
+            .differences
+            .keys()
+            .filter_map(|id| counting_entry(known, id, self.set_of(id)))
+            .collect();
         known
             .keys()
             .copied()
-            .filter(|entry| match prefix_of(entry) {
-                Some(prefix) => self.seen_under(prefix) && !self.differs_under(prefix),
-                None => self.seen.contains(*entry) && !self.differences.contains_key(*entry),
-            })
+            .filter(|entry| self.seen_listed(Listed::of(entry)) && !live.contains(entry))
             .collect()
     }
 
-    /// The entries of `known` for a kind whose sets were read that are no
-    /// longer among its cases.
+    /// The entries of `known` whose set the tree holds that are no longer
+    /// among its cases.
     fn gone<'k>(&self, known: &BTreeMap<&'k str, &'k str>) -> Vec<&'k str> {
         known
             .keys()
             .copied()
             .filter(|entry| {
-                let dir = entry.rsplit_once('/').map_or("", |(dir, _)| dir);
-                self.loaded_dirs.contains(dir)
-                    && match prefix_of(entry) {
-                        Some(prefix) => !self.seen_under(prefix),
-                        None => !self.seen.contains(*entry),
-                    }
+                let listed = Listed::of(entry);
+                self.holds(listed) && !self.seen_listed(listed)
             })
             .collect()
     }
+
+    /// Whether the tree read holds what `listed` stands for, so that an entry
+    /// with no case under it is stale: for a case name, any loaded model; for
+    /// a set, the set read; for an id or a prefix, its model loaded and its
+    /// set read: the set whose name the id or the prefix begins with, any set
+    /// under a prefix of set names, and the hand-written set for an id of a
+    /// hand-written case's shape. A benchmark case is `<set>-<n>` and a
+    /// hand-written case a name, so an id that no read set prefixes is a
+    /// hand-written case unless it ends in `-<n>`: a benchmark set the tree
+    /// omits, the unpack's sample being every Nth, leaves its entries alone,
+    /// an id of one of its cases among them, while an id of a hand-written
+    /// case the tree no longer has (renamed, dropped, or a typo in the entry)
+    /// is held to the hand-written set and read as gone.
+    fn holds(&self, listed: Listed<'_>) -> bool {
+        let entry = match listed {
+            Listed::Suffix(_) => return !self.loaded_dirs.is_empty(),
+            Listed::Set(set) => return self.sets_read.contains(set),
+            Listed::Id(entry) | Listed::Prefix(entry) => entry,
+        };
+        // `<slug>/<kind>/` and what follows it.
+        let (dir, rest) = entry
+            .match_indices('/')
+            .nth(1)
+            .map_or((entry, ""), |(at, _)| entry.split_at(at + 1));
+        let mut sets = self
+            .sets_read
+            .range::<str, _>((Bound::Included(dir), Bound::Unbounded))
+            .map_while(|set| set.strip_prefix(dir));
+        match listed {
+            Listed::Prefix(_) => sets.any(|set| set.starts_with(rest) || rest.starts_with(set)),
+            _ => {
+                sets.any(|set| rest.starts_with(set))
+                    || (!is_benchmark_case(rest)
+                        && self.sets_read.contains(&format!("{dir}{HAND_WRITTEN_SET}")))
+            }
+        }
+    }
+}
+
+/// Whether `name`, the part of a case id after `<slug>/<kind>/`, is of a
+/// benchmark case's shape, `<set>-<n>`; a hand-written case's name does not
+/// end in a number.
+fn is_benchmark_case(name: &str) -> bool {
+    name.rsplit_once('-')
+        .is_some_and(|(_, n)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 #[test]
@@ -788,6 +1057,8 @@ where
     let mut read = BTreeMap::new();
     for (kind, set, path) in &sets {
         report.loaded_dirs.insert(format!("{slug}/{kind}"));
+        let set_path = format!("{slug}/{set}");
+        report.sets_read.insert(set_path.clone());
         let mut tokenizers = None;
         let cases = if *kind == "render" {
             encode.loaded = true;
@@ -801,7 +1072,12 @@ where
                 tokenizers.get_or_insert_with(|| recorded_with(&case.reference.provenance));
                 let outcome = check_encode(tok.as_ref(), &case.reference);
                 let ids = case.reference.input_ids.len();
-                report.record(case.id, outcome, ids, &mut encode, known, &mut lines);
+                let read = CaseRead {
+                    id: case.id,
+                    set: &set_path,
+                    ids,
+                };
+                report.record(read, outcome, &mut encode, known, &mut lines);
             })?
         } else {
             decode.loaded = true;
@@ -815,7 +1091,12 @@ where
                 tokenizers.get_or_insert_with(|| recorded_with(&case.reference.provenance));
                 let outcome = check_decode(&tok, &case);
                 let ids = case.output_ids.len();
-                report.record(case.id, outcome, ids, &mut decode, known, &mut lines);
+                let read = CaseRead {
+                    id: case.id,
+                    set: &set_path,
+                    ids,
+                };
+                report.record(read, outcome, &mut decode, known, &mut lines);
             })?
         };
         let tokenizers = tokenizers.map_or(String::new(), |version| {
@@ -828,7 +1109,16 @@ where
     report
         .mismatches
         .extend(set_mismatches(slug, &read, &listed));
-    let stale = report.healed(known).len() + report.gone(known).len();
+    // The model's own stale entries, judged with the whole list so that a case
+    // counts as it does on the merged report; the entries that span models
+    // (`*/...`) are judged once, there.
+    let own_prefix = format!("{slug}/");
+    let stale = report
+        .healed(known)
+        .into_iter()
+        .chain(report.gone(known))
+        .filter(|entry| entry.starts_with(&own_prefix))
+        .count();
     Ok(Compared {
         lines,
         summary: format!("{slug}: encode: {encode}; incremental decode: {decode}; {stale} stale"),
@@ -1278,15 +1568,15 @@ fn download(
         return Ok(None);
     }
     let url = format!("{hub}/{model}/resolve/{revision}/{file}");
-    let response = fetch(client, &url)?;
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
+    let answer = fetch(client, &url).map_err(|e| format!("GET {url}: {e}"))?;
+    if answer.status == reqwest::StatusCode::NOT_FOUND {
         fs::write(&absent, b"").map_err(|e| format!("cannot write {}: {e}", absent.display()))?;
         return Ok(None);
     }
-    if !response.status().is_success() {
-        return Err(format!("GET {url}: HTTP {}", response.status()));
+    if !answer.status.is_success() {
+        return Err(format!("GET {url}: HTTP {}", answer.status));
     }
-    let bytes = response.bytes().map_err(|e| format!("GET {url}: {e}"))?;
+    let bytes = answer.body;
     if bytes.len() < min_bytes {
         return Err(format!(
             "{url}: {} bytes, expected at least {min_bytes}",
@@ -1416,6 +1706,146 @@ fn compare_quietly(
             verbose: false,
         },
     )
+}
+
+#[test]
+fn a_prefix_entry_heals_when_only_cases_listed_by_their_own_id_still_differ() {
+    let model = "org/m";
+    let listed = BTreeMap::from([
+        ("m/render/*", "recorded with another pipeline"),
+        ("m/render/common-0", "the template drops the role"),
+    ]);
+    // common-2 differs under the prefix with no entry of its own: the prefix
+    // is live, and nothing fails the run.
+    let root = tree(&[
+        ("m/manifest.toml", &manifest(model)),
+        ("m/sets.toml", &sets_toml(&[("render/common", 3)])),
+        (
+            "m/render/common.jsonl",
+            &(differing_line("m/render/common-0", model)
+                + &render_line("m/render/common-1", model)
+                + &differing_line("m/render/common-2", model)),
+        ),
+    ])
+    .unwrap();
+    let manifests = read_manifests(root.path()).unwrap();
+    let report = compare_quietly(root.path(), &manifests, &listed, |_, _| Ok(mock())).unwrap();
+    assert_eq!(report.differences.len(), 2, "{:#?}", report.differences);
+    assert_eq!(
+        report.failures(root.path(), &listed, &BTreeMap::new()),
+        Vec::<String>::new()
+    );
+    // Once common-2 matches, the one difference left under the prefix is the
+    // by-id entry's own: the prefix has healed and must go, the by-id entry
+    // stays.
+    let root = tree(&[
+        ("m/manifest.toml", &manifest(model)),
+        ("m/sets.toml", &sets_toml(&[("render/common", 3)])),
+        (
+            "m/render/common.jsonl",
+            &(differing_line("m/render/common-0", model)
+                + &render_line("m/render/common-1", model)
+                + &render_line("m/render/common-2", model)),
+        ),
+    ])
+    .unwrap();
+    let manifests = read_manifests(root.path()).unwrap();
+    let report = compare_quietly(root.path(), &manifests, &listed, |_, _| Ok(mock())).unwrap();
+    assert_eq!(report.differences.len(), 1, "{:#?}", report.differences);
+    let failures = report.failures(root.path(), &listed, &BTreeMap::new());
+    assert_eq!(failures.len(), 1, "{failures:#?}");
+    assert!(
+        failures[0].contains("matching the reference now")
+            && failures[0].ends_with("remove: m/render/*"),
+        "{failures:#?}"
+    );
+}
+
+/// Two models for the tests of entries that share a case: "m", whose whole
+/// render side an entry covers, with common-0 differing and common-2 as
+/// `m_common_2` says; "n", with no entry of its own, with common-0 as
+/// `n_common_0` says. The case-name entry `*/render/common-0` names common-0
+/// of both.
+fn two_models(
+    m_common_2: fn(&str, &str) -> String,
+    n_common_0: fn(&str, &str) -> String,
+) -> io::Result<tempfile::TempDir> {
+    tree(&[
+        ("m/manifest.toml", &manifest("org/m")),
+        ("m/sets.toml", &sets_toml(&[("render/common", 3)])),
+        (
+            "m/render/common.jsonl",
+            &(differing_line("m/render/common-0", "org/m")
+                + &render_line("m/render/common-1", "org/m")
+                + &m_common_2("m/render/common-2", "org/m")),
+        ),
+        ("n/manifest.toml", &manifest("org/n")),
+        ("n/sets.toml", &sets_toml(&[("render/common", 2)])),
+        (
+            "n/render/common.jsonl",
+            &(n_common_0("n/render/common-0", "org/n")
+                + &render_line("n/render/common-1", "org/n")),
+        ),
+    ])
+}
+
+#[test]
+fn a_prefix_entry_heals_when_only_the_cases_a_suffix_entry_names_still_differ() {
+    let listed = BTreeMap::from([
+        (
+            "*/render/common-0",
+            "a marker token decoded with a leading space",
+        ),
+        ("m/render/*", "recorded with another pipeline"),
+    ]);
+    // m's common-2 and n's common-0 differ: each entry has a case of its own
+    // (m's common-0, which both cover, counts for neither), nothing fails.
+    let root = two_models(differing_line, differing_line).unwrap();
+    let manifests = read_manifests(root.path()).unwrap();
+    let report = compare_quietly(root.path(), &manifests, &listed, |_, _| Ok(mock())).unwrap();
+    assert_eq!(report.differences.len(), 3, "{:#?}", report.differences);
+    assert_eq!(
+        report.failures(root.path(), &listed, &BTreeMap::new()),
+        Vec::<String>::new()
+    );
+    // m's common-2 matches: the one difference left under the prefix is a
+    // case the suffix entry names too, so the prefix has healed and must go,
+    // while the suffix lives on n's case.
+    let root = two_models(render_line, differing_line).unwrap();
+    let manifests = read_manifests(root.path()).unwrap();
+    let report = compare_quietly(root.path(), &manifests, &listed, |_, _| Ok(mock())).unwrap();
+    let failures = report.failures(root.path(), &listed, &BTreeMap::new());
+    assert_eq!(failures.len(), 1, "{failures:#?}");
+    assert!(
+        failures[0].contains("matching the reference now")
+            && failures[0].ends_with("remove: m/render/*"),
+        "{failures:#?}"
+    );
+}
+
+#[test]
+fn a_suffix_entry_heals_when_its_only_differing_case_sits_under_a_whole_side_prefix() {
+    let listed = BTreeMap::from([
+        (
+            "*/render/common-0",
+            "a marker token decoded with a leading space",
+        ),
+        ("m/render/*", "recorded with another pipeline"),
+    ]);
+    // n's common-0 matches: the suffix entry's one difference left is m's
+    // common-0, which the prefix covers too, so the suffix has healed and
+    // must go, while the prefix lives on m's common-2.
+    let root = two_models(differing_line, render_line).unwrap();
+    let manifests = read_manifests(root.path()).unwrap();
+    let report = compare_quietly(root.path(), &manifests, &listed, |_, _| Ok(mock())).unwrap();
+    assert_eq!(report.differences.len(), 2, "{:#?}", report.differences);
+    let failures = report.failures(root.path(), &listed, &BTreeMap::new());
+    assert_eq!(failures.len(), 1, "{failures:#?}");
+    assert!(
+        failures[0].contains("matching the reference now")
+            && failures[0].ends_with("remove: */render/common-0"),
+        "{failures:#?}"
+    );
 }
 
 #[test]
@@ -1628,10 +2058,13 @@ fn a_prefix_entry_covers_the_cases_under_it_and_must_cover_one() {
         "{failures:#?}"
     );
     // A prefix under which every loaded case matches must go, and so must one
-    // that no loaded case begins with.
+    // under a set the tree holds that no loaded case begins with; one under a
+    // set the tree omits is left alone, since the tree holds every Nth
+    // benchmark set.
     let stale = BTreeMap::from([
         ("m/render/common-*", "matches now"),
-        ("m/render/mgsm-bn-*", "no such set"),
+        ("m/render/mgsm-bn-*", "a set the tree omits"),
+        ("m/render/mgsm-th-9*", "no such case"),
         ("m/render/mgsm-th-*", "recorded with another pre-tokenizer"),
     ]);
     let failures = report.failures(root.path(), &stale, &BTreeMap::new());
@@ -1647,8 +2080,193 @@ fn a_prefix_entry_covers_the_cases_under_it_and_must_cover_one() {
     assert!(
         failures.iter().any(|failure| {
             failure.contains("no longer among the loaded fixtures")
-                && failure.contains("m/render/mgsm-bn-*")
-                && !failure.contains("mgsm-th")
+                && failure.contains("m/render/mgsm-th-9*")
+                && !failure.contains("mgsm-bn")
+                && !failure.contains("mgsm-th-*")
+        }),
+        "{failures:#?}"
+    );
+}
+
+#[test]
+fn an_id_entry_of_an_omitted_benchmark_case_is_left_alone_and_of_a_lost_hand_written_one_is_not() {
+    let model = "org/m";
+    let root = tree(&[
+        ("m/manifest.toml", &manifest(model)),
+        (
+            "m/sets.toml",
+            &sets_toml(&[("render/bfcl-multi-turn-base", 1), ("render/common", 1)]),
+        ),
+        (
+            "m/render/bfcl-multi-turn-base.jsonl",
+            &render_line("m/render/bfcl-multi-turn-base-0", model),
+        ),
+        (
+            "m/render/common.jsonl",
+            &render_line("m/render/text-developer-role", model),
+        ),
+    ])
+    .unwrap();
+    let manifests = read_manifests(root.path()).unwrap();
+    let report =
+        compare_quietly(root.path(), &manifests, &BTreeMap::new(), |_, _| Ok(mock())).unwrap();
+    // A hand-written case that matches now, a case of a set the tree holds
+    // that is not among its cases, and a hand-written name the tree's set
+    // lacks (renamed, dropped, or a typo) are stale; a case of a set the tree
+    // omits is left alone, since the tree holds every Nth benchmark set.
+    let stale = BTreeMap::from([
+        ("m/render/bfcl-multi-turn-base-9", "no such case"),
+        ("m/render/text-developer-role", "matches now"),
+        ("m/render/text-develoepr-role", "a typo"),
+        ("m/render/continue-final-message", "no such case"),
+        ("m/render/gsm8k-17", "a case of a set the tree omits"),
+    ]);
+    // One line names the healed entry, one the gone entries.
+    let failures = report.failures(root.path(), &stale, &BTreeMap::new());
+    assert_eq!(failures.len(), 2, "{failures:#?}");
+    assert!(
+        failures.iter().all(|failure| !failure.contains("gsm8k")),
+        "{failures:#?}"
+    );
+    assert!(
+        failures.iter().any(|failure| {
+            failure.contains("matching the reference now")
+                && failure.contains("m/render/text-developer-role")
+        }),
+        "{failures:#?}"
+    );
+    for gone in [
+        "m/render/bfcl-multi-turn-base-9",
+        "m/render/text-develoepr-role",
+        "m/render/continue-final-message",
+    ] {
+        assert!(
+            failures.iter().any(|failure| {
+                failure.contains("no longer among the loaded fixtures") && failure.contains(gone)
+            }),
+            "{gone}: {failures:#?}"
+        );
+    }
+}
+
+#[test]
+fn a_set_entry_covers_the_set_whole_and_must_cover_a_difference() {
+    let model = "org/m";
+    let root = tree(&[
+        ("m/manifest.toml", &manifest(model)),
+        (
+            "m/sets.toml",
+            &sets_toml(&[("render/common", 1), ("render/glaive-v2-05", 2)]),
+        ),
+        (
+            "m/render/common.jsonl",
+            &render_line("m/render/common-1", model),
+        ),
+        // The set's ids carry the sample's numbers, not the set's name.
+        (
+            "m/render/glaive-v2-05.jsonl",
+            &(differing_line("m/render/glaive-v2-8174-3", model)
+                + &differing_line("m/render/glaive-v2-8194-1", model)),
+        ),
+    ])
+    .unwrap();
+    let manifests = read_manifests(root.path()).unwrap();
+    let listed = BTreeMap::from([(
+        "m/render/glaive-v2-05.jsonl",
+        "recorded with another pre-tokenizer",
+    )]);
+    let report = compare_quietly(root.path(), &manifests, &listed, |_, _| Ok(mock())).unwrap();
+    assert_eq!(report.differences.len(), 2, "{:#?}", report.differences);
+    // The set entry covers both differing cases, so nothing fails the run.
+    assert_eq!(
+        report.failures(root.path(), &listed, &BTreeMap::new()),
+        Vec::<String>::new()
+    );
+    // Without it the two are unlisted.
+    let failures = report.failures(root.path(), &BTreeMap::new(), &BTreeMap::new());
+    assert_eq!(failures.len(), 1, "{failures:#?}");
+    assert!(
+        failures[0].contains("m/render/glaive-v2-8174-3")
+            && failures[0].contains("m/render/glaive-v2-8194-1"),
+        "{failures:#?}"
+    );
+    // A set entry whose every case matches must go; one for a set the tree
+    // omits is left alone.
+    let stale = BTreeMap::from([
+        ("m/render/common.jsonl", "matches now"),
+        (
+            "m/render/glaive-v2-05.jsonl",
+            "recorded with another pre-tokenizer",
+        ),
+        ("m/render/gsm8k.jsonl", "a set the tree omits"),
+    ]);
+    let failures = report.failures(root.path(), &stale, &BTreeMap::new());
+    assert_eq!(failures.len(), 1, "{failures:#?}");
+    assert!(
+        failures[0].contains("matching the reference now")
+            && failures[0].contains("m/render/common.jsonl")
+            && !failures[0].contains("glaive")
+            && !failures[0].contains("gsm8k"),
+        "{failures:#?}"
+    );
+}
+
+#[test]
+fn a_suffix_entry_covers_the_case_of_every_model_and_must_cover_one() {
+    let (m, n) = ("org/m", "org/n");
+    let root = tree(&[
+        ("m/manifest.toml", &manifest(m)),
+        ("m/sets.toml", &sets_toml(&[("render/common", 2)])),
+        (
+            "m/render/common.jsonl",
+            &(render_line("m/render/common-1", m) + &differing_line("m/render/common-2", m)),
+        ),
+        ("n/manifest.toml", &manifest(n)),
+        ("n/sets.toml", &sets_toml(&[("render/common", 2)])),
+        (
+            "n/render/common.jsonl",
+            &(render_line("n/render/common-1", n) + &differing_line("n/render/common-2", n)),
+        ),
+    ])
+    .unwrap();
+    let manifests = read_manifests(root.path()).unwrap();
+    let listed = BTreeMap::from([("*/render/common-2", "recorded with another pre-tokenizer")]);
+    let report = compare_quietly(root.path(), &manifests, &listed, |_, _| Ok(mock())).unwrap();
+    assert_eq!(report.differences.len(), 2, "{:#?}", report.differences);
+    // The suffix covers the case of both models, so nothing fails the run.
+    assert_eq!(
+        report.failures(root.path(), &listed, &BTreeMap::new()),
+        Vec::<String>::new()
+    );
+    // Without it the two are unlisted.
+    let failures = report.failures(root.path(), &BTreeMap::new(), &BTreeMap::new());
+    assert_eq!(failures.len(), 1, "{failures:#?}");
+    assert!(
+        failures[0].contains("m/render/common-2") && failures[0].contains("n/render/common-2"),
+        "{failures:#?}"
+    );
+    // A suffix whose every loaded case matches must go, and so must one that
+    // no loaded case ends with.
+    let stale = BTreeMap::from([
+        ("*/render/common-1", "matches now"),
+        ("*/render/common-2", "recorded with another pre-tokenizer"),
+        ("*/render/common-3", "no such case"),
+    ]);
+    let failures = report.failures(root.path(), &stale, &BTreeMap::new());
+    assert_eq!(failures.len(), 2, "{failures:#?}");
+    assert!(
+        failures.iter().any(|failure| {
+            failure.contains("matching the reference now")
+                && failure.contains("*/render/common-1")
+                && !failure.contains("common-2")
+        }),
+        "{failures:#?}"
+    );
+    assert!(
+        failures.iter().any(|failure| {
+            failure.contains("no longer among the loaded fixtures")
+                && failure.contains("*/render/common-3")
+                && !failure.contains("common-2")
         }),
         "{failures:#?}"
     );
@@ -1861,17 +2479,29 @@ fn an_error_in_the_fan_out_leaves_the_other_threads_their_item_in_flight_and_no_
     );
 }
 
-/// A loopback server for the loaders' tests: it answers its connections with `heads` in order
-/// (each a response head whole; the body is `ok`), then stops, so a request past the last answer
-/// is refused; the count is the requests read, bumped before the answer goes out. A failure on
-/// the server's side ends it, and the test reads it in the count or in a refused connection.
-fn loopback(heads: &'static [&'static str]) -> io::Result<(String, Arc<AtomicUsize>)> {
+/// What the loopback server does with one connection once it has read the request: answers
+/// with the head and the body `ok`; closes it before any answer, as a connection the hub
+/// dropped does (the client reads `error sending request`); or announces a long body and cuts
+/// it short (the client reads `error decoding response body`).
+#[derive(Clone, Copy)]
+enum Reply {
+    Head(&'static str),
+    NoAnswer,
+    CutBody,
+}
+
+/// A loopback server for the loaders' tests: it answers its connections with `replies` in order
+/// (each a response head whole with the body `ok`, or a connection broken below HTTP), then
+/// stops, so a request past the last answer is refused; the count is the requests read, bumped
+/// before the answer goes out. A failure on the server's side ends it, and the test reads it in
+/// the count or in a refused connection.
+fn loopback(replies: &'static [Reply]) -> io::Result<(String, Arc<AtomicUsize>)> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let url = format!("http://{}", listener.local_addr()?);
     let served = Arc::new(AtomicUsize::new(0));
     let count = Arc::clone(&served);
     std::thread::spawn(move || {
-        for head in heads {
+        for reply in replies {
             let Ok((mut stream, _)) = listener.accept() else {
                 return;
             };
@@ -1881,7 +2511,16 @@ fn loopback(heads: &'static [&'static str]) -> io::Result<(String, Arc<AtomicUsi
                 request.push(byte[0]);
             }
             count.fetch_add(1, Ordering::SeqCst);
-            let answer = format!("{head}\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+            let answer = match reply {
+                Reply::Head(head) => {
+                    format!("{head}\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                }
+                Reply::NoAnswer => continue,
+                Reply::CutBody => {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\nok"
+                        .to_string()
+                }
+            };
             if stream.write_all(answer.as_bytes()).is_err() {
                 return;
             }
@@ -1894,25 +2533,25 @@ fn loopback(heads: &'static [&'static str]) -> io::Result<(String, Arc<AtomicUsi
 /// past the limit is the one returned; after the last try, the limit itself is.
 #[test]
 fn a_rate_limited_get_is_sent_again_after_the_retry_after_wait() {
-    const LIMITED: &str = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0";
-    const LIMITED_EVERY_TIME: &[&str] = &[LIMITED; RATE_LIMITED_TRIES as usize];
+    const LIMITED: Reply = Reply::Head("HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0");
+    const LIMITED_EVERY_TIME: &[Reply] = &[LIMITED; RATE_LIMITED_TRIES as usize];
     let client = common::http_client();
-    let (url, served) = loopback(&[LIMITED, "HTTP/1.1 200 OK"]).unwrap();
-    let response = fetch(
+    let (url, served) = loopback(&[LIMITED, Reply::Head("HTTP/1.1 200 OK")]).unwrap();
+    let answer = fetch(
         &client,
         &format!("{url}/org/m/resolve/r/tokenizer_config.json"),
     )
     .unwrap();
-    assert_eq!(response.status(), reqwest::StatusCode::OK);
-    assert_eq!(response.text().unwrap(), "ok");
+    assert_eq!(answer.status, reqwest::StatusCode::OK);
+    assert_eq!(answer.body, b"ok");
     assert_eq!(served.load(Ordering::SeqCst), 2);
     let (url, served) = loopback(LIMITED_EVERY_TIME).unwrap();
-    let response = fetch(
+    let answer = fetch(
         &client,
         &format!("{url}/org/m/resolve/r/tokenizer_config.json"),
     )
     .unwrap();
-    assert_eq!(response.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(answer.status, reqwest::StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(served.load(Ordering::SeqCst), RATE_LIMITED_TRIES as usize);
 }
 
@@ -1964,8 +2603,8 @@ fn the_wait_after_a_rate_limit_is_what_the_answer_says_and_a_window_at_most() {
 /// failing on the poison.
 #[test]
 fn a_cached_download_outlives_a_rate_limit_and_a_failed_download_before_it() {
-    const LIMITED: &str = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0";
-    const LIMITED_EVERY_TIME: &[&str] = &[LIMITED; RATE_LIMITED_TRIES as usize];
+    const LIMITED: Reply = Reply::Head("HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0");
+    const LIMITED_EVERY_TIME: &[Reply] = &[LIMITED; RATE_LIMITED_TRIES as usize];
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tokenizer.json");
     let (url, served) = loopback(LIMITED_EVERY_TIME).unwrap();
@@ -1980,7 +2619,7 @@ fn a_cached_download_outlives_a_rate_limit_and_a_failed_download_before_it() {
     );
     assert_eq!(served.load(Ordering::SeqCst), RATE_LIMITED_TRIES as usize);
     assert!(!path.exists(), "a failed download leaves no file");
-    let (url, served) = loopback(&[LIMITED, "HTTP/1.1 200 OK"]).unwrap();
+    let (url, served) = loopback(&[LIMITED, Reply::Head("HTTP/1.1 200 OK")]).unwrap();
     cached_download(&common::http_client(), &url, &path, 2);
     assert_eq!(fs::read(&path).unwrap(), b"ok");
     assert_eq!(served.load(Ordering::SeqCst), 2);
@@ -1997,7 +2636,7 @@ fn a_cached_download_outlives_a_rate_limit_and_a_failed_download_before_it() {
 #[test]
 fn a_file_the_checkpoint_does_not_serve_is_asked_for_once() {
     let client = common::http_client();
-    let (url, served) = loopback(&["HTTP/1.1 404 Not Found"]).unwrap();
+    let (url, served) = loopback(&[Reply::Head("HTTP/1.1 404 Not Found")]).unwrap();
     let dir = tempfile::tempdir().unwrap();
     for _ in 0..2 {
         let got = download(&client, &url, "org/m", "r", dir.path(), "config.json", 2).unwrap();
@@ -2005,4 +2644,137 @@ fn a_file_the_checkpoint_does_not_serve_is_asked_for_once() {
     }
     assert!(dir.path().join("config.json.absent").is_file());
     assert_eq!(served.load(Ordering::SeqCst), 1);
+}
+
+/// A GET whose body breaks below HTTP is sent again after a short wait and the file lands whole
+/// on the second try; a whole first answer costs one request and no wait.
+#[test]
+#[expect(
+    clippy::print_stdout,
+    reason = "the requests counted and the times measured are test diagnostic output"
+)]
+fn a_download_whose_body_breaks_is_sent_again_and_lands_on_the_second_try() {
+    let client = common::http_client();
+    let dir = tempfile::tempdir().unwrap();
+    let (url, served) = loopback(&[Reply::CutBody, Reply::Head("HTTP/1.1 200 OK")]).unwrap();
+    let started = Instant::now();
+    let path = download(&client, &url, "org/m", "r", dir.path(), "tokenizer.json", 2)
+        .unwrap()
+        .expect("the file lands on the second try");
+    let elapsed = started.elapsed();
+    assert_eq!(fs::read(&path).unwrap(), b"ok");
+    assert_eq!(served.load(Ordering::SeqCst), 2);
+    assert!(
+        elapsed >= TRANSPORT_ERROR_WAIT,
+        "the wait before the second try was {elapsed:?}"
+    );
+    assert!(
+        !dir.path().join("tokenizer.json.part").exists(),
+        "no part is left behind"
+    );
+    println!("a body broken once: 2 requests, the file landed after {elapsed:?}");
+    let (url, served) = loopback(&[Reply::Head("HTTP/1.1 200 OK")]).unwrap();
+    let started = Instant::now();
+    download(&client, &url, "org/m", "r", dir.path(), "config.json", 2)
+        .unwrap()
+        .expect("the file lands on the first try");
+    let elapsed = started.elapsed();
+    assert_eq!(
+        served.load(Ordering::SeqCst),
+        1,
+        "a whole first answer is one request"
+    );
+    println!("a whole first answer: 1 request, the file landed after {elapsed:?}");
+}
+
+/// `answered` is what decides whether a loader fails or skips: a body the hub cut under the read
+/// on every try is an answered error; a hub that never answers is not; and a try that fails to
+/// connect after answered tries does not turn them into a skip, since `fetch` keeps the first
+/// answered error.
+#[test]
+fn a_broken_body_reads_as_answered_and_no_answer_does_not() {
+    const CUT_EVERY_TIME: &[Reply] = &[
+        Reply::CutBody,
+        Reply::CutBody,
+        Reply::CutBody,
+        Reply::CutBody,
+    ];
+    const NO_ANSWER_EVER: &[Reply] = &[
+        Reply::NoAnswer,
+        Reply::NoAnswer,
+        Reply::NoAnswer,
+        Reply::NoAnswer,
+    ];
+    const ANSWERED_THEN_NOT: &[Reply] = &[
+        Reply::CutBody,
+        Reply::NoAnswer,
+        Reply::NoAnswer,
+        Reply::NoAnswer,
+    ];
+    assert_eq!(CUT_EVERY_TIME.len(), TRANSPORT_ERROR_RETRIES as usize + 1);
+    let client = common::http_client();
+    let fetch_error = |replies: &'static [Reply]| {
+        let (url, served) = loopback(replies).unwrap();
+        let error = fetch(&client, &format!("{url}/org/m/resolve/r/tokenizer.json")).unwrap_err();
+        assert_eq!(served.load(Ordering::SeqCst), replies.len());
+        error
+    };
+    assert!(
+        answered(&fetch_error(CUT_EVERY_TIME)),
+        "a body cut under the read is an answer"
+    );
+    assert!(
+        !answered(&fetch_error(NO_ANSWER_EVER)),
+        "no connection is no answer"
+    );
+    assert!(
+        answered(&fetch_error(ANSWERED_THEN_NOT)),
+        "the first answered error is kept past later tries that never connected"
+    );
+}
+
+/// A GET that breaks below HTTP at every try (the connection closed before any answer, then the
+/// body cut short) fails after the bounded retries with the waits honoured, no file and no part
+/// left behind: the loader reports the model as not loaded instead of hanging.
+#[test]
+#[expect(
+    clippy::print_stdout,
+    reason = "the requests counted and the times measured are test diagnostic output"
+)]
+fn a_download_that_breaks_at_every_try_fails_after_the_bounded_retries() {
+    const BROKEN_EVERY_TIME: &[Reply] = &[
+        Reply::NoAnswer,
+        Reply::CutBody,
+        Reply::CutBody,
+        Reply::CutBody,
+    ];
+    assert_eq!(
+        BROKEN_EVERY_TIME.len(),
+        TRANSPORT_ERROR_RETRIES as usize + 1
+    );
+    let client = common::http_client();
+    let dir = tempfile::tempdir().unwrap();
+    let (url, served) = loopback(BROKEN_EVERY_TIME).unwrap();
+    let started = Instant::now();
+    let error = download(&client, &url, "org/m", "r", dir.path(), "tokenizer.json", 2).unwrap_err();
+    let elapsed = started.elapsed();
+    assert!(
+        error.starts_with(&format!("GET {url}/org/m/resolve/r/tokenizer.json: ")),
+        "{error}"
+    );
+    assert_eq!(
+        served.load(Ordering::SeqCst),
+        TRANSPORT_ERROR_RETRIES as usize + 1
+    );
+    let waits = TRANSPORT_ERROR_WAIT * (2u32.pow(TRANSPORT_ERROR_RETRIES) - 1);
+    assert!(
+        elapsed >= waits,
+        "the waits of {waits:?} in all were honoured: {elapsed:?}"
+    );
+    assert!(!dir.path().join("tokenizer.json").exists());
+    assert!(!dir.path().join("tokenizer.json.part").exists());
+    println!(
+        "broken at every try: {} requests, failed after {elapsed:?}: {error}",
+        served.load(Ordering::SeqCst)
+    );
 }

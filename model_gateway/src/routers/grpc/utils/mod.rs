@@ -2,11 +2,13 @@
 
 mod aliases;
 mod chat_utils;
+pub(crate) mod isolation;
 mod logprobs;
 pub(crate) mod message_utils;
 mod metrics;
 mod parsers;
 mod pd_bootstrap;
+mod prepared_tools;
 pub(crate) mod stream_failure;
 pub(crate) mod tonic_ext;
 
@@ -29,7 +31,10 @@ pub(crate) use logprobs::{
 };
 pub use message_utils::{process_messages_with_encoding, template_tools};
 pub(crate) use message_utils::{resolve_media, MediaContext};
-pub(crate) use metrics::{error_type_for_response, error_type_from_status, route_to_endpoint};
+pub(crate) use metrics::{
+    error_reason_for_response, error_type_for_response, error_type_from_status, mark_error_reason,
+    route_to_endpoint,
+};
 // `pub` (not `pub(crate)`) so the Go bindings can reuse the gateway's arming
 // predicate instead of duplicating it.
 pub use parsers::chat_reasoning_starts_in_prefill;

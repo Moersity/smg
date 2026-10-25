@@ -4,8 +4,30 @@
 //! scheduler speaks to the Router's direct lane). The Router cannot tell the
 //! two implementations apart; Python keeps the lifecycle, launching the
 //! headless scheduler and driving this server through the binding.
+//!
+//! Prefill/decode disaggregation works as on the Python servicer: a request's
+//! bootstrap fields (host, port, room) ride the scheduler's own request struct
+//! over the wire, the launcher starts the prefill side's bootstrap server
+//! before the ranks, and `GetServerInfo` carries the server args the Router
+//! pairs on. A request the Router pins to a data-parallel rank goes to that
+//! rank's scheduler (the connector sends it on that rank's socket, the
+//! dispatch the engine's data-parallel controller does behind its own
+//! frontend), with the rank in the request's `routed_dp_rank` slot. On the
+//! prefill side of a disaggregated pair a request runs on the rank of its
+//! room's residue instead (`bootstrap_room % dp_size`: where SGLang's prefill
+//! side requires it and the decode side looks for the KV), the pin yielding
+//! to it with a warning; the decode side keeps the pin.
+//!
+//! The language side of encode/prefill disaggregation (`--language-only`)
+//! works as behind the engine's own frontend: a request's image references
+//! go to the encoders through the dispatcher the launcher supplies (SGLang's
+//! own receiver, in the launcher process) before the request reaches the
+//! scheduler, the scheduler's request carries what that dispatch set (its
+//! wait flag, the per-encoder assignment, the encoder list) and the prompt
+//! text the scheduler rebuilds from, and a dispatch that fails afterwards
+//! reaches the scheduler as its own failure notice on the request's rank
+//! ([`engine_zmq_adapter::sglang_encode`]).
 
-mod admin;
 mod embed;
 mod engine;
 mod generate;
@@ -17,12 +39,11 @@ mod tests;
 use std::{sync::Arc, time::Duration};
 
 use engine_zmq_adapter::{
-    ConstraintKinds, StructuredOutputBackend, StructuredOutputsBackendConfig,
-    StructuredOutputsSupport,
+    ConstraintKinds, SglangEncodeDispatcher, StructuredOutputBackend,
+    StructuredOutputsBackendConfig, StructuredOutputsSupport,
 };
 use smg_grpc_client::sglang_proto::sglang_scheduler_server::SglangSchedulerServer;
 use tonic::service::Routes;
-use tracing::info;
 
 use crate::{
     engine_link::EngineLink,
@@ -66,9 +87,11 @@ pub struct SglangModelInfo {
     /// The model's generation-config sampling defaults merged with the
     /// preferred ones, as JSON text, or empty.
     pub default_sampling_params_json: String,
-    /// Whether the model takes multimodal input, as the launcher reports it.
-    /// Not advertised until this servicer carries media to the scheduler
-    /// (see `info`): the wire refuses `mm_inputs` today.
+    /// Whether the model takes multimodal input, as the launcher reports it:
+    /// SGLang's own `ModelConfig.is_multimodal` for the checkpoint and the
+    /// launch, the decision the scheduler itself runs under. Advertised by
+    /// `GetModelInfo`; the gateway's media pipeline preprocesses for such a
+    /// worker and the wire carries the tensors to the scheduler.
     pub supports_vision: bool,
     /// Classification heads: `id2label` as JSON text and the label count.
     pub id2label_json: String,
@@ -157,8 +180,57 @@ pub(super) fn truncates_long_prompts(model: &SglangModelInfo) -> bool {
         == Some(true)
 }
 
+/// Whether the scheduler is the prefill side of a disaggregated pair
+/// (`--disaggregation-mode prefill`), read off the launcher's `server_args`:
+/// SGLang's prefill side follows the room by default (`load_balance_method`
+/// `auto` resolves to `follow_bootstrap_room` there), its KV sender fails a
+/// request that runs on another rank than `bootstrap_room % dp_size`, and the
+/// decode side looks for the KV on that rank, so the connection places a
+/// disaggregated request by its room's residue, the Router's pin yielding to
+/// it. The decode side's own placement is free (its `auto` is
+/// `round_robin`): it keeps the pin, as an aggregated engine does.
+pub(super) fn places_by_rendezvous_room(model: &SglangModelInfo) -> bool {
+    let args: serde_json::Value = serde_json::from_str(&model.server_args_json).unwrap_or_default();
+    args.get("disaggregation_mode")
+        .and_then(serde_json::Value::as_str)
+        == Some("prefill")
+}
+
+/// SGLang's `CaptureHiddenMode`: how much of the hidden states the scheduler
+/// was launched to return.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum HiddenStatesCap {
+    Null,
+    Last,
+    Full,
+}
+
+/// The scheduler's launch-time cap on hidden states, as its own frontend
+/// keeps it: `--return-hidden-states-mode {last,full}` (the earlier
+/// `--enable-return-hidden-states` is `full`), read off the launcher's
+/// `server_args`. `None` when they name neither: an engine release without
+/// the cap, which then decides itself.
+pub(super) fn hidden_states_cap(model: &SglangModelInfo) -> Option<HiddenStatesCap> {
+    let args: serde_json::Value = serde_json::from_str(&model.server_args_json).unwrap_or_default();
+    let mode = args
+        .get("return_hidden_states_mode")
+        .and_then(serde_json::Value::as_str);
+    let legacy = args
+        .get("enable_return_hidden_states")
+        .and_then(serde_json::Value::as_bool);
+    // The engine's own order (`get_server_return_hidden_states_mode`): a
+    // `last` mode wins over the legacy flag, which the engine sets whenever a
+    // mode is given.
+    match (mode, legacy) {
+        (Some("last"), _) => Some(HiddenStatesCap::Last),
+        (Some("full"), _) | (_, Some(true)) => Some(HiddenStatesCap::Full),
+        (None, None) => None,
+        _ => Some(HiddenStatesCap::Null),
+    }
+}
+
 /// How to bind, where the engines dial in, and what to advertise.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SglangServicerConfig {
     /// The listener, the scheduler's endpoints, the tokenizer directory and
     /// the start-up bounds. `handshake_address` is what the headless
@@ -168,6 +240,22 @@ pub struct SglangServicerConfig {
     /// strings.
     pub servicer: ServicerConfig,
     pub model: SglangModelInfo,
+    /// The encode dispatch of a language-side worker under encode/prefill
+    /// disaggregation (`--language-only`): a request's image references go
+    /// to the encoders through it before the request reaches the scheduler,
+    /// as the engine's own frontend sends them ([`SglangEncodeDispatcher`]).
+    /// `None` on every other worker: a request of references is refused.
+    pub encode_dispatcher: Option<Arc<dyn SglangEncodeDispatcher>>,
+}
+
+impl std::fmt::Debug for SglangServicerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SglangServicerConfig")
+            .field("servicer", &self.servicer)
+            .field("model", &self.model)
+            .field("encode_dispatcher", &self.encode_dispatcher.is_some())
+            .finish()
+    }
 }
 
 /// The servicer's `GetLoads` figures, read for the load record the relay
@@ -192,6 +280,8 @@ pub(super) struct State {
     /// What every servicer's state shares: the engine link, the admitted
     /// requests, the KV-event relay, the metrics and the serving switch.
     pub(super) shared: Shared,
+    /// The language-side encode dispatch, when this worker runs one.
+    pub(super) encode: Option<Arc<dyn SglangEncodeDispatcher>>,
 }
 
 impl WireState for State {
@@ -225,14 +315,6 @@ impl SglangServicerServer {
                 return Err(invalid(&format!("{name} must be a JSON object")));
             }
         }
-        if config.model.supports_vision {
-            info!(
-                served_model_name = %config.model.served_model_name,
-                "the model takes multimodal input, but this servicer does not carry media to \
-                 the scheduler yet: it advertises supports_vision=false, so the gateway refuses \
-                 image and video input at its gate instead of after fetching it"
-            );
-        }
         // One publisher per data-parallel rank: the launcher's width (the
         // handshake's figure, which may differ, is not known yet).
         let kv_relay = KvEventRelay::for_publisher(
@@ -249,12 +331,15 @@ impl SglangServicerServer {
                 max_model_len: u32::try_from(config.model.max_context_length).unwrap_or(0),
                 // The scheduler matches string stops itself.
                 matches_string_stops: false,
+                // No media reach this scheduler through the servicer yet.
+                processes_media: false,
             },
             config.servicer.metrics_bind_address.is_some(),
         )?;
         let state = Arc::new(State {
             model: config.model,
             shared: Shared::new(kv_relay, metrics, config.servicer.tokenizer_dir.clone()),
+            encode: config.encode_dispatcher,
         });
         let routes = Routes::new(
             SglangSchedulerServer::new(service::SglangService {
@@ -264,41 +349,14 @@ impl SglangServicerServer {
             .max_encoding_message_size(usize::MAX),
         );
         let connect_state = Arc::clone(&state);
-        let silence = config.servicer.silence_bounds();
-        let ServicerConfig {
-            bind_address,
-            metrics_bind_address,
-            ipc_base_url,
-            handshake_address,
-            engine_count,
-            engine_startup_timeout,
-            engine_startup_ceiling,
-            ..
-        } = config.servicer;
         let server = servicer::Server::start(
             "smg-sglang-servicer",
-            &bind_address,
-            metrics_bind_address.as_deref(),
+            config.servicer,
             SERVICE_NAME,
+            "SGLang",
             &state,
             routes,
-            move |address, last_error| {
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "engine connect is fire-and-forget; the runtime drop cancels it"
-                )]
-                let _connect = tokio::spawn(engine::connect_engine(
-                    connect_state,
-                    ipc_base_url,
-                    handshake_address,
-                    engine_count,
-                    engine_startup_timeout,
-                    engine_startup_ceiling,
-                    silence,
-                    last_error,
-                ));
-                info!(%address, "SGLang gRPC servicer listening");
-            },
+            move |inputs| engine::connect_engine(connect_state, inputs),
         )?;
         Ok(Self { server, state })
     }
@@ -343,9 +401,11 @@ impl SglangServicerServer {
     }
 
     /// Hold (`false`) or release (`true`) readiness alone: health flips as
-    /// with `set_serving`, admission stays open, so the lifecycle owner's own
-    /// requests (its planned warm-up before SERVING) still reach the engine.
-    /// `set_serving(false)` is the drain switch and closes admission as well.
+    /// with `set_serving`, admission stays open to the lifecycle owner's own
+    /// requests (its planned warm-up before SERVING, `smg-warmup-<n>`) and to
+    /// nothing else, so the warm-up's steps share the engine with no client
+    /// request. `set_serving(false)` is the drain switch and closes admission
+    /// as well.
     pub fn set_ready(&self, ready: bool) {
         self.state.shared.set_ready(ready);
     }

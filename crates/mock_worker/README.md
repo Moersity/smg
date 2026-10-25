@@ -26,7 +26,11 @@ Two modes:
 **gRPC** (TokenSpeed scheduler — the gateway tokenizes, the worker speaks token
 ids): `HealthCheck`, `GetModelInfo`, `GetServerInfo`, `Generate` (streamed
 chunks + complete), `GetLoads`, `Abort`, and (realistic mode only)
-`SubscribeKvEvents`; other admin RPCs return `unimplemented`.
+`SubscribeKvEvents`; other admin RPCs return `unimplemented`. Beside the
+scheduler service the server hosts the standard `grpc.health.v1` service
+(`Check`, `Watch`): the empty name and the scheduler service are SERVING
+exactly when `HealthCheck` answers healthy (`POST /admin/serving/{port}` flips
+both), any other name is unknown.
 
 **ZMQ** (`--zmq-handshake <ipc://…> --zmq-count N [--zmq-start-index I]`):
 mock vLLM `EngineCore` ranks on the `engine-zmq-client` wire. Unlike the HTTP
@@ -89,10 +93,20 @@ experiments against it transfer to engines:
 - **cached tokens** — a request sharing a prefix with cached blocks pays less
   prefill and reports `cached_tokens` (gRPC chunks, HTTP
   `usage.prompt_tokens_details.cached_tokens`).
+- **repeatable output** — `--output-seed prompt` derives synthetic output from
+  the complete prompt token sequence, including its partial last block. Equal
+  token inputs then produce equal output regardless of transport request ID,
+  worker placement, cache warmth, or preemption. Repeated prompts can share
+  decode blocks too. Request IDs still identify cancellation and records.
+  The default `request-id` mode preserves existing stress workloads. This option
+  applies to the realistic engine; canned and scripted responses are unchanged.
+  Synthetic output remains in the existing token range 100–30099; a benchmark
+  must separately verify those IDs against its pinned tokenizer and special IDs.
 
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `--timing` | polynomial | `polynomial`, `linear`, or `fit:<path>` (a hardware calibration JSON, below) |
+| `--output-seed` | request-id | `prompt` selects output from normalized input tokens for cross-router/retry comparisons |
 | `--prefill-poly a,b,c` | AISimulate | prefill ms = a + b·T + c·T² |
 | `--decode-poly a,b,c` | AISimulate | decode ms = max(1, a + b·u + c·u²) |
 | `--request-overhead-ms` | 0 | fixed per-request latency added to every event of a stream (TTFT and e2e grow by it, ITL does not) |

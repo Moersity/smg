@@ -6,9 +6,11 @@ readiness until the pass ran, and the Python servicer's health hold."""
 from __future__ import annotations
 
 import asyncio
+import base64
 import dataclasses
 import importlib.util
 import logging
+import re
 import sys
 import threading
 import time
@@ -229,6 +231,16 @@ def test_every_request_of_a_plan_has_its_own_tokens():
     assert len(ids) == len(set(ids))
 
 
+def test_every_request_id_has_the_form_the_servicer_admits_while_readiness_is_held():
+    # The Rust servicers admit only `smg-warmup-<ordinal>` while readiness is
+    # held for the warm-up (WARMUP_REQUEST_ID_PREFIX / is_warmup_request_id in
+    # the engine servicer crate's request registry): a rename on either side
+    # would have every warm-up request refused and the pass count only errors.
+    plan = plan_warmup(ISSUE, "full")
+    ids = [request.request_id for step in plan.steps for request in step.requests]
+    assert ids and all(re.fullmatch(r"smg-warmup-[0-9]+", request_id) for request_id in ids)
+
+
 def test_a_prompt_never_exceeds_the_step_nor_the_context_less_its_output():
     tight = WarmupInputs(
         max_num_seqs=8, max_num_batched_tokens=4096, max_model_len=1000, vocab_size=100
@@ -240,6 +252,75 @@ def test_a_prompt_never_exceeds_the_step_nor_the_context_less_its_output():
             assert len(request.token_ids) + request.max_tokens <= 1000
     lengths = [len(step.requests[0].token_ids) for step in plan.steps if step.kind == "prefill"]
     assert max(lengths) == 999  # the context's bound stands in for the step
+
+
+# The window/step pairs the plans are built from on the test legs and the
+# fleet's recipes: an 8k context at the engine's default 8k step (the pair
+# that reached the context's edge), a 16k context at a 16k step, a long
+# context at a 16k step, a 4k chunk under a long context, a 1k chunk under an
+# 8k context, and two tight ones.
+WINDOW_STEP_PAIRS = [
+    (8192, 8192),
+    (16384, 16384),
+    (196608, 16384),
+    (1 << 20, 4096),
+    (8192, 1024),
+    (1000, 4096),
+    (256, 64),
+]
+
+
+@pytest.mark.parametrize("context, step", WINDOW_STEP_PAIRS)
+@pytest.mark.parametrize("reserve", [0, 2, 3, 6])
+def test_the_longest_prompt_leaves_the_engine_the_positions_it_keeps_back(context, step, reserve):
+    inputs = WarmupInputs(
+        max_num_seqs=8,
+        max_num_batched_tokens=step,
+        max_model_len=context,
+        vocab_size=100,
+        context_reserve_tokens=reserve,
+        every_prefill_length=True,
+    )
+    plan = plan_warmup(inputs, "full")
+    assert plan.steps
+    for s in plan.steps:
+        for request in s.requests:
+            assert request.prompt_tokens <= step
+            # Prompt and output together leave the engine its positions.
+            assert request.prompt_tokens + request.max_tokens <= context - reserve
+    prefills = [s.requests[0].prompt_tokens for s in plan.steps if s.kind != "decode"]
+    # The longest prompt is the step, or the context less the output token
+    # and the reserve: one below the context is planned only where the
+    # engine admits it (a reserve of zero).
+    assert max(prefills) == min(step, context - 1 - reserve)
+    if reserve:
+        assert context - 1 not in prefills
+    # Every count up to that bound is still visited once (the measured second
+    # pass repeats the grid by design).
+    visited = [
+        s.requests[0].prompt_tokens for s in plan.steps if s.kind in ("prefill", "remainder")
+    ]
+    assert sorted(visited) == list(range(1, min(step, context - 1 - reserve) + 1))
+
+
+def test_a_reserve_of_zero_keeps_the_tables_as_they_were():
+    # The default reserve plans what the planner planned before it existed:
+    # the same step names on the issue's engine, the small one and a tight one.
+    for inputs in (ISSUE, SMALL, WarmupInputs(8, 4096, 1000, 100)):
+        for level in ("fast", "full"):
+            with_default = plan_warmup(inputs, level)
+            explicit = plan_warmup(dataclasses.replace(inputs, context_reserve_tokens=0), level)
+            assert [s.name for s in with_default.steps] == [s.name for s in explicit.steps]
+    # A reserve on an unknown context changes nothing: the step is the bound.
+    assert [
+        s.name for s in plan_warmup(WarmupInputs(8, 64, 0, 100, context_reserve_tokens=6)).steps
+    ] == [s.name for s in plan_warmup(WarmupInputs(8, 64, 0, 100)).steps]
+    # A tight context: the staircase keeps inside the reserve too.
+    tight = plan_warmup(WarmupInputs(8, 64, 20, 100, context_reserve_tokens=6))
+    staircase = [s for s in tight.steps if s.kind == "decode"]
+    assert staircase and all(
+        warmup.STAIRCASE_PROMPT_TOKENS + r.max_tokens <= 20 - 6 for r in staircase[0].requests
+    )
 
 
 def test_a_small_engine_gets_a_small_plan_in_the_same_order():
@@ -556,7 +637,36 @@ def test_three_failed_steps_in_a_row_stop_the_pass():
     wire = _Wire(fail=lambda request: True)
     report = run_warmup(plan, wire, budget_secs=30)
     assert len(report.results) == warmup.CONSECUTIVE_FAILED_STEPS
-    assert report.stopped == f"{warmup.CONSECUTIVE_FAILED_STEPS} steps failed in a row"
+    # The end line names the first of them: the shape the engine refused.
+    assert report.stopped == (
+        f"{warmup.CONSECUTIVE_FAILED_STEPS} steps failed in a row, from "
+        "decode batch 4 down to 1 (4 requests)"
+    )
+    assert "from decode batch 4 down to 1 (4 requests)" in report.summary()
+
+
+def test_the_end_line_names_the_step_that_opened_the_run_past_a_partly_failed_one():
+    """A partly failed step neither extends nor ends a run of whole failures,
+    so the run's length does not locate its first step: the four-request
+    decode step, moved second, fails one request between whole failures of
+    the steps around it, and the line names the first step, not the decode
+    step the old arithmetic landed on."""
+    small = plan_warmup(SMALL, "fast")
+    decode, first, *rest = small.steps
+    assert len(decode.requests) == 4 and len(first.requests) == 1
+    plan = dataclasses.replace(small, steps=(first, decode, *rest))
+    # The first step fails; of the decode step's four only the first (the
+    # step's requests go out on four threads at once, so the spared ones are
+    # named by id, not counted on arrival); then every request fails: two
+    # more whole steps make three.
+    spared = {request.request_id for request in decode.requests[1:]}
+    assert len(spared) == 3, "the decode step's requests carry distinct ids"
+    wire = _Wire(fail=lambda request: request.request_id not in spared)
+    report = run_warmup(plan, wire, budget_secs=30)
+    assert [r.errors for r in report.results] == [1, 1, 1, 1]
+    assert report.stopped == (
+        f"{warmup.CONSECUTIVE_FAILED_STEPS} steps failed in a row, from {first.name}"
+    )
 
 
 def test_a_flush_the_engine_refuses_is_a_line_not_a_failure(caplog):
@@ -565,6 +675,127 @@ def test_a_flush_the_engine_refuses_is_a_line_not_a_failure(caplog):
     wire.flush_cache = lambda: (_ for _ in ()).throw(RuntimeError("UNIMPLEMENTED"))
     report = run_warmup(plan_warmup(SMALL, "fast"), wire, budget_secs=30)
     assert report.flushed is False and "was not flushed" in report.summary()
+    # The end line says why, in the wire's words; so does the line at the refusal.
+    assert report.flush_refusal == "UNIMPLEMENTED"
+    assert report.summary().endswith("(the warm-up's blocks stay cached): UNIMPLEMENTED")
+    assert "The warm-up's cache flush was not accepted: UNIMPLEMENTED" in caplog.text
+
+
+@pytest.mark.parametrize("module", [vllm_warmup, sglang_warmup, tokenspeed_warmup])
+def test_a_flush_the_servicer_answers_as_refused_raises_its_message(module):
+    """A refusal the servicer answers (success false, with its reason) reaches
+    the warm-up's end line like a raised status: the wire raises the message.
+    An answer with no words stays a plain False; success stays True."""
+    wire = module.GrpcWire.__new__(module.GrpcWire)
+    refused = common_pb2.FlushCacheResponse(
+        success=False, message="KV prefix cache reset refused; requests may be in flight"
+    )
+    wire._stub = SimpleNamespace(FlushCache=lambda request, timeout=None: refused)
+    with pytest.raises(RuntimeError, match="requests may be in flight"):
+        wire.flush_cache()
+    flushed, refusal = warmup._flush(wire, logging.getLogger("test"))
+    assert (flushed, refusal) == (False, "KV prefix cache reset refused; requests may be in flight")
+    wire._stub = SimpleNamespace(
+        FlushCache=lambda request, timeout=None: common_pb2.FlushCacheResponse(success=False)
+    )
+    assert wire.flush_cache() is False
+    wire._stub = SimpleNamespace(
+        FlushCache=lambda request, timeout=None: common_pb2.FlushCacheResponse(success=True)
+    )
+    assert wire.flush_cache() is True
+
+
+def test_a_status_with_empty_details_is_worded_by_its_code():
+    """A status whose details are empty would put its multi-line repr on the
+    end line; its code's name is the one-line reason instead."""
+
+    class _Status(Exception):
+        def details(self):
+            return ""
+
+        def code(self):
+            return SimpleNamespace(name="UNAVAILABLE")
+
+        def __str__(self):
+            return "<_InactiveRpcError of RPC that terminated with:\n\tstatus = UNAVAILABLE\n>"
+
+    assert warmup._refusal(_Status()) == "UNAVAILABLE"
+    wire = _Wire()
+    wire.flush_cache = lambda: (_ for _ in ()).throw(_Status())
+    flushed, refusal = warmup._flush(wire, logging.getLogger("test"))
+    assert (flushed, refusal) == (False, "UNAVAILABLE") and "\n" not in refusal
+
+
+def test_a_multi_line_refusal_is_worded_on_one_line():
+    """Details with newlines (an engine's multi-line message forwarded by the
+    servicer), and an exception text with newlines, read as one line on the
+    end line; whitespace-only details fall through to the code's name."""
+
+    class _Status(Exception):
+        def __init__(self, text):
+            super().__init__(text)
+            self._text = text
+
+        def details(self):
+            return self._text
+
+        def code(self):
+            return SimpleNamespace(name="FAILED_PRECONDITION")
+
+        def __str__(self):
+            return "<_InactiveRpcError of RPC that terminated with:\n\tstatus = ...\n>"
+
+    assert (
+        warmup._refusal(_Status("engine busy:\n\tflush refused while 3 requests run\n"))
+        == "engine busy: flush refused while 3 requests run"
+    )
+    assert warmup._refusal(_Status(" \n\t ")) == "FAILED_PRECONDITION"
+    assert warmup._refusal(RuntimeError("line one\nline two")) == "line one line two"
+    wire = _Wire()
+    wire.flush_cache = lambda: (_ for _ in ()).throw(_Status("a\nb"))
+    report = run_warmup(plan_warmup(SMALL, "fast"), wire, budget_secs=30)
+    assert report.flush_refusal == "a b"
+    assert "\n" not in report.summary() and report.summary().endswith(": a b")
+
+
+def test_a_refused_flush_is_worded_by_the_status_details_not_its_repr():
+    """A gRPC status' ``str`` runs over several lines (code, details, debug
+    string); the end line carries its ``details()`` alone."""
+
+    class _Status(RuntimeError):
+        def __str__(self):
+            return "<_InactiveRpcError of RPC that terminated with:\n\tstatus = UNIMPLEMENTED\n>"
+
+        def details(self):
+            return "FlushCache is not available through this servicer: the wire carries no flush"
+
+    wire = _Wire()
+    wire.flush_cache = lambda: (_ for _ in ()).throw(_Status())
+    report = run_warmup(plan_warmup(SMALL, "fast"), wire, budget_secs=30)
+    assert report.flushed is False
+    assert report.flush_refusal == (
+        "FlushCache is not available through this servicer: the wire carries no flush"
+    )
+    assert "\n" not in report.summary()
+    assert report.summary().endswith(": " + report.flush_refusal)
+
+
+def test_the_async_pass_words_a_refused_flush_the_same_way():
+    class _Refusing:
+        async def generate(self, request, timeout):
+            return None
+
+        async def flush_cache(self):
+            raise RuntimeError("UNIMPLEMENTED")
+
+        async def close(self):
+            return None
+
+    report = asyncio.run(
+        warmup.run_warmup_async(plan_warmup(SMALL, "fast"), _Refusing(), budget_secs=30)
+    )
+    assert report.flushed is False and report.flush_refusal == "UNIMPLEMENTED"
+    assert report.summary().endswith("(the warm-up's blocks stay cached): UNIMPLEMENTED")
 
 
 def test_the_async_pass_matches_the_blocking_one():
@@ -673,34 +904,64 @@ class _Seen:
     def __init__(self):
         self.requests: list[tuple[int, int]] = []
         self.ranks: list[int | None] = []
+        self.bootstraps: list[tuple[str, int] | None] = []
         self.flushes = 0
         self.inflight = 0
         self.max_inflight = 0
         self.lock = threading.Lock()
 
-    def enter(self, prompt_len, max_tokens, rank=None):
+    def enter(self, prompt_len, max_tokens, rank=None, bootstrap=None):
         with self.lock:
             self.inflight += 1
             self.max_inflight = max(self.max_inflight, self.inflight)
             self.requests.append((prompt_len, max_tokens))
             self.ranks.append(rank)
+            self.bootstraps.append(bootstrap)
 
     def leave(self):
         with self.lock:
             self.inflight -= 1
 
 
+def _never(prompt_len, max_tokens):
+    return False
+
+
+def _refuse(context, shape, refusal):
+    """A stand-in's refusal in the status encoding (``refusal == "status"``,
+    the Python TokenSpeed servicer's and the Rust SGLang servicer's answer):
+    the call ends with INVALID_ARGUMENT and the engine's words, nothing is
+    streamed (``context.abort`` raises). In the completion encoding the
+    caller streams the abort finish itself."""
+    if refusal == "status":
+        context.abort(
+            grpc.StatusCode.INVALID_ARGUMENT,
+            f"Invalid request: the input ({shape[0]} tokens) exceeds the engine's maximum "
+            f"input length ({shape[0] - 1} tokens)",
+        )
+
+
 class _VllmEngine(vllm_grpc.VllmEngineServicer):
-    def __init__(self, seen):
+    def __init__(self, seen, refuse=_never, refusal="complete"):
         self.seen = seen
+        self.refuse = refuse
+        self.refusal = refusal
 
     def Generate(self, request, context):
         assert request.HasField("tokenized") and request.sampling_params.ignore_eos
         assert request.sampling_params.temperature == 0.0
         rank = request.data_parallel_rank if request.HasField("data_parallel_rank") else None
-        self.seen.enter(len(request.tokenized.input_ids), request.sampling_params.max_tokens, rank)
+        shape = (len(request.tokenized.input_ids), request.sampling_params.max_tokens)
+        self.seen.enter(*shape, rank)
         time.sleep(0.01)
         self.seen.leave()
+        if self.refuse(*shape):
+            # An engine that ended the request at admission, in either
+            # encoding a servicer answers it with: the status, or a
+            # completion with the abort finish and no token.
+            _refuse(context, shape, self.refusal)
+            yield vllm_pb.GenerateResponse(complete=vllm_pb.GenerateComplete(finish_reason="abort"))
+            return
         yield vllm_pb.GenerateResponse(complete=vllm_pb.GenerateComplete(finish_reason="length"))
 
     def FlushCache(self, request, context):
@@ -709,15 +970,27 @@ class _VllmEngine(vllm_grpc.VllmEngineServicer):
 
 
 class _SglangEngine(sgl_grpc.SglangSchedulerServicer):
-    def __init__(self, seen):
+    def __init__(self, seen, refuse=_never, refusal="complete"):
         self.seen = seen
+        self.refuse = refuse
+        self.refusal = refusal
 
     def Generate(self, request, context):
         params = request.sampling_params
         assert params.ignore_eos and params.top_k == 1 and params.top_p == 1.0 and params.n == 1
-        self.seen.enter(len(request.tokenized.input_ids), params.max_new_tokens)
+        bootstrap = None
+        if request.HasField("disaggregated_params"):
+            disaggregated = request.disaggregated_params
+            bootstrap = (disaggregated.bootstrap_host, disaggregated.bootstrap_room)
+        shape = (len(request.tokenized.input_ids), params.max_new_tokens)
+        rank = request.data_parallel_rank if request.HasField("data_parallel_rank") else None
+        self.seen.enter(*shape, rank, bootstrap=bootstrap)
         time.sleep(0.01)
         self.seen.leave()
+        if self.refuse(*shape):
+            _refuse(context, shape, self.refusal)
+            yield sgl_pb.GenerateResponse(complete=sgl_pb.GenerateComplete(finish_reason="abort"))
+            return
         yield sgl_pb.GenerateResponse(complete=sgl_pb.GenerateComplete())
 
     def FlushCache(self, request, context):
@@ -725,14 +998,21 @@ class _SglangEngine(sgl_grpc.SglangSchedulerServicer):
 
 
 class _TokenSpeedEngine(ts_grpc.TokenSpeedSchedulerServicer):
-    def __init__(self, seen):
+    def __init__(self, seen, refuse=_never, refusal="complete"):
         self.seen = seen
+        self.refuse = refuse
+        self.refusal = refusal
 
     def Generate(self, request, context):
         assert request.sampling_params.ignore_eos and request.sampling_params.temperature == 0.0
-        self.seen.enter(len(request.tokenized.input_ids), request.sampling_params.max_new_tokens)
+        shape = (len(request.tokenized.input_ids), request.sampling_params.max_new_tokens)
+        self.seen.enter(*shape)
         time.sleep(0.01)
         self.seen.leave()
+        if self.refuse(*shape):
+            _refuse(context, shape, self.refusal)
+            yield ts_pb.GenerateResponse(complete=ts_pb.GenerateComplete(finish_reason="abort"))
+            return
         yield ts_pb.GenerateResponse(complete=ts_pb.GenerateComplete())
 
     def FlushCache(self, request, context):
@@ -784,6 +1064,291 @@ def test_each_wire_drives_the_plan_through_the_engines_own_service(add, engine, 
     assert sorted(seen.requests) == sorted(expected)
     assert seen.max_inflight >= 2  # the staircase reached the engine together, not one by one
     assert report.flushed is flushable and seen.flushes == (1 if flushable else 0)
+    # A refusal over the wire reaches the end line as the status' details.
+    assert report.flush_refusal == (None if flushable else "no cache flush on this wire")
+
+
+def test_the_sglang_wire_carries_a_lone_legs_stand_in_bootstrap():
+    """A prefill or decode leg's plan runs without its peer: every request
+    carries the engine's stand-in bootstrap (the host and room 0) the way the
+    engine's own warm-up sends it; a single engine's requests carry none. Over
+    two ranks each request is pinned to its rank and its stand-in room is that
+    rank, so a prefill leg, which places a disaggregated request by its room's
+    residue, runs the request where the plan pinned it."""
+    seen = _Seen()
+    server, target = _serve(sgl_grpc.add_SglangSchedulerServicer_to_server, _SglangEngine(seen))
+    try:
+        wire = sglang_warmup.warmup_wire(target)
+        try:
+            lone = plan_warmup(dataclasses.replace(SMALL, lone_leg_bootstrap="2.2.2.2"), "fast")
+            report = run_warmup(lone, wire, budget_secs=30, request_timeout_secs=10)
+            carried = len(seen.requests)
+            run_warmup(plan_warmup(SMALL, "fast"), wire, budget_secs=30, request_timeout_secs=10)
+            plain = len(seen.requests)
+            two = plan_warmup(
+                dataclasses.replace(SMALL, lone_leg_bootstrap="2.2.2.2", data_parallel_size=2),
+                "fast",
+            )
+            two_report = run_warmup(two, wire, budget_secs=30, request_timeout_secs=10)
+        finally:
+            wire.close()
+    finally:
+        server.stop(0)
+    assert report.covered == len(lone.steps) and report.errors == 0
+    assert carried >= 2 and set(seen.bootstraps[:carried]) == {("2.2.2.2", 0)}
+    assert set(seen.ranks[:carried]) == {None}  # one rank: no pin
+    assert set(seen.bootstraps[carried:plain]) == {None}
+    assert two_report.covered == len(two.steps) and two_report.errors == 0
+    assert set(zip(seen.ranks[plain:], seen.bootstraps[plain:])) == {
+        (0, ("2.2.2.2", 0)),
+        (1, ("2.2.2.2", 1)),
+    }
+
+
+@pytest.mark.parametrize(
+    "finish, tokens, words",
+    [
+        ("length", 1, None),
+        ("stop", 3, None),
+        ("", 0, None),  # a stand-in's completion without a finish
+        (None, 0, None),
+        ("abort", 0, "the engine ended the request with finish_reason 'abort' before any token"),
+        ("abort", 2, "the engine ended the request with finish_reason 'abort' after 2 tokens"),
+        ("error", 1, "the engine ended the request with finish_reason 'error' after 1 token"),
+    ],
+)
+def test_a_request_the_engine_did_not_serve_is_worded_by_its_finish_and_its_tokens(
+    finish, tokens, words
+):
+    error = warmup.unserved(finish, tokens)
+    assert (None if error is None else str(error)) == words
+    assert error is None or isinstance(error, warmup.UnservedRequest)
+
+
+def test_a_run_of_refused_shapes_does_not_stop_the_pass(caplog):
+    """An engine whose input bound sits below the plan's longest prompts
+    refuses those steps in a row (the prefill shapes run in ascending
+    order). They are failed steps, not the stop meant for an engine that
+    answers nothing: the steps after them (the re-measures, the chunk
+    remainders) still run."""
+    caplog.set_level(logging.INFO, logger="smg_grpc_servicer.warmup")
+    plan = plan_warmup(SMALL, "fast")
+    longest = sorted({len(r.token_ids) for s in plan.steps for r in s.requests})[-3:]
+    assert len(longest) == 3
+
+    class Refusing(_Wire):
+        def generate(self, request, timeout):
+            super().generate(request, timeout)
+            if len(request.token_ids) in longest and request.max_tokens == 1:
+                raise warmup.unserved("abort", 0)
+
+    wire = Refusing()
+    report = run_warmup(plan, wire, budget_secs=30)
+    assert report.stopped is None and not report.budget_hit
+    assert len(report.results) == len(plan.steps)  # every step ran
+    refused = [r for r in report.results if r.errors]
+    assert len(refused) >= 3 and all(r.errors == len(r.step.requests) for r in refused)
+    assert report.covered == len(plan.steps) - len(refused)
+    assert len(wire.requests) == sum(len(s.requests) for s in plan.steps)
+    assert (
+        "stopped" not in report.summary()
+        and f"({len(refused)} failed requests)" in report.summary()
+    )
+
+
+def test_a_wire_refusing_from_the_first_request_on_still_stops_the_pass(caplog):
+    """A refusal holds the streak only once some step was covered. A
+    servicer that refuses every request from the first one on (a field the
+    engine rejects on every call, a version skew) is not the engine the rule
+    above was written for: the pass stops after three steps as it does for
+    any failure, instead of warning once per step over the whole plan."""
+    caplog.set_level(logging.INFO, logger="smg_grpc_servicer.warmup")
+    plan = plan_warmup(SMALL, "fast")
+
+    class RefusingAll(_Wire):
+        def generate(self, request, timeout):
+            super().generate(request, timeout)
+            raise warmup.unserved("abort", 0)
+
+    report = run_warmup(plan, RefusingAll(), budget_secs=30)
+    stop = warmup.CONSECUTIVE_FAILED_STEPS
+    assert len(report.results) == stop and report.covered == 0
+    assert report.errors == sum(len(step.requests) for step in plan.steps[:stop])
+    assert (
+        report.stopped
+        == f"{stop} steps failed in a row, from decode batch 4 down to 1 (4 requests)"
+    )
+    warnings = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING and r.getMessage().startswith("Warm-up step ")
+    ]
+    assert len(warnings) == stop and all("finish_reason 'abort'" in w for w in warnings)
+
+
+@pytest.mark.parametrize(
+    "add, engine, wire_of",
+    [
+        (vllm_grpc.add_VllmEngineServicer_to_server, _VllmEngine, vllm_warmup.warmup_wire),
+        (sgl_grpc.add_SglangSchedulerServicer_to_server, _SglangEngine, sglang_warmup.warmup_wire),
+        (
+            ts_grpc.add_TokenSpeedSchedulerServicer_to_server,
+            _TokenSpeedEngine,
+            tokenspeed_warmup.warmup_wire,
+        ),
+    ],
+    ids=["vllm", "sglang", "tokenspeed"],
+)
+@pytest.mark.parametrize(
+    "refusal, worded",
+    [
+        ("complete", "finish_reason 'abort' before any token"),
+        ("status", "INVALID_ARGUMENT: Invalid request: the input (8 tokens) exceeds"),
+    ],
+    ids=["as-a-completion", "as-a-status"],
+)
+def test_a_request_the_engine_ended_with_an_abort_is_a_failed_request_on_every_wire(
+    add, engine, wire_of, refusal, worded, caplog
+):
+    """An engine that refuses a request at admission answers in one of two
+    encodings: a completion with the abort finish and no token (the
+    servicer's gRPC call succeeds), or the status its code means
+    (INVALID_ARGUMENT with the engine's words). Either way the step is a
+    failed one, named in the warning with the finish or the status, not a
+    covered one; the pass goes on."""
+    caplog.set_level(logging.INFO, logger="smg_grpc_servicer.warmup")
+    seen = _Seen()
+    refused = engine(
+        seen,
+        refuse=lambda prompt_len, max_tokens: prompt_len == 8 and max_tokens == 1,
+        refusal=refusal,
+    )
+    server, target = _serve(add, refused)
+    try:
+        plan = plan_warmup(SMALL, "fast")
+        wire = wire_of(target)
+        try:
+            report = run_warmup(plan, wire, budget_secs=30, request_timeout_secs=10)
+        finally:
+            wire.close()
+    finally:
+        server.stop(0)
+    assert report.errors == 2  # the 8-token shape, first pass and measured again
+    assert report.covered == len(plan.steps) - 2
+    expected = [(len(r.token_ids), r.max_tokens) for step in plan.steps for r in step.requests]
+    assert sorted(seen.requests) == sorted(expected)  # the pass went on past the refusals
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(
+        "prefill 8 tokens: 1 of 1 requests failed" in line and worded in line for line in warnings
+    ), warnings
+    assert "0 failed requests" not in report.summary() and "(2 failed requests)" in report.summary()
+
+
+@pytest.mark.parametrize(
+    "add, engine, wire_of",
+    [
+        (vllm_grpc.add_VllmEngineServicer_to_server, _VllmEngine, vllm_warmup.warmup_wire),
+        (sgl_grpc.add_SglangSchedulerServicer_to_server, _SglangEngine, sglang_warmup.warmup_wire),
+        (
+            ts_grpc.add_TokenSpeedSchedulerServicer_to_server,
+            _TokenSpeedEngine,
+            tokenspeed_warmup.warmup_wire,
+        ),
+    ],
+    ids=["vllm", "sglang", "tokenspeed"],
+)
+def test_a_run_of_refusals_answered_as_a_status_does_not_stop_the_pass_on_any_wire(
+    add, engine, wire_of
+):
+    """The in-process rule above, over the wire in the status encoding: an
+    engine whose input bound sits below the plan's three longest prompts
+    answers each of those steps with INVALID_ARGUMENT, in a row; they are
+    failed steps, and every step after them still runs."""
+    plan = plan_warmup(SMALL, "fast")
+    longest = sorted({len(r.token_ids) for s in plan.steps for r in s.requests})[-3:]
+    seen = _Seen()
+    refusing = engine(
+        seen,
+        refuse=lambda prompt_len, max_tokens: prompt_len in longest and max_tokens == 1,
+        refusal="status",
+    )
+    server, target = _serve(add, refusing)
+    try:
+        wire = wire_of(target)
+        try:
+            report = run_warmup(plan, wire, budget_secs=30, request_timeout_secs=10)
+        finally:
+            wire.close()
+    finally:
+        server.stop(0)
+    assert report.stopped is None and not report.budget_hit
+    assert len(report.results) == len(plan.steps)  # every step ran
+    refused = [r for r in report.results if r.errors]
+    assert len(refused) >= 3 and all(r.errors == len(r.step.requests) for r in refused)
+    assert report.covered == len(plan.steps) - len(refused)
+    assert len(seen.requests) == sum(len(s.requests) for s in plan.steps)
+
+
+class _RaisedStatus(grpc.RpcError):
+    """A raised status as the stub raises it: ``code()`` and ``details()``."""
+
+    def __init__(self, code, details=""):
+        self._code, self._details = code, details
+
+    def code(self):
+        return self._code
+
+    def details(self):
+        return self._details
+
+
+@pytest.mark.parametrize(
+    "error, words",
+    [
+        (
+            _RaisedStatus(grpc.StatusCode.INVALID_ARGUMENT, "the input exceeds the bound"),
+            "the engine refused the request: INVALID_ARGUMENT: the input exceeds the bound",
+        ),
+        (
+            _RaisedStatus(grpc.StatusCode.RESOURCE_EXHAUSTED),
+            "the engine refused the request: RESOURCE_EXHAUSTED: no details",
+        ),
+        (_RaisedStatus(grpc.StatusCode.UNAVAILABLE, "connection refused"), None),
+        (_RaisedStatus(grpc.StatusCode.DEADLINE_EXCEEDED), None),
+        (_RaisedStatus(grpc.StatusCode.INTERNAL, "boom"), None),
+        (RuntimeError("the request ended without a complete frame"), None),
+    ],
+    ids=["invalid-argument", "resource-exhausted", "unavailable", "deadline", "internal", "other"],
+)
+def test_a_raised_status_is_a_refusal_by_its_code_alone(error, words):
+    refusal = warmup.refused(error)
+    assert (None if refusal is None else str(refusal)) == words
+    assert refusal is None or isinstance(refusal, warmup.UnservedRequest)
+
+
+def test_the_in_process_wire_counts_a_request_the_engine_ended_with_an_abort_as_failed(monkeypatch):
+    """The Python servicer's in-process wire reads the last output's finish
+    the same way: an abort with no token raises, a served request returns."""
+    stub = types.ModuleType("vllm")
+    stub.SamplingParams = lambda **kwargs: kwargs
+    stub.TokensPrompt = lambda **kwargs: kwargs
+    monkeypatch.setitem(sys.modules, "vllm", stub)
+
+    class AsyncLlm:
+        def __init__(self, finish, token_ids):
+            self.finish, self.token_ids = finish, token_ids
+
+        async def generate(self, prompt, params, request_id, **pinned):
+            yield SimpleNamespace(
+                outputs=[SimpleNamespace(finish_reason=self.finish, token_ids=self.token_ids)]
+            )
+
+    request = warmup.WarmupRequest("r", 3, 2, seed=0, vocab_size=100)
+    assert (
+        asyncio.run(vllm_warmup.EngineWire(AsyncLlm("length", [1, 2])).generate(request, 5)) is None
+    )
+    with pytest.raises(RuntimeError, match="finish_reason 'abort' before any token"):
+        asyncio.run(vllm_warmup.EngineWire(AsyncLlm("abort", [])).generate(request, 5))
 
 
 def test_the_vllm_wire_pins_each_request_to_its_rank_over_the_servicers_port():
@@ -812,6 +1377,156 @@ def test_the_vllm_wire_pins_each_request_to_its_rank_over_the_servicers_port():
         ]
         assert sorted(seen_on_rank) == one_ranks_shapes
     assert set(seen.ranks[pinned:]) == {None}  # one rank: the field stays unset
+
+
+def test_a_media_leg_follows_the_second_pass_and_precedes_the_chunk_remainders():
+    """An engine module that asks for the media leg gets one step with one
+    media request per rank, after the measured second pass and before the
+    chunk remainders (a budget cut takes the remainders first); without the
+    flag no request carries media, and the start line counts the item."""
+    plain = plan_warmup(SMALL, "full")
+    assert not any(s.kind == "media" or any(r.media for r in s.requests) for s in plain.steps)
+    assert "media" not in plain.describe()
+    with_media = plan_warmup(
+        dataclasses.replace(SMALL, media_leg=True, every_prefill_length=True), "full"
+    )
+    kinds = [step.kind for step in with_media.steps]
+    assert kinds.count("media") == 1
+    media_at = kinds.index("media")
+    assert (kinds[media_at - 1], kinds[media_at + 1]) == ("again", "remainder")
+    step = with_media.steps[media_at]
+    assert [(r.media, r.max_tokens) for r in step.requests] == [(True, 1)]
+    assert "one media item" in with_media.describe()
+    # The fast level has no remainders: the media leg ends the plan, one per rank.
+    two_ranks = plan_warmup(
+        dataclasses.replace(SMALL, media_leg=True, data_parallel_size=2), "fast"
+    )
+    assert two_ranks.steps[-1].kind == "media"
+    assert [r.data_parallel_rank for r in two_ranks.steps[-1].requests] == [0, 1]
+
+
+def test_the_sglang_wire_sends_the_media_leg_as_a_client_names_an_image():
+    """The media leg's request carries the rendered prompt and its ids (not
+    the plan's drawn ids) and the image as a reference on the multimodal
+    slot; a plain request keeps the plan's ids and no media; a media request
+    on a wire given no media is an error, never a text request."""
+    seen = []
+
+    class _Engine(sgl_grpc.SglangSchedulerServicer):
+        def Generate(self, request, context):
+            seen.append(
+                (
+                    list(request.tokenized.input_ids),
+                    request.tokenized.original_text,
+                    list(request.mm_inputs.image_urls),
+                    list(request.mm_inputs.modalities),
+                )
+            )
+            yield sgl_pb.GenerateResponse(complete=sgl_pb.GenerateComplete())
+
+    server, target = _serve(sgl_grpc.add_SglangSchedulerServicer_to_server, _Engine())
+    try:
+        media = sglang_warmup.MediaWarmup(
+            prompt="<image>describe", input_ids=(5, 6, 7), image_url="data:image/png;base64,AAAA"
+        )
+        wire = sglang_warmup.warmup_wire(target, media=media)
+        try:
+            wire.generate(
+                warmup.WarmupRequest("smg-warmup-0", 3, 1, seed=0, vocab_size=100, media=True), 10
+            )
+            wire.generate(warmup.WarmupRequest("smg-warmup-1", 3, 1, seed=1, vocab_size=100), 10)
+        finally:
+            wire.close()
+        bare = sglang_warmup.warmup_wire(target)
+        try:
+            with pytest.raises(RuntimeError, match="nothing to send"):
+                bare.generate(
+                    warmup.WarmupRequest("smg-warmup-2", 3, 1, seed=2, vocab_size=100, media=True),
+                    10,
+                )
+        finally:
+            bare.close()
+    finally:
+        server.stop(0)
+    assert seen[0] == ([5, 6, 7], "<image>describe", ["data:image/png;base64,AAAA"], ["image"])
+    ids, text, urls, modalities = seen[1]
+    assert (len(ids), text, urls, modalities) == (3, "warm-up", [], [])
+    assert len(seen) == 2
+
+
+def test_the_media_leg_material_comes_from_the_models_own_template(caplog):
+    """The prompt is what the model's chat template renders around one image
+    item and the question, its ids are that prompt's tokens, the image is the
+    engine's own minimal PNG as a data URL; no tokenizer directory, a
+    tokenizer that does not load, or a template that renders no image
+    placeholder leaves the leg out, with the reason in the log."""
+
+    class _Tokenizer:
+        def __init__(self, placeholder):
+            self.placeholder = placeholder
+
+        def apply_chat_template(self, messages, tokenize, add_generation_prompt):
+            assert tokenize is False and add_generation_prompt is True
+            content = messages[0]["content"]
+            images = sum(1 for part in content if part["type"] == "image")
+            text = "".join(part["text"] for part in content if part["type"] == "text")
+            return f"<user>{self.placeholder * images}{text}<assistant>"
+
+        def __call__(self, text, add_special_tokens):
+            assert add_special_tokens is False
+            return {"input_ids": [len(text), 7]}
+
+    loaded = []
+
+    def load(directory):
+        loaded.append(directory)
+        return _Tokenizer("<image>")
+
+    media = sglang_warmup.media_warmup("/tok", load_tokenizer=load)
+    assert loaded == ["/tok"]
+    assert media.prompt == "<user><image>Describe the image.<assistant>"
+    assert media.input_ids == (len(media.prompt), 7)
+    assert media.image_url == f"data:image/png;base64,{sglang_warmup.WARMUP_IMAGE_PNG_BASE64}"
+    png = base64.b64decode(sglang_warmup.WARMUP_IMAGE_PNG_BASE64)
+    assert png[:8] == b"\x89PNG\r\n\x1a\n" and png[16:24] == (32).to_bytes(4, "big") * 2
+
+    def broken(directory):
+        raise OSError("no tokenizer.json")
+
+    with caplog.at_level("INFO"):
+        assert sglang_warmup.media_warmup("/tok", load_tokenizer=lambda d: _Tokenizer("")) is None
+        assert sglang_warmup.media_warmup(None, load_tokenizer=load) is None
+        assert sglang_warmup.media_warmup("/tok", load_tokenizer=broken) is None
+    assert "renders no image placeholder" in caplog.text
+    assert "no tokenizer directory" in caplog.text
+    assert "could not be rendered: no tokenizer.json" in caplog.text
+
+
+def test_a_render_that_raises_is_a_warning_with_its_traceback(caplog):
+    """The two expected omissions (no tokenizer directory, a chat template
+    that renders no image placeholder) are INFO lines. A render that raises
+    (a tokenizer that does not load, a template that fails, a tokenization
+    error) is a fault worth a look: its line is a WARNING and carries the
+    traceback; the leg is still left out and the servicer starts."""
+
+    class _Tokenizer:
+        def apply_chat_template(self, messages, tokenize, add_generation_prompt):
+            raise ValueError("the template failed to render")
+
+    def broken(directory):
+        raise OSError("no tokenizer.json")
+
+    with caplog.at_level(logging.INFO):
+        assert sglang_warmup.media_warmup("/tok", load_tokenizer=broken) is None
+        assert sglang_warmup.media_warmup("/tok", load_tokenizer=lambda d: _Tokenizer()) is None
+        assert sglang_warmup.media_warmup(None, load_tokenizer=broken) is None
+    legs = [r for r in caplog.records if r.getMessage().startswith("Planned warm-up: no image leg")]
+    assert [r.levelno for r in legs] == [logging.WARNING, logging.WARNING, logging.INFO]
+    assert [type(r.exc_info[1]) for r in legs[:2]] == [OSError, ValueError]
+    assert legs[2].exc_info is None
+    assert "Traceback (most recent call last)" in caplog.text
+    assert "OSError: no tokenizer.json" in caplog.text
+    assert "ValueError: the template failed to render" in caplog.text
 
 
 def test_a_wire_over_a_borrowed_channel_leaves_it_open():
@@ -857,7 +1572,16 @@ def test_the_vllm_inputs_come_from_the_resolved_configuration():
     assert vllm_warmup.warmup_inputs_from_config(config) is None
 
 
-def test_the_sglang_inputs_come_from_the_server_arguments_and_the_facts():
+def test_a_lone_legs_plan_marks_every_request_and_says_so():
+    lone = plan_warmup(dataclasses.replace(SMALL, lone_leg_bootstrap="2.2.2.2"), "fast")
+    assert {r.lone_leg_bootstrap for s in lone.steps for r in s.requests} == {"2.2.2.2"}
+    assert "the requests carrying the lone leg's stand-in bootstrap" in lone.describe()
+    plain = plan_warmup(SMALL, "fast")
+    assert {r.lone_leg_bootstrap for s in plain.steps for r in s.requests} == {None}
+    assert "stand-in bootstrap" not in plain.describe()
+
+
+def test_the_sglang_inputs_come_from_the_server_arguments_and_the_facts(monkeypatch, caplog):
     args = SimpleNamespace(max_running_requests=64, chunked_prefill_size=8192, context_length=None)
     facts = {"is_generation": True, "max_context_length": 32768, "vocab_size": 151936}
     inputs = sglang_warmup.warmup_inputs(args, facts)
@@ -880,10 +1604,41 @@ def test_the_sglang_inputs_come_from_the_server_arguments_and_the_facts():
     )
     assert sglang_warmup.warmup_inputs(SimpleNamespace(), facts).max_num_seqs == 0
     assert sglang_warmup.warmup_inputs(args, {**facts, "is_generation": False}) is None
-    assert (
-        sglang_warmup.warmup_inputs(SimpleNamespace(disaggregation_mode="prefill"), facts) is None
+    # A prefill or decode leg plans as a single engine does, its requests
+    # bound for nobody: the engine's own stand-in bootstrap host rides along.
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.disaggregation.utils",
+        SimpleNamespace(FAKE_BOOTSTRAP_HOST="2.2.2.2"),
     )
-    assert sglang_warmup.warmup_inputs(SimpleNamespace(language_only=True), facts) is None
+    for role in ("prefill", "decode"):
+        leg = sglang_warmup.warmup_inputs(SimpleNamespace(disaggregation_mode=role), facts)
+        assert leg.lone_leg_bootstrap == "2.2.2.2"
+        assert leg.max_num_batched_tokens == sglang_warmup.DEFAULT_STEP_TOKENS
+        # A leg of two ranks plans both, each request pinned to its rank.
+        two = sglang_warmup.warmup_inputs(
+            SimpleNamespace(disaggregation_mode=role, dp_size=2), facts
+        )
+        assert (two.data_parallel_size, two.lone_leg_bootstrap) == (2, "2.2.2.2")
+    assert sglang_warmup.warmup_inputs(SimpleNamespace(), facts).lone_leg_bootstrap is None
+    # An aggregated engine of two ranks plans both on the wire that pins; on
+    # the Python servicer's wire, which forwards no pin, the plan is one
+    # rank's and a WARNING says the other rank pays the first-time cost.
+    caplog.set_level(logging.WARNING, logger="smg_grpc_servicer.sglang.warmup")
+    assert sglang_warmup.warmup_inputs(SimpleNamespace(dp_size=2), facts).data_parallel_size == 2
+    assert not caplog.records
+    one = sglang_warmup.warmup_inputs(SimpleNamespace(dp_size=2), facts, pins_ranks=False)
+    assert one.data_parallel_size == 1
+    assert [r.levelno for r in caplog.records] == [logging.WARNING]
+    assert "2 scheduler ranks and this servicer's warm-up requests carry no" in caplog.text
+    # The language side of an encode-disaggregated deployment plans as a
+    # plain worker (its warm-up requests carry no media, so the encoders see
+    # nothing of them); the encoder-only role is the engine's own server.
+    assert sglang_warmup.warmup_inputs(
+        SimpleNamespace(language_only=True, max_running_requests=64, chunked_prefill_size=8192),
+        facts,
+    ) == sglang_warmup.warmup_inputs(args, facts)
+    assert sglang_warmup.warmup_inputs(SimpleNamespace(encoder_only=True), facts) is None
 
 
 def test_the_tokenspeed_inputs_come_from_the_server_arguments_and_the_facts():
@@ -909,27 +1664,132 @@ def test_the_tokenspeed_inputs_come_from_the_server_arguments_and_the_facts():
     )
 
 
-def test_the_sglang_and_tokenspeed_inputs_say_when_the_pass_spreads_over_ranks(caplog):
+def test_the_sglang_inputs_cover_every_rank_and_the_tokenspeed_ones_say_when_they_do_not(
+    caplog,
+):
     caplog.set_level(logging.WARNING, logger="smg_grpc_servicer")
     facts = {"is_generation": True, "max_context_length": 32768, "vocab_size": 151936}
     sglang = sglang_warmup.warmup_inputs(SimpleNamespace(dp_size=4, max_running_requests=64), facts)
     tokenspeed = tokenspeed_warmup.warmup_inputs(
         SimpleNamespace(mapping=SimpleNamespace(attn=SimpleNamespace(dp_size=2))), facts
     )
-    # One rank's plan: the servicer routes these engines' requests by load.
-    assert sglang.data_parallel_size == 1 and tokenspeed.data_parallel_size == 1
+    # SGLang's wire pins a rank: every rank's plan, nothing to warn about.
+    # The newer releases' attention-DP width counts too (dp_size=1 beside it).
+    assert sglang.data_parallel_size == 4
+    assert (
+        sglang_warmup.warmup_inputs(
+            SimpleNamespace(dp_size=1, attn_dp_size=2), facts
+        ).data_parallel_size
+        == 2
+    )
+    # One rank's plan on TokenSpeed: the servicer routes its requests by load.
+    assert tokenspeed.data_parallel_size == 1
     spread = [r.getMessage() for r in caplog.records if "reaches one rank" in r.getMessage()]
-    assert [line.split(" scheduler ranks")[0] for line in spread] == [
-        "The engine runs 4",
-        "The engine runs 2",
-    ]
+    assert [line.split(" scheduler ranks")[0] for line in spread] == ["The engine runs 2"]
     # TokenSpeed's remainders answer a hazard, and reach one rank each too.
-    assert "chunk remainders, when the plan runs them (the full level), reach one rank" in spread[1]
-    assert "chunk remainders" not in spread[0]
+    assert "chunk remainders, when the plan runs them (the full level), reach one rank" in spread[0]
     caplog.clear()
     sglang_warmup.warmup_inputs(SimpleNamespace(max_running_requests=64), facts)
     tokenspeed_warmup.warmup_inputs(SimpleNamespace(), facts)
     assert not caplog.records
+
+
+def test_the_tokenspeed_inputs_leave_the_engine_its_two_positions_or_its_draft_window():
+    facts = {"max_context_length": 8192, "vocab_size": 248320}
+    # The engine's scheduler keeps two positions beyond prompt and output
+    # (its request length is the context less one, its output clamp one less
+    # again); a prompt one below the context, with one output token, is a
+    # request it refuses, and the plan no longer ends on it.
+    one = tokenspeed_warmup.warmup_inputs(
+        SimpleNamespace(max_num_seqs=64, max_model_len=8192), facts
+    )
+    assert one.context_reserve_tokens == tokenspeed_warmup.SCHEDULER_RESERVE_TOKENS == 2
+    prefills = [s.requests[0].prompt_tokens for s in plan_warmup(one).steps if s.kind != "decode"]
+    assert max(prefills) == 8189 and 8191 not in prefills and 8190 not in prefills
+    # Under speculative decoding the engine keeps its draft window behind the
+    # prompt: the wider of the two bounds holds.
+    spec = tokenspeed_warmup.warmup_inputs(
+        SimpleNamespace(
+            max_num_seqs=64,
+            max_model_len=8192,
+            speculative_algorithm="EAGLE",
+            speculative_num_draft_tokens=4,
+        ),
+        facts,
+    )
+    assert spec.context_reserve_tokens == 3
+    assert max(s.requests[0].prompt_tokens for s in plan_warmup(spec).steps) == 8188
+    # A draft window of two or less, or no algorithm, is inside the scheduler's two.
+    narrow = SimpleNamespace(speculative_algorithm="EAGLE", speculative_num_draft_tokens=2)
+    assert tokenspeed_warmup.warmup_inputs(narrow, facts).context_reserve_tokens == 2
+    unset = SimpleNamespace(speculative_algorithm=None, speculative_num_draft_tokens=8)
+    assert tokenspeed_warmup.warmup_inputs(unset, facts).context_reserve_tokens == 2
+
+
+def test_a_one_process_engine_plans_the_ladder_and_a_wider_layout_the_remainders():
+    facts = {"is_generation": True, "max_context_length": 8192, "vocab_size": 248320}
+
+    def tokenspeed(world_size):
+        mapping = SimpleNamespace(world_size=world_size, attn=SimpleNamespace(dp_size=1))
+        return tokenspeed_warmup.warmup_inputs(
+            SimpleNamespace(max_num_seqs=64, max_model_len=8192, mapping=mapping), facts
+        )
+
+    # One process: no collective to deadlock against, so the length classes
+    # alone, and the same step count as the other engines plan for the window.
+    one = tokenspeed(1)
+    assert one.every_prefill_length is False
+    plan = plan_warmup(one)
+    assert not any(s.kind == "remainder" for s in plan.steps)
+    sglang = plan_warmup(
+        sglang_warmup.warmup_inputs(
+            SimpleNamespace(
+                max_running_requests=64, chunked_prefill_size=8192, context_length=8192
+            ),
+            facts,
+        )
+    )
+    assert len(plan.steps) == len(sglang.steps) == 109
+    assert plan.prompt_tokens < 400_000  # not the 33 million of every count
+    # More than one process, or a layout the arguments do not state: every
+    # count up to the step, as before, with the edge bounded.
+    for inputs in (tokenspeed(2), tokenspeed(8)):
+        assert inputs.every_prefill_length is True
+    unknown = tokenspeed_warmup.warmup_inputs(
+        SimpleNamespace(max_num_seqs=64, max_model_len=8192), facts
+    )
+    assert unknown.every_prefill_length is True
+    wide = plan_warmup(tokenspeed(2))
+    assert len(wide.steps) == 8211
+    assert {s.requests[0].prompt_tokens for s in wide.steps if s.kind != "decode"} == set(
+        range(1, 8190)
+    )
+    # The four-process 4,096-token chunk under a long context plans as before.
+    chunk = tokenspeed_warmup.warmup_inputs(
+        SimpleNamespace(
+            max_num_seqs=8,
+            chunked_prefill_size=4096,
+            max_model_len=1 << 20,
+            mapping=SimpleNamespace(world_size=4, attn=SimpleNamespace(dp_size=1)),
+        ),
+        facts,
+    )
+    assert len(plan_warmup(chunk).steps) == 4117
+
+
+def test_the_sglang_inputs_leave_the_engine_its_six_positions():
+    facts = {"is_generation": True, "max_context_length": 8192, "vocab_size": 151936}
+    inputs = sglang_warmup.warmup_inputs(
+        SimpleNamespace(max_running_requests=64, chunked_prefill_size=8192, context_length=8192),
+        facts,
+    )
+    assert inputs.context_reserve_tokens == sglang_warmup.CONTEXT_RESERVE_TOKENS == 6
+    prefills = [
+        s.requests[0].prompt_tokens for s in plan_warmup(inputs).steps if s.kind != "decode"
+    ]
+    # Below the engine's admitted request length (the context less one, less
+    # five more), never at or above it.
+    assert max(prefills) == 8185 and not {8186, 8191} & set(prefills)
 
 
 def test_only_the_tokenspeed_inputs_ask_for_every_prefill_length():
@@ -1184,7 +2044,8 @@ def test_the_hold_flips_health_alone_and_falls_back_on_an_older_binding():
 def test_the_real_server_classes_carry_the_health_only_setter():
     """The Rust servers of every engine expose ``set_ready`` beside
     ``set_serving`` (the semantics are pinned by the servers' own tests: held
-    = NOT_SERVING with admission open; drained = admission closed)."""
+    = NOT_SERVING, admitting the warm-up's own requests only; drained =
+    admission closed)."""
     servicer = pytest.importorskip("smg.servicer")
     for name in ("VllmGrpcServer", "SglangGrpcServer", "TokenSpeedGrpcServer"):
         cls = getattr(servicer, name)
@@ -1233,7 +2094,11 @@ class _AsyncLlm:
         self.requests.append((len(prompt.prompt_token_ids), params.max_tokens))
         self.pins.append(kwargs)
         await asyncio.sleep(0.002)
-        yield SimpleNamespace(request_id=request_id)
+        # The engine's request output: one completion, served to its length.
+        yield SimpleNamespace(
+            request_id=request_id,
+            outputs=[SimpleNamespace(finish_reason="length", token_ids=[1] * params.max_tokens)],
+        )
 
     async def reset_prefix_cache(self, reset_running_requests=False, reset_connector=False):
         self.resets += 1

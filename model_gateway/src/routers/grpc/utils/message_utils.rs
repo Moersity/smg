@@ -3,14 +3,13 @@
 //!
 //! Parallel to `chat_utils.rs` but works with `CreateMessageRequest` / `InputMessage`
 //! instead of `ChatCompletionRequest` / `ChatMessage`.
-#![allow(dead_code)] // wired in follow-up PR (pipeline factory)
 
 use std::{borrow::Cow, collections::HashMap, fmt::Display, sync::Arc};
 
 use axum::response::Response;
 use llm_multimodal::{MediaPartOrder, Modality};
 use llm_tokenizer::{
-    chat_template::{ChatTemplateContentFormat, ChatTemplateParams},
+    chat_template::{ChatTemplateContentFormat, ChatTemplateParams, PreparedTools},
     traits::{MediaHandling, PromptEncoding, RendererCapabilities, Tokenizer},
 };
 use openai_protocol::{
@@ -23,15 +22,18 @@ use openai_protocol::{
 use serde_json::{json, Value};
 use tracing::error;
 
-use super::chat_utils;
-use crate::routers::{
-    error,
-    grpc::{
-        context::SharedComponents,
-        multimodal::{
-            self, anchor_rendered_markers, MediaPlan, MultimodalComponents, PlaceholderTokens,
+use super::{chat_utils, prepared_tools::prepare_tools};
+use crate::{
+    observability::metrics::Metrics,
+    routers::{
+        error,
+        grpc::{
+            context::SharedComponents,
+            multimodal::{
+                self, anchor_rendered_markers, MediaPlan, MultimodalComponents, PlaceholderTokens,
+            },
+            ProcessedMessages,
         },
-        ProcessedMessages,
     },
 };
 
@@ -127,7 +129,7 @@ pub(crate) fn process_messages_prompt(
     placeholder_tokens: Option<&PlaceholderTokens>,
     media_order: MediaPartOrder,
 ) -> Result<(ProcessedMessages, PromptEncoding), String> {
-    let content_format = tokenizer.chat_template_content_format();
+    let content_format = tokenizer.chat_template_content_format_for_request(chat_tools.is_some());
 
     // Step 1: Convert InputMessages to chat template JSON values
     let mut transformed_messages = process_message_content_format(
@@ -166,19 +168,13 @@ pub(crate) fn process_messages_prompt(
     // Step 3: Process tool call arguments in assistant messages (reuse from
     // chat_utils), unless the renderer parses them itself as written.
     if !capabilities.raw_tool_call_arguments {
-        chat_utils::process_tool_call_arguments(&mut transformed_messages)?;
+        chat_utils::process_tool_call_arguments(&mut transformed_messages);
     }
 
-    // Step 4: Serialize tools to JSON values for template processing
-    let tools_json: Option<Vec<Value>> = chat_tools
-        .map(|tools| {
-            tools
-                .iter()
-                .map(serde_json::to_value)
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .transpose()
-        .map_err(|e| format!("Failed to serialize tools: {e}"))?;
+    // Step 4: the tools as the template reads them, prepared once per
+    // distinct tool set and shared by every request that carries the same
+    // tools.
+    let prepared_tools = chat_tools.map(prepare_tools).transpose()?;
 
     // Step 5: the thinking preference the request states, or its provider
     // profile reads from the effort, as for Chat.
@@ -227,7 +223,8 @@ pub(crate) fn process_messages_prompt(
     let params = ChatTemplateParams {
         add_generation_prompt: !native_continuation,
         continue_final_message: native_continuation,
-        tools: tools_json.as_deref(),
+        tools: prepared_tools.as_deref().map(PreparedTools::tools),
+        prepared_tools: prepared_tools.as_deref(),
         template_kwargs: template_kwargs.as_ref(),
         thinking,
         ..Default::default()
@@ -322,6 +319,7 @@ pub(crate) async fn resolve_messages_media(
     model_id: &str,
     tokenizer: &dyn Tokenizer,
     messages: &[InputMessage],
+    record_media: bool,
 ) -> Result<ResolvedMedia, Response> {
     resolve_media(
         components,
@@ -329,6 +327,7 @@ pub(crate) async fn resolve_messages_media(
         tokenizer,
         "resolve_messages_media",
         || multimodal::media_plan_messages(messages),
+        record_media,
     )
     .await
 }
@@ -337,7 +336,8 @@ pub(crate) async fn resolve_messages_media(
 /// renders: the model's media-part order and, for a request with media, the
 /// plan `plan` builds from the request and the placeholder tokens (the
 /// engine's own limits applied). A renderer that writes media as template
-/// text has no plan and keeps the authored order. The chat and Messages
+/// text has no plan and keeps the authored order, its request's media
+/// recorded all the same. The chat and Messages
 /// preparation stages and count_tokens resolve through here, so the three
 /// refuse a request alike; `stage` names the caller in the log lines, as
 /// each caller's own lines named it before.
@@ -347,8 +347,28 @@ pub(crate) async fn resolve_media(
     tokenizer: &dyn Tokenizer,
     stage: &'static str,
     plan: impl FnOnce() -> MediaPlan,
+    record_media: bool,
 ) -> Result<ResolvedMedia, Response> {
+    // What a generation request carries, counted once and before any
+    // refusal or limit (a refused request's media included); a token count
+    // resolves the same plan and is not a request here.
+    let record = |plan: &MediaPlan| {
+        for &modality in plan.modalities() {
+            Metrics::record_mm_request_media(
+                model_id,
+                modality,
+                plan.count(modality),
+                &plan.source_counts(modality),
+            );
+        }
+    };
     if tokenizer.renderer_capabilities().media_handling == MediaHandling::TemplateText {
+        // A template that writes media as text takes no plan; a request
+        // that is recorded builds one for the count alone, a token count
+        // builds none.
+        if record_media {
+            record(&plan());
+        }
         return Ok(ResolvedMedia {
             media_order: MediaPartOrder::Authored,
             media: None,
@@ -375,6 +395,9 @@ pub(crate) async fn resolve_media(
     };
 
     let plan = plan();
+    if record_media {
+        record(&plan);
+    }
     // No images or video to a pool whose every worker is language model only (the engine admits
     // such a request and never schedules it), and no modality to a pool whose engines take none of
     // it (the capability matrix): both are refused here, for the chat and the Messages paths alike,

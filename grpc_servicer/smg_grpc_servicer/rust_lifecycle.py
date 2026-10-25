@@ -34,7 +34,7 @@ import socket
 import subprocess
 import threading
 import time
-from collections.abc import Callable, Mapping, MutableMapping
+from collections.abc import Callable, Iterable, Mapping, MutableMapping
 from typing import Any
 
 from smg_grpc_servicer.hostport import host_port, loopback_target
@@ -926,7 +926,9 @@ class SchedulerProcesses:
     it was given, or raises; :meth:`watch_ready` runs it on a thread, so the
     reports are drained (a process never blocks on its report) and a failed
     start is logged at once, while the supervisor keeps polling the
-    processes themselves.
+    processes themselves. ``holding`` is what lives as long as the processes
+    do (a prefill side's bootstrap server, which the ranks register with):
+    referenced here, and shut down with them where it has a ``shutdown``.
     """
 
     def __init__(
@@ -935,10 +937,12 @@ class SchedulerProcesses:
         *,
         ready: Callable[[], Any] | None = None,
         grace_secs: float = SCHEDULER_GRACE_SECS,
+        holding: Iterable[Any] = (),
     ):
         self.processes = list(processes)
         self._ready = ready
         self._grace_secs = grace_secs
+        self.holding = list(holding)
         self.ready_thread: threading.Thread | None = None
         self.ready_error: Exception | None = None
 
@@ -990,6 +994,11 @@ class SchedulerProcesses:
                 )
                 process.kill()
                 process.join(SCHEDULER_KILL_SECS)
+        for held in self.holding:
+            shutdown = getattr(held, "shutdown", None)
+            if callable(shutdown) and not asyncio.iscoroutinefunction(shutdown):
+                with contextlib.suppress(Exception):
+                    shutdown()
 
 
 def wait_for_ready_reports(
@@ -1225,12 +1234,14 @@ async def drain_server(server: Any, engine: Any, timeout: float, poll_secs: floa
 
 def hold_readiness(server: Any, ready: bool) -> None:
     """Hold (``False``) or release (``True``) the server's health answer
-    alone, admission left open, so the servicer's own requests still reach
-    the engine while readiness is held (the planned warm-up runs over the
-    server's own port): ``set_ready`` where the server has it. ``set_serving``
-    is the drain switch (it closes admission as well, and would refuse the
-    warm-up's requests); a server without ``set_ready`` is an older binding
-    whose ``set_serving`` flipped health alone, and that is what it gets."""
+    alone, admission left open to the servicer's own requests (the planned
+    warm-up's ``smg-warmup-<n>``, over the server's own port) and closed to
+    every other while readiness is held, so nothing shares the engine's
+    steps with the warm-up: ``set_ready`` where the server has it.
+    ``set_serving`` is the drain switch (it closes admission as well, and
+    would refuse the warm-up's requests); a server without ``set_ready`` is
+    an older binding whose ``set_serving`` flipped health alone, and that is
+    what it gets."""
     setter = getattr(server, "set_ready", None)
     if setter is None:
         setter = server.set_serving
@@ -1314,7 +1325,8 @@ async def supervise(
 
     A ``warmup`` (the planned warm-up over the servicer's own port, blocking;
     the caller held the server's health at NOT_SERVING with
-    :func:`hold_readiness`, admission open) runs on a thread once the engine
+    :func:`hold_readiness`, admission open to the warm-up's own requests only)
+    runs on a thread once the engine
     connected and the KV-event relay's subscription reached the engine's
     publisher (``kv_relay_subscribed``, waited for up to
     :data:`RELAY_JOIN_GRACE_SECS` so the warm-up's batches start the relay's
@@ -1610,7 +1622,14 @@ class RustLauncher:
         self.announce_capabilities(facts, tokenizer_dir)
         plan = None
         if self.warmup_env:
-            plan = plan_for(warmup_setting, self.warmup_inputs(args, facts), knob=self.warmup_env)
+            # The inputs (a tokenizer load, the media material of a language-side
+            # worker) are built only when the knob is on: plan_for logs the off
+            # reason first and reads no inputs then.
+            plan = plan_for(
+                warmup_setting,
+                self.warmup_inputs(args, facts) if warmup_setting.enabled else None,
+                knob=self.warmup_env,
+            )
         handshake_port = knobs.handshake_port or free_port()
         # The metrics endpoint, resolved and checked before the port is
         # bound and the engine starts (a clash with the gRPC port is refused

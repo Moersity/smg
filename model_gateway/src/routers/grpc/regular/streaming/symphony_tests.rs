@@ -39,7 +39,11 @@ use crate::{
 };
 
 /// The spec with Symphony assigned `format`, replaying `prompt`.
-fn assigned(mut spec: ChatResponseSpec, format: Format, prompt: &str) -> ChatResponseSpec {
+pub(super) fn assigned(
+    mut spec: ChatResponseSpec,
+    format: Format,
+    prompt: &str,
+) -> ChatResponseSpec {
     spec.symphony = Some(Assignment {
         format: Arc::new(format),
         prompt: prompt.to_string(),
@@ -548,6 +552,30 @@ async fn a_whole_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_finish
     }
 }
 
+/// A DSML block the token limit cut before its invoke named a call, after a refusal inside it (a
+/// parameter tag where the name's quote should have come, and the text after it): no call, so the
+/// reader releases the output's own slice from the invoke's opener as the content at the end, the
+/// held newline the cut found included, where a `Malformed` event with bytes at the cut ended that
+/// release and left the client the newline alone. The `calls` marker before it is the table's
+/// framing, dropped as always.
+#[tokio::test]
+async fn a_block_the_token_limit_cut_before_a_call_was_named_is_released_whole_as_content() {
+    let invoke = "<｜DSML｜ invoke name=\"f<｜DSML｜ parameter name=\"s\" string=\"true\">x\n";
+    let output = format!("</think>\n\n<｜DSML｜ calls>\n{invoke}");
+    let (choice, _) = fold_finished(&output, deepseek_v4_1(), "<think>", "length").await;
+    assert!(choice.message.tool_calls.is_none(), "{choice:?}");
+    assert_eq!(
+        choice.message.content.as_deref(),
+        Some(invoke),
+        "the slice from the invoke's opener, whole: {choice:?}"
+    );
+    assert_eq!(
+        choice.finish_reason.as_deref(),
+        Some("length"),
+        "{choice:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_refused_block_released_as_the_answer_keeps_its_tokens_logprobs() {
     // The whole answer after the thought is a call written as Python inside the call tag: the
@@ -616,7 +644,11 @@ fn lookup_tools() -> Vec<Tool> {
 }
 
 /// A Messages spec with Symphony assigned `format`, replaying `prompt`, with the `lookup` tool.
-fn assigned_message(format: Format, prompt: &str, thinking: bool) -> MessagesResponseSpec {
+pub(super) fn assigned_message(
+    format: Format,
+    prompt: &str,
+    thinking: bool,
+) -> MessagesResponseSpec {
     MessagesResponseSpec {
         first_tool_call_only: false,
         thinking_requested: thinking,
@@ -1023,7 +1055,7 @@ async fn a_message_whose_tool_use_input_cannot_carry_the_arguments_is_refused() 
 
 /// The scrape of a recorder of this test's own after `read` ran on this thread (the test
 /// runtime is single-threaded, so the local recorder sees every record of the future).
-async fn scraped<F: std::future::Future>(read: F) -> (F::Output, String) {
+pub(super) async fn scraped<F: std::future::Future>(read: F) -> (F::Output, String) {
     let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
     let guard = metrics::set_default_local_recorder(&recorder);
@@ -1033,7 +1065,7 @@ async fn scraped<F: std::future::Future>(read: F) -> (F::Output, String) {
 }
 
 /// The line of `scrape` for the series `name` with every label in `labels`.
-fn series_line<'a>(scrape: &'a str, name: &str, labels: &[&str]) -> Option<&'a str> {
+pub(super) fn series_line<'a>(scrape: &'a str, name: &str, labels: &[&str]) -> Option<&'a str> {
     scrape
         .lines()
         .find(|line| line.starts_with(name) && labels.iter().all(|label| line.contains(label)))

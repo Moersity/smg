@@ -14,17 +14,19 @@
 //! run in this process.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use bytes::Bytes;
 use engine_servicer::{
-    BoxFuture, MediaError, MediaFeatures, MediaProcessor, MediaRequest, ProcessedMedia,
-    ServicerConfig, ServicerError, SglangModelInfo, SglangServicerConfig, SglangServicerServer,
-    TokenSpeedModelInfo, TokenSpeedServicerConfig, TokenSpeedServicerServer, VllmModelInfo,
-    VllmServicerConfig, VllmServicerServer, ALL_MODALITIES, DEFAULT_ENGINE_PREFILL_TOKENS_PER_SEC,
+    BoxFuture, EncodeDispatchErrorSink, EncodeDispatchOutcome, EncodeDispatchRequest, EncodeFuture,
+    EncodeRelease, EncoderDispatchErrorReq, MediaError, MediaFeatures, MediaProcessor,
+    MediaRequest, ProcessedMedia, ServicerConfig, ServicerError, SglangEncodeDispatcher,
+    SglangModelInfo, SglangServicerConfig, SglangServicerServer, TokenSpeedModelInfo,
+    TokenSpeedServicerConfig, TokenSpeedServicerServer, VllmModelInfo, VllmServicerConfig,
+    VllmServicerServer, ALL_MODALITIES, DEFAULT_ENGINE_PREFILL_TOKENS_PER_SEC,
     DEFAULT_ENGINE_SILENCE_TIMEOUT, DEFAULT_ENGINE_STARTUP_CEILING, DEFAULT_ENGINE_STARTUP_TIMEOUT,
     PIXEL_MODALITIES,
 };
@@ -916,7 +918,8 @@ impl PyVllmGrpcServer {
 
     /// Hold (`False`) or release (`True`) readiness alone: health flips,
     /// admission stays open for the launcher's own requests before SERVING
-    /// (its planned warm-up); `set_serving(False)` is the drain switch.
+    /// (its planned warm-up's, `smg-warmup-<n>`) and closes to every other;
+    /// `set_serving(False)` is the drain switch.
     fn set_ready(&self, ready: bool) {
         self.inner.set_ready(ready);
     }
@@ -981,6 +984,9 @@ impl PyTokenSpeedGrpcServer {
         supports_multimodal = false,
         supported_modalities = None,
         mrope_positions = None,
+        spatial_merge_size = None,
+        image_token_id = None,
+        video_token_id = None,
         model_dtype = String::new(),
         multimodal_encoder_dtype = String::new(),
         server_args_json = String::new(),
@@ -1023,6 +1029,9 @@ impl PyTokenSpeedGrpcServer {
         supports_multimodal: bool,
         supported_modalities: Option<Vec<i32>>,
         mrope_positions: Option<bool>,
+        spatial_merge_size: Option<u32>,
+        image_token_id: Option<u32>,
+        video_token_id: Option<u32>,
         model_dtype: String,
         multimodal_encoder_dtype: String,
         server_args_json: String,
@@ -1058,6 +1067,9 @@ impl PyTokenSpeedGrpcServer {
             supports_multimodal,
             supported_modalities: supported_modalities.unwrap_or_default(),
             mrope_positions,
+            spatial_merge_size,
+            image_token_id,
+            video_token_id,
             model_dtype,
             multimodal_encoder_dtype,
             server_args_json,
@@ -1144,7 +1156,8 @@ impl PyTokenSpeedGrpcServer {
 
     /// Hold (`False`) or release (`True`) readiness alone: health flips,
     /// admission stays open for the launcher's own requests before SERVING
-    /// (its planned warm-up); `set_serving(False)` is the drain switch.
+    /// (its planned warm-up's, `smg-warmup-<n>`) and closes to every other;
+    /// `set_serving(False)` is the drain switch.
     fn set_ready(&self, ready: bool) {
         self.inner.set_ready(ready);
     }
@@ -1170,6 +1183,139 @@ impl PyTokenSpeedGrpcServer {
         }
         let timeout = Duration::from_secs_f64(timeout_secs);
         py.detach(|| self.inner.stop(timeout)).map_err(to_py_err)
+    }
+}
+
+/// What the encode bridge answers one dispatch with: whether the scheduler is
+/// to wait for embeddings, the per-encoder assignment by the modality's enum
+/// value, the encoder list it indexes, and the callable that releases the
+/// receiver's dispatch thread once the request is on the wire.
+type DispatchAnswer = (
+    bool,
+    Option<BTreeMap<u32, Vec<u32>>>,
+    Option<Vec<String>>,
+    Option<Py<PyAny>>,
+);
+
+/// The bridge's answer converted with its release slot taken out first: the
+/// receiver's thread is parked on that release from the moment the bridge
+/// returns, so an answer that does not convert runs it here before the error
+/// is reported, never dropping it unrun.
+fn dispatch_answer(py: Python<'_>, answer: &Bound<'_, PyAny>) -> PyResult<DispatchAnswer> {
+    let release = answer
+        .get_item(3)
+        .ok()
+        .and_then(|slot| slot.extract::<Option<Py<PyAny>>>().ok())
+        .flatten();
+    answer.extract::<DispatchAnswer>().inspect_err(|_| {
+        if let Some(release) = release {
+            if let Err(release_error) = release.call0(py) {
+                tracing::warn!(%release_error, "encode dispatch release failed after a malformed answer");
+            }
+        }
+    })
+}
+
+/// The encode dispatch of an SGLang language-side worker behind a Python
+/// object (see `smg_grpc_servicer.sglang.rust_encode.EncodeDispatchBridge`):
+/// `dispatch(rid, image_urls, on_error)` runs SGLang's own receiver for the
+/// request (the assignment across the encoders, the encode requests to them
+/// on the receiver's thread) and returns a [`DispatchAnswer`]; `on_error` is
+/// this side's [`DispatchError`], which the bridge calls with the receiver's
+/// failure once the release ran, so the notice reaches the scheduler rank
+/// holding the request. Calls into Python only from a blocking thread, as
+/// the media bridge does.
+struct PythonEncodeDispatcher {
+    bridge: Arc<Py<PyAny>>,
+}
+
+impl SglangEncodeDispatcher for PythonEncodeDispatcher {
+    fn dispatch(
+        &self,
+        request: EncodeDispatchRequest,
+    ) -> EncodeFuture<Result<EncodeDispatchOutcome, String>> {
+        let bridge = Arc::clone(&self.bridge);
+        Box::pin(async move {
+            let EncodeDispatchRequest {
+                rid,
+                image_urls,
+                on_error,
+            } = request;
+            // The release becomes its guard inside the blocking task: a
+            // handler gone before this task ends drops the task's output
+            // with it, and the guard still releases the receiver's thread.
+            let runtime = tokio::runtime::Handle::current();
+            let answer = tokio::task::spawn_blocking(move || {
+                let (need_wait_for_mm_inputs, num_items_assigned, encoder_urls, release) =
+                    Python::attach(|py| -> PyResult<DispatchAnswer> {
+                        let on_error = Py::new(
+                            py,
+                            DispatchError {
+                                rid: rid.clone(),
+                                sink: on_error,
+                            },
+                        )?;
+                        let answer =
+                            bridge.call_method1(py, "dispatch", (rid, image_urls, on_error))?;
+                        dispatch_answer(py, answer.bind(py))
+                    })?;
+                let sent = release.map(|release| {
+                    EncodeRelease::new(
+                        Box::new(move || {
+                            Box::pin(async move {
+                                let released = tokio::task::spawn_blocking(move || {
+                                    Python::attach(|py| release.call0(py).map(|_| ()))
+                                })
+                                .await;
+                                match released {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(error)) => {
+                                        tracing::warn!(%error, "encode dispatch release failed");
+                                    }
+                                    Err(join) => {
+                                        tracing::warn!(%join, "encode dispatch release did not run");
+                                    }
+                                }
+                            })
+                        }),
+                        runtime,
+                    )
+                });
+                Ok::<_, PyErr>(EncodeDispatchOutcome {
+                    need_wait_for_mm_inputs,
+                    num_items_assigned,
+                    encoder_urls,
+                    sent,
+                })
+            })
+            .await;
+            match answer {
+                Ok(Ok(outcome)) => Ok(outcome),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(join) => Err(format!("encode dispatch did not run: {join}")),
+            }
+        })
+    }
+}
+
+/// Where the encode bridge reports a dispatch failure, called once from the
+/// receiver's thread after the release: `(error_msg, error_code)`, the
+/// receiver's own `EncoderDispatchErrorReq` fields. A code outside the HTTP
+/// range is reported as 500.
+#[pyclass(name = "_DispatchError")]
+struct DispatchError {
+    rid: String,
+    sink: EncodeDispatchErrorSink,
+}
+
+#[pymethods]
+impl DispatchError {
+    fn __call__(&self, error_msg: String, error_code: i64) {
+        (self.sink)(EncoderDispatchErrorReq {
+            rid: self.rid.clone(),
+            error_msg,
+            error_code: u16::try_from(error_code).unwrap_or(500),
+        });
     }
 }
 
@@ -1218,6 +1364,7 @@ impl PySglangGrpcServer {
         kv_events_endpoint = String::new(),
         kv_events_replay_endpoint = String::new(),
         kv_events_topic = String::new(),
+        encode_dispatcher = None,
         engine_startup_timeout_secs = None,
         engine_startup_ceiling_secs = None,
         engine_silence_timeout_secs = None,
@@ -1258,12 +1405,20 @@ impl PySglangGrpcServer {
         kv_events_endpoint: String,
         kv_events_replay_endpoint: String,
         kv_events_topic: String,
+        encode_dispatcher: Option<Bound<'_, PyAny>>,
         engine_startup_timeout_secs: Option<f64>,
         engine_startup_ceiling_secs: Option<f64>,
         engine_silence_timeout_secs: Option<f64>,
         engine_prefill_tokens_per_sec: Option<i64>,
         metrics_bind_address: Option<String>,
     ) -> PyResult<Self> {
+        // The language side's encode dispatch, behind the launcher's bridge
+        // object; absent on every other worker.
+        let encode_dispatcher = encode_dispatcher.map(|bridge| {
+            Arc::new(PythonEncodeDispatcher {
+                bridge: Arc::new(bridge.unbind()),
+            }) as Arc<dyn SglangEncodeDispatcher>
+        });
         let model = SglangModelInfo {
             served_model_name: served_model_name.unwrap_or_else(|| model_path.clone()),
             tokenizer_path: tokenizer_path.unwrap_or_else(|| model_path.clone()),
@@ -1304,7 +1459,11 @@ impl PySglangGrpcServer {
             engine_prefill_tokens_per_sec: prefill_tokens_per_sec(engine_prefill_tokens_per_sec)?,
             metrics_bind_address,
         };
-        let config = SglangServicerConfig { servicer, model };
+        let config = SglangServicerConfig {
+            servicer,
+            model,
+            encode_dispatcher,
+        };
         let inner = py
             .detach(|| SglangServicerServer::start(config))
             .map_err(to_py_err)?;
@@ -1366,7 +1525,8 @@ impl PySglangGrpcServer {
 
     /// Hold (`False`) or release (`True`) readiness alone: health flips,
     /// admission stays open for the launcher's own requests before SERVING
-    /// (its planned warm-up); `set_serving(False)` is the drain switch.
+    /// (its planned warm-up's, `smg-warmup-<n>`) and closes to every other;
+    /// `set_serving(False)` is the drain switch.
     fn set_ready(&self, ready: bool) {
         self.inner.set_ready(ready);
     }

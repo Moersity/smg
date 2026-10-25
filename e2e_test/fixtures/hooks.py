@@ -87,8 +87,9 @@ def pytest_configure(config: pytest.Config) -> None:
     )
     config.addinivalue_line(
         "markers",
-        "gateway(policy=..., timeout=..., extra_args=..., reuse=False): gateway/router "
-        "configuration; opt reviewed functional classes into identical ZMQ serving reuse",
+        "gateway(policy=..., timeout=..., extra_args=..., env=..., reuse=False): gateway/router "
+        "configuration (env: variables added to the gateway process's environment); opt "
+        "reviewed functional classes into identical ZMQ serving reuse",
     )
     config.addinivalue_line(
         "markers",
@@ -192,10 +193,18 @@ def _is_multi_worker(item: pytest.Item) -> bool:
     return bool(kwargs.get("prefill") or kwargs.get("decode"))
 
 
-def _is_pd_worker_set(item: pytest.Item) -> bool:
-    """True when the item's ``workers`` marker asks for prefill/decode workers."""
+def _is_epd_worker_set(item: pytest.Item) -> bool:
+    """True when the item's ``workers`` marker asks for encode workers."""
     marker = resolve_class_marker(item, "workers")
-    return marker is not None and bool(marker.kwargs.get("prefill") or marker.kwargs.get("decode"))
+    return marker is not None and bool(marker.kwargs.get("encode"))
+
+
+def _is_pd_param(param) -> bool:
+    """True for a ``pd_*`` ``setup_backend`` value, bare (``"pd_grpc"``) or as
+    the head of a topology tuple (``("pd_grpc", (p, d))``): a prefill/decode
+    topology."""
+    mode = param[0] if isinstance(param, tuple) and param else param
+    return isinstance(mode, str) and mode.startswith("pd_")
 
 
 def _zmq_dedup_key(item: pytest.Item) -> tuple:
@@ -278,6 +287,32 @@ def _filter_tokenspeed_dp_items(
     return kept, deselected
 
 
+def _topology_mode(param) -> str | None:
+    """The backend mode a ``setup_backend`` param names: the string itself, or
+    the head of a topology tuple such as ``("pd_grpc", (p, d))``."""
+    mode = param[0] if isinstance(param, tuple) and param else param
+    return mode if isinstance(mode, str) else None
+
+
+def _is_epd_topology(param) -> bool:
+    """True when a ``setup_backend`` param asks for an encode-prefill-decode
+    fleet (``("epd_grpc", (e, p, d))``, or a bare ``epd_*`` mode), whose
+    encode role runs the Python servicer only."""
+    return (_topology_mode(param) or "").startswith("epd")
+
+
+def _is_pd_topology(param) -> bool:
+    """True when a ``setup_backend`` param asks for a prefill/decode fleet
+    (``("pd_grpc", (p, d))``, or a bare ``pd_*`` mode)."""
+    return (_topology_mode(param) or "").startswith("pd")
+
+
+def _workers_marker_kwargs(item: pytest.Item) -> dict:
+    """The item's ``workers`` marker arguments, empty without the marker."""
+    marker = resolve_class_marker(item, "workers")
+    return dict(marker.kwargs) if marker is not None else {}
+
+
 def _filter_tokenspeed_rust_items(
     items: list[pytest.Item],
 ) -> tuple[list[pytest.Item], list[pytest.Item]]:
@@ -285,18 +320,29 @@ def _filter_tokenspeed_rust_items(
     workers run the Rust servicer.
 
     The Rust servicer reaches the scheduler over the msgpack wire, which
-    carries generate and abort only: no PD/EPD bootstrap fields and no
-    control messages. The PD/EPD and multi-worker topologies and the admin
-    operations (flush cache, profiling) stay with the Python servicer, so
-    their cases are dropped here rather than failing on a known gap.
+    carries generate and abort only: no control messages, so the admin
+    operations (flush cache, profiling) stay with the Python servicer. The
+    prefill/decode topologies run on it (the request's bootstrap fields ride
+    the wire; the launcher starts the prefill side's bootstrap server); the
+    encode-prefill-decode topologies need the encode role, which stays with
+    the Python servicer, so their cases are dropped here rather than failing
+    on a known gap, as are the multi-worker fleets of plain workers.
     """
     kept: list[pytest.Item] = []
     deselected: list[pytest.Item] = []
     for item in items:
         param = _setup_backend_param(item)
-        pd_topology = param is not None and param not in _ZMQ_LOCAL_WIRES
+        workers = _workers_marker_kwargs(item)
+        # A wire this lane does not serve: anything but the local wires and
+        # the prefill/decode topologies (an EPD topology is one of those).
+        unserved_wire = (
+            param is not None and param not in _ZMQ_LOCAL_WIRES and not _is_pd_topology(param)
+        )
         admin_ops = "test_admin_ops.py" in item.nodeid
-        if pd_topology or _is_multi_worker(item) or admin_ops:
+        encode_workers = bool(workers.get("encode"))
+        pd_workers = bool(workers.get("prefill") or workers.get("decode"))
+        plain_fleet = (workers.get("count") or 1) > 1 and not pd_workers
+        if unserved_wire or _is_epd_topology(param) or encode_workers or plain_fleet or admin_ops:
             deselected.append(item)
         else:
             kept.append(item)
@@ -310,20 +356,21 @@ def _filter_sglang_rust_items(
     workers run the Rust servicer.
 
     The Rust servicer reaches the scheduler over the msgpack wire, which
-    carries no PD/EPD bootstrap fields and no multimodal payloads. Those
-    topologies and cases stay with the Python servicer, so they are dropped
-    here rather than failing on a known gap; everything else (admin ops,
+    runs no encode dispatch. The EPD topologies stay with the Python servicer,
+    so they are dropped here rather than failing on a known gap; everything
+    else (multimodal payloads, the prefill/decode topologies, admin ops,
     embeddings, data-parallel workers) runs.
     """
     kept: list[pytest.Item] = []
     deselected: list[pytest.Item] = []
     for item in items:
         param = _setup_backend_param(item)
-        pd_topology = param is not None and param not in _ZMQ_LOCAL_WIRES
-        module = item.nodeid.split("::", 1)[0]
-        # An HTTP case talks to SGLang's own server, never to the servicer.
-        multimodal = module.endswith("test_multimodal.py") and param != "http"
-        if pd_topology or _is_pd_worker_set(item) or multimodal:
+        # The wires this servicer serves: the local ones and the
+        # prefill/decode topologies; EPD and anything else stay with Python.
+        unserved_wire = (
+            param is not None and param not in _ZMQ_LOCAL_WIRES and not _is_pd_param(param)
+        )
+        if unserved_wire or _is_epd_worker_set(item):
             deselected.append(item)
         else:
             kept.append(item)

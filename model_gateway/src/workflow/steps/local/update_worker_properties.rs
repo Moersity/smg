@@ -14,6 +14,7 @@ use super::create_worker::{
     warn_on_conflicting_parser_overrides, DP_WIDTH_LABELS,
 };
 use crate::{
+    service_discovery::DISCOVERY_PROVIDER_LABEL,
     worker::{
         overload::OverloadThresholds, service::MAX_WORKER_LABELS, worker::merge_labels,
         BasicWorker, BasicWorkerBuilder, RuntimeType, Worker,
@@ -113,7 +114,25 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                     // A window set here is the worker's only window, as at
                     // registration (see `create_worker::merge_labels`).
                     let updated_labels = match request.labels {
-                        Some(ref new_labels) => merge_labels(existing, new_labels),
+                        Some(ref new_labels) => {
+                            // The admin check refused labels for a discovered
+                            // worker when the request arrived, but a provider
+                            // can register the URL between then and this job
+                            // (its upsert queued first): held again against
+                            // the worker the update would change.
+                            if let Some(provider) = existing.get(DISCOVERY_PROVIDER_LABEL) {
+                                return Err(WorkflowError::StepFailed {
+                                    step_id: StepId::new("update_worker_properties"),
+                                    message: format!(
+                                        "worker {} is owned by the '{provider}' discovery provider \
+                                         since this update was accepted; its labels come from its \
+                                         discovery source",
+                                        worker.url()
+                                    ),
+                                });
+                            }
+                            merge_labels(existing, new_labels)
+                        }
                         None => existing.clone(),
                     };
                     // A `constrained_decoding` label sent in the update must name a
@@ -334,36 +353,42 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
             }
             let new_worker: Arc<dyn Worker> = Arc::new(new_worker);
 
-            // Replace the worker in the registry (overwrite-then-diff). A
-            // refresh writes back a snapshot taken before a network read,
+            // Replace the worker in the registry (overwrite-then-diff),
             // against the id and revision the find step captured: a worker
-            // updated or replaced meanwhile fails the guard and is left as it
-            // is, one removed (or removed and registered again at the same
-            // address, under a new id) is not touched; the next transition
-            // into service refreshes again.
-            let worker_id = if refresh {
-                match snapshot.as_ref().and_then(|entries| entries.get(index)) {
-                    Some((id, expected))
-                        if app_context.worker_registry.replace_claiming_local(
-                            id,
-                            new_worker.clone(),
-                            *expected,
-                        ) =>
-                    {
-                        id.clone()
-                    }
-                    _ => {
-                        debug!(
-                            worker_url = %worker.url(),
-                            "Worker changed or left during the label refresh; not rebuilt"
-                        );
-                        continue;
-                    }
+            // updated or replaced meanwhile (a provider registering its
+            // address included) fails the guard and is left as it is, and one
+            // removed (or removed and registered again at the same address,
+            // under a new id) is neither brought back nor touched. A refresh
+            // is dropped, and the next transition into service refreshes
+            // again; an update fails, rather than overwrite the newer
+            // registration with a rebuild of the one it found.
+            let worker_id = match snapshot.as_ref().and_then(|entries| entries.get(index)) {
+                Some((id, expected))
+                    if app_context.worker_registry.replace_claiming_local(
+                        id,
+                        new_worker.clone(),
+                        *expected,
+                    ) =>
+                {
+                    id.clone()
                 }
-            } else {
-                app_context
-                    .worker_registry
-                    .register_or_replace(new_worker.clone())
+                _ if refresh => {
+                    debug!(
+                        worker_url = %worker.url(),
+                        "Worker changed or left during the label refresh; not rebuilt"
+                    );
+                    continue;
+                }
+                _ => {
+                    return Err(WorkflowError::StepFailed {
+                        step_id: StepId::new("update_worker_properties"),
+                        message: format!(
+                            "worker {} was replaced or removed since this update found it, so \
+                             the update was dropped",
+                            worker.url()
+                        ),
+                    });
+                }
             };
 
             // Same-URL replace preserves the existing shared runtime. If the
@@ -678,7 +703,6 @@ mod tests {
     use super::*;
     use crate::{
         app_context::AppContext,
-        middleware::AuthConfig,
         routers::{
             common::kv_transfer::{connector_mode_for_worker, KvConnectorMode},
             grpc::{
@@ -688,6 +712,7 @@ mod tests {
         },
         worker::{
             circuit_breaker::{CircuitBreakerConfig, CircuitState},
+            registry::WorkerId,
             BasicWorker, ConnectionMode, RuntimeType,
         },
     };
@@ -703,14 +728,8 @@ mod tests {
         tool_parser_factory: Option<tool_parser::ParserFactory>,
     ) -> Arc<AppContext> {
         use crate::{
-            config::RouterConfig,
-            middleware::TokenBucket,
-            observability::inflight_tracker::InFlightRequestTracker,
-            routers::{
-                common::{openai_bridge, realtime::RealtimeRegistry},
-                grpc::multimodal::MultimodalConfigRegistry,
-            },
-            worker::{WorkerRegistry, WorkerService},
+            app_context::testing::app_context_for_tests, config::RouterConfig,
+            worker::WorkerRegistry,
         };
 
         let router_config = RouterConfig::builder()
@@ -720,49 +739,21 @@ mod tests {
         for w in workers {
             registry.register(Arc::clone(w)).unwrap();
         }
-        let job_queue = Arc::new(std::sync::OnceLock::new());
+        app_context_for_tests(router_config, registry, tool_parser_factory)
+    }
 
-        Arc::new(AppContext {
-            gateway_auth: AuthConfig::new(None),
-            client: crate::clients::http_client(),
-            router_config: router_config.clone(),
-            rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
-            rate_limit_manager: None,
-            worker_registry: Arc::clone(&registry),
-            prefill_admission: None,
-            policy_registry: Arc::new(crate::policies::PolicyRegistry::new(
-                router_config.policy.clone(),
-            )),
-            reasoning_parser_factory: None,
-            tool_parser_factory,
-            gateway: None,
-            response_storage: Arc::new(smg_data_connector::MemoryResponseStorage::new()),
-            conversation_storage: Arc::new(smg_data_connector::MemoryConversationStorage::new()),
-            conversation_item_storage: Arc::new(
-                smg_data_connector::MemoryConversationItemStorage::new(),
-            ),
-            worker_monitor: None,
-            configured_reasoning_parser: None,
-            configured_tool_parser: None,
-            worker_job_queue: Arc::clone(&job_queue),
-            workflow_engines: Arc::new(std::sync::OnceLock::new()),
-            mcp_orchestrator: Arc::new(std::sync::OnceLock::new()),
-            mcp_format_registry: openai_bridge::FormatRegistry::new(),
-            tokenizer_registry: Arc::new(llm_tokenizer::registry::TokenizerRegistry::new()),
-            multimodal_config_registry: Arc::new(MultimodalConfigRegistry::new()),
-            tokenizer_load_failures: Arc::default(),
-            wasm_manager: None,
-            worker_client_cache: Arc::new(crate::worker::WorkerHttpClientCache::new(
-                &router_config,
-            )),
-            worker_service: Arc::new(WorkerService::new(registry, job_queue, router_config)),
-            inflight_tracker: InFlightRequestTracker::new(),
-            kv_event_monitor: None,
-            rl: None,
-            realtime_registry: Arc::new(RealtimeRegistry::new()),
-            webrtc_bind_addr: None,
-            webrtc_stun_server: None,
-        })
+    /// Each worker's id and revision, as the find step captures them.
+    fn snapshot_of(app_context: &AppContext, workers: &[Arc<dyn Worker>]) -> Vec<(WorkerId, u64)> {
+        workers
+            .iter()
+            .map(|worker| {
+                let id = app_context
+                    .worker_registry
+                    .get_id_by_url(worker.url())
+                    .expect("the worker is registered");
+                (id, worker.revision())
+            })
+            .collect()
     }
 
     fn make_context(
@@ -770,6 +761,7 @@ mod tests {
         worker: Arc<dyn Worker>,
         labels: HashMap<String, String>,
     ) -> WorkflowContext<WorkerUpdateWorkflowData> {
+        let snapshot = snapshot_of(&app_context, std::slice::from_ref(&worker));
         let data = WorkerUpdateWorkflowData {
             config: WorkerUpdateRequest {
                 priority: None,
@@ -784,7 +776,7 @@ mod tests {
             updated_workers: None,
             refresh_discovered_labels: false,
             fresh_engine_labels: None,
-            snapshot: None,
+            snapshot: Some(snapshot),
         };
         WorkflowContext::new(WorkflowInstanceId::new(), data)
     }
@@ -1512,6 +1504,97 @@ mod tests {
         );
     }
 
+    /// A worker a provider registered after its update was accepted keeps
+    /// its labels: the step refuses them against the worker it would change.
+    /// An update of what no provider publishes still applies to it.
+    #[tokio::test]
+    async fn an_update_of_labels_is_refused_for_a_worker_discovered_since_it_was_accepted() {
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://w:8000")
+                .status(WorkerStatus::Ready)
+                .label(DISCOVERY_PROVIDER_LABEL, "kubernetes")
+                .build(),
+        );
+        let app_ctx = make_app_context(std::slice::from_ref(&worker));
+        let mut labels = make_context(
+            Arc::clone(&app_ctx),
+            Arc::clone(&worker),
+            HashMap::from([("env".to_string(), "prod".to_string())]),
+        );
+        let err = UpdateWorkerPropertiesStep
+            .execute(&mut labels)
+            .await
+            .expect_err("labels for a discovered worker");
+        assert!(
+            err.to_string()
+                .contains("owned by the 'kubernetes' discovery provider"),
+            "{err}"
+        );
+        let mut priority = make_context(Arc::clone(&app_ctx), Arc::clone(&worker), HashMap::new());
+        priority.data.config.labels = None;
+        priority.data.config.priority = Some(3);
+        assert_eq!(
+            UpdateWorkerPropertiesStep
+                .execute(&mut priority)
+                .await
+                .unwrap(),
+            StepResult::Success
+        );
+        let updated = priority.data.updated_workers.expect("the updated worker");
+        assert_eq!(updated[0].priority(), 3);
+    }
+
+    /// An update writes back against the registration its find step found:
+    /// one replaced since (a provider registering the address) keeps what
+    /// replaced it, and one removed since is not brought back. The update
+    /// fails instead.
+    #[tokio::test]
+    async fn an_update_is_dropped_for_a_worker_replaced_or_removed_since_it_was_found() {
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://w:8000")
+                .status(WorkerStatus::Ready)
+                .build(),
+        );
+        let app_ctx = make_app_context(std::slice::from_ref(&worker));
+        let registry = &app_ctx.worker_registry;
+        let id = registry.get_id_by_url("http://w:8000").unwrap();
+        let mut update = make_context(Arc::clone(&app_ctx), Arc::clone(&worker), HashMap::new());
+        update.data.config.labels = None;
+        update.data.config.priority = Some(7);
+        let discovered: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://w:8000")
+                .status(WorkerStatus::Ready)
+                .label(DISCOVERY_PROVIDER_LABEL, "file")
+                .build(),
+        );
+        assert!(registry.replace(&id, discovered));
+        let err = UpdateWorkerPropertiesStep
+            .execute(&mut update)
+            .await
+            .expect_err("the worker was replaced since it was found");
+        assert!(err.to_string().contains("replaced or removed"), "{err}");
+        let current = registry.get_by_url("http://w:8000").unwrap();
+        assert_eq!(
+            current.metadata().spec.labels.get(DISCOVERY_PROVIDER_LABEL),
+            Some(&"file".to_string()),
+            "the provider's registration stands"
+        );
+        assert_ne!(current.priority(), 7);
+
+        let mut update = make_context(Arc::clone(&app_ctx), Arc::clone(&current), HashMap::new());
+        update.data.config.labels = None;
+        update.data.config.priority = Some(7);
+        registry.remove(&id);
+        UpdateWorkerPropertiesStep
+            .execute(&mut update)
+            .await
+            .expect_err("the worker was removed since it was found");
+        assert!(
+            registry.get_by_url("http://w:8000").is_none(),
+            "a removed worker is not brought back"
+        );
+    }
+
     #[tokio::test]
     async fn pd_update_preserves_connector_and_pair_descriptor() {
         for (connector, mode, protocol, transport, pair_key, expected_mode) in [
@@ -1929,7 +2012,10 @@ mod tests {
             updated_workers: None,
             refresh_discovered_labels: false,
             fresh_engine_labels: None,
-            snapshot: None,
+            snapshot: Some(snapshot_of(
+                &app_ctx,
+                &[Arc::clone(&first), Arc::clone(&second)],
+            )),
         };
         let mut context = WorkflowContext::new(WorkflowInstanceId::new(), data);
         let err = UpdateWorkerPropertiesStep

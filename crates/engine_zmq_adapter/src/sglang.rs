@@ -7,10 +7,13 @@
 //! sampling params SMG sends, and slices each step's output to the slim
 //! batch decoded here).
 
+use std::collections::BTreeMap;
+
 use engine_zmq_client::{
     codec::OpaqueValue,
     connector::SglangStream,
     protocol::sglang::{
+        multimodal::{SglangWireMmInputs, SglangWireMmItem, SglangWireModality, SglangWireTensor},
         output::{MatchedStop, SglangOutput},
         request::{TokenizedEmbeddingReqInput, TokenizedGenerateReqInput},
         sampling::SamplingParams as SglangSamplingParams,
@@ -21,6 +24,7 @@ use smg_grpc_client::{constraint_failed_status, sglang_proto, vllm_proto as vllm
 use tracing::warn;
 
 use crate::{
+    abort_status::engine_abort_status,
     context_window::admit_prompt,
     fanout::fan_out_n,
     stream::{poll_mapped, MappedGenerateStream, StreamState},
@@ -51,6 +55,15 @@ pub struct SglangGenerateStream {
     /// rows on completion (including prefill-only scores with no output ids).
     selected_logprobs: Vec<sglang_proto::TopLogProbs>,
     selected_logprobs_delta: Vec<sglang_proto::TopLogProbs>,
+    /// The final hidden layer's vectors the scheduler reported for this
+    /// choice, when the request asked for them: the rows accumulated from
+    /// what each tick added (the plugin sends only the new rows: the prompt
+    /// positions the prefill computed, then a decode step's rows), and how
+    /// many of them the chunks before the current tick carried. The
+    /// vLLM-proto intermediate has no slot for them either: the chunk carries
+    /// the tick's rows, the completion the whole list with absolute positions.
+    hidden_states: Vec<Vec<f32>>,
+    hidden_states_sent: usize,
 }
 
 impl SglangGenerateStream {
@@ -64,6 +77,8 @@ impl SglangGenerateStream {
             input_logprobs_emitted: false,
             selected_logprobs: Vec::new(),
             selected_logprobs_delta: Vec::new(),
+            hidden_states: Vec::new(),
+            hidden_states_sent: 0,
         }
     }
 
@@ -83,7 +98,8 @@ impl SglangGenerateStream {
         self.inner.engine_index()
     }
 
-    /// Convert a stream item without discarding SGLang-only score rows.
+    /// Convert a stream item without discarding the SGLang-only rows: the
+    /// selected scores and the hidden states.
     pub fn to_sglang_response(
         &self,
         request_id: &str,
@@ -106,42 +122,24 @@ impl SglangGenerateStream {
                 .token_ids_logprobs
                 .clone_from(selected);
         }
-        response
-    }
-
-    /// Attach the accumulated prompt logprobs: once on the first token-bearing
-    /// chunk and on every `Complete`, including one parked in `pending`. The
-    /// scheduler reports them with the prefill tick, before any sampled token.
-    fn attach_input_logprobs(&mut self, response: &mut vllm::GenerateResponse) {
-        if self.state.prompt_logprobs.is_empty() {
-            return;
-        }
-        let state = &self.state;
-        let build = || vllm::InputLogProbs {
-            token_logprobs: state.prompt_logprobs.clone(),
-            token_ids: state.prompt_token_ids.clone(),
-            top_logprobs: state.prompt_top_logprobs.clone(),
-        };
-        if let Some(vllm::generate_response::Response::Complete(parked)) = self
-            .pending
-            .as_mut()
-            .and_then(|pending| pending.response.as_mut())
-        {
-            parked.input_logprobs = Some(build());
-        }
         match response.response.as_mut() {
-            Some(vllm::generate_response::Response::Chunk(chunk))
-                if !self.input_logprobs_emitted && !chunk.token_ids.is_empty() =>
-            {
-                chunk.input_logprobs = Some(build());
-                self.input_logprobs_emitted = true;
+            Some(Response::Chunk(chunk)) => {
+                chunk.hidden_states =
+                    flat_hidden_states(&self.hidden_states[self.hidden_states_sent..]);
             }
-            Some(vllm::generate_response::Response::Chunk(_)) => {}
-            Some(vllm::generate_response::Response::Complete(complete)) => {
-                complete.input_logprobs = Some(build());
+            Some(Response::Complete(complete)) => {
+                complete.all_hidden_states = all_hidden_states(
+                    &self.hidden_states,
+                    first_hidden_position(
+                        self.state.prompt_tokens,
+                        self.state.completion_tokens,
+                        self.hidden_states.len(),
+                    ),
+                );
             }
             None => {}
         }
+        response
     }
 
     /// Whether the engine already finished this choice and its terminal
@@ -170,7 +168,11 @@ impl SglangGenerateStream {
             Some(("abort".to_string(), None)),
             &mut pending,
         );
-        self.attach_input_logprobs(&mut response);
+        self.state.attach_input_logprobs(
+            &mut self.pending,
+            &mut self.input_logprobs_emitted,
+            &mut response,
+        );
         response
     }
 }
@@ -178,9 +180,10 @@ impl SglangGenerateStream {
 /// A vLLM-proto response of an SGLang stream as the SGLang proto the
 /// `SglangScheduler` service answers with, under `request_id` (the vLLM proto
 /// carries none) and the stream's `reasoning_tokens` (which it has no slot
-/// for). The two share the chunk and completion fields this wire fills; what
-/// it does not carry (hidden states, speculative counters) stays at the proto
-/// defaults, as it does on the Python servicer.
+/// for). The two share the chunk and completion fields this wire fills; the
+/// hidden states, which the intermediate has no slot for either, are the
+/// stream's own (the method above); what the wire does not carry (speculative
+/// counters) stays at the proto defaults, as it does on the Python servicer.
 pub fn to_sglang_response(
     request_id: &str,
     response: vllm::GenerateResponse,
@@ -254,6 +257,42 @@ pub fn to_sglang_response(
     }
 }
 
+/// The layer `GenerateComplete.all_hidden_states` names: the model's final
+/// hidden layer, the only one SGLang returns.
+const FINAL_HIDDEN_LAYER: i32 = -1;
+
+/// `GenerateStreamChunk.hidden_states`: the rows a tick added, flattened (the
+/// client splits them by the hidden size).
+fn flat_hidden_states(rows: &[Vec<f32>]) -> Vec<f32> {
+    rows.iter().flatten().copied().collect()
+}
+
+/// The absolute position of the first row a request carries, from the
+/// scheduler's own counters: the last row is always the last fed-back token
+/// (position `prompt + generated - 2`), whatever prefix the radix cache
+/// served without rows, so the first is that position less the rows after
+/// it.
+fn first_hidden_position(prompt_tokens: u32, completion_tokens: u32, rows: usize) -> i32 {
+    let first = i64::from(prompt_tokens) + i64::from(completion_tokens) - 1 - rows as i64;
+    i32::try_from(first.max(0)).unwrap_or(i32::MAX)
+}
+
+/// `GenerateComplete.all_hidden_states`: one entry per position a forward
+/// ran on (the prompt positions the prefill computed, as the engine returns
+/// them, then each generated token fed back for the next; the last sampled
+/// token has no row), the final hidden layer, the positions absolute from
+/// `first_position` ([`first_hidden_position`]).
+fn all_hidden_states(rows: &[Vec<f32>], first_position: i32) -> Vec<sglang_proto::HiddenStates> {
+    rows.iter()
+        .enumerate()
+        .map(|(position, values)| sglang_proto::HiddenStates {
+            values: values.clone(),
+            layer: FINAL_HIDDEN_LAYER,
+            position: first_position.saturating_add(i32::try_from(position).unwrap_or(i32::MAX)),
+        })
+        .collect()
+}
+
 impl MappedGenerateStream for SglangGenerateStream {
     type Output = SglangOutput;
     type Inner = SglangStream;
@@ -285,6 +324,11 @@ impl MappedGenerateStream for SglangGenerateStream {
         state.completion_tokens = output.completion_tokens;
         state.output_ids.extend(output.output_ids.iter().copied());
         self.reasoning_tokens = output.reasoning_tokens;
+        // The plugin sends the rows the tick added (the prompt positions the
+        // prefill computed, then a decode step's rows): the chunk carries
+        // them, the completion the whole list.
+        self.hidden_states_sent = self.hidden_states.len();
+        self.hidden_states.extend(output.output_hidden_states);
         self.selected_logprobs_delta = output
             .output_token_ids_logprobs_val
             .iter()
@@ -360,7 +404,7 @@ impl MappedGenerateStream for SglangGenerateStream {
         // status (400 when the request is at fault). The frontend never asked
         // for it (its own aborts drop the stream first), so it is an error to
         // the caller, not an empty success, with the status mapped by the one
-        // table the engine's front ends share (`scheduler_abort_status`). The
+        // table the engine's front ends share (`engine_abort_status`). The
         // one abort the scheduler itself attributes to the request's grammar
         // (the plugin's `err_type` stamp on the scheduler's own grammar
         // failure, see `GRAMMAR_REJECTED_ERR_TYPE`) is the constraint failing
@@ -380,7 +424,7 @@ impl MappedGenerateStream for SglangGenerateStream {
             if output.finish_err_type.as_deref() == Some(GRAMMAR_REJECTED_ERR_TYPE) {
                 return Err(constraint_failed_status(message));
             }
-            return Err(scheduler_abort_status(output.finish_status, message));
+            return Err(engine_abort_status(output.finish_status, message));
         }
         let finish = output.finish_reason.map(|reason| {
             (
@@ -402,7 +446,11 @@ impl MappedGenerateStream for SglangGenerateStream {
             finish,
             &mut self.pending,
         );
-        self.attach_input_logprobs(&mut response);
+        self.state.attach_input_logprobs(
+            &mut self.pending,
+            &mut self.input_logprobs_emitted,
+            &mut response,
+        );
         Ok(response)
     }
 }
@@ -440,21 +488,28 @@ pub(crate) fn fan_out_sglang_requests(
 /// Translate an SGLang proto `GenerateRequest` into the scheduler's
 /// `TokenizedGenerateReqInput`. ZMQ mode requires pre-tokenized input (SMG
 /// tokenizes upstream). The slim output carries sampled and prompt logprobs
-/// with their ranked and selected candidates; what it has no columns for
-/// (hidden states) and what
-/// the wire does not carry (multimodal payloads, PD bootstrap fields) is
-/// refused rather than silently dropped. `max_model_len` is the context
-/// window the scheduler reported at the handshake: an empty prompt, or one
-/// that fills the window, is refused before it reaches the scheduler
-/// ([`admit_prompt`]).
+/// with their ranked and selected candidates, and the hidden states a request
+/// asks for. Multimodal inputs become the scheduler's processor output
+/// ([`translate_sglang_multimodal`]), and a disaggregated request's
+/// bootstrap fields ride the scheduler's own slots, as the Python servicer
+/// forwards them. `max_model_len` is the context window the scheduler
+/// reported at the handshake: an empty prompt, or one that fills the window,
+/// is refused before it reaches the scheduler ([`admit_prompt`]). `ranks` is
+/// how many scheduler ranks are connected and `placement` how a request is
+/// placed among them ([`RankPlacement`]): by its data-parallel pin, as the
+/// engine's own frontend places it ([`routed_dp_rank`]), or, on the prefill
+/// side of a disaggregated pair, by its room's residue
+/// ([`room_residue_rank`]).
 pub(crate) fn translate_request_sglang(
     req: sglang_proto::GenerateRequest,
     max_model_len: u64,
+    ranks: usize,
+    placement: RankPlacement,
 ) -> Result<TokenizedGenerateReqInput, String> {
-    let input_ids = req
+    let tokenized = req
         .tokenized
-        .map(|tokenized| tokenized.input_ids)
         .ok_or_else(|| "ZMQ mode requires pre-tokenized input; no input provided".to_string())?;
+    let input_ids = tokenized.input_ids;
     // The scheduler's own bound on the prompt applies only after admission
     // (an abort with its reason; a cut down to the bound for a scheduler
     // started with `--allow-auto-truncate`, whose servicer then passes no
@@ -462,26 +517,46 @@ pub(crate) fn translate_request_sglang(
     // `max_new_tokens` stays unset: the scheduler caps it at the remaining
     // context itself.
     admit_prompt(input_ids.len(), max_model_len)?;
-    if req.mm_inputs.is_some() {
-        return Err(
-            "multimodal inputs are not supported over the SGLang ZMQ backend yet".to_string(),
-        );
-    }
-    if req.return_hidden_states {
-        return Err("hidden states are not supported over the SGLang ZMQ backend".to_string());
-    }
-    // The bootstrap slots stay at the scheduler's defaults on this wire;
-    // refuse rather than run without the PD bootstrap the request asked for.
-    if req.disaggregated_params.is_some() {
-        return Err(
-            "PD disaggregation (disaggregated_params) is not supported over the SGLang ZMQ \
-             backend"
-                .to_string(),
-        );
-    }
+    // Media by reference (the encoders' input on a language-side worker)
+    // leaves the processor-output slot empty and forwards the prompt text:
+    // the scheduler's receiver rebuilds the prompt from it once the
+    // embeddings arrive, as behind the engine's own frontend, which sends the
+    // text it rendered. Preprocessed tensors take the processor-output path.
+    let (mm_inputs, input_text) = match req.mm_inputs {
+        Some(mm) if encode_media_refs(&mm)?.is_some() => (
+            None,
+            (!tokenized.original_text.is_empty()).then_some(tokenized.original_text),
+        ),
+        Some(mm) => (
+            Some(translate_sglang_multimodal(mm, input_ids.len())?),
+            None,
+        ),
+        None => (None, None),
+    };
+    // The prefill/decode rendezvous (the prefill side's bootstrap server and
+    // the room both sides meet in), forwarded as the Python servicer forwards
+    // it: an empty host and a zero port are unset, the room is kept as given
+    // (0 is a room: the fake-transfer probe's) whenever the message is
+    // present, and an absent message leaves the scheduler's defaults.
+    let (bootstrap_host, bootstrap_port, bootstrap_room) = match req.disaggregated_params {
+        Some(params) => (
+            (!params.bootstrap_host.is_empty()).then_some(params.bootstrap_host),
+            (params.bootstrap_port != 0).then_some(params.bootstrap_port),
+            Some(i64::from(params.bootstrap_room)),
+        ),
+        None => (None, None, None),
+    };
+    let routed_dp_rank = match (placement, bootstrap_room) {
+        (RankPlacement::RoomResidue, Some(room)) => {
+            room_residue_rank(room, req.data_parallel_rank, ranks, &req.request_id)
+        }
+        _ => routed_dp_rank(req.data_parallel_rank, ranks)?,
+    };
     Ok(TokenizedGenerateReqInput {
         rid: req.request_id,
+        input_text,
         input_ids,
+        mm_inputs,
         sampling_params: req
             .sampling_params
             .map(translate_sampling_sglang)
@@ -491,20 +566,217 @@ pub(crate) fn translate_request_sglang(
         top_logprobs_num: u32::try_from(req.top_logprobs_num).unwrap_or(0),
         token_ids_logprob: (!req.token_ids_logprob.is_empty()).then_some(req.token_ids_logprob),
         stream: req.stream,
+        // Full capture, the one mode the contract's bool can ask for; the
+        // servicer keeps the scheduler's launch-time cap ahead of this.
+        return_hidden_states: req.return_hidden_states,
         // Forwarded as the Python servicer forwards them: the scheduler
         // resolves the adapter id and runs the processor it was started with.
         lora_id: (!req.lora_id.is_empty()).then_some(req.lora_id),
         custom_logit_processor: (!req.custom_logit_processor.is_empty())
             .then_some(req.custom_logit_processor),
+        bootstrap_host,
+        bootstrap_port,
+        bootstrap_room,
+        routed_dp_rank,
         require_reasoning: req.require_reasoning,
         ..TokenizedGenerateReqInput::default()
     })
 }
 
+/// The image references a payload names for the encoders of an
+/// encode/prefill-disaggregated deployment, in prompt order: `Some` for a
+/// payload of references without preprocessed tensors (the encoders' input
+/// on a language-side worker, see [`crate::sglang_encode`]), `None` for one
+/// carrying tensors (the processor-output path, whatever references ride
+/// beside them: the engine's frontend processes such a request locally) or
+/// nothing at all. Video and audio references are refused by name: the
+/// encoders' gRPC service takes images only.
+pub(crate) fn encode_media_refs(
+    mm: &sglang_proto::MultimodalInputs,
+) -> Result<Option<Vec<String>>, String> {
+    if mm.pixel_values.is_some() {
+        return Ok(None);
+    }
+    if !mm.video_urls.is_empty() || !mm.audio_urls.is_empty() {
+        return Err(
+            "multimodal payload carries video or audio references; the encoders of an \
+             encode/prefill-disaggregated deployment take image references only"
+                .to_string(),
+        );
+    }
+    Ok((!mm.image_urls.is_empty()).then(|| mm.image_urls.clone()))
+}
+
+/// The request's multimodal payload as the scheduler's processor output, by
+/// the Python servicer's rules (`_parse_mm_inputs`): one image item whose
+/// feature is `pixel_values`, the model-specific tensors beside it, the
+/// placeholder ranges as inclusive `[start, end]` offsets (none at all leaves
+/// the slot unset, with the same warning), and the image token id. Nothing
+/// is derived here: the scheduler hashes the feature, pads the prompt with
+/// its model's pattern and computes the position tensors it needs, as it
+/// does behind the Python servicer. What that servicer would mis-tag or
+/// silently drop is refused instead: a payload naming another modality
+/// (every item is tagged an image), one of media references without tensors
+/// (the encoders' input, which [`encode_media_refs`] takes before this and
+/// the dispatch serves; refused here on a worker that runs none), a tensor
+/// of a dtype the wire does not carry or of the wrong length, and a
+/// placeholder outside the prompt or of zero length.
+pub(crate) fn translate_sglang_multimodal(
+    mm: sglang_proto::MultimodalInputs,
+    prompt_len: usize,
+) -> Result<SglangWireMmInputs, String> {
+    if let Some(other) = mm.modalities.iter().find(|modality| *modality != "image") {
+        return Err(format!(
+            "multimodal modality {other:?} is not carried over the SGLang ZMQ backend; the \
+             scheduler takes preprocessed image tensors on this wire"
+        ));
+    }
+    let Some(pixel_values) = mm.pixel_values else {
+        return Err(
+            if mm.image_urls.is_empty() && mm.video_urls.is_empty() && mm.audio_urls.is_empty() {
+                "multimodal payload carries no pixel_values".to_string()
+            } else {
+                "multimodal payload carries media references but no preprocessed tensors; the \
+                 scheduler's encode path is not served over the SGLang ZMQ backend"
+                    .to_string()
+            },
+        );
+    };
+    let feature = wire_tensor_sglang("pixel_values", pixel_values)?;
+    let mut model_specific_data = BTreeMap::new();
+    for (key, tensor) in mm.model_specific_tensors {
+        let tensor = wire_tensor_sglang(&key, tensor)?;
+        model_specific_data.insert(key, tensor);
+    }
+    let mut offsets = Vec::with_capacity(mm.mm_placeholders.len());
+    for range in &mm.mm_placeholders {
+        let (start, length) = (u64::from(range.offset), u64::from(range.length));
+        if length == 0 {
+            return Err(format!(
+                "multimodal placeholder at offset {start} has zero length"
+            ));
+        }
+        let end = start + length - 1;
+        if end >= prompt_len as u64 {
+            return Err(format!(
+                "multimodal placeholder {start}..={end} lies outside the prompt of {prompt_len} \
+                 tokens"
+            ));
+        }
+        offsets.push((start, end));
+    }
+    let offsets = if offsets.is_empty() {
+        // The Python servicer's warning, word for word in substance.
+        warn!(
+            "multimodal payload carries no mm_placeholders: the prompt's placeholder expansion \
+             may have missed the image token; check that the placeholder token id matches the \
+             tokenized image token"
+        );
+        None
+    } else {
+        Some(offsets)
+    };
+    Ok(SglangWireMmInputs {
+        mm_items: vec![SglangWireMmItem {
+            modality: SglangWireModality::Image,
+            offsets,
+            feature: Some(feature),
+            model_specific_data,
+        }],
+        im_token_id: mm.im_token_id,
+    })
+}
+
+/// A proto tensor as the wire carries it: the bytes are viewed, not copied;
+/// the dtype name and the length are checked as the Python servicer's reader
+/// checks them.
+fn wire_tensor_sglang(
+    name: &str,
+    tensor: sglang_proto::TensorData,
+) -> Result<SglangWireTensor, String> {
+    SglangWireTensor::new(
+        tensor.dtype,
+        tensor.shape.into_iter().map(u64::from).collect(),
+        tensor.data,
+    )
+    .map_err(|error| format!("multimodal tensor {name:?}: {error}"))
+}
+
+/// How a request is placed among the scheduler ranks: by its data-parallel
+/// pin, as the engine's own frontend places one (an aggregated engine, and
+/// the decode side of a disaggregated pair, whose own placement is free), or
+/// by the residue of its rendezvous room, as the prefill side of a
+/// disaggregated pair requires: SGLang's prefill side follows the room by
+/// default (`load_balance_method` `auto` resolves to `follow_bootstrap_room`
+/// there), its KV sender fails a request that runs on another rank than
+/// `bootstrap_room % dp_size`, and the decode side looks for the KV on that
+/// rank. The servicer that launched the engine says which
+/// (`ZmqEngineClient::note_engine_places_by_rendezvous_room`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RankPlacement {
+    Pin,
+    RoomResidue,
+}
+
+/// The scheduler rank a disaggregated request goes to on a prefill side that
+/// follows the room: `bootstrap_room % ranks`, Python's `%` as the engine
+/// computes it (a negative room folds the same way); a pin that names
+/// another rank is logged and ignored, never refused, since placing by the
+/// pin would fail the request at the engine's KV sender. A single rank takes
+/// everything.
+fn room_residue_rank(room: i64, pin: Option<i32>, ranks: usize, request_id: &str) -> Option<u32> {
+    let Ok(ranks) = u32::try_from(ranks) else {
+        return None;
+    };
+    if ranks <= 1 {
+        return None;
+    }
+    let rank = u32::try_from(room.rem_euclid(i64::from(ranks))).unwrap_or(0);
+    if let Some(pin) = pin {
+        if u32::try_from(pin).ok() != Some(rank) {
+            warn!(
+                request_id,
+                data_parallel_rank = pin,
+                bootstrap_room = room,
+                dp_size = ranks,
+                "data_parallel_rank conflicts with the bootstrap_room residue; the room \
+                 stays authoritative on a disaggregated request, the pin is ignored"
+            );
+        }
+    }
+    Some(rank)
+}
+
+/// The scheduler rank a request's data-parallel pin routes it to, by the
+/// rule of SGLang's own frontend (`TokenizerManager`, where the API's pin
+/// becomes the request's `routed_dp_rank`): no pin leaves the placement to
+/// the dispatcher (here the connector's least-loaded selection); on an
+/// engine of one rank any non-negative pin is ignored, as the frontend logs
+/// and ignores it; a pin among several ranks must name one of them, else it
+/// is refused with the frontend's 400 wording. Each scheduler rank dials the connector with its
+/// rank as its engine index, so the rank is the engine the request goes to.
+fn routed_dp_rank(pin: Option<i32>, ranks: usize) -> Result<Option<u32>, String> {
+    let Some(pin) = pin else {
+        return Ok(None);
+    };
+    let out_of_range = || format!("routed_dp_rank={pin} out of range [0, {ranks})");
+    let rank = u32::try_from(pin).map_err(|_| out_of_range())?;
+    if ranks <= 1 {
+        return Ok(None);
+    }
+    if usize::try_from(rank).is_ok_and(|rank| rank < ranks) {
+        Ok(Some(rank))
+    } else {
+        Err(out_of_range())
+    }
+}
+
 /// Translate an SGLang proto `EmbedRequest` into the scheduler's
 /// `TokenizedEmbeddingReqInput`, as the Python servicer does: the tokenized
 /// prompt with `max_new_tokens = 0` (the scheduler pools, nothing samples),
-/// token type ids for cross-encoder inputs. Multimodal payloads are refused.
+/// token type ids for cross-encoder inputs. A multimodal payload is refused
+/// (the Python servicer drops it without a word, which no embedding model it
+/// serves depends on).
 pub(crate) fn translate_embed_request_sglang(
     req: sglang_proto::EmbedRequest,
 ) -> Result<TokenizedEmbeddingReqInput, String> {
@@ -519,7 +791,9 @@ pub(crate) fn translate_embed_request_sglang(
     }
     if req.mm_inputs.is_some() {
         return Err(
-            "multimodal inputs are not supported over the SGLang ZMQ backend yet".to_string(),
+            "multimodal inputs on an embedding request are not served over the SGLang ZMQ \
+             backend"
+                .to_string(),
         );
     }
     let mut sampling_params = req
@@ -668,13 +942,21 @@ pub(crate) fn translate_sampling_sglang(sp: sglang_proto::SamplingParams) -> Sgl
         stop: (!sp.stop.is_empty()).then_some(sp.stop),
         stop_token_ids: (!sp.stop_token_ids.is_empty()).then_some(sp.stop_token_ids),
         temperature: f64::from(sp.temperature),
-        top_p: f64::from(sp.top_p),
-        top_k: sp.top_k,
+        // proto3 cannot tell an unset scalar from its zero, and the zeros of
+        // these three are never meant: top_p 0.0 keeps the top token only,
+        // top_k 0 is an empty candidate set, and a repetition factor of 0.0
+        // sends a repeated token's positive logit to infinity (the
+        // scheduler's `verify()` refuses all three). An unset one means the
+        // neutral value: the whole distribution, every token, no penalty.
+        top_p: if sp.top_p == 0.0 {
+            1.0
+        } else {
+            f64::from(sp.top_p)
+        },
+        top_k: if sp.top_k == 0 { -1 } else { sp.top_k },
         min_p: f64::from(sp.min_p),
         frequency_penalty: f64::from(sp.frequency_penalty),
         presence_penalty: f64::from(sp.presence_penalty),
-        // proto3 cannot tell an unset float from 0.0; a zero penalty factor
-        // is never meant and would zero every logit.
         repetition_penalty: if sp.repetition_penalty == 0.0 {
             1.0
         } else {
@@ -727,23 +1009,6 @@ pub(crate) fn constraint_ref(sp: &sglang_proto::SamplingParams) -> Option<Constr
 /// (`smg_grpc_servicer.sglang`) stamps it, this wire reads it.
 pub(crate) const GRAMMAR_REJECTED_ERR_TYPE: &str = "GrammarRejectedToken";
 
-/// The gRPC status for a request the scheduler aborted with an HTTP-style
-/// status: the table the engine's Python servicer uses for the same status,
-/// so the two front ends of one engine answer alike. 400 is the caller's
-/// fault, 404 a missing resource, 408 and 504 a deadline, 429 a full queue,
-/// 503 an unavailable engine; anything else, a missing status included, is
-/// internal.
-pub(crate) fn scheduler_abort_status(status: Option<u16>, message: String) -> tonic::Status {
-    match status {
-        Some(400) => tonic::Status::invalid_argument(message),
-        Some(404) => tonic::Status::not_found(message),
-        Some(408 | 504) => tonic::Status::deadline_exceeded(message),
-        Some(429) => tonic::Status::resource_exhausted(message),
-        Some(503) => tonic::Status::unavailable(message),
-        _ => tonic::Status::internal(message),
-    }
-}
-
 /// Normalize an SGLang finish reason into the canonical set the gateway's
 /// response layer exact-matches (`stop`, `length`, `abort`).
 pub(crate) fn normalize_finish_reason(reason: &str) -> &'static str {
@@ -776,28 +1041,234 @@ mod tests {
     use super::*;
     use crate::test_support::connected_pair;
 
-    /// The translation under the mock scheduler's context window.
+    /// The translation under the mock scheduler's context window, one rank.
     fn translate(req: sglang_proto::GenerateRequest) -> Result<WireRequest, String> {
-        translate_request_sglang(req, default_ready_response().max_model_len)
+        translate_request_sglang(
+            req,
+            default_ready_response().max_model_len,
+            1,
+            RankPlacement::Pin,
+        )
     }
 
+    fn tensor(dtype: &str, shape: Vec<u32>, data: Vec<u8>) -> sglang_proto::TensorData {
+        sglang_proto::TensorData {
+            data: data.into(),
+            shape,
+            dtype: dtype.to_string(),
+        }
+    }
+
+    /// The payload the gateway assembles for this wire: the pixel tensor,
+    /// one grid tensor, the placeholder ranges and the image token.
+    fn media_payload() -> sglang_proto::MultimodalInputs {
+        let pixels: Vec<u8> = (0..8)
+            .flat_map(|i| (i as f32 * 0.5).to_le_bytes())
+            .collect();
+        let grid: Vec<u8> = [1i64, 2, 2].iter().flat_map(|v| v.to_le_bytes()).collect();
+        sglang_proto::MultimodalInputs {
+            modalities: vec!["image".to_string()],
+            pixel_values: Some(tensor("float32", vec![2, 4], pixels)),
+            model_specific_tensors: [(
+                "image_grid_thw".to_string(),
+                tensor("int64", vec![1, 3], grid),
+            )]
+            .into_iter()
+            .collect(),
+            im_token_id: Some(7),
+            mm_placeholders: vec![sglang_proto::PlaceholderRange {
+                offset: 1,
+                length: 3,
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn media_request(mm: sglang_proto::MultimodalInputs) -> sglang_proto::GenerateRequest {
+        sglang_proto::GenerateRequest {
+            request_id: "mm".into(),
+            tokenized: Some(sglang_proto::TokenizedInput {
+                input_ids: vec![1, 7, 7, 7, 2],
+                original_text: String::new(),
+            }),
+            mm_inputs: Some(mm),
+            ..Default::default()
+        }
+    }
+
+    /// The gateway's preprocessed media becomes the scheduler's processor
+    /// output by the Python servicer's rules: one image item, the pixel
+    /// tensor as its feature (bytes viewed, not copied), the grid beside it,
+    /// inclusive offsets, the image token id; the hash and pad slots are left
+    /// to the scheduler.
     #[test]
-    fn a_scheduler_abort_carries_the_status_its_http_code_means() {
-        let rows = [
-            (Some(400), tonic::Code::InvalidArgument),
-            (Some(404), tonic::Code::NotFound),
-            (Some(408), tonic::Code::DeadlineExceeded),
-            (Some(429), tonic::Code::ResourceExhausted),
-            (Some(500), tonic::Code::Internal),
-            (Some(503), tonic::Code::Unavailable),
-            (Some(504), tonic::Code::DeadlineExceeded),
-            (Some(418), tonic::Code::Internal),
-            (None, tonic::Code::Internal),
-        ];
-        for (status, code) in rows {
-            let got = scheduler_abort_status(status, "why".to_string());
-            assert_eq!(got.code(), code, "{status:?}");
-            assert_eq!(got.message(), "why");
+    fn multimodal_inputs_become_the_schedulers_processor_output() {
+        let payload = media_payload();
+        let pixel_ptr = payload.pixel_values.as_ref().unwrap().data.as_ptr();
+        let request = translate(media_request(payload)).unwrap();
+        let media = request.mm_inputs.expect("the processor output");
+        assert_eq!(media.im_token_id, Some(7));
+        assert_eq!(media.mm_items.len(), 1);
+        let item = &media.mm_items[0];
+        assert_eq!(item.modality, SglangWireModality::Image);
+        assert_eq!(item.offsets, Some(vec![(1, 3)]));
+        let feature = item.feature.as_ref().unwrap();
+        assert_eq!(feature.dtype, "float32");
+        assert_eq!(feature.shape, vec![2, 4]);
+        assert_eq!(
+            feature.data.as_ptr(),
+            pixel_ptr,
+            "the proto bytes are viewed"
+        );
+        let grid = &item.model_specific_data["image_grid_thw"];
+        assert_eq!(
+            (grid.dtype.as_str(), grid.shape.as_slice()),
+            ("int64", &[1, 3][..])
+        );
+        // The prompt is handed over as it came: the scheduler pads it.
+        assert_eq!(request.input_ids, vec![1, 7, 7, 7, 2]);
+        // No placeholders: the slot is left unset, as the Python servicer
+        // leaves it (with its warning).
+        let mut bare = media_payload();
+        bare.mm_placeholders.clear();
+        let request = translate(media_request(bare)).unwrap();
+        assert_eq!(request.mm_inputs.unwrap().mm_items[0].offsets, None);
+        // A text request carries none.
+        let mut text = media_request(media_payload());
+        text.mm_inputs = None;
+        assert_eq!(translate(text).unwrap().mm_inputs, None);
+    }
+
+    /// What the Python servicer would mis-tag or drop is refused by name:
+    /// another modality, references without tensors, a dtype the wire does
+    /// not carry, a wrong byte length, a placeholder outside the prompt or
+    /// of zero length; and a media payload on an embedding request.
+    #[test]
+    fn malformed_multimodal_inputs_are_refused_before_the_scheduler() {
+        let refused = |mm: sglang_proto::MultimodalInputs, needle: &str| {
+            let error = translate(media_request(mm)).unwrap_err();
+            assert!(error.contains(needle), "{error}");
+        };
+        let mut video = media_payload();
+        video.modalities = vec!["video".to_string()];
+        refused(video, "modality \"video\" is not carried");
+        // References without tensors are the encoders' input, taken before
+        // this translation by `encode_media_refs`; handed to the
+        // processor-output path anyway, they are refused by name.
+        let mut references = media_payload();
+        references.pixel_values = None;
+        references.image_urls = vec!["http://example.test/a.png".to_string()];
+        let error = translate_sglang_multimodal(references, 5).unwrap_err();
+        assert!(
+            error.contains("media references but no preprocessed tensors"),
+            "{error}"
+        );
+        let mut empty = media_payload();
+        empty.pixel_values = None;
+        refused(empty, "carries no pixel_values");
+        let mut wide = media_payload();
+        wide.pixel_values = Some(tensor("float64", vec![1], vec![0; 8]));
+        refused(
+            wide,
+            "multimodal tensor \"pixel_values\": unsupported tensor dtype \"float64\"",
+        );
+        let mut short = media_payload();
+        short.model_specific_tensors.insert(
+            "image_grid_thw".to_string(),
+            tensor("int64", vec![1, 3], vec![0; 8]),
+        );
+        refused(
+            short,
+            "multimodal tensor \"image_grid_thw\": TensorData byte length mismatch",
+        );
+        let mut outside = media_payload();
+        outside.mm_placeholders = vec![sglang_proto::PlaceholderRange {
+            offset: 3,
+            length: 3,
+        }];
+        refused(
+            outside,
+            "placeholder 3..=5 lies outside the prompt of 5 tokens",
+        );
+        let mut zero = media_payload();
+        zero.mm_placeholders = vec![sglang_proto::PlaceholderRange {
+            offset: 1,
+            length: 0,
+        }];
+        refused(zero, "placeholder at offset 1 has zero length");
+        let embed = sglang_proto::EmbedRequest {
+            request_id: "e".into(),
+            tokenized: Some(sglang_proto::TokenizedInput {
+                input_ids: vec![1, 2],
+                original_text: String::new(),
+            }),
+            mm_inputs: Some(media_payload()),
+            ..Default::default()
+        };
+        let error = translate_embed_request_sglang(embed).unwrap_err();
+        assert!(error.contains("embedding request"), "{error}");
+    }
+
+    /// References without tensors are the encoders' input on a language-side
+    /// worker, not the scheduler's processor output: the translation leaves
+    /// the media slot empty, carries the unexpanded prompt for the
+    /// scheduler's rebuild once the embeddings land, and sets none of the
+    /// dispatch's slots (the dispatch does, once it ran). Tensors beside
+    /// references take the processor-output path; video and audio references
+    /// are refused: the encoders take images only.
+    #[test]
+    fn reference_only_media_is_the_encoders_input_not_the_schedulers() {
+        let mut references = media_payload();
+        references.pixel_values = None;
+        references.image_urls = vec!["http://example.test/a.png".to_string()];
+        assert_eq!(
+            encode_media_refs(&references).unwrap(),
+            Some(vec!["http://example.test/a.png".to_string()])
+        );
+        let mut request = media_request(references.clone());
+        request.tokenized.as_mut().unwrap().original_text =
+            "<|vision_start|><|image_pad|><|vision_end|>What is this?".to_string();
+        let translated = translate(request).unwrap();
+        assert_eq!(translated.mm_inputs, None);
+        assert_eq!(
+            translated.input_text.as_deref(),
+            Some("<|vision_start|><|image_pad|><|vision_end|>What is this?")
+        );
+        assert_eq!(translated.input_ids, vec![1, 7, 7, 7, 2]);
+        assert_eq!(
+            (
+                translated.need_wait_for_mm_inputs,
+                translated.num_items_assigned.clone(),
+                translated.encoder_urls.clone(),
+            ),
+            (None, None, None)
+        );
+        // Without the prompt text the slot stays empty: nothing to rebuild from.
+        assert_eq!(
+            translate(media_request(references)).unwrap().input_text,
+            None
+        );
+        // Tensors win: references beside them are the frontend's own record.
+        let mut both = media_payload();
+        both.image_urls = vec!["http://example.test/a.png".to_string()];
+        assert_eq!(encode_media_refs(&both).unwrap(), None);
+        let translated = translate(media_request(both)).unwrap();
+        assert!(translated.mm_inputs.is_some() && translated.input_text.is_none());
+        // Nothing at all is nothing to dispatch.
+        let mut empty = media_payload();
+        empty.pixel_values = None;
+        assert_eq!(encode_media_refs(&empty).unwrap(), None);
+        let mut video = media_payload();
+        video.pixel_values = None;
+        video.video_urls = vec!["http://example.test/a.mp4".to_string()];
+        let mut audio = media_payload();
+        audio.pixel_values = None;
+        audio.audio_urls = vec!["http://example.test/a.wav".to_string()];
+        for refs in [video, audio] {
+            let error = encode_media_refs(&refs).unwrap_err();
+            assert!(error.contains("image references only"), "{error}");
+            let error = translate(media_request(refs)).unwrap_err();
+            assert!(error.contains("image references only"), "{error}");
         }
     }
 
@@ -834,6 +1305,71 @@ mod tests {
     }
 
     #[test]
+    fn sglang_sampling_translation_reads_an_unset_scalar_as_its_neutral_value() {
+        // proto3 serializes an unset scalar as nothing and reads it back as
+        // its zero, so the wire cannot carry a zero for these three.
+        let unset = translate_sampling_sglang(sglang_proto::SamplingParams::default());
+        assert_eq!(unset.top_p, 1.0, "the whole distribution");
+        assert_eq!(unset.top_k, -1, "every token (the API sentinel)");
+        assert_eq!(unset.repetition_penalty, 1.0, "no penalty");
+        assert_eq!(
+            unset.temperature, 0.0,
+            "a zero the scheduler reads as greedy stays"
+        );
+        assert_eq!(unset.min_p, 0.0);
+
+        let set = translate_sampling_sglang(sglang_proto::SamplingParams {
+            top_p: 0.5,
+            top_k: 40,
+            repetition_penalty: 1.25,
+            ..Default::default()
+        });
+        assert_eq!(
+            (set.top_p, set.top_k, set.repetition_penalty),
+            (0.5, 40, 1.25)
+        );
+
+        let neutral = translate_sampling_sglang(sglang_proto::SamplingParams {
+            top_p: 1.0,
+            top_k: -1,
+            repetition_penalty: 1.0,
+            ..Default::default()
+        });
+        assert_eq!(
+            (neutral.top_p, neutral.top_k, neutral.repetition_penalty),
+            (1.0, -1, 1.0)
+        );
+    }
+
+    /// The rows become the proto's shapes: a tick's rows flattened on the
+    /// chunk, one `HiddenStates` per position on the completion, the final
+    /// layer, the positions absolute from the anchor the scheduler's counters
+    /// give (a prefix the radix cache served has no rows).
+    #[test]
+    fn hidden_state_rows_map_to_the_chunk_and_completion_shapes() {
+        let rows = vec![vec![0.5, -0.5], vec![1.0, 2.0], vec![3.0, 4.0]];
+        assert_eq!(flat_hidden_states(&rows[1..]), vec![1.0, 2.0, 3.0, 4.0]);
+        assert!(flat_hidden_states(&[]).is_empty());
+        let all = all_hidden_states(&rows, 0);
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[2].values, vec![3.0, 4.0]);
+        assert!(all
+            .iter()
+            .enumerate()
+            .all(|(i, hs)| hs.layer == -1 && hs.position == i32::try_from(i).unwrap()));
+        let anchored = all_hidden_states(&rows, 3);
+        assert_eq!(
+            anchored.iter().map(|hs| hs.position).collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
+        // Three prompt rows and one fed-back token: the first row is position
+        // 0; a prompt of five with three served from the cache: position 3.
+        assert_eq!(first_hidden_position(3, 2, 4), 0);
+        assert_eq!(first_hidden_position(5, 2, 3), 3);
+        assert_eq!(first_hidden_position(0, 0, 0), 0);
+    }
+
+    #[test]
     fn sglang_request_translation_refuses_what_the_slim_wire_cannot_carry() {
         let base = sglang_proto::GenerateRequest {
             request_id: "r".into(),
@@ -857,16 +1393,15 @@ mod tests {
             .top_logprobs_num,
             3
         );
-        assert!(translate(sglang_proto::GenerateRequest {
-            return_hidden_states: true,
-            ..base.clone()
-        })
-        .is_err());
-        assert!(translate(sglang_proto::GenerateRequest {
-            disaggregated_params: Some(sglang_proto::DisaggregatedParams::default()),
-            ..base.clone()
-        })
-        .is_err());
+        assert!(
+            translate(sglang_proto::GenerateRequest {
+                return_hidden_states: true,
+                ..base.clone()
+            })
+            .unwrap()
+            .return_hidden_states,
+            "hidden states ride the wire"
+        );
         // Forwarded as the Python servicer forwards them.
         let forwarded = translate(sglang_proto::GenerateRequest {
             lora_id: "adapter".into(),
@@ -919,6 +1454,217 @@ mod tests {
         assert!(ok.return_logprob && ok.stream && ok.require_reasoning);
     }
 
+    /// A disaggregated request's bootstrap fields reach the scheduler's own
+    /// slots with the Python servicer's rules: an empty host and a zero port
+    /// are unset, the room is kept as given (0 included) whenever the message
+    /// is present, and no message leaves all three unset.
+    #[test]
+    fn sglang_translation_forwards_the_pd_bootstrap_as_the_python_servicer_does() {
+        let base = sglang_proto::GenerateRequest {
+            request_id: "pd".into(),
+            tokenized: Some(sglang_proto::TokenizedInput {
+                input_ids: vec![1, 2],
+                original_text: String::new(),
+            }),
+            ..Default::default()
+        };
+        let rendezvous = translate(sglang_proto::GenerateRequest {
+            disaggregated_params: Some(sglang_proto::DisaggregatedParams {
+                bootstrap_host: "10.0.0.7".into(),
+                bootstrap_port: 8998,
+                bootstrap_room: 41,
+            }),
+            ..base.clone()
+        })
+        .unwrap();
+        assert_eq!(rendezvous.bootstrap_host.as_deref(), Some("10.0.0.7"));
+        assert_eq!(rendezvous.bootstrap_port, Some(8998));
+        assert_eq!(rendezvous.bootstrap_room, Some(41));
+        // The fake-transfer probe: a host, room 0, no port.
+        let probe = translate(sglang_proto::GenerateRequest {
+            disaggregated_params: Some(sglang_proto::DisaggregatedParams {
+                bootstrap_host: "2.2.2.2".into(),
+                bootstrap_port: 0,
+                bootstrap_room: 0,
+            }),
+            ..base.clone()
+        })
+        .unwrap();
+        assert_eq!(probe.bootstrap_host.as_deref(), Some("2.2.2.2"));
+        assert_eq!(probe.bootstrap_port, None);
+        assert_eq!(probe.bootstrap_room, Some(0));
+        // An empty message is present: the room is 0, the rest unset.
+        let empty = translate(sglang_proto::GenerateRequest {
+            disaggregated_params: Some(sglang_proto::DisaggregatedParams::default()),
+            ..base.clone()
+        })
+        .unwrap();
+        assert_eq!(
+            (
+                empty.bootstrap_host,
+                empty.bootstrap_port,
+                empty.bootstrap_room
+            ),
+            (None, None, Some(0))
+        );
+        let plain = translate(base).unwrap();
+        assert_eq!(
+            (
+                plain.bootstrap_host,
+                plain.bootstrap_port,
+                plain.bootstrap_room
+            ),
+            (None, None, None)
+        );
+    }
+
+    /// The data-parallel pin is placed as the engine's own frontend places
+    /// it: no pin stays unrouted, a pin names a connected rank, a pin on an
+    /// engine of one rank is ignored, and a pin past the connected ranks (or
+    /// a negative one) is refused with the frontend's 400 wording.
+    #[test]
+    fn sglang_translation_routes_the_data_parallel_pin_as_the_engine_frontend_does() {
+        let pinned = |pin: Option<i32>| sglang_proto::GenerateRequest {
+            request_id: "dp".into(),
+            tokenized: Some(sglang_proto::TokenizedInput {
+                original_text: String::new(),
+                input_ids: vec![1, 2, 3],
+            }),
+            data_parallel_rank: pin,
+            ..Default::default()
+        };
+        let translate_among = |pin: Option<i32>, ranks: usize| {
+            translate_request_sglang(
+                pinned(pin),
+                default_ready_response().max_model_len,
+                ranks,
+                RankPlacement::Pin,
+            )
+        };
+        assert_eq!(translate_among(None, 2).unwrap().routed_dp_rank, None);
+        assert_eq!(translate_among(Some(1), 2).unwrap().routed_dp_rank, Some(1));
+        assert_eq!(translate_among(Some(0), 2).unwrap().routed_dp_rank, Some(0));
+        assert_eq!(
+            translate_among(Some(0), 1).unwrap().routed_dp_rank,
+            None,
+            "a pin on the only rank is ignored, as the frontend ignores it"
+        );
+        assert_eq!(
+            translate_among(Some(2), 2).unwrap_err(),
+            "routed_dp_rank=2 out of range [0, 2)"
+        );
+        assert_eq!(
+            translate_among(Some(1), 1).unwrap().routed_dp_rank,
+            None,
+            "any non-negative pin on the only rank is ignored"
+        );
+        assert_eq!(
+            translate_among(Some(-1), 2).unwrap_err(),
+            "routed_dp_rank=-1 out of range [0, 2)"
+        );
+        // The routed rank survives the wire (its slot is pinned by the wire's
+        // own tests) and is what the protocol's rank hook reads.
+        let wire = translate_among(Some(1), 2).unwrap();
+        let back: WireRequest = decode_msgpack(&encode_msgpack(&wire).unwrap()).unwrap();
+        assert_eq!(back.routed_dp_rank, Some(1));
+    }
+
+    /// On the prefill side of a disaggregated pair the room places the
+    /// request: `bootstrap_room % ranks` over two and over four ranks, a
+    /// negative room folding as the engine's `%` does; a pin that disagrees
+    /// yields to the room (and is logged once, which the servicer's test
+    /// reads); a request without a room, the decode side and an aggregated
+    /// engine keep the pin rule; a single rank takes everything.
+    #[test]
+    fn sglang_translation_places_a_prefill_sides_request_by_its_rooms_residue() {
+        use RankPlacement::{Pin, RoomResidue};
+
+        let disaggregated = |room: Option<i32>, pin: Option<i32>| sglang_proto::GenerateRequest {
+            request_id: "pd".into(),
+            tokenized: Some(sglang_proto::TokenizedInput {
+                original_text: String::new(),
+                input_ids: vec![1, 2, 3],
+            }),
+            data_parallel_rank: pin,
+            disaggregated_params: room.map(|room| sglang_proto::DisaggregatedParams {
+                bootstrap_host: "10.0.0.1".into(),
+                bootstrap_port: 8998,
+                bootstrap_room: room,
+            }),
+            ..Default::default()
+        };
+        let place = |placement: RankPlacement, room: Option<i32>, pin: Option<i32>, ranks| {
+            translate_request_sglang(
+                disaggregated(room, pin),
+                default_ready_response().max_model_len,
+                ranks,
+                placement,
+            )
+            .map(|wire| wire.routed_dp_rank)
+        };
+        assert_eq!(place(RoomResidue, Some(7), None, 2), Ok(Some(1)));
+        assert_eq!(place(RoomResidue, Some(8), None, 2), Ok(Some(0)));
+        assert_eq!(place(RoomResidue, Some(7), None, 4), Ok(Some(3)));
+        assert_eq!(place(RoomResidue, Some(9), None, 4), Ok(Some(1)));
+        assert_eq!(
+            place(RoomResidue, Some(7), Some(0), 2),
+            Ok(Some(1)),
+            "the room stays authoritative over the pin"
+        );
+        assert_eq!(
+            place(RoomResidue, Some(7), Some(1), 2),
+            Ok(Some(1)),
+            "a pin that agrees changes nothing"
+        );
+        assert_eq!(
+            place(RoomResidue, Some(7), Some(5), 2),
+            Ok(Some(1)),
+            "a pin past the ranks yields too, never refused"
+        );
+        assert_eq!(
+            place(RoomResidue, Some(-3), None, 4),
+            Ok(Some(1)),
+            "a negative room folds as Python's % does"
+        );
+        assert_eq!(
+            place(RoomResidue, Some(0), Some(3), 4),
+            Ok(Some(0)),
+            "room 0 (a lone leg's stand-in) is a room"
+        );
+        assert_eq!(
+            place(RoomResidue, Some(7), Some(1), 1),
+            Ok(None),
+            "a single rank takes everything"
+        );
+        // No room: the pin rule, as on an aggregated engine.
+        assert_eq!(place(RoomResidue, None, Some(1), 2), Ok(Some(1)));
+        assert_eq!(place(RoomResidue, None, None, 2), Ok(None));
+        assert_eq!(
+            place(RoomResidue, None, Some(2), 2),
+            Err("routed_dp_rank=2 out of range [0, 2)".to_string())
+        );
+        // The decode side and an aggregated engine: the pin, the room's
+        // residue not consulted.
+        assert_eq!(place(Pin, Some(7), Some(0), 2), Ok(Some(0)));
+        assert_eq!(place(Pin, Some(7), None, 2), Ok(None));
+        assert_eq!(
+            place(Pin, Some(7), Some(2), 2),
+            Err("routed_dp_rank=2 out of range [0, 2)".to_string())
+        );
+        // The room rides the wire beside the rank it placed the request on.
+        let wire = translate_request_sglang(
+            disaggregated(Some(7), Some(0)),
+            default_ready_response().max_model_len,
+            2,
+            RoomResidue,
+        )
+        .unwrap();
+        assert_eq!(
+            (wire.bootstrap_room, wire.routed_dp_rank),
+            (Some(7), Some(1))
+        );
+    }
+
     /// Prompt bounds apply before the scheduler, with or without an output
     /// limit, under the window the handshake reported; the request's own
     /// limit is kept as it is (an unset one stays the scheduler's to cap).
@@ -954,8 +1700,12 @@ mod tests {
                 (1_049_692, 0, true),
                 (0, 0, false),
             ] {
-                let result =
-                    translate_request_sglang(request(prompt_len, sampling.clone()), max_model_len);
+                let result = translate_request_sglang(
+                    request(prompt_len, sampling.clone()),
+                    max_model_len,
+                    1,
+                    RankPlacement::Pin,
+                );
                 assert_eq!(
                     result.is_ok(),
                     accepted,

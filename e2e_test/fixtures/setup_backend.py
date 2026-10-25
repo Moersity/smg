@@ -57,6 +57,9 @@ _GW_DEFAULTS = {
     "policy": "round_robin",
     "timeout": DEFAULT_ROUTER_TIMEOUT,
     "extra_args": None,
+    # Variables added to the gateway process's environment (a gateway-side
+    # test hook a class arms); None adds nothing.
+    "env": None,
     "log_level": None,
     "log_dir": None,
     "reuse": False,
@@ -128,6 +131,7 @@ def _start_gateway(gateway: Gateway, gateway_config: dict, **mode_kwargs) -> Non
         policy=gateway_config["policy"],
         timeout=gateway_config["timeout"],
         extra_args=gateway_config["extra_args"],
+        env=gateway_config.get("env"),
         log_level=gateway_config.get("log_level"),
         log_dir=gateway_config.get("log_dir"),
     )
@@ -509,6 +513,7 @@ def _setup_local(
             gateway,
             gateway_config,
             worker_urls=[w.base_url for w in workers],
+            workers=workers,
             model_path=model_path,
             backend=engine if is_zmq else None,
         )
@@ -929,6 +934,7 @@ def backend_router(request: pytest.FixtureRequest):
     try:
         gateway.start(
             worker_urls=[w.base_url for w in workers],
+            workers=workers,
             model_path=model_path,
             backend=engine if is_zmq else None,
             # ZMQ loads the model inside the gateway's readiness gate; cover it.

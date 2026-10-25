@@ -10,7 +10,10 @@ use async_trait::async_trait;
 use axum::{
     body::Body,
     extract::Request,
-    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
+    http::{
+        header::{CONTENT_TYPE, RETRY_AFTER},
+        HeaderMap, HeaderValue, StatusCode,
+    },
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
@@ -27,7 +30,6 @@ use openai_protocol::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{
-    json,
     value::{to_raw_value, RawValue},
     Value,
 };
@@ -35,7 +37,7 @@ use tracing::{debug, error, warn};
 
 use super::{
     request_body::RawBody,
-    stream_failure::{head_success_recorded, RelaySource},
+    stream_failure::{cause, head_success_recorded, RelaySource},
     stream_relay::{relay_streaming_body, ChunkMode, ChunkStep, Relay},
 };
 use crate::{
@@ -59,6 +61,7 @@ use crate::{
                 NIXL_PREFILL_KV_PARAMS,
             },
             overload,
+            pd_failure::{PdSide, SidePhase},
             placement::{self, PairFailure, PlacementFailure, PlacementInputs, RefusalSite},
             request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
             retry::{
@@ -69,15 +72,18 @@ use crate::{
             trim_serialization_slack,
         },
         error,
-        grpc::utils::{error_type_for_response, error_type_from_status, route_to_endpoint},
+        grpc::utils::{
+            error_reason_for_response, error_type_for_response, error_type_from_status,
+            route_to_endpoint,
+        },
         http::router::send_with_stale_conn_retry,
         prefill_queue_full, prefill_queue_timeout, RouterTrait, PD_PREFILL_QUEUE_FULL,
         PD_PREFILL_QUEUE_TIMEOUT,
     },
     worker::{
-        acquire_prefill, PdPairIndex, PdWire, PrefillAcquireError, PrefillAdmission,
-        PrefillAdmissionRejection, PrefillLoadGuard, PrefillSelectionContext, RoutingPool,
-        RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry, UNKNOWN_MODEL_ID,
+        acquire_prefill, endpoint::Endpoint, PdPairIndex, PdWire, PrefillAcquireError,
+        PrefillAdmission, PrefillAdmissionRejection, PrefillLoadGuard, PrefillSelectionContext,
+        RoutingPool, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry, UNKNOWN_MODEL_ID,
     },
 };
 
@@ -370,7 +376,7 @@ impl PDRouter {
                         error!("Failed to read response body: {}", e);
                         error::internal_error(
                             "read_response_body_failed",
-                            format!("Failed to read response body: {e}"),
+                            format!("Failed to read response body: {}", cause(&e)),
                         )
                     }
                 }
@@ -410,7 +416,7 @@ impl PDRouter {
                 error!("Failed to proxy request server: {}", e);
                 error::internal_error(
                     "proxy_request_failed",
-                    format!("Failed to proxy request: {e}"),
+                    format!("Failed to proxy request: {}", cause(&e)),
                 )
             }
         }
@@ -703,6 +709,7 @@ impl PDRouter {
                 model_label,
                 endpoint,
                 error_type_for_response(&response),
+                error_reason_for_response(&response),
             );
         }
 
@@ -1090,116 +1097,32 @@ impl PDRouter {
         }
     }
 
-    async fn handle_decode_error_response(
-        &self,
-        res: reqwest::Response,
-        context: &PDRequestContext<'_>,
-        decode: Arc<dyn Worker>,
-        decode_guard: WorkerLoadGuard,
-    ) -> Response {
-        let status = res.status();
-
-        if context.is_stream {
-            // Handle streaming error response
-            let response_headers = header_utils::preserve_response_headers(res.headers());
-            let error_payload = match res.bytes().await {
-                Ok(error_body) => {
-                    if let Ok(error_json) = serde_json::from_slice::<Value>(&error_body) {
-                        json!({ "message": error_json, "status": status.as_u16() })
-                    } else {
-                        json!({ "message": String::from_utf8_lossy(&error_body).to_string(), "status": status.as_u16() })
-                    }
-                }
-                Err(e) => {
-                    json!({ "message": format!("Decode server error: {}", e), "status": status.as_u16() })
-                }
-            };
-
-            let sse_data = format!(
-                "data: {}\n\n",
-                serde_json::to_string(&json!({ "error": error_payload })).unwrap_or_default()
-            );
-            let error_stream = tokio_stream::once(Ok(Bytes::from(sse_data)));
-
-            self.create_streaming_response(
-                error_stream,
-                status,
-                None,
-                context.return_logprob,
-                RelaySource::decode_side(context.model_id, context.route, decode),
-                Some(response_headers),
-                decode_guard,
-            )
-        } else {
-            // Handle non-streaming error response
-            match res.bytes().await {
-                Ok(error_body) => {
-                    // Try to parse error message from body, fallback to status-based error
-                    let error_message = if let Ok(error_json) =
-                        serde_json::from_slice::<Value>(&error_body)
-                    {
-                        if let Some(msg) = error_json
-                            .get("error")
-                            .and_then(|e| e.get("message"))
-                            .and_then(|m| m.as_str())
-                        {
-                            msg.to_string()
-                        } else if let Some(msg) = error_json.get("message").and_then(|m| m.as_str())
-                        {
-                            msg.to_string()
-                        } else {
-                            String::from_utf8_lossy(&error_body).to_string()
-                        }
-                    } else {
-                        String::from_utf8_lossy(&error_body).to_string()
-                    };
-
-                    let status_code = StatusCode::from_u16(status.as_u16())
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    match status_code {
-                        StatusCode::BAD_REQUEST => {
-                            error::bad_request("decode_bad_request", error_message)
-                        }
-                        StatusCode::NOT_FOUND => {
-                            error::not_found("decode_not_found", error_message)
-                        }
-                        StatusCode::INTERNAL_SERVER_ERROR => {
-                            error::internal_error("decode_internal_error", error_message)
-                        }
-                        StatusCode::SERVICE_UNAVAILABLE => {
-                            error::service_unavailable("decode_unavailable", error_message)
-                        }
-                        StatusCode::BAD_GATEWAY => {
-                            error::bad_gateway("decode_bad_gateway", error_message)
-                        }
-                        _ => error::internal_error("decode_error", error_message),
-                    }
-                }
-                Err(e) => {
-                    let error_message = format!("Decode server error: {e}");
-                    let status_code = StatusCode::from_u16(status.as_u16())
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    match status_code {
-                        StatusCode::BAD_REQUEST => {
-                            error::bad_request("decode_read_failed", error_message)
-                        }
-                        StatusCode::NOT_FOUND => {
-                            error::not_found("decode_read_failed", error_message)
-                        }
-                        StatusCode::INTERNAL_SERVER_ERROR => {
-                            error::internal_error("decode_read_failed", error_message)
-                        }
-                        StatusCode::SERVICE_UNAVAILABLE => {
-                            error::service_unavailable("decode_read_failed", error_message)
-                        }
-                        StatusCode::BAD_GATEWAY => {
-                            error::bad_gateway("decode_read_failed", error_message)
-                        }
-                        _ => error::internal_error("decode_read_failed", error_message),
-                    }
-                }
-            }
+    /// The answer for `side` whose worker answered a status before the side's
+    /// first byte: the side never started (see `pd_failure`), under the
+    /// worker's own status and with the worker's `Retry-After` when it sent
+    /// one, both kept as they are so the retry layer and the client's
+    /// back-off read what the worker said, with the message its error body
+    /// carries. The same JSON answer whether or not the client asked for a
+    /// stream: nothing of the response is out, and a client reads an error
+    /// status's body as the envelope, not as events. An error body that
+    /// cannot be read says so in the detail.
+    async fn side_refused(side: PdSide, response: reqwest::Response) -> Response {
+        let status = StatusCode::from_u16(response.status().as_u16())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        // Taken before the body read consumes the response.
+        let retry_after = response.headers().get(RETRY_AFTER).cloned();
+        let detail = match response.bytes().await {
+            Ok(body) => upstream_error_message(&body),
+            Err(e) => format!(
+                "{status}, and its error body could not be read: {}",
+                cause(&e)
+            ),
+        };
+        let mut answer = side.answer(SidePhase::Start, status, detail);
+        if let Some(value) = retry_after {
+            answer.headers_mut().insert(RETRY_AFTER, value);
         }
+        answer
     }
 
     /// The decode side's response head, once the prefill side is done with:
@@ -1230,9 +1153,7 @@ impl PDRouter {
                 decode.url(),
                 status
             );
-            return self
-                .handle_decode_error_response(decode_response, context, decode, decode_guard)
-                .await;
+            return Self::side_refused(PdSide::Decode, decode_response).await;
         }
         Metrics::record_pd_ttft(
             metrics_labels::BACKEND_PD,
@@ -1254,77 +1175,73 @@ impl PDRouter {
         what: &str,
         e: &reqwest::Error,
     ) -> Response {
-        error!("PD {what} timed out: {e}");
+        error!(
+            worker = Endpoint::redacted_str(worker.url()),
+            "PD {what} timed out: {}",
+            cause(e)
+        );
         Self::record_sequential_side(worker, role, StatusCode::GATEWAY_TIMEOUT);
-        request_timeout_response(format!("{what} timed out: {e}"))
+        request_timeout_response(format!("{what} timed out: {}", cause(e)))
     }
 
-    /// A prefill side that failed below HTTP: logged, recorded on its worker
-    /// as a 502, answered as one.
+    /// A side that failed below HTTP in `phase`: the call never reached its
+    /// worker or died before the side's first byte (`Start`), or the body
+    /// was cut after its 2xx head (`Stream`). The request's own timeout is
+    /// the request's end, whichever side spent it; anything else is the
+    /// worker's 502, recorded on it and answered under the side's code of
+    /// the shared vocabulary (see `pd_failure`) with the transport's reason
+    /// and its causes. `what` names the call in the log and the timeout.
+    fn side_failed_below_http(
+        side: PdSide,
+        phase: SidePhase,
+        what: &str,
+        worker: &dyn Worker,
+        e: &reqwest::Error,
+    ) -> Response {
+        if is_request_timeout(e) {
+            return Self::side_timed_out(worker, side.name(), what, e);
+        }
+        error!(
+            worker = Endpoint::redacted_str(worker.url()),
+            worker_type = side.name(),
+            "PD {what} failed below HTTP: {}",
+            cause(e)
+        );
+        Self::record_sequential_side(worker, side.name(), StatusCode::BAD_GATEWAY);
+        side.answer(phase, StatusCode::BAD_GATEWAY, cause(e))
+    }
+
+    /// A prefill side whose call failed below HTTP before its first byte.
     fn prefill_transport_failed(prefill: &dyn Worker, e: &reqwest::Error) -> Response {
-        if is_request_timeout(e) {
-            return Self::side_timed_out(
-                prefill,
-                metrics_labels::WORKER_PREFILL,
-                "Prefill request",
-                e,
-            );
-        }
-        error!("PD prefill transport error: {e}");
-        Self::record_sequential_side(
+        Self::side_failed_below_http(
+            PdSide::Prefill,
+            SidePhase::Start,
+            "Prefill request",
             prefill,
-            metrics_labels::WORKER_PREFILL,
-            StatusCode::BAD_GATEWAY,
-        );
-        error::bad_gateway(
-            "prefill_request_failed",
-            format!("Prefill transport error: {e}"),
+            e,
         )
     }
 
-    /// A prefill side whose answer could not be read to its end: the same
-    /// record and answer shape as a transport failure, under its own code.
+    /// A prefill side whose answer could not be read to its end: its stream
+    /// failed after it began.
     fn prefill_read_failed(prefill: &dyn Worker, e: &reqwest::Error) -> Response {
-        if is_request_timeout(e) {
-            return Self::side_timed_out(
-                prefill,
-                metrics_labels::WORKER_PREFILL,
-                "Prefill response",
-                e,
-            );
-        }
-        error!("Failed to read prefill response: {e}");
-        Self::record_sequential_side(
+        Self::side_failed_below_http(
+            PdSide::Prefill,
+            SidePhase::Stream,
+            "Prefill response",
             prefill,
-            metrics_labels::WORKER_PREFILL,
-            StatusCode::BAD_GATEWAY,
-        );
-        error::bad_gateway(
-            "prefill_read_failed",
-            format!("Failed to read prefill response: {e}"),
+            e,
         )
     }
 
-    /// A decode side that failed below HTTP: logged, recorded on its worker
-    /// as a 502, answered as one.
+    /// A decode side whose call failed below HTTP before its first byte.
     fn decode_transport_failed(decode: &dyn Worker, e: &reqwest::Error) -> Response {
-        if is_request_timeout(e) {
-            return Self::side_timed_out(
-                decode,
-                metrics_labels::WORKER_DECODE,
-                "Decode request",
-                e,
-            );
-        }
-        error!("PD decode transport error: {e}");
-        Self::record_sequential_side(
+        Self::side_failed_below_http(
+            PdSide::Decode,
+            SidePhase::Start,
+            "Decode request",
             decode,
-            metrics_labels::WORKER_DECODE,
-            StatusCode::BAD_GATEWAY,
-        );
-        error::bad_gateway(
-            "decode_request_failed",
-            format!("Decode transport error: {e}"),
+            e,
         )
     }
 
@@ -1384,7 +1301,7 @@ impl PDRouter {
         // Drain Prefill and release its slot inside its own future. A
         // non-streaming Decode may not send its head until generation ends.
         enum DispatchError {
-            Transport(reqwest::Error),
+            Transport(PdSide, reqwest::Error),
             Prefill(Response),
             Decode(reqwest::Response),
         }
@@ -1396,7 +1313,7 @@ impl PDRouter {
         let prefill_fut = async {
             let resp = send_with_stale_conn_retry(prefill_request)
                 .await
-                .map_err(DispatchError::Transport)?;
+                .map_err(|e| DispatchError::Transport(PdSide::Prefill, e))?;
             if context.is_stream && !context.return_logprob && resp.status().is_success() {
                 let prefill = Arc::clone(&prefill);
                 let model_id = context.model_id.to_string();
@@ -1455,7 +1372,7 @@ impl PDRouter {
         let decode_fut = async {
             let resp = send_with_stale_conn_retry(decode_request)
                 .await
-                .map_err(DispatchError::Transport)?;
+                .map_err(|e| DispatchError::Transport(PdSide::Decode, e))?;
             if !resp.status().is_success() {
                 return Err(DispatchError::Decode(resp));
             }
@@ -1467,21 +1384,22 @@ impl PDRouter {
 
         let (prefill_body, (decode_head_elapsed, decode_response)) = match pd_result {
             Ok(pair) => pair,
-            Err(DispatchError::Transport(e)) => {
+            Err(DispatchError::Transport(side, e)) => {
                 // The request's own timeout on either side is the request's
                 // end (see `retry::request_timeout_response`); the caller
                 // records the 504 on both workers as it records every status.
                 if is_request_timeout(&e) {
                     error!("PD request timed out, both sides aborted: {e}");
-                    return request_timeout_response(format!("Transport error: {e}"));
+                    return request_timeout_response(format!("Transport error: {}", cause(&e)));
                 }
-                error!("PD request transport error, both sides aborted: {e}");
+                error!(
+                    worker_type = side.name(),
+                    "PD {} request failed below HTTP, both sides aborted: {e}",
+                    side.name()
+                );
                 // Don't record_outcome here — the caller (execute_dual_dispatch)
                 // records outcomes from the response status after we return.
-                return error::bad_gateway(
-                    "PD disaggregation request failed",
-                    format!("Transport error: {e}"),
-                );
+                return side.answer(SidePhase::Start, StatusCode::BAD_GATEWAY, cause(&e));
             }
             Err(DispatchError::Prefill(response)) => return response,
             Err(DispatchError::Decode(response)) => {
@@ -1490,9 +1408,7 @@ impl PDRouter {
                     decode.url(),
                     response.status()
                 );
-                return self
-                    .handle_decode_error_response(response, &context, decode, decode_guard)
-                    .await;
+                return Self::side_refused(PdSide::Decode, response).await;
             }
         };
 
@@ -1746,7 +1662,7 @@ impl PDRouter {
                     metrics_labels::WORKER_PREFILL,
                     prefill_status,
                 );
-                return Self::prefill_error_response(prefill_status, prefill_response).await;
+                return Self::side_refused(PdSide::Prefill, prefill_response).await;
             }
             let prefill_bytes = match prefill_response.bytes().await {
                 Ok(bytes) => bytes,
@@ -1951,7 +1867,7 @@ impl PDRouter {
                     metrics_labels::WORKER_PREFILL,
                     status,
                 );
-                return Err(Self::prefill_error_response(status, response).await);
+                return Err(Self::side_refused(PdSide::Prefill, response).await);
             }
             match response.bytes().await {
                 Ok(bytes) => {
@@ -2043,28 +1959,6 @@ impl PDRouter {
         .await
     }
 
-    /// Map a failed prefill response to a client-facing error. The exact
-    /// upstream status is preserved (not classified into a fixed set) so
-    /// retryability and capacity-pushback handling see what the worker sent.
-    async fn prefill_error_response(status: StatusCode, response: reqwest::Response) -> Response {
-        let message = match response.bytes().await {
-            Ok(body) => {
-                if let Ok(json) = serde_json::from_slice::<Value>(&body) {
-                    json.get("error")
-                        .and_then(|e| e.get("message"))
-                        .and_then(Value::as_str)
-                        .or_else(|| json.get("message").and_then(Value::as_str))
-                        .map(str::to_string)
-                        .unwrap_or_else(|| String::from_utf8_lossy(&body).to_string())
-                } else {
-                    String::from_utf8_lossy(&body).to_string()
-                }
-            }
-            Err(e) => format!("Prefill server error: {e}"),
-        };
-        error::create_error(status, "prefill_upstream_error", message)
-    }
-
     /// Per-side outcome accounting for the sequential path: a side that was
     /// never contacted must not feed the other worker's circuit breaker.
     fn record_sequential_side(worker: &dyn Worker, role: &'static str, status: StatusCode) {
@@ -2138,11 +2032,11 @@ impl PDRouter {
                     }
                     Err(e) if is_request_timeout(&e) => {
                         error!("Decode response timed out: {e}");
-                        request_timeout_response(format!("Failed to read response: {e}"))
+                        request_timeout_response(format!("Failed to read response: {}", cause(&e)))
                     }
                     Err(e) => {
                         error!("Failed to read decode response: {}", e);
-                        error::internal_error("read_response_failed", "Failed to read response")
+                        PdSide::Decode.answer(SidePhase::Stream, StatusCode::BAD_GATEWAY, cause(&e))
                     }
                 }
             };
@@ -2359,11 +2253,15 @@ impl PDRouter {
             Ok(decode_body) => decode_body,
             Err(e) if is_request_timeout(&e) => {
                 error!("Decode response timed out: {e}");
-                return request_timeout_response(format!("Failed to read response: {e}"));
+                return request_timeout_response(format!("Failed to read response: {}", cause(&e)));
             }
             Err(e) => {
                 error!("Failed to read decode response: {}", e);
-                return error::internal_error("read_response_failed", "Failed to read response");
+                return PdSide::Decode.answer(
+                    SidePhase::Stream,
+                    StatusCode::BAD_GATEWAY,
+                    cause(&e),
+                );
             }
         };
 
@@ -2410,47 +2308,12 @@ impl PDRouter {
         let prefill_status = StatusCode::from_u16(prefill_response.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
-        // Check if prefill succeeded
         if !prefill_status.is_success() {
-            // Get error body from prefill
-            let error_msg = prefill_response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown prefill error".to_string());
-
             error!(
-                "Prefill server returned error status prefill_url={} status={} body={}",
-                prefill_url, prefill_status, error_msg
+                "Prefill server returned error status prefill_url={} status={}",
+                prefill_url, prefill_status
             );
-
-            // Map prefill_status to appropriate error function
-            let error_response = match prefill_status {
-                StatusCode::BAD_REQUEST => error::bad_request(
-                    "prefill_bad_request",
-                    format!("Prefill server error ({prefill_status}): {error_msg}"),
-                ),
-                StatusCode::NOT_FOUND => error::not_found(
-                    "prefill_not_found",
-                    format!("Prefill server error ({prefill_status}): {error_msg}"),
-                ),
-                StatusCode::INTERNAL_SERVER_ERROR => error::internal_error(
-                    "prefill_internal_error",
-                    format!("Prefill server error ({prefill_status}): {error_msg}"),
-                ),
-                StatusCode::SERVICE_UNAVAILABLE => error::service_unavailable(
-                    "prefill_unavailable",
-                    format!("Prefill server error ({prefill_status}): {error_msg}"),
-                ),
-                StatusCode::BAD_GATEWAY => error::bad_gateway(
-                    "prefill_bad_gateway",
-                    format!("Prefill server error ({prefill_status}): {error_msg}"),
-                ),
-                _ => error::internal_error(
-                    "prefill_error",
-                    format!("Prefill server error ({prefill_status}): {error_msg}"),
-                ),
-            };
-            return Err(error_response);
+            return Err(Self::side_refused(PdSide::Prefill, prefill_response).await);
         }
 
         // Read prefill body if needed for logprob merging
@@ -2853,11 +2716,31 @@ impl RouterTrait for PDRouter {
         Metrics::record_worker_request(worker.url(), worker.model_id());
         let res = match send_with_stale_conn_retry(request).await {
             Ok(res) => res,
+            Err(e) if is_request_timeout(&e) => {
+                // The request's own timeout is a 504, as on every other
+                // path, and the worker records it as such.
+                error!(
+                    worker = Endpoint::redacted_str(worker.url()),
+                    endpoint = "/v1/messages/count_tokens",
+                    "PD count-tokens request timed out: {}",
+                    cause(&e)
+                );
+                worker.record_outcome(StatusCode::GATEWAY_TIMEOUT.as_u16());
+                return request_timeout_response(format!("count-tokens timed out: {}", cause(&e)));
+            }
             Err(e) => {
+                // The worker's address belongs in the log, not in the
+                // client's answer: it names the endpoint an operator reads.
+                error!(
+                    worker = Endpoint::redacted_str(worker.url()),
+                    endpoint = "/v1/messages/count_tokens",
+                    "PD count-tokens request failed below HTTP: {}",
+                    cause(&e)
+                );
                 worker.record_outcome(StatusCode::BAD_GATEWAY.as_u16());
                 return error::bad_gateway(
                     "prefill_count_tokens_failed",
-                    format!("Prefill server error: {e}"),
+                    format!("Prefill server error: {}", cause(&e)),
                 );
             }
         };
@@ -2873,11 +2756,27 @@ impl RouterTrait for PDRouter {
                 *response.headers_mut() = response_headers;
                 response
             }
+            Err(e) if is_request_timeout(&e) => {
+                error!(
+                    worker = Endpoint::redacted_str(worker.url()),
+                    endpoint = "/v1/messages/count_tokens",
+                    "PD count-tokens response timed out: {}",
+                    cause(&e)
+                );
+                worker.record_outcome(StatusCode::GATEWAY_TIMEOUT.as_u16());
+                request_timeout_response(format!("count-tokens timed out: {}", cause(&e)))
+            }
             Err(e) => {
+                error!(
+                    worker = Endpoint::redacted_str(worker.url()),
+                    endpoint = "/v1/messages/count_tokens",
+                    "PD count-tokens response body could not be read: {}",
+                    cause(&e)
+                );
                 worker.record_outcome(StatusCode::BAD_GATEWAY.as_u16());
                 error::bad_gateway(
                     "prefill_count_tokens_failed",
-                    format!("Failed to read prefill response: {e}"),
+                    format!("Failed to read prefill response: {}", cause(&e)),
                 )
             }
         }
@@ -2918,10 +2817,27 @@ impl RouterTrait for PDRouter {
     }
 }
 
+/// The message of a worker's error body: the envelope's `error.message`, a
+/// bare `message`, else the body's text as it is.
+fn upstream_error_message(body: &[u8]) -> String {
+    if let Ok(json) = serde_json::from_slice::<Value>(body) {
+        if let Some(message) = json
+            .get("error")
+            .and_then(|error| error.get("message"))
+            .and_then(Value::as_str)
+            .or_else(|| json.get("message").and_then(Value::as_str))
+        {
+            return message.to_string();
+        }
+    }
+    String::from_utf8_lossy(body).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
-    use axum::http::header::{AUTHORIZATION, RETRY_AFTER};
+    use axum::http::header::AUTHORIZATION;
     use openai_protocol::model_card::ModelCard;
+    use serde_json::json;
     use tokio::sync::{mpsc, oneshot};
     use tokio_stream::wrappers::ReceiverStream;
 
@@ -2934,6 +2850,98 @@ mod tests {
         tenant::TenantKey,
         worker::{circuit_breaker::CircuitState, BasicWorkerBuilder, WorkerType},
     };
+
+    /// A call that never reached its worker, with the worker's URL on the
+    /// error as reqwest attaches it.
+    async fn call_refused_by(addr: std::net::SocketAddr) -> reqwest::Error {
+        crate::clients::http_client_builder()
+            .build()
+            .unwrap()
+            .get(format!("http://{addr}/generate"))
+            .send()
+            .await
+            .unwrap_err()
+    }
+
+    /// The message of the error envelope `response` carries.
+    async fn error_message(response: Response) -> String {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        body["error"]["message"].as_str().unwrap().to_string()
+    }
+
+    /// A side that failed below HTTP is answered with the side's words and the
+    /// transport's reason, and never with the worker's address: the client is
+    /// told what happened, not where the gateway's workers are.
+    #[tokio::test]
+    async fn a_side_that_failed_below_http_is_answered_without_the_workers_address() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let worker = BasicWorkerBuilder::new(format!("http://{addr}")).build();
+        let error = call_refused_by(addr).await;
+        assert!(
+            error.url().is_some(),
+            "reqwest attaches the URL to the error"
+        );
+
+        let response = PDRouter::side_failed_below_http(
+            PdSide::Prefill,
+            SidePhase::Start,
+            "prefill request",
+            &worker,
+            &error,
+        );
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let message = error_message(response).await;
+        assert!(
+            message.starts_with(PdSide::Prefill.description(SidePhase::Start)),
+            "{message}"
+        );
+        assert!(message.contains("error sending request"), "{message}");
+        assert!(!message.contains(&addr.to_string()), "{message}");
+        assert!(!message.contains("for url"), "{message}");
+    }
+
+    /// The request's own timeout on a side is the gateway's 504 with the
+    /// reason, and the worker's address stays out of it the same way.
+    #[tokio::test]
+    async fn a_side_that_timed_out_is_answered_without_the_workers_address() {
+        // Never accepted: the connect completes into the backlog and the
+        // request waits for an answer that never comes until the client's
+        // timeout fires.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker = BasicWorkerBuilder::new(format!("http://{addr}")).build();
+        let error = crate::clients::http_client_builder()
+            .timeout(std::time::Duration::from_millis(100))
+            .build()
+            .unwrap()
+            .get(format!("http://{addr}/generate"))
+            .send()
+            .await
+            .unwrap_err();
+        drop(listener);
+        assert!(is_request_timeout(&error));
+
+        let response = PDRouter::side_failed_below_http(
+            PdSide::Decode,
+            SidePhase::Start,
+            "decode request",
+            &worker,
+            &error,
+        );
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let message = error_message(response).await;
+        assert!(
+            message.starts_with("decode request timed out: "),
+            "{message}"
+        );
+        assert!(!message.contains(&addr.to_string()), "{message}");
+        assert!(!message.contains("for url"), "{message}");
+    }
 
     #[test]
     fn pd_route_facts_per_request_type() {
@@ -3790,6 +3798,81 @@ mod tests {
             );
             assert_eq!(worker.load(), 0);
             assert_eq!(worker.circuit_breaker_can_execute(), !truncated);
+        }
+    }
+
+    /// The request's own timeout on the count-tokens route is a 504, as on
+    /// every other path, whether the worker holds back the head or the body:
+    /// the route answers the timeout, not a 502.
+    #[tokio::test]
+    async fn messages_count_tokens_answers_the_requests_own_timeout_as_504() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        for head_sent in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = Arc::new(
+                crate::clients::http_client_builder()
+                    .timeout(std::time::Duration::from_millis(100))
+                    .build()
+                    .unwrap(),
+            );
+            // One recorded failure opens the breaker: a timeout the route
+            // did not record against the worker leaves it closed.
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(format!("http://{}", listener.local_addr().unwrap()))
+                    .worker_type(WorkerType::Prefill)
+                    .http_client(client)
+                    .circuit_breaker_config(crate::worker::CircuitBreakerConfig {
+                        failure_threshold: 1,
+                        ..Default::default()
+                    })
+                    .build(),
+            );
+            worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+            let router = create_test_pd_router();
+            router.worker_registry.register_or_replace(worker.clone());
+            let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+            let body = serde_json::from_value(json!({"model": "m", "messages": []})).unwrap();
+            let (release_tx, release_rx) = oneshot::channel::<()>();
+            let server = async {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                if head_sent {
+                    // The head arrives whole; the body stops after one byte.
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{")
+                        .await
+                        .unwrap();
+                }
+                // The worker holds the rest until the route has answered.
+                let _ = release_rx.await;
+            };
+            let (response, ()) = tokio::time::timeout(ROUND_TRIP_GUARD, async {
+                tokio::join!(
+                    async {
+                        let response = router
+                            .route_messages_count_tokens(None, &tenant, body, UNKNOWN_MODEL_ID)
+                            .await;
+                        let _ = release_tx.send(());
+                        response
+                    },
+                    server,
+                )
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::GATEWAY_TIMEOUT,
+                "head sent: {head_sent}"
+            );
+            assert_eq!(worker.load(), 0);
+            assert!(
+                !worker.circuit_breaker_can_execute(),
+                "head sent: {head_sent}: the timeout was not recorded against the worker"
+            );
         }
     }
 
@@ -5231,7 +5314,7 @@ mod tests {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 json!({"error": {"message": "boom"}}),
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "prefill_upstream_error",
+                "prefill_worker_failed_to_start",
             ),
             (
                 "no handoff",
@@ -5286,7 +5369,7 @@ mod tests {
         let response = moriio_call(&router, "/v1/chat/completions", None, &json!({})).await;
         assert!(started.elapsed() < computing, "waited for the prefill");
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-        assert_eq!(error_code(&response), Some("decode_request_failed"));
+        assert_eq!(error_code(&response), Some("decode_worker_failed_to_start"));
     }
 
     #[tokio::test]
@@ -5553,56 +5636,68 @@ mod tests {
         assert_eq!(decode_worker.load(), 0);
     }
 
+    /// A decode worker that answers an error status to a streamed request
+    /// gets the answer an unstreamed one gets: the side's failure to start,
+    /// in the JSON envelope under the worker's status, the body's own words
+    /// (the quoted word that once broke the frame) as the detail. Nothing of
+    /// the response was out, so the client reads the envelope, not events.
     #[tokio::test]
-    async fn test_streaming_decode_error_emits_valid_json_sse() {
-        let router = create_test_pd_router();
-
-        let _prefill: Arc<dyn Worker> = Arc::from(create_test_worker(
-            "http://prefill".to_string(),
-            WorkerType::Prefill,
-            true,
-        ));
-        let decode: Arc<dyn Worker> = Arc::from(create_test_worker(
-            "http://decode".to_string(),
-            WorkerType::Decode,
-            true,
-        ));
-
+    async fn a_streamed_decode_refusal_is_the_json_answer_an_unstreamed_one_gets() {
         let upstream = http::Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
             .body(r#"{"error":"boom \"quoted\""}"#)
             .unwrap();
-        let decode_response = reqwest::Response::from(upstream);
 
-        let context = PDRequestContext {
-            route: "/v1/chat/completions",
-            batch_size: None,
-            is_stream: true,
-            return_logprob: false,
-            model_id: UNKNOWN_MODEL_ID,
-            headers: None,
-        };
+        let response =
+            PDRouter::side_refused(PdSide::Decode, reqwest::Response::from(upstream)).await;
 
-        let decode_guard = WorkerLoadGuard::new(decode.clone(), None);
-
-        let response = router
-            .handle_decode_error_response(decode_response, &context, decode, decode_guard)
-            .await;
-
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error_code(&response), Some("decode_worker_failed_to_start"));
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        let frame = std::str::from_utf8(&body).unwrap();
+        let parsed: Value = serde_json::from_slice(&body).expect("the envelope is valid JSON");
+        assert_eq!(parsed["error"]["code"], "decode_worker_failed_to_start");
+        assert_eq!(parsed["error"]["type"], "server_error");
+        assert_eq!(
+            parsed["error"]["message"],
+            r#"Decode worker failed to start: {"error":"boom \"quoted\""}"#
+        );
+    }
 
-        let payload = frame
-            .strip_prefix("data: ")
-            .expect("SSE frame must start with `data: `")
-            .trim_end();
-        let parsed: Value =
-            serde_json::from_str(payload).expect("bytes after `data: ` must be valid JSON");
-        assert!(
-            parsed.get("error").is_some(),
-            "parsed SSE payload must contain an `error` field: {parsed}"
+    /// A worker that refuses with a back-off hint keeps it: the 429's
+    /// `Retry-After` rides on the side's answer, under the worker's status,
+    /// so the client's back-off reads what the worker said, on a streamed
+    /// and an unstreamed request alike.
+    #[tokio::test]
+    async fn a_refused_side_keeps_the_workers_retry_after() {
+        let upstream = http::Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header(RETRY_AFTER, "7")
+            .body(r#"{"error":"busy"}"#)
+            .unwrap();
+
+        let response =
+            PDRouter::side_refused(PdSide::Prefill, reqwest::Response::from(upstream)).await;
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            error_code(&response),
+            Some("prefill_worker_failed_to_start")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("7")
         );
     }
 
@@ -6652,6 +6747,274 @@ mod tests {
                 self.refusal_lines.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+
+    /// The sequential shape's pair: a prefill engine of the handoff kind (its
+    /// side runs first, its server answering the handoff the decode side
+    /// carries) and a decode engine of the same runtime, both ready.
+    fn sequential_pair(prefill_url: String, decode_url: String) -> [Arc<dyn Worker>; 2] {
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(prefill_url)
+                .worker_type(WorkerType::Prefill)
+                .runtime_type(RuntimeType::Vllm)
+                .kv_connector("NixlConnector")
+                .build(),
+        );
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(decode_url)
+                .worker_type(WorkerType::Decode)
+                .runtime_type(RuntimeType::Vllm)
+                .build(),
+        );
+        for worker in [&prefill, &decode] {
+            worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+        }
+        [prefill, decode]
+    }
+
+    /// Which dispatch shape a failure row runs on.
+    #[derive(Clone, Copy, Debug)]
+    enum Shape {
+        Sequential,
+        Parallel,
+    }
+
+    /// What the failing side's server does.
+    #[derive(Clone, Copy, Debug)]
+    enum Fault {
+        /// Nothing listens at its address: the call fails below HTTP.
+        Unreachable,
+        /// It answers the status, with an error body, before the side's
+        /// first byte.
+        Refuses(StatusCode),
+        /// It answers a 2xx head and dies before the body's end.
+        CutAfterHead,
+    }
+
+    /// The words the refusing servers put in their error body.
+    const REFUSAL: &str = "the engine says no";
+
+    /// A healthy server for `side` on `shape`: what its partner's failure is
+    /// measured next to.
+    async fn healthy_stub(shape: Shape, side: PdSide) -> String {
+        match (shape, side) {
+            (Shape::Sequential, PdSide::Prefill) => spawn_recording_stub(
+                r#"{"kv_transfer_params":{"remote_engine_id":"eng0","remote_block_ids":[1,2]}}"#,
+            )
+            .await
+            .0,
+            (Shape::Parallel, PdSide::Prefill) => spawn_recording_stub("{}").await.0,
+            (_, PdSide::Decode) => spawn_recording_stub(r#"{"choices":[]}"#).await.0,
+        }
+    }
+
+    /// A server with `fault` for the failing side.
+    async fn faulty_stub(fault: Fault) -> String {
+        match fault {
+            Fault::Unreachable => {
+                // The listener drops with the block: the port is closed.
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                format!("http://{}", listener.local_addr().unwrap())
+            }
+            Fault::Refuses(status) => {
+                spawn_delayed_stub(
+                    status,
+                    json!({"error": {"message": REFUSAL}}),
+                    std::time::Duration::ZERO,
+                )
+                .await
+                .0
+            }
+            Fault::CutAfterHead => {
+                spawn_cut_stub(
+                    "/v1/chat/completions",
+                    "application/json",
+                    &["{\"choices\":["],
+                    true,
+                )
+                .await
+            }
+        }
+    }
+
+    /// One chat through `router`, streamed or not.
+    async fn chat_through(router: &PDRouter, streamed: bool) -> Response {
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let request = serde_json::from_value(json!({
+            "model": "m",
+            "stream": streamed,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .expect("valid chat request");
+        router
+            .route_chat(None, &tenant, request, UNKNOWN_MODEL_ID)
+            .await
+    }
+
+    /// How a side's failure is named, row by row, on both dispatch shapes:
+    /// this router answers the vocabulary the gRPC prefill-decode path
+    /// answers (`routers::common::pd_failure`; the gRPC rows run in the
+    /// `grpc_pd_side_failure_codes` integration test), the status the
+    /// failure's own class, the message opening with the side's words and
+    /// ending with the worker's own. A side that fails below HTTP is a 502
+    /// under the side's start code; a status the worker answered before the
+    /// side's first byte is kept as it is, a 429 included, under the same
+    /// code; a side cut after its 2xx head is its stream's failure; and a
+    /// streamed request the decode worker refuses gets the JSON answer an
+    /// unstreamed one gets. (A decode stream cut after the response began
+    /// cannot change its status and keeps the typed `stream_error` event:
+    /// `a_decode_cut_mid_stream_ends_the_sse_response_with_a_typed_error_event_and_done`.)
+    #[tokio::test]
+    async fn a_side_failure_is_named_by_the_shared_vocabulary_on_both_dispatch_shapes() {
+        use Fault::{CutAfterHead, Refuses, Unreachable};
+        use PdSide::{Decode, Prefill};
+        use Shape::{Parallel, Sequential};
+        use SidePhase::{Start, Stream};
+        const BAD_GATEWAY: StatusCode = StatusCode::BAD_GATEWAY;
+        const SERVICE_UNAVAILABLE: StatusCode = StatusCode::SERVICE_UNAVAILABLE;
+        const TOO_MANY_REQUESTS: StatusCode = StatusCode::TOO_MANY_REQUESTS;
+
+        // (shape, failing side, its fault, streamed request, status, phase)
+        let rows = [
+            (Sequential, Prefill, Unreachable, false, BAD_GATEWAY, Start),
+            (
+                Sequential,
+                Prefill,
+                Refuses(SERVICE_UNAVAILABLE),
+                false,
+                SERVICE_UNAVAILABLE,
+                Start,
+            ),
+            (
+                Sequential,
+                Prefill,
+                Refuses(TOO_MANY_REQUESTS),
+                false,
+                TOO_MANY_REQUESTS,
+                Start,
+            ),
+            (
+                Sequential,
+                Prefill,
+                CutAfterHead,
+                false,
+                BAD_GATEWAY,
+                Stream,
+            ),
+            (Sequential, Decode, Unreachable, false, BAD_GATEWAY, Start),
+            (
+                Sequential,
+                Decode,
+                Refuses(SERVICE_UNAVAILABLE),
+                false,
+                SERVICE_UNAVAILABLE,
+                Start,
+            ),
+            (
+                Sequential,
+                Decode,
+                Refuses(TOO_MANY_REQUESTS),
+                false,
+                TOO_MANY_REQUESTS,
+                Start,
+            ),
+            (
+                Sequential,
+                Decode,
+                Refuses(SERVICE_UNAVAILABLE),
+                true,
+                SERVICE_UNAVAILABLE,
+                Start,
+            ),
+            (Sequential, Decode, CutAfterHead, false, BAD_GATEWAY, Stream),
+            (Parallel, Prefill, Unreachable, false, BAD_GATEWAY, Start),
+            (
+                Parallel,
+                Prefill,
+                Refuses(SERVICE_UNAVAILABLE),
+                false,
+                SERVICE_UNAVAILABLE,
+                Start,
+            ),
+            (
+                Parallel,
+                Prefill,
+                Refuses(TOO_MANY_REQUESTS),
+                false,
+                TOO_MANY_REQUESTS,
+                Start,
+            ),
+            (Parallel, Decode, Unreachable, false, BAD_GATEWAY, Start),
+            (
+                Parallel,
+                Decode,
+                Refuses(SERVICE_UNAVAILABLE),
+                false,
+                SERVICE_UNAVAILABLE,
+                Start,
+            ),
+            (
+                Parallel,
+                Decode,
+                Refuses(SERVICE_UNAVAILABLE),
+                true,
+                SERVICE_UNAVAILABLE,
+                Start,
+            ),
+        ];
+        let total = rows.len();
+        let mut mismatches = Vec::new();
+        for (shape, side, fault, streamed, status, phase) in rows {
+            let case = format!("{shape:?} {side:?} {fault:?} streamed={streamed}");
+            let failing = faulty_stub(fault).await;
+            let healthy = healthy_stub(shape, side.partner()).await;
+            let (prefill_url, decode_url) = match side {
+                Prefill => (failing, healthy),
+                Decode => (healthy, failing),
+            };
+            let router = single_attempt_router();
+            match shape {
+                Sequential => {
+                    for worker in sequential_pair(prefill_url, decode_url) {
+                        router.worker_registry.register_or_replace(worker);
+                    }
+                }
+                Parallel => register_pd_pair(&router, prefill_url, decode_url),
+            }
+
+            let response = chat_through(&router, streamed).await;
+
+            // Every row is read to its end, so one run names every row that
+            // answers something else.
+            let got_status = response.status();
+            let header_code = error_code(&response).unwrap_or("none").to_string();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let envelope = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+            let body_code = envelope["error"]["code"].as_str().unwrap_or("none");
+            let message = envelope["error"]["message"].as_str().unwrap_or_default();
+            let words = format!("{}: ", side.description(phase));
+            let own_words = !matches!(fault, Refuses(_)) || message.ends_with(REFUSAL);
+            let right = got_status == status
+                && header_code == side.code(phase)
+                && body_code == side.code(phase)
+                && message.starts_with(&words)
+                && own_words;
+            if !right {
+                mismatches.push(format!(
+                    "{case}: expected {status} {} {words:?}..., got {got_status} header {header_code} body {body_code} {message:?} ({})",
+                    side.code(phase),
+                    String::from_utf8_lossy(&body).chars().take(160).collect::<String>()
+                ));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "{} of {total} rows do not answer the shared vocabulary:\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        );
     }
 
     /// A request with no prefill/decode pair to take it is refused with the

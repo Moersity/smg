@@ -62,9 +62,11 @@ which defines them on a gRPC launcher's parser that lacks them: `vllm serve
 --grpc` and the stock `python -m vllm.entrypoints.grpc_server` (there the
 values also reach a servicer built without the namespace, through the
 environment). A flag left out falls back to the matching `SMG_VLLM_MM_*`
-variable, which logs a deprecation line on a launcher that has the flag; a
-launcher without the flags (no plugins loaded, a servicer built on its own)
-takes the variable as its documented setting and logs nothing. The startup
+variable. Legacy variables log a deprecation line on a launcher that has the
+flag; the TurboJPEG policy and download timeout variables remain supported
+fallbacks and never log a deprecation warning. A launcher without the flags
+(no plugins loaded, a servicer built on its own) takes the variable as its
+documented setting and logs nothing. The startup
 line `VllmEngineServicer initialized (mm_processor=inprocess, source=flag)` and
 the `mm_processor_source` label name where the value came from.
 
@@ -115,6 +117,34 @@ owner, which the router relays as a 400 `start_generation_failed`. With the
 defaults a 50 MB item clears the router and stops at the worker's 32 MiB, so
 that flag is the one to raise; the router's `--max-payload-size` (default
 512 MiB) must also hold the whole request body.
+
+Media URL download budgets can be set with `--mm-fetch-timeout-ms` (images
+and audio, default **10000**) and `--mm-video-fetch-timeout-ms` (video,
+default **30000**). Both take positive integer milliseconds and cover the
+fetch from connection through the last byte, not decoding or inference.
+Set them on the process that downloads the media:
+
+- **Router preprocessing** (shared by vLLM, SGLang and TokenSpeed): the Rust
+  and Python router CLIs accept both flags, with environment fallbacks
+  `SMG_MM_FETCH_TIMEOUT_MS` and `SMG_MM_VIDEO_FETCH_TIMEOUT_MS`.
+- **vLLM Rust worker**, `--servicer-impl rust --mm-processor smg`: the same
+  flags use `SMG_VLLM_MM_FETCH_TIMEOUT_MS` and
+  `SMG_VLLM_MM_VIDEO_FETCH_TIMEOUT_MS` as environment fallbacks.
+
+An explicit flag takes precedence over its environment variable. Unset
+values retain the defaults above. These settings do not change downloads
+performed by vLLM's own `inprocess` or `redis` processors; configure those
+through the engine's media loader settings. SGLang and TokenSpeed currently
+use the Router's media pipeline, so set the budgets on the Router for them.
+
+A fetch that fails is answered under `media_fetch_failed` by whose fault it
+is, on the Router's pipeline and the vLLM Rust worker's alike: a reference the
+request got wrong (a URL that cannot be parsed or resolved, a host that refuses
+the connection or answers 4xx, a payload that is not the media it claims to
+be) is a 400; a host that does not deliver within the budget, answers 5xx or
+breaks the transfer is a 502, so a client knows whether to retry. Neither
+counts against the worker's circuit breaker, and the Router does not replay
+either on another worker, which would meet the same host.
 
 On the router side, `--mm-processing` selects `auto` (default: forward when
 every registered worker of the model advertises `mm_processor` and the model's
@@ -253,8 +283,9 @@ tokens, and the time-to-first-token, inter-token, per-request-mean and
 end-to-end latency histograms (vLLM's own bucket edges), plus the servicer's
 lifecycle state and start time. The listener binds beside the gRPC one, before
 the engine connects (a scrape during the engine's start answers
-`smg_servicer_state{state="starting"} 1`; a readiness hold with admission open
-reads `warming_up`, a drain `draining`), runs on its own thread, and closes
+`smg_servicer_state{state="starting"} 1`; a readiness hold (admission open to
+the warm-up's own requests only) reads `warming_up`, a drain `draining`), runs
+on its own thread, and closes
 with the servicer; a port equal to `--port` is refused before the engine
 starts, and the flag needs `--servicer-impl rust` (the Python servicer exposes
 no endpoint). A planned warm-up's own requests go through the request path
@@ -329,7 +360,11 @@ contract the Python servicer serves: text generation, PD disaggregation
 (`--kv-transfer-config`: connector params pass through both ways and
 `GetServerInfo` carries the pairing identity), Router-preprocessed media
 (inline and `/dev/shm` tensors), worker-side media processing (`media_refs`,
-below), `Embed`, `FlushCache`, `GetTokenizer` (which answers
+below), `Embed`, `FlushCache`, `StartProfile` and `StopProfile` (the engine's own
+torch profiler as its launch configured it, started and stopped on every rank;
+a start that sets per-request options is refused, since the engine takes its
+profiler's directory and options at launch; the same on the Python servicer),
+`GetTokenizer` (which answers
 FAILED_PRECONDITION when the launcher could not resolve a local tokenizer
 directory) and `SubscribeKvEvents` (vLLM's ZMQ publisher, which the servicer
 turns on by itself, on this path as on the Python one, when the launcher is
@@ -437,9 +472,13 @@ graph-capture sizes, lengths one above the tuners' bucket grid), a second
 pass over the bucket grid whose timings show what the first pass paid, and,
 where the engine's module asks for it (TokenSpeed, below), every remaining
 prompt length up to the step, last, in an order whose every prefix is a
-uniform spread of the range, so a budget cut leaves an even coverage. Every
-request carries its own token ids, so prefix caching never hides a prefill,
-and the engine's prefix cache is flushed at the end. One INFO line per shape
+uniform spread of the range, so a budget cut leaves an even coverage. The
+longest prompt is what the engine's scheduler admits with one output token:
+the context less the positions the engine keeps back (none on vLLM, where a
+prompt and an output budget may fill the context; two on TokenSpeed, or its
+speculative draft window when wider; six on SGLang), never the context
+itself. Every request carries its own token ids, so prefix caching never
+hides a prefill, and the engine's prefix cache is flushed at the end. One INFO line per shape
 with its time (a chunk remainder's at DEBUG, with an INFO progress line every
 500 remainders and one at their end); readiness (the gRPC health service, so the startup and
 readiness probes) stays NOT_SERVING until the pass ran, and flips SERVING
@@ -783,11 +822,24 @@ decided). With `--servicer-impl rust` the same process serves the
 launcher computes the model and server facts from TokenSpeed's own config,
 runs the scheduler(s) headless in a spawned child over the msgpack ZMQ wire,
 and supervises both. What that wire does not carry is reported, not emulated:
-`FlushCache` and profiling answer UNIMPLEMENTED, ranked `top_logprobs` and
-prompt logprobs are refused, and PD/EPD disaggregation stays with the Python
-implementation, as do the RL control-plane extras (the `rl.*` advertisement,
-the live `weight_version` on generate responses, `is_paused`); the Rust server
-redacts credentials from `server_args` the same way. `SubscribeKvEvents` relays
+`FlushCache` and profiling ride the wire's control call on a scheduler whose
+handshake declares its control reply (the control-wire revision) and answer
+UNIMPLEMENTED, naming the gap, on one that does not; ranked `top_logprobs` and
+prompt logprobs are refused, and the RL control-plane extras (the `rl.*`
+advertisement, the live `weight_version` on generate responses, `is_paused`)
+stay with the Python implementation; the Rust server redacts credentials from
+`server_args` the same way. Prefill/decode disaggregation is served on this
+path: a request's `kv_bootstrap_info` rides the wire in the scheduler's own
+bootstrap slots as the Python servicer forwards it, a prefill launch starts
+the engine's KV bootstrap server in the launcher process before the ranks (as
+the engine's own frontend does), and under attention data parallelism the
+servicer places a disaggregated request on the rank of its room's residue,
+the engine's own dispatch rule, and an aggregated one on its
+`data_parallel_rank` pin. The EPD prefill side is served the same way (each
+item's `encode_bootstrap_info` entry rides on the item); the EPD encode role
+(`--disaggregation-mode encode`) is refused at launch under `--servicer-impl
+rust` and stays with the Python implementation, whose encode servicer feeds
+the encode worker over the engine's in-process channel. `SubscribeKvEvents` relays
 TokenSpeed's ZMQ KV-event publisher, which the servicer turns on by itself, on
 this path as on the Python one, when the launcher is given no
 `--kv-events-config`, at a port found free on the host rather than
@@ -800,7 +852,10 @@ free port), `SMG_TOKENSPEED_SERVICER_DRAIN_SECS` (default 5),
 `SMG_TOKENSPEED_SERVICER_WARMUP` (the planned warm-up before SERVING, as for
 vLLM above: `full` by default, `fast`, `off`, a budget in seconds or
 `<level>:<seconds>`; planned from `--max-num-seqs` and the chunk size or
-`--max-prefill-tokens`; at the `full` level this engine's plan also visits
+`--max-prefill-tokens`; at the `full` level, on an engine of more than one
+process (its parallel layout off the server arguments; a one-process engine
+plans the classes alone, like the other engines, since the hang below needs
+a collective waiting on a peer), this engine's plan also visits
 every prompt length up to the chunk size the class ladder leaves out, last,
 in an order whose every prefix is a uniform spread (`fast` plans the classes
 alone and leaves the hazard below open, which the start log says): a chunked prefill's last chunk is any count
@@ -1036,10 +1091,58 @@ generation with sampled and prompt logprobs, reasoning-token counts, LoRA ids
 and custom logit processors forwarded as the Python servicer forwards them,
 `Embed`, `FlushCache` and profiling (the scheduler's own control requests,
 carried by the wire's control call) all answer as the Python servicer does.
-What the wire does not carry is reported, not emulated: multimodal inputs and
-hidden states are refused, PD/EPD disaggregation stays with the Python
-implementation (the worker refuses to start on the Rust path in those modes),
-and LoRA loading answers UNIMPLEMENTED, as it does on the Python servicer.
+Hidden states (`return_hidden_states`) are served on this path, and on this
+path only: the final hidden layer's vector per position a forward ran on (the
+prompt positions the prefill computed, then each generated token fed back:
+(prompt - cached prefix) + generated - 1 rows, with absolute positions anchored
+from the engine's counters), the prefill block on the first chunk, a decode
+step's rows on each later one and the whole list on the completion, within the
+scheduler's `--return-hidden-states-mode` cap, which both servicers keep ahead
+of the scheduler with the engine's own words; the Python servicer then refuses
+the request by name (`INVALID_ARGUMENT`, pointing at `--servicer-impl rust`),
+where it once accepted the flag and returned nothing.
+Prefill/decode disaggregation (`--disaggregation-mode prefill|decode`) works as
+on the Python servicer: a request's bootstrap fields (host, port, room) ride
+the scheduler's own request struct over the wire, the prefill side's bootstrap
+server starts in the servicer process before the ranks, and `GetServerInfo`
+carries the server args the Router pairs on. Multimodal inputs reach the
+scheduler as its own processor output: the preprocessed tensors the Router's
+media pipeline sends ride the wire as SGLang's own tensor encoding, and the
+scheduler hashes, pads and positions them as it does behind the Python
+servicer; `supports_vision` is advertised as SGLang's model config decides it.
+The language side of encode/prefill disaggregation (`--language-only`) works as
+behind SGLang's own frontend: the servicer process runs SGLang's own encoder
+bootstrap server and receiver (`--encoder-bootstrap-port`, `--encoder-urls`,
+the receiver's transport by `SGLANG_ENCODER_MM_RECEIVER_MODE`), a request's
+image references (`mm_inputs.image_urls`, with the prompt tokenized but not
+expanded and no tensors) go to the encoders through them before the request
+reaches the scheduler, the scheduler's request carries what the dispatch set
+(its wait flag, the per-encoder assignment, the encoder list) and the prompt
+text the scheduler rebuilds from once the embeddings arrive, and a dispatch
+that fails afterwards reaches the scheduler as its own failure notice. A
+request of references on any other worker, or on a language-only worker with
+no encoder registered, is refused (`FAILED_PRECONDITION`) rather than answered
+as text. A request the Router pins to a data-parallel rank (`--dp-size` above one
+behind a dp-aware Router) goes to that rank's scheduler, as the engine's
+data-parallel controller sends it behind SGLang's own frontend; a pin past the
+connected ranks is refused as the caller's error. On the prefill side of a disaggregated pair a request runs on
+the rank of its room's residue instead (`bootstrap_room % dp_size`: SGLang's
+prefill side follows the room and its KV sender fails a request placed
+elsewhere, and the decode side looks for the KV on that rank), the Router's pin
+yielding to it with a warning; the decode side keeps the pin. A prefill leg of
+several plain data-parallel replicas (`--dp-size N` without attention DP) is
+refused at launch with the engine's reason: every replica reports attention-DP
+rank 0 to the engine's KV sender, which fails each request whose room's residue
+is not 0; attention DP (`--tp-size N --attn-dp-size N`) is the multi-rank
+prefill shape. The planned
+warm-up pins each of its requests to a rank (on a prefill or decode leg with a
+stand-in room of that rank's residue), so every rank is warm before the Router
+sends anything. What the wire does not carry is reported, not emulated: an `--encoder-only` launch is refused (SGLang's entrypoint runs
+that role on its own encoder server, never on a servicer), a `--language-only`
+launch on the `zmq_to_tokenizer` transfer backend is refused (the frontend
+itself receives and processes the embeddings there, which neither servicer
+runs), and LoRA loading answers UNIMPLEMENTED, as it does on the Python
+servicer.
 `SubscribeKvEvents` relays SGLang's ZMQ KV-event publisher, which the servicer
 turns on by itself, on this path as on the Python one, when the launcher is
 given no `--kv-events-config`, at a port found free on the host rather than
@@ -1053,7 +1156,18 @@ above: `full` by default, `fast`, `off`, a budget in seconds or
 `<level>:<seconds>`; planned from `--max-running-requests` and
 `--chunked-prefill-size` or `--max-prefill-tokens`, the engine's defaults
 where unset; the Python servicer runs the same plan over its own port after
-its first warm-up request, and both skip it on a disaggregation role; under
+its first warm-up request and skips it on a disaggregation role; the Rust
+path plans a prefill or decode leg as a single engine, its requests carrying
+the engine's stand-in bootstrap so the leg warms up without its peer, and the
+language side of an encode-disaggregated deployment (`--language-only`) plans
+as a single engine, so the first forward of its fresh scheduler is paid before
+SERVING rather than by its first request, as the engine's own frontend warms
+that role on the text path, and where its
+frontend dispatches to the encoders the plan ends its shapes with one image
+through them (the prompt the model's chat template renders around the
+engine's own minimal warm-up image; a template without an image placeholder
+leaves the leg out, a leg the encoders cannot serve yet is a logged step), so
+the scheduler's first media forward is paid before SERVING too; under
 data parallelism the servicer routes a request by load, not by rank, so each
 prefill shape warms one rank and the log says so),
 `SMG_SGLANG_SERVICER_STARTUP_TIMEOUT_SECS` (default 1800) and

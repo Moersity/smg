@@ -101,6 +101,9 @@ pub struct RouterConfig {
     /// routes always remain available on the main `port` regardless.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_check_port: Option<u16>,
+    /// Optional capacity thresholds for PD/EPD readiness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pd_readiness: Option<PdReadinessConfig>,
     /// Port of the admin listener. When set, the control-plane routes (the
     /// admin, worker-registry and RL routes) are served on it, with the probe
     /// routes, and the data listener answers 404 for them. `None` keeps the
@@ -383,6 +386,14 @@ pub struct RouterConfig {
     /// instead. When unset, falls back to `SMG_MM_TURBOJPEG`, then `prefer`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mm_turbojpeg: Option<TurboJpegPolicy>,
+    /// Video download timeout in milliseconds; positive. Falls back to
+    /// `SMG_MM_VIDEO_FETCH_TIMEOUT_MS`, then 30000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mm_video_fetch_timeout_ms: Option<u64>,
+    /// Image/audio download timeout in milliseconds; positive. Falls back to
+    /// `SMG_MM_FETCH_TIMEOUT_MS`, then 10000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mm_fetch_timeout_ms: Option<u64>,
     /// Listener IP for the RDMA metadata exchange, a plain IPv4 or IPv6 address
     /// (the workers connect to it as written, so `ConfigValidator` refuses
     /// anything else); when unset, falls back to `SMG_RDMA_LISTEN_IP`, and
@@ -600,6 +611,52 @@ pub struct RouterConfig {
     /// When set, wraps all storage backends with hook-based interceptors.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_hook_wasm_path: Option<String>,
+}
+
+/// Capacity threshold for one PD role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReadinessRoleConfig {
+    /// Desired fleet size used as the stable percentage denominator. Has no
+    /// effect unless `min_healthy_percent` is also set.
+    pub expected_workers: Option<usize>,
+    /// Absolute safety floor, independent of the percentage threshold.
+    pub min_healthy_workers: usize,
+    /// Minimum healthy percentage of `expected_workers`.
+    pub min_healthy_percent: Option<u8>,
+}
+
+impl Default for ReadinessRoleConfig {
+    /// Preserve the one-healthy-worker requirement without a percentage gate.
+    fn default() -> Self {
+        Self {
+            expected_workers: None,
+            min_healthy_workers: 1,
+            min_healthy_percent: None,
+        }
+    }
+}
+
+impl ReadinessRoleConfig {
+    /// Effective number of healthy workers required for this role.
+    pub fn required_workers(self) -> usize {
+        let percentage_required =
+            self.expected_workers
+                .zip(self.min_healthy_percent)
+                .map_or(0, |(expected, percent)| {
+                    let percent = usize::from(percent);
+                    (expected / 100) * percent + ((expected % 100) * percent).div_ceil(100)
+                });
+        self.min_healthy_workers.max(percentage_required)
+    }
+}
+
+/// Independent readiness thresholds for the two PD pipeline roles.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PdReadinessConfig {
+    pub prefill: ReadinessRoleConfig,
+    pub decode: ReadinessRoleConfig,
 }
 
 /// How a request's tenant is resolved on the serving path. The tenant scopes
@@ -1287,8 +1344,8 @@ pub enum PolicyConfig {
         /// when a request's token count is unknown at routing time.
         #[serde(default = "default_least_load_mean_prefill")]
         mean_prefill_tokens: u32,
-        /// Throughput (tokens/s) for prefill workers, and fallback when other
-        /// workers report no live `gen_throughput`. Set to per-replica input
+        /// Throughput (tokens/s) for prefill workers, and fallback for other
+        /// workers when no candidate reports a live `gen_throughput`. Set to per-replica input
         /// tokens/s for prefill, output tokens/s otherwise; co-tunes with
         /// `kv_pressure_weight`. The CLI shares one value across roles; use
         /// programmatically constructed `prefill_policy` / `decode_policy` for
@@ -1481,6 +1538,36 @@ impl Serialize for PolicyConfig {
 }
 
 impl PolicyConfig {
+    /// A cache-aware policy with these thresholds and every other knob at
+    /// the value a configuration file gets when it leaves the knob out.
+    pub fn cache_aware(
+        cache_threshold: f32,
+        balance_abs_threshold: usize,
+        balance_rel_threshold: f32,
+        eviction_interval_secs: u64,
+        max_tree_size: usize,
+    ) -> Self {
+        PolicyConfig::CacheAware {
+            cache_threshold,
+            balance_abs_threshold,
+            balance_rel_threshold,
+            eviction_interval_secs,
+            max_tree_size,
+            block_size: default_block_size(),
+            balance_token_usage_threshold: default_balance_token_usage_threshold(),
+            overload_token_usage_threshold: default_balance_token_usage_threshold(),
+            overlap_decay: default_overlap_decay(),
+            selection_temperature: default_selection_temperature(),
+            cache_index: CacheIndexKind::default(),
+            cache_ttl_secs: default_cache_ttl_secs(),
+            cache_boundaries: Vec::new(),
+            selection_policy: None,
+            selection_accounting_ttl_ms: 0,
+            balance_prefix_margin_tokens: 0,
+            balance_uncached_credit: false,
+        }
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             PolicyConfig::Random => "random",
@@ -1931,6 +2018,7 @@ impl Default for RouterConfig {
             pd_pairing_mode: PdPairingMode::default(),
             host: "0.0.0.0".to_string(),
             port: 3001,
+            pd_readiness: None,
             health_check_port: None,
             admin_port: None,
             admin_host: None,
@@ -1979,6 +2067,8 @@ impl Default for RouterConfig {
             mm_allowed_media_domains: None,
             mm_allow_private_media_hosts: false,
             mm_turbojpeg: None,
+            mm_video_fetch_timeout_ms: None,
+            mm_fetch_timeout_ms: None,
             rdma_listen_ip: None,
             rdma_slot_ttl_s: None,
             log_mm_timing: false,
@@ -2310,6 +2400,7 @@ mod tests {
     }
 
     #[test]
+    /// Old configs preserve defaults and explicit media settings round-trip.
     fn test_multimodal_settings_serde_roundtrip_and_backward_compat() {
         // Unset by default, and the optional ones stay out of serialized output.
         let config = RouterConfig::default();
@@ -2319,6 +2410,8 @@ mod tests {
             "mm_pixel_cache_mb",
             "mm_allowed_media_domains",
             "mm_turbojpeg",
+            "mm_fetch_timeout_ms",
+            "mm_video_fetch_timeout_ms",
             "rdma_listen_ip",
             "rdma_slot_ttl_s",
         ] {
@@ -2338,6 +2431,8 @@ mod tests {
         assert_eq!(without.mm_allowed_media_domains, None);
         assert!(!without.mm_allow_private_media_hosts);
         assert_eq!(without.mm_turbojpeg, None);
+        assert_eq!(without.mm_fetch_timeout_ms, None);
+        assert_eq!(without.mm_video_fetch_timeout_ms, None);
         assert_eq!(without.rdma_listen_ip, None);
         assert_eq!(without.rdma_slot_ttl_s, None);
         assert!(!without.log_mm_timing);
@@ -2351,6 +2446,8 @@ mod tests {
             .mm_allowed_media_domains(Some(vec!["media.example".to_string()]))
             .mm_allow_private_media_hosts(true)
             .mm_turbojpeg(Some(TurboJpegPolicy::Require))
+            .mm_fetch_timeout_ms(Some(60000))
+            .mm_video_fetch_timeout_ms(Some(120000))
             .rdma_listen_ip(Some("10.0.0.7"))
             .rdma_slot_ttl_s(Some(600))
             .log_mm_timing(true)
@@ -2368,6 +2465,8 @@ mod tests {
         );
         assert!(with.mm_allow_private_media_hosts);
         assert_eq!(with.mm_turbojpeg, Some(TurboJpegPolicy::Require));
+        assert_eq!(with.mm_fetch_timeout_ms, Some(60000));
+        assert_eq!(with.mm_video_fetch_timeout_ms, Some(120000));
         assert_eq!(with.rdma_listen_ip.as_deref(), Some("10.0.0.7"));
         assert_eq!(with.rdma_slot_ttl_s, Some(600));
         assert!(with.log_mm_timing);
@@ -2775,25 +2874,7 @@ mod tests {
         assert_eq!(PolicyConfig::RoundRobin.name(), "round_robin");
         assert_eq!(PolicyConfig::Passthrough.name(), "passthrough");
 
-        let cache_aware = PolicyConfig::CacheAware {
-            cache_threshold: 0.8,
-            balance_abs_threshold: 10,
-            balance_rel_threshold: 1.5,
-            eviction_interval_secs: 300,
-            max_tree_size: 1000,
-            block_size: 16,
-            balance_token_usage_threshold: 1.0,
-            overload_token_usage_threshold: 1.0,
-            overlap_decay: 0.0,
-            selection_temperature: 0.0,
-            cache_index: Default::default(),
-            cache_ttl_secs: 180,
-            cache_boundaries: Vec::new(),
-            selection_policy: None,
-            selection_accounting_ttl_ms: 0,
-            balance_prefix_margin_tokens: 0,
-            balance_uncached_credit: false,
-        };
+        let cache_aware = PolicyConfig::cache_aware(0.8, 10, 1.5, 300, 1000);
         assert_eq!(cache_aware.name(), "cache_aware");
 
         let power_of_two = PolicyConfig::PowerOfTwo {
@@ -2808,25 +2889,7 @@ mod tests {
         let json = serde_json::to_string(&random).unwrap();
         assert_eq!(json, r#"{"type":"random"}"#);
 
-        let cache_aware = PolicyConfig::CacheAware {
-            cache_threshold: 0.8,
-            balance_abs_threshold: 10,
-            balance_rel_threshold: 1.5,
-            eviction_interval_secs: 300,
-            max_tree_size: 1000,
-            block_size: 16,
-            balance_token_usage_threshold: 1.0,
-            overload_token_usage_threshold: 1.0,
-            overlap_decay: 0.0,
-            selection_temperature: 0.0,
-            cache_index: Default::default(),
-            cache_ttl_secs: 180,
-            cache_boundaries: Vec::new(),
-            selection_policy: None,
-            selection_accounting_ttl_ms: 0,
-            balance_prefix_margin_tokens: 0,
-            balance_uncached_credit: false,
-        };
+        let cache_aware = PolicyConfig::cache_aware(0.8, 10, 1.5, 300, 1000);
         let json = serde_json::to_string(&cache_aware).unwrap();
         assert!(json.contains("\"type\":\"cache_aware\""));
         assert!(json.contains("\"cache_threshold\":0.8"));
@@ -2842,25 +2905,7 @@ mod tests {
 
     #[test]
     fn test_cache_aware_parameters() {
-        let cache_aware = PolicyConfig::CacheAware {
-            cache_threshold: 0.75,
-            balance_abs_threshold: 20,
-            balance_rel_threshold: 2.0,
-            eviction_interval_secs: 600,
-            max_tree_size: 5000,
-            block_size: 16,
-            balance_token_usage_threshold: 1.0,
-            overload_token_usage_threshold: 1.0,
-            overlap_decay: 0.0,
-            selection_temperature: 0.0,
-            cache_index: Default::default(),
-            cache_ttl_secs: 180,
-            cache_boundaries: Vec::new(),
-            selection_policy: None,
-            selection_accounting_ttl_ms: 0,
-            balance_prefix_margin_tokens: 0,
-            balance_uncached_credit: false,
-        };
+        let cache_aware = PolicyConfig::cache_aware(0.75, 20, 2.0, 600, 5000);
 
         match cache_aware {
             PolicyConfig::CacheAware {
@@ -2879,6 +2924,25 @@ mod tests {
             }
             _ => panic!("Expected CacheAware"),
         }
+    }
+
+    /// The constructor's policy is the one a configuration file yields when
+    /// it names the five thresholds and nothing else.
+    #[test]
+    fn cache_aware_constructor_matches_the_file_defaults() {
+        let json = r#"{
+            "type": "cache_aware",
+            "cache_threshold": 0.5,
+            "balance_abs_threshold": 32,
+            "balance_rel_threshold": 1.1,
+            "eviction_interval_secs": 60,
+            "max_tree_size": 1000
+        }"#;
+        let from_file: PolicyConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            serde_json::to_value(PolicyConfig::cache_aware(0.5, 32, 1.1, 60, 1000)).unwrap(),
+            serde_json::to_value(from_file).unwrap()
+        );
     }
 
     #[test]
@@ -3663,25 +3727,7 @@ discovery:
         let pd = RoutingMode::PrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), None)],
             decode_urls: vec!["http://decode1".to_string()],
-            prefill_policy: Some(PolicyConfig::CacheAware {
-                cache_threshold: 0.5,
-                balance_abs_threshold: 32,
-                balance_rel_threshold: 1.1,
-                eviction_interval_secs: 60,
-                max_tree_size: 1000,
-                block_size: 16,
-                balance_token_usage_threshold: 1.0,
-                overload_token_usage_threshold: 1.0,
-                overlap_decay: 0.0,
-                selection_temperature: 0.0,
-                cache_index: Default::default(),
-                cache_ttl_secs: 180,
-                cache_boundaries: Vec::new(),
-                selection_policy: None,
-                selection_accounting_ttl_ms: 0,
-                balance_prefix_margin_tokens: 0,
-                balance_uncached_credit: false,
-            }),
+            prefill_policy: Some(PolicyConfig::cache_aware(0.5, 32, 1.1, 60, 1000)),
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_metric: Default::default(),
             }),
@@ -3705,25 +3751,7 @@ discovery:
         let pd = RoutingMode::PrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), None)],
             decode_urls: vec!["http://decode1".to_string()],
-            prefill_policy: Some(PolicyConfig::CacheAware {
-                cache_threshold: 0.5,
-                balance_abs_threshold: 32,
-                balance_rel_threshold: 1.1,
-                eviction_interval_secs: 60,
-                max_tree_size: 1000,
-                block_size: 16,
-                balance_token_usage_threshold: 1.0,
-                overload_token_usage_threshold: 1.0,
-                overlap_decay: 0.0,
-                selection_temperature: 0.0,
-                cache_index: Default::default(),
-                cache_ttl_secs: 180,
-                cache_boundaries: Vec::new(),
-                selection_policy: None,
-                selection_accounting_ttl_ms: 0,
-                balance_prefix_margin_tokens: 0,
-                balance_uncached_credit: false,
-            }),
+            prefill_policy: Some(PolicyConfig::cache_aware(0.5, 32, 1.1, 60, 1000)),
             decode_policy: None,
         };
 
@@ -3773,25 +3801,7 @@ discovery:
             decode_policy: None,
         };
 
-        let main_policy = PolicyConfig::CacheAware {
-            cache_threshold: 0.7,
-            balance_abs_threshold: 20,
-            balance_rel_threshold: 1.5,
-            eviction_interval_secs: 300,
-            max_tree_size: 2000,
-            block_size: 16,
-            balance_token_usage_threshold: 1.0,
-            overload_token_usage_threshold: 1.0,
-            overlap_decay: 0.0,
-            selection_temperature: 0.0,
-            cache_index: Default::default(),
-            cache_ttl_secs: 180,
-            cache_boundaries: Vec::new(),
-            selection_policy: None,
-            selection_accounting_ttl_ms: 0,
-            balance_prefix_margin_tokens: 0,
-            balance_uncached_credit: false,
-        };
+        let main_policy = PolicyConfig::cache_aware(0.7, 20, 1.5, 300, 2000);
 
         match pd.get_prefill_policy(&main_policy) {
             PolicyConfig::CacheAware {

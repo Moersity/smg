@@ -4,18 +4,20 @@
 //! does.
 
 use std::{
+    collections::BTreeMap,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use bytes::Bytes;
 use engine_zmq_client::{
-    codec::{decode_msgpack, encode_msgpack},
+    codec::{decode_msgpack, decode_value, encode_msgpack, OpaqueValue},
     mock_engine::{
         connect_to_frontend, default_ready_response, hello, MockEngineInput, MockEngineOutput,
         MOCK_DEADLINE,
     },
     protocol::{
+        control::ControlReplySlim,
         handshake::EngineCoreReadyResponse,
         tokenspeed::{
             output::BatchTokenIDOutSlim,
@@ -39,7 +41,7 @@ use tonic_health::pb::{
 use super::*;
 use crate::{
     kv_events,
-    testing::{assert_bucket_edges, assert_golden, http_get, servicer_config, Bounded},
+    testing::{assert_bucket_edges, assert_golden, bound_port, http_get, servicer_config, Bounded},
     ServicerError,
 };
 
@@ -98,15 +100,6 @@ async fn assert_handshake_released(handshake: &str) {
     UnixListener::bind(path).expect("handshake endpoint released");
 }
 
-/// The port a socket bound to `tcp://127.0.0.1:0` was given.
-fn bound_port(endpoint: &str) -> u16 {
-    endpoint
-        .rsplit(':')
-        .next()
-        .and_then(|port| port.parse().ok())
-        .expect("a bound tcp endpoint ends with its port")
-}
-
 async fn wait_until(mut condition: impl FnMut() -> bool) {
     for _ in 0..400 {
         if condition() {
@@ -138,6 +131,29 @@ struct Harness {
 }
 
 async fn harness(model: TokenSpeedModelInfo, tokenizer: Option<Arc<dyn Tokenizer>>) -> Harness {
+    harness_with_ready(model, tokenizer, default_ready_response()).await
+}
+
+/// The READY a scheduler of the control-wire revision sends: it declares
+/// the control reply it answers control calls with.
+fn control_wire_ready() -> EngineCoreReadyResponse {
+    EngineCoreReadyResponse {
+        positional_layouts: BTreeMap::from([(
+            "ControlReplySlim".to_string(),
+            ["call_id", "success", "message", "engine_index"]
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        )]),
+        ..default_ready_response()
+    }
+}
+
+async fn harness_with_ready(
+    model: TokenSpeedModelInfo,
+    tokenizer: Option<Arc<dyn Tokenizer>>,
+    ready: EngineCoreReadyResponse,
+) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let handshake = handshake_address(dir.path());
     let config = config(dir.path(), &handshake, model);
@@ -151,7 +167,7 @@ async fn harness(model: TokenSpeedModelInfo, tokenizer: Option<Arc<dyn Tokenizer
         EngineId::from_engine_index(0),
         EngineCoreReadyResponse {
             cache_trace_epochs: vec!["capture-epoch".to_string()],
-            ..default_ready_response()
+            ..ready
         },
     )
     .await
@@ -192,6 +208,8 @@ fn batch(
         num_waiting,
         kv_active_pages,
         kv_total_pages,
+        finished_status_codes: Vec::new(),
+        finished_messages: Vec::new(),
     }
 }
 
@@ -330,6 +348,10 @@ async fn a_scheduler_that_falls_silent_after_hello_fails_the_link_at_the_bound()
         "{error}"
     );
     assert!(error.contains("without a sign of life"), "{error}");
+    assert!(
+        error.starts_with("TokenSpeed scheduler connection failed: "),
+        "{error}"
+    );
     assert!(!server.engine_ready());
     server.stop(Duration::from_secs(5)).unwrap();
 }
@@ -482,8 +504,9 @@ async fn health_gates_on_the_engine_link_and_the_drain_flag() {
     }
 
     // Readiness held alone (the lifecycle owner's planned warm-up): health
-    // answers NOT_SERVING with its own message while admission stays open,
-    // then the release restores SERVING; the drain below closes admission.
+    // answers NOT_SERVING with its own message while admission stays open to
+    // the warm-up's own requests only, then the release restores SERVING and
+    // admits every request; the drain below closes admission.
     server.set_ready(false);
     let held = client
         .health_check(ts::HealthCheckRequest::default())
@@ -492,14 +515,30 @@ async fn health_gates_on_the_engine_link_and_the_drain_flag() {
         .into_inner();
     assert!(!held.healthy);
     assert_eq!(held.message, "Warming up");
+    let refused = server
+        .state
+        .shared
+        .registry
+        .register("held-probe")
+        .err()
+        .expect("a request that is not the warm-up's is refused while readiness is held");
+    assert_eq!(refused.code(), Code::Unavailable);
+    assert_eq!(refused.message(), "servicer is warming up");
+    let (admitted, _cancel) = server
+        .state
+        .shared
+        .registry
+        .register("smg-warmup-1")
+        .expect("the warm-up's own request is admitted while readiness is held");
+    drop(admitted);
+    server.set_ready(true);
     let (admitted, _cancel) = server
         .state
         .shared
         .registry
         .register("held-probe")
-        .expect("admission stays open while readiness is held");
+        .expect("the release admits every request");
     drop(admitted);
-    server.set_ready(true);
     assert!(
         client
             .health_check(ts::HealthCheckRequest::default())
@@ -522,6 +561,59 @@ async fn health_gates_on_the_engine_link_and_the_drain_flag() {
         "the drain closes admission"
     );
     server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// Readiness held for the lifecycle owner's planned warm-up: a request that
+/// is not the warm-up's own is refused as not serving before anything of it
+/// reaches the engine (the engine's next admission is the warm-up's), the
+/// warm-up's own request is served, and the release admits the other again.
+#[tokio::test]
+async fn a_request_that_is_not_the_warm_ups_is_refused_while_readiness_is_held() {
+    let mut h = harness(model_info(), None).await;
+    h.server.set_ready(false);
+    let status = h
+        .client
+        .generate(generate_request("chatcmpl-1", true, Vec::new()))
+        .await
+        .expect_err("readiness held: not the warm-up's request");
+    assert_eq!(status.code(), Code::Unavailable);
+    assert_eq!(status.message(), "servicer is warming up");
+    assert_eq!(h.server.active_requests(), 0);
+
+    let mut own = h
+        .client
+        .generate(generate_request("smg-warmup-1", true, Vec::new()))
+        .await
+        .expect("the warm-up's own request is admitted")
+        .into_inner();
+    let request = recv_add(&mut h.engine_in).await;
+    assert_eq!(
+        request.rid, "smg-warmup-1",
+        "the engine's first admission is the warm-up's"
+    );
+    send(
+        &mut h.engine_out,
+        &batch("smg-warmup-1", vec![10], 1, Some("length"), None),
+    )
+    .await;
+    while own.message().bounded().await.unwrap().is_some() {}
+
+    h.server.set_ready(true);
+    let mut late = h
+        .client
+        .generate(generate_request("chatcmpl-1", true, Vec::new()))
+        .await
+        .expect("the release admits every request")
+        .into_inner();
+    let request = recv_add(&mut h.engine_in).await;
+    assert_eq!(request.rid, "chatcmpl-1");
+    send(
+        &mut h.engine_out,
+        &batch("chatcmpl-1", vec![10], 1, Some("length"), None),
+    )
+    .await;
+    while late.message().bounded().await.unwrap().is_some() {}
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
 /// Streaming: one chunk per scheduler step, then the scheduler's own
@@ -596,6 +688,102 @@ async fn non_streaming_generate_delivers_only_the_complete() {
     assert_eq!(done.finish_reason, "stop");
     assert_eq!(done.output_ids, vec![10, 11, 12]);
     assert!(stream.message().bounded().await.unwrap().is_none());
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A request the scheduler refuses at admission on a scheduler that
+/// declares the finish-detail columns: its abort carries the 400 and the
+/// reason, and the Generate ends with INVALID_ARGUMENT and the scheduler's
+/// own words (streamed and not); the next request is served. The same frame
+/// from a scheduler that declares no such column ends the Generate with
+/// INTERNAL and the sentence naming an engine abort whose reason did not
+/// travel: an engine abort is never an empty success on either kind of
+/// scheduler.
+#[tokio::test]
+async fn a_refusal_the_scheduler_attributes_ends_the_generate_with_its_status_and_words() {
+    use engine_zmq_client::protocol::tokenspeed::output::{
+        BASE_COLUMN_NAMES, BATCH_TOKEN_ID_OUT_SLIM_TAG, FINISHED_MESSAGES, FINISHED_STATUS_CODES,
+    };
+    const REFUSAL: &str =
+        "Invalid request: the input (8191 tokens) exceeds the engine's maximum input length \
+         (8190 tokens)";
+    let refused = |rid: &str| BatchTokenIDOutSlim {
+        finished_status_codes: vec![Some(400)],
+        finished_messages: vec![Some(REFUSAL.to_string())],
+        ..batch(rid, Vec::new(), 0, Some("abort"), None)
+    };
+
+    let mut declaring = default_ready_response();
+    declaring.cache_trace_epochs = vec!["capture-epoch".to_string()];
+    declaring.positional_layouts.insert(
+        BATCH_TOKEN_ID_OUT_SLIM_TAG.to_string(),
+        BASE_COLUMN_NAMES
+            .iter()
+            .copied()
+            .chain([FINISHED_STATUS_CODES, FINISHED_MESSAGES])
+            .map(str::to_string)
+            .collect(),
+    );
+    let mut h = harness_with_ready(model_info(), None, declaring).await;
+    for stream in [false, true] {
+        let rid = if stream { "edge-s" } else { "edge" };
+        let mut responses = h
+            .client
+            .generate(generate_request(rid, stream, Vec::new()))
+            .await
+            .expect("generate")
+            .into_inner();
+        recv_add(&mut h.engine_in).await;
+        send(&mut h.engine_out, &refused(rid)).await;
+        let status = responses
+            .message()
+            .bounded()
+            .await
+            .expect_err("the scheduler's refusal");
+        assert_eq!(status.code(), Code::InvalidArgument, "stream {stream}");
+        assert_eq!(status.message(), REFUSAL, "stream {stream}");
+    }
+    // The next request is served as usual.
+    let mut responses = h
+        .client
+        .generate(generate_request("next", false, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    send(
+        &mut h.engine_out,
+        &batch("next", vec![10], 1, Some("stop"), None),
+    )
+    .await;
+    let done = complete(responses.message().bounded().await.unwrap().unwrap());
+    assert_eq!(
+        (done.finish_reason.as_str(), done.output_ids),
+        ("stop", vec![10])
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+
+    // A scheduler that declares no such column: the columns are not read,
+    // and the abort is the internal status with the fixed sentence.
+    let mut h = harness(model_info(), None).await;
+    let mut responses = h
+        .client
+        .generate(generate_request("plain", false, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    send(&mut h.engine_out, &refused("plain")).await;
+    let status = responses
+        .message()
+        .bounded()
+        .await
+        .expect_err("an engine abort is never an empty success");
+    assert_eq!(status.code(), Code::Internal);
+    assert_eq!(
+        status.message(),
+        "the engine aborted the request (its reason stays in the engine's log on this wire)"
+    );
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
@@ -691,8 +879,9 @@ async fn string_stops_without_a_tokenizer_are_refused() {
 }
 
 /// `Abort` ends the stream with an `abort` Complete and reaches the
-/// scheduler. The caller's own abort stays a completion; only a shutdown
-/// under an open request is a status
+/// scheduler. The caller's own abort stays a completion (the scheduler's own
+/// terminal abort frame for it, which arrives after, reaches no stream and
+/// is never a status); only a shutdown under an open request is a status
 /// (`a_shutdown_ends_an_open_stream_with_unavailable_not_an_abort_completion`).
 #[tokio::test]
 async fn abort_rpc_cancels_an_in_flight_stream() {
@@ -727,6 +916,31 @@ async fn abort_rpc_cancels_an_in_flight_stream() {
     assert_eq!(aborted.output_ids, vec![10]);
     assert!(stream.message().bounded().await.unwrap().is_none());
     assert_eq!(recv_abort(&mut h.engine_in).await, vec!["r4".to_string()]);
+    // The scheduler's own terminal abort frame for the aborted request
+    // arrives after the stream ended: nothing to answer, and the next request
+    // is served as usual.
+    send(
+        &mut h.engine_out,
+        &batch("r4", Vec::new(), 1, Some("abort"), None),
+    )
+    .await;
+    let mut next = h
+        .client
+        .generate(generate_request("r4-next", false, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    send(
+        &mut h.engine_out,
+        &batch("r4-next", vec![11], 1, Some("stop"), None),
+    )
+    .await;
+    let done = complete(next.message().bounded().await.unwrap().unwrap());
+    assert_eq!(
+        (done.finish_reason.as_str(), done.output_ids),
+        ("stop", vec![11])
+    );
     // An unknown id is a no-op, not an error (idempotent cleanup).
     h.client
         .abort(ts::AbortRequest {
@@ -1041,9 +1255,97 @@ async fn info_rpcs_report_the_launcher_facts_and_the_handshake() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
-/// The msgpack wire has no control messages, so the scheduler's control RPCs
-/// say so instead of pretending; a disabled KV publisher reads as the Python
-/// servicer's UNIMPLEMENTED.
+/// A control call as the mock scheduler sees it: `[CONTROL, (call_id,
+/// method, args)]`.
+async fn recv_control(engine: &mut MockEngineInput) -> (i64, String, Vec<OpaqueValue>) {
+    let frames = engine.recv_frames().await.unwrap();
+    assert_eq!(
+        TokenSpeedRequestType::from_frame(frames[0].as_ref()),
+        Some(TokenSpeedRequestType::Control)
+    );
+    decode_msgpack(frames[1].as_ref()).unwrap()
+}
+
+async fn reply_control(
+    engine_out: &mut MockEngineOutput,
+    call_id: i64,
+    success: bool,
+    message: Option<&str>,
+) {
+    let reply = ControlReplySlim {
+        call_id,
+        success,
+        message: message.map(str::to_string),
+        engine_index: 0,
+    };
+    engine_out
+        .send_frames(vec![Bytes::from(encode_msgpack(&reply).unwrap())])
+        .await
+        .unwrap();
+}
+
+/// A scheduler whose handshake declares the control reply (the control-wire
+/// revision) gets `FlushCache` and the profile RPCs as control calls on its
+/// input socket, answered under the call id with its own `success` and
+/// `message`, aggregated as the Python servicer aggregates them.
+#[tokio::test]
+async fn control_rpcs_ride_the_control_wire_when_the_scheduler_declares_it() {
+    let mut h = harness_with_ready(model_info(), None, control_wire_ready()).await;
+    let (engine_in, engine_out) = (&mut h.engine_in, &mut h.engine_out);
+    let (flushed, ()) = tokio::join!(
+        h.client
+            .flush_cache(common::FlushCacheRequest { timeout_s: 0.0 }),
+        async {
+            let (call_id, method, args) = recv_control(engine_in).await;
+            assert_eq!(method, "flush_cache");
+            assert_eq!(args, vec![OpaqueValue::F64(0.0)]);
+            reply_control(engine_out, call_id, true, None).await;
+        }
+    );
+    let flushed = flushed.unwrap().into_inner();
+    assert!(flushed.success);
+    assert_eq!(flushed.message, "Cache flushed successfully");
+
+    let (started, ()) = tokio::join!(
+        h.client.start_profile(common::StartProfileRequest {
+            output_dir: Some("/tmp/traces".to_string()),
+            num_steps: Some(3),
+            ..Default::default()
+        }),
+        async {
+            let (call_id, method, args) = recv_control(engine_in).await;
+            assert_eq!(method, "start_profile");
+            let options = args[0].as_map().unwrap();
+            assert!(options
+                .iter()
+                .any(|(k, v)| k.as_str() == Some("num_steps") && *v == OpaqueValue::from(3i64)));
+            reply_control(engine_out, call_id, true, None).await;
+        }
+    );
+    assert!(started.unwrap().into_inner().success);
+
+    let (stopped, ()) = tokio::join!(
+        h.client.stop_profile(common::StopProfileRequest::default()),
+        async {
+            let (call_id, method, _args) = recv_control(engine_in).await;
+            assert_eq!(method, "stop_profile");
+            reply_control(engine_out, call_id, false, Some("no profiler running")).await;
+        }
+    );
+    let stopped = stopped.unwrap().into_inner();
+    assert!(!stopped.success);
+    assert!(
+        stopped.message.contains("no profiler running"),
+        "{}",
+        stopped.message
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A scheduler whose handshake declares no control reply (today's) carries
+/// generate and abort only, so the scheduler's control RPCs say so instead of
+/// pretending, and nothing reaches it; a disabled KV publisher reads as the
+/// Python servicer's UNIMPLEMENTED.
 #[tokio::test]
 async fn control_rpcs_report_what_the_wire_cannot_carry() {
     let mut h = harness(model_info(), None).await;
@@ -1053,12 +1355,32 @@ async fn control_rpcs_report_what_the_wire_cannot_carry() {
         .await
         .expect_err("no control wire");
     assert_eq!(flush.code(), Code::Unimplemented);
+    assert!(
+        flush.message().contains("declares no control reply"),
+        "{}",
+        flush.message()
+    );
     let profile = h
         .client
         .start_profile(common::StartProfileRequest::default())
         .await
         .expect_err("no control wire");
     assert_eq!(profile.code(), Code::Unimplemented);
+    let stopped = h
+        .client
+        .stop_profile(common::StopProfileRequest::default())
+        .await
+        .expect_err("no control wire");
+    assert_eq!(stopped.code(), Code::Unimplemented);
+    // "Nothing reaches it": the adapter's gate is the only thing between a
+    // control frame and a scheduler that declared no reply, so the mock's
+    // input must stay silent after the three RPCs.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), h.engine_in.recv_frames())
+            .await
+            .is_err(),
+        "no control frame may reach a scheduler that declared no control reply"
+    );
     let events = h
         .client
         .subscribe_kv_events(common::SubscribeKvEventsRequest::default())
@@ -1159,29 +1481,13 @@ async fn the_relay_subscribes_to_the_publisher_at_boot_before_any_gateway() {
 /// publisher's first batch, and the first gateway gets all four from it.
 #[tokio::test]
 async fn a_publisher_already_counting_when_the_servicer_starts_is_replayed_from_its_start() {
-    use zeromq::{prelude::*, PubSocket, RouterSocket, ZmqMessage};
+    use crate::testing::{publisher_and_replay_socket, replayed_from_the_publishers_start};
 
-    use crate::kv_events::golden;
-
-    let mut publisher = PubSocket::new();
-    let pub_port = bound_port(
-        &publisher
-            .bind("tcp://127.0.0.1:0")
-            .await
-            .expect("publisher binds")
-            .to_string(),
-    );
-    let mut router = RouterSocket::new();
-    let replay_port = bound_port(
-        &router
-            .bind("tcp://127.0.0.1:0")
-            .await
-            .expect("replay socket binds")
-            .to_string(),
-    );
+    let (mut publisher, mut router, events_endpoint, replay_endpoint) =
+        publisher_and_replay_socket().await;
     let mut model = model_info();
-    model.kv_events_endpoint = format!("tcp://*:{pub_port}");
-    model.kv_events_replay_endpoint = format!("tcp://*:{replay_port}");
+    model.kv_events_endpoint = events_endpoint;
+    model.kv_events_replay_endpoint = replay_endpoint;
     model.kv_events_topic = "kv".to_string();
     let mut h = harness(model, None).await;
     let relay = h
@@ -1191,61 +1497,7 @@ async fn a_publisher_already_counting_when_the_servicer_starts_is_replayed_from_
         .kv_relay
         .clone()
         .expect("a relay for the publisher");
-    // Sequences 0..=2 went out before the subscription landed: publish 3
-    // until the relay asks the replay socket, which it must do from 0.
-    let batch1 = golden::bytes(golden::BATCH1);
-    let batch2 = golden::bytes(golden::BATCH2);
-    let mut request = None;
-    for _ in 0..250 {
-        publisher
-            .send(golden::frame(b"kv", 3, &batch2))
-            .await
-            .expect("publish");
-        if let Ok(message) = tokio::time::timeout(Duration::from_millis(20), router.recv()).await {
-            request = Some(message.expect("a replay request"));
-            break;
-        }
-    }
-    let request = request.expect("the relay asked the replay socket");
-    let frames: Vec<Vec<u8>> = request.iter().map(|frame| frame.to_vec()).collect();
-    assert_eq!(frames.len(), 3, "[identity, empty, start]");
-    assert_eq!(
-        frames[2],
-        0u64.to_be_bytes(),
-        "asked from the publisher's start"
-    );
-    for (sequence, payload) in [(0u64, &batch1), (1, &batch2), (2, &batch2), (3, &batch2)] {
-        let mut reply = ZmqMessage::from(frames[0].clone());
-        reply.push_back(Vec::new().into());
-        reply.push_back(b"kv".to_vec().into());
-        reply.push_back(sequence.to_be_bytes().to_vec().into());
-        reply.push_back(payload.clone().into());
-        router.send(reply).await.expect("reply");
-    }
-    let mut end = ZmqMessage::from(frames[0].clone());
-    end.push_back(Vec::new().into());
-    end.push_back(Vec::new().into());
-    end.push_back([0xff; 8].to_vec().into());
-    end.push_back(Vec::new().into());
-    router.send(end).await.expect("end marker");
-    for _ in 0..250 {
-        if relay.counts().relayed >= 4 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    // Whichever asked first, the start replay or the late join: all four came
-    // from the replay socket and nothing is unknown.
-    let counts = relay.counts();
-    assert_eq!(
-        (
-            counts.relayed,
-            counts.gap_batches_recovered + counts.primed_batches,
-            counts.unknown_before_start
-        ),
-        (4, 4, 0),
-        "{counts:?}"
-    );
+    replayed_from_the_publishers_start(&mut publisher, &mut router, &relay).await;
 
     // The window is the publisher's whole life: the first gateway gets it.
     let mut stream = h
@@ -1490,6 +1742,406 @@ async fn every_rank_of_a_data_parallel_publisher_reaches_the_gateway() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// A request of a prefill or decode side under PD disaggregation.
+fn disaggregated_request(id: &str, room: i64) -> ts::GenerateRequest {
+    let mut request = generate_request(id, false, Vec::new());
+    request.kv_bootstrap_info = Some(ts::KvBootstrapInfo {
+        bootstrap_host: "10.0.0.7".to_string(),
+        bootstrap_port: 8998,
+        bootstrap_room: room,
+    });
+    request
+}
+
+/// A disaggregated request's rendezvous reaches the scheduler in the
+/// request's own bootstrap slots, as the Python servicer forwards it, and
+/// its answer comes back as any request's; an aggregated request still
+/// carries no rendezvous.
+#[tokio::test]
+async fn a_disaggregated_requests_rendezvous_reaches_the_scheduler() {
+    let mut h = harness(model_info(), None).await;
+    let mut stream = h
+        .client
+        .generate(disaggregated_request("pd-1", 41))
+        .await
+        .expect("generate")
+        .into_inner();
+    let add = recv_add(&mut h.engine_in).await;
+    assert_eq!(add.rid, "pd-1");
+    assert_eq!(add.bootstrap_host.as_deref(), Some("10.0.0.7"));
+    assert_eq!(add.bootstrap_port, Some(8998));
+    assert_eq!(add.bootstrap_room, Some(41));
+    assert_eq!(add.input_ids, vec![1, 2, 3]);
+    send(
+        &mut h.engine_out,
+        &batch("pd-1", vec![10], 1, Some("stop"), None),
+    )
+    .await;
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(done.finish_reason, "stop");
+    assert_eq!(done.output_ids, vec![10]);
+    assert!(stream.message().bounded().await.unwrap().is_none());
+
+    let mut stream = h
+        .client
+        .generate(generate_request("plain", false, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    let add = recv_add(&mut h.engine_in).await;
+    assert_eq!(
+        (add.bootstrap_host, add.bootstrap_port, add.bootstrap_room),
+        (None, None, None)
+    );
+    send(
+        &mut h.engine_out,
+        &batch("plain", vec![10], 1, Some("stop"), None),
+    )
+    .await;
+    complete(stream.message().bounded().await.unwrap().unwrap());
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    assert_eq!(h.server.active_requests(), 0);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// An EPD prefill's item reaches the scheduler with its encode rendezvous
+/// in the item's own slot and no feature (the encode worker ships the
+/// embedding); an encode rendezvous that names no item is refused before
+/// the scheduler, in the Python servicer's words.
+#[tokio::test]
+async fn an_epd_prefill_items_rendezvous_reaches_the_scheduler() {
+    let mut h = harness(model_info(), None).await;
+    let mut request = generate_request("epd-1", false, Vec::new());
+    request.tokenized.as_mut().unwrap().input_ids = vec![1, 2, 3, 4, 5];
+    request.mm_inputs = Some(ts::MultimodalInputs {
+        items: vec![ts::MultimodalItem {
+            modality: common::Modality::Image as i32,
+            content_hash: 7u64.to_le_bytes().to_vec(),
+            encoder_input: None,
+            model_specific_tensors: Default::default(),
+            placeholders: vec![ts::PlaceholderRange {
+                offset: 1,
+                length: 3,
+            }],
+            placeholder_token_id: Some(9),
+        }],
+    });
+    request.encode_bootstrap_info = Some(ts::EncodeBootstrapInfo {
+        items: vec![ts::EncodeItemBootstrapInfo {
+            item_index: 0,
+            bootstrap_host: "10.0.0.9".to_string(),
+            bootstrap_port: 8998,
+            bootstrap_room: 41,
+        }],
+    });
+    let mut stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    let frames = h.engine_in.recv_frames().await.unwrap();
+    assert_eq!(
+        TokenSpeedRequestType::from_frame(frames[0].as_ref()),
+        Some(TokenSpeedRequestType::Add)
+    );
+    let payload = decode_value(frames[1].as_ref()).unwrap();
+    let array = payload.as_array().expect("a positional array");
+    assert_eq!(
+        array.len(),
+        23,
+        "the extended form, through multimodal_inputs"
+    );
+    assert!(
+        array[16..=18].iter().all(rmpv::Value::is_nil),
+        "no KV rendezvous on an EPD prefill: {:?}",
+        &array[16..=18]
+    );
+    let items = array[22].as_array().expect("multimodal inputs")[0]
+        .as_array()
+        .expect("items");
+    let item = items[0].as_array().expect("an item");
+    assert_eq!(item.len(), 10);
+    assert!(item[4].is_nil(), "no feature: {:?}", item[4]);
+    let handshake = item[9].as_map().expect("the handshake map");
+    let field = |name: &str| {
+        handshake
+            .iter()
+            .find(|(key, _)| key.as_str() == Some(name))
+            .map(|(_, value)| value.clone())
+            .unwrap_or_else(|| panic!("{name} in the handshake"))
+    };
+    assert_eq!(field("bootstrap_host").as_str(), Some("10.0.0.9"));
+    assert_eq!(field("bootstrap_port").as_i64(), Some(8998));
+    assert_eq!(field("bootstrap_room").as_i64(), Some(41));
+    send(
+        &mut h.engine_out,
+        &batch("epd-1", vec![10], 1, Some("stop"), None),
+    )
+    .await;
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(done.finish_reason, "stop");
+    assert!(stream.message().bounded().await.unwrap().is_none());
+
+    let mut refused = generate_request("epd-2", false, Vec::new());
+    refused.encode_bootstrap_info = Some(ts::EncodeBootstrapInfo { items: vec![] });
+    let status = h.client.generate(refused).await.expect_err("no items");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(
+        status
+            .message()
+            .contains("encode_bootstrap_info present but mm_inputs is missing"),
+        "{}",
+        status.message()
+    );
+    assert_scheduler_idle(&mut h.engine_in).await;
+    assert_eq!(h.server.active_requests(), 0);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A Qwen3.5-lineage checkpoint's image request reaches the scheduler with
+/// the MRoPE position table the engine's own input processor would have
+/// written (slots 3-5 of the request's multimodal inputs: the `(3, L)` int64
+/// table, the `(1, 1)` delta, the scalar), computed from the launcher's
+/// layout facts; the same checkpoint without those facts refuses the item
+/// before the scheduler, so the engine never takes 1-D positions for it.
+#[tokio::test]
+async fn a_qwen35_image_request_carries_the_position_table_the_engine_would_compute() {
+    const IMAGE_TOKEN: u32 = 248056;
+    let qwen35 = TokenSpeedModelInfo {
+        model_type: "qwen3_5".to_string(),
+        architectures: vec!["Qwen3_5ForConditionalGeneration".to_string()],
+        mrope_positions: Some(true),
+        spatial_merge_size: Some(2),
+        image_token_id: Some(IMAGE_TOKEN),
+        video_token_id: Some(248057),
+        supports_vision: true,
+        supports_multimodal: true,
+        supported_modalities: vec![1],
+        ..model_info()
+    };
+    let image_request = |id: &str| {
+        let mut request = generate_request(id, false, Vec::new());
+        // The engine's own image case: text, vision start, a (1, 4, 6) grid's
+        // six merged positions, text.
+        let mut ids = vec![10, 248053];
+        ids.extend([IMAGE_TOKEN; 6]);
+        ids.push(11);
+        request.tokenized.as_mut().unwrap().input_ids = ids;
+        request.mm_inputs = Some(ts::MultimodalInputs {
+            items: vec![ts::MultimodalItem {
+                modality: common::Modality::Image as i32,
+                content_hash: 7u64.to_le_bytes().to_vec(),
+                encoder_input: Some(ts::TensorData {
+                    shape: vec![6, 4],
+                    dtype: "bfloat16".to_string(),
+                    payload: Some(ts::tensor_data::Payload::Inline(vec![0u8; 48].into())),
+                }),
+                model_specific_tensors: [(
+                    "image_grid_thw".to_string(),
+                    ts::TensorData {
+                        shape: vec![1, 3],
+                        dtype: "int64".to_string(),
+                        payload: Some(ts::tensor_data::Payload::Inline(
+                            [1i64, 4, 6]
+                                .iter()
+                                .flat_map(|v| v.to_le_bytes())
+                                .collect::<Vec<u8>>()
+                                .into(),
+                        )),
+                    },
+                )]
+                .into(),
+                placeholders: vec![ts::PlaceholderRange {
+                    offset: 2,
+                    length: 6,
+                }],
+                placeholder_token_id: Some(IMAGE_TOKEN),
+            }],
+        });
+        request
+    };
+
+    let mut h = harness(qwen35.clone(), None).await;
+    let mut stream = h
+        .client
+        .generate(image_request("mrope-1"))
+        .await
+        .expect("generate")
+        .into_inner();
+    let frames = h.engine_in.recv_frames().await.unwrap();
+    let payload = decode_value(frames[1].as_ref()).unwrap();
+    let array = payload.as_array().expect("a positional array");
+    let mm = array[22].as_array().expect("multimodal inputs");
+    assert_eq!(mm.len(), 7);
+    let table = mm[3].as_array().expect("the position table tuple");
+    assert_eq!(table[0].as_str(), Some("int64"));
+    assert_eq!(
+        table[1]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![3, 9]
+    );
+    let raw_view = |value: &rmpv::Value| -> Vec<u8> {
+        match value {
+            rmpv::Value::Ext(_, bytes) => bytes.clone(),
+            other => panic!("expected the raw-view ext, got {other:?}"),
+        }
+    };
+    let values: Vec<i64> = raw_view(&table[2])
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| i64::from_le_bytes(*c))
+        .collect();
+    assert_eq!(
+        values,
+        vec![
+            0, 1, 2, 2, 2, 2, 2, 2, 5, // time
+            0, 1, 2, 2, 2, 3, 3, 3, 5, // height
+            0, 1, 2, 3, 4, 2, 3, 4, 5, // width
+        ]
+    );
+    let delta = mm[4].as_array().expect("the delta tuple");
+    assert_eq!(
+        delta[1]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![1, 1]
+    );
+    assert_eq!(
+        i64::from_le_bytes(raw_view(&delta[2]).as_chunks::<8>().0[0]),
+        -3
+    );
+    assert_eq!(mm[5].as_i64(), Some(-3));
+    assert!(mm[6].is_nil());
+    send(
+        &mut h.engine_out,
+        &batch("mrope-1", vec![10], 1, Some("stop"), None),
+    )
+    .await;
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(done.finish_reason, "stop");
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    assert_scheduler_idle(&mut h.engine_in).await;
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+
+    // The same checkpoint whose launcher shipped no layout facts: refused
+    // before the scheduler, never empty position slots.
+    let without_facts = TokenSpeedModelInfo {
+        spatial_merge_size: None,
+        image_token_id: None,
+        video_token_id: None,
+        ..qwen35
+    };
+    let mut h = harness(without_facts, None).await;
+    let status = h
+        .client
+        .generate(image_request("mrope-2"))
+        .await
+        .expect_err("refused");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(
+        status.message().contains("did not provide"),
+        "{}",
+        status.message()
+    );
+    assert_scheduler_idle(&mut h.engine_in).await;
+    assert_eq!(h.server.active_requests(), 0);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// Under attention data parallelism a disaggregated request goes to the
+/// rank of its room's residue, the engine's own dispatch rule on both sides
+/// (the decode receiver looks for the KV on the prefill rank of that
+/// residue), where "rank" is the one each scheduler declares at its
+/// handshake, not the order or the identity it dialled in with: here the
+/// scheduler that dialled in as identity 0 declares rank 1. An aggregated
+/// request goes where its pin says, under the same numbering, and a pin
+/// outside the ranks is refused as the engine refuses it.
+#[tokio::test]
+async fn a_disaggregated_request_is_placed_on_the_rank_of_its_rooms_residue() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let mut config = config(dir.path(), &handshake, model_info());
+    config.servicer.engine_count = 2;
+    config.model.data_parallel_size = 2;
+    let server = TokenSpeedServicerServer::start(config).expect("servicer starts");
+    let ready = |rank: u32| EngineCoreReadyResponse {
+        data_parallel_rank: rank,
+        ..default_ready_response()
+    };
+    // Identity 0 is rank 1 and identity 1 is rank 0.
+    let (first, second) = tokio::join!(
+        connect_to_frontend(&handshake, EngineId::from_engine_index(0), ready(1)),
+        connect_to_frontend(&handshake, EngineId::from_engine_index(1), ready(0)),
+    );
+    let (mut rank1_in, mut rank1_out) = first.expect("identity 0 handshake").split();
+    let (mut rank0_in, mut rank0_out) = second.expect("identity 1 handshake").split();
+    wait_until(|| server.engine_ready()).await;
+    let mut client = TokenSpeedSchedulerClient::new(grpc_channel(server.address()).await);
+
+    let mut odd = client
+        .generate(disaggregated_request("room-7", 7))
+        .await
+        .expect("generate")
+        .into_inner();
+    let add = recv_add(&mut rank1_in).await;
+    assert_eq!((add.rid.as_str(), add.bootstrap_room), ("room-7", Some(7)));
+    let mut even = client
+        .generate(disaggregated_request("room-8", 8))
+        .await
+        .expect("generate")
+        .into_inner();
+    let add = recv_add(&mut rank0_in).await;
+    assert_eq!((add.rid.as_str(), add.bootstrap_room), ("room-8", Some(8)));
+    let mut pinned_request = generate_request("pin-1", false, Vec::new());
+    pinned_request.data_parallel_rank = Some(1);
+    let mut pinned = client
+        .generate(pinned_request)
+        .await
+        .expect("generate")
+        .into_inner();
+    let add = recv_add(&mut rank1_in).await;
+    assert_eq!((add.rid.as_str(), add.bootstrap_room), ("pin-1", None));
+
+    // Each scheduler answers under its own identity.
+    let answer = |rid: &str, identity: u32| BatchTokenIDOutSlim {
+        engine_index: identity,
+        ..batch(rid, vec![10], 1, Some("stop"), None)
+    };
+    send(&mut rank1_out, &answer("room-7", 0)).await;
+    send(&mut rank0_out, &answer("room-8", 1)).await;
+    send(&mut rank1_out, &answer("pin-1", 0)).await;
+    for stream in [&mut odd, &mut even, &mut pinned] {
+        let done = complete(stream.message().bounded().await.unwrap().unwrap());
+        assert_eq!(done.finish_reason, "stop");
+        assert!(stream.message().bounded().await.unwrap().is_none());
+    }
+
+    let mut outside = generate_request("pin-9", false, Vec::new());
+    outside.data_parallel_rank = Some(9);
+    let status = client.generate(outside).await.expect_err("out of range");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(
+        status
+            .message()
+            .contains("data_parallel_rank must be in [0, 2)"),
+        "{}",
+        status.message()
+    );
+    assert_scheduler_idle(&mut rank0_in).await;
+    assert_scheduler_idle(&mut rank1_in).await;
+    assert_eq!(server.active_requests(), 0);
+    server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// What the scheduler enforces of a structured request, as the launcher's
 /// `server_args` say: the grammar backend it resolved; nothing is judged
 /// when the launcher could not tell.
@@ -1524,8 +2176,9 @@ fn structured_outputs_support_follows_the_launcher_args() {
 /// A constraint the scheduler's grammar backend cannot enforce is refused
 /// before the scheduler, as the caller's error, on this wire as on the
 /// others: every kind under `--grammar-backend none` (the scheduler would
-/// admit the request and abort it, which this wire reports as a bare
-/// `abort`, an empty answer), and a schema with a feature xgrammar drops;
+/// admit the request and abort it, which reaches the caller as INTERNAL with
+/// `BARE_ENGINE_ABORT`, or as INVALID_ARGUMENT with the engine's reason when
+/// the engine declares its status columns), and a schema with a feature xgrammar drops;
 /// what the backend compiles reaches the scheduler with its constraint, an
 /// unconstrained request is served as before, and nothing is judged when
 /// the launcher wrote no backend.
@@ -1847,7 +2500,7 @@ const GOLDEN_SCRAPE: &str = r#"
 # HELP smg_servicer_requests_refused_total Requests refused before they reached the engine, by reason.
 # HELP smg_servicer_requests_total Requests whose stream ended, by how they ended; a fan-out (n > 1) is one request with the reason of its last choice to end, an abort winning.
 # HELP smg_servicer_start_time_seconds When the servicer started, in seconds since the Unix epoch.
-# HELP smg_servicer_state The servicer's lifecycle state, one-hot: starting, serving, warming_up (readiness held with admission open), draining (admission closed) or engine_down.
+# HELP smg_servicer_state The servicer's lifecycle state, one-hot: starting, serving, warming_up (readiness held, admitting the warm-up's own requests only), draining (admission closed) or engine_down.
 # HELP smg_servicer_string_stops_total Requests this servicer ended on a stop string it matched itself.
 # HELP smg_servicer_time_to_first_token_seconds Seconds from a request's arrival at the servicer to its first output.
 # TYPE smg_servicer_e2e_request_latency_seconds histogram
@@ -2108,4 +2761,46 @@ async fn the_listener_binds_before_the_engine_connects_and_answers_starting() {
     );
     drop(engine);
     server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// Two connected schedulers whose handshakes each say a data-parallel size
+/// of one: the zero-filled `GetLoads` before the first snapshot names the
+/// ranks the servicer serves (one per connected scheduler), as the pinned
+/// request path counts them.
+#[tokio::test]
+async fn the_zero_filled_loads_count_the_connected_ranks() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let mut config = config(dir.path(), &handshake, model_info());
+    config.servicer.engine_count = 2;
+    config.model.data_parallel_size = 2;
+    let server = TokenSpeedServicerServer::start(config).expect("servicer starts");
+    let ready = |rank: u32| EngineCoreReadyResponse {
+        data_parallel_rank: rank,
+        ..default_ready_response()
+    };
+    assert_eq!(ready(1).data_parallel_size, 1);
+    let (rank0, rank1) = tokio::join!(
+        connect_to_frontend(&handshake, EngineId::from_engine_index(0), ready(0)),
+        connect_to_frontend(&handshake, EngineId::from_engine_index(1), ready(1)),
+    );
+    let _rank0 = rank0.expect("rank 0 handshake");
+    let _rank1 = rank1.expect("rank 1 handshake");
+    wait_until(|| server.engine_ready()).await;
+    let mut client = TokenSpeedSchedulerClient::new(grpc_channel(server.address()).await);
+
+    let loads = client
+        .get_loads(ts::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(loads.dp_rank_count, 2);
+    assert_eq!(
+        loads
+            .loads
+            .iter()
+            .map(|load| load.dp_rank)
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
 }

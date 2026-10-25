@@ -1257,7 +1257,9 @@ impl WorkerRegistry {
     //   (WorkerManager)            Pending/NotReady -> Failed       (decided under the lock)
     //                              Ready -> NotReady
     //   connect signal             any -> Ready                     `transition_status_if_revision`
-    //   (WorkerManager)
+    //   (WorkerManager)            (a ZMQ handshake, or a worker
+    //                              without health checks; a probed
+    //                              worker's signal moves its probe)
     //   mesh health hint           Pending/NotReady -> Ready        `transition_under_lock`
     //   (`on_remote_worker_state`) Ready -> NotReady                (decided under the lock)
     //   drain step                 Ready -> Draining                `apply_if_revision`
@@ -2057,6 +2059,7 @@ impl WorkerRegistry {
         Metrics::set_worker_health(worker.url(), worker.is_healthy());
         Metrics::set_worker_http2(worker.url(), worker.http2());
         Metrics::set_worker_cb_state(worker.url(), worker.circuit_breaker_state().as_int());
+        worker.republish_state();
 
         // The worker's request counter starts at zero with its registration,
         // so a worker that gets no traffic shows as such.

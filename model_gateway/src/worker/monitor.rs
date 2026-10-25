@@ -265,12 +265,15 @@ impl NativeLoadsPath {
         }
     }
 
-    /// Where to probe this route on `worker`.
+    /// Where to probe this route on `worker`: its engine's address (a
+    /// dp-aware rank worker's URL carries the router's `@rank` suffix, which
+    /// is no part of the host).
     fn probe_url(self, worker: &Arc<dyn Worker>) -> String {
+        let base = worker.base_url();
         match self {
             // Sections beyond `core` degrade gracefully: an engine that does
             // not report them omits the fields, which deserialize to `None`.
-            Self::Engine => worker.endpoint_url("/v1/loads?include=core,disagg,queues,memory"),
+            Self::Engine => format!("{base}/v1/loads?include=core,disagg,queues,memory"),
             // A gateway serves a whole fleet, so an unscoped `/loads` blends
             // every model it fronts. A worker registered for exactly one
             // model must be asked about that model alone.
@@ -278,9 +281,9 @@ impl NativeLoadsPath {
                 [card] => {
                     let model: String =
                         url::form_urlencoded::byte_serialize(card.id.as_bytes()).collect();
-                    worker.endpoint_url(&format!("/loads?model={model}"))
+                    format!("{base}/loads?model={model}")
                 }
-                _ => worker.endpoint_url("/loads"),
+                _ => format!("{base}/loads"),
             },
         }
     }
@@ -1199,7 +1202,7 @@ impl WorkerMonitor {
     /// exposed as `vllm:gpu_cache_usage_perc` in vLLM v0 and renamed to
     /// `vllm:kv_cache_usage_perc` in vLLM v1, so accept either.
     async fn fetch_http_load_vllm(worker: &Arc<dyn Worker>) -> Option<WorkerLoadResponse> {
-        let url = worker.endpoint_url("/metrics");
+        let url = format!("{}/metrics", worker.base_url());
         let body = Self::authed_get(worker, &url).await?.text().await.ok()?;
         let m = PromScrape::parse(&body);
 
@@ -1225,7 +1228,7 @@ impl WorkerMonitor {
     /// the `sglang:` metric prefix through v0.5.3 and switched to `sglang_`
     /// in v0.5.4+, so detect whichever is present and use it throughout.
     async fn fetch_http_load_sglang(worker: &Arc<dyn Worker>) -> Option<WorkerLoadResponse> {
-        let url = worker.endpoint_url("/metrics");
+        let url = format!("{}/metrics", worker.base_url());
         let body = Self::authed_get(worker, &url).await?.text().await.ok()?;
         let m = PromScrape::parse(&body);
 
@@ -2521,6 +2524,36 @@ mod native_loads_tests {
             memo.get(worker.url()).and_then(|hit| hit.answered()),
             Some(NativeLoadsPath::Engine)
         );
+    }
+
+    /// The load probe of a dp-aware HTTP worker goes to its engine's address:
+    /// the `@rank` suffix of the worker's URL is the router's, not a host. The
+    /// test checks the address (one probe, the engine's native report read);
+    /// which entry of that report is the worker's rank is a separate question.
+    #[tokio::test]
+    async fn a_dp_aware_http_workers_probe_reaches_its_engine() {
+        let stub = spawn_engine(StatusCode::OK, NATIVE_DP_BODY).await;
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(stub.url.as_str())
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Http)
+                .runtime_type(RuntimeType::Vllm)
+                .model(ModelCard::new("a"))
+                .dp_config(1, 2)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        assert_eq!(worker.url(), format!("{}@1", stub.url));
+        let memo = DashMap::new();
+        let resp = WorkerMonitor::fetch_http_load(&worker, Some(&memo))
+            .await
+            .expect("the engine answers at its address");
+        assert_eq!(resp.loads[0].dp_rank, 1);
+        assert_eq!(resp.loads[0].num_running_reqs, 9);
+        assert_eq!(stub.probes.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

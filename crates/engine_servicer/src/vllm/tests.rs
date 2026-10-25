@@ -51,7 +51,8 @@ use super::*;
 use crate::{
     kv_events,
     testing::{
-        assert_bucket_edges, assert_golden, captured_logs, http_get, servicer_config, Bounded,
+        assert_bucket_edges, assert_golden, bound_port, captured_logs, http_get, servicer_config,
+        Bounded,
     },
     tokenizer_bundle, ServicerError,
 };
@@ -100,15 +101,6 @@ async fn assert_handshake_released(handshake: &str) {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     UnixListener::bind(path).expect("handshake endpoint released");
-}
-
-/// The port a socket bound to `tcp://127.0.0.1:0` was given.
-fn bound_port(endpoint: &str) -> u16 {
-    endpoint
-        .rsplit(':')
-        .next()
-        .and_then(|port| port.parse().ok())
-        .expect("a bound tcp endpoint ends with its port")
 }
 
 async fn wait_until(mut condition: impl FnMut() -> bool) {
@@ -232,7 +224,7 @@ fn batch(
             ..Default::default()
         }],
         finished_requests: finish.map(|_| BTreeSet::from([request_id.to_string()])),
-        scheduler_stats: stats.map(Box::new),
+        scheduler_stats: stats,
         ..Default::default()
     })
 }
@@ -422,8 +414,9 @@ async fn health_gates_on_the_engine_link_and_the_drain_flag() {
     assert_eq!(unknown.code(), Code::NotFound);
 
     // Readiness held alone (the lifecycle owner's planned warm-up): health
-    // answers NOT_SERVING with its own message while admission stays open,
-    // then the release restores SERVING; the drain below closes admission.
+    // answers NOT_SERVING with its own message while admission stays open to
+    // the warm-up's own requests only, then the release restores SERVING and
+    // admits every request; the drain below closes admission.
     server.set_ready(false);
     let held = client
         .health_check(vllm::HealthCheckRequest::default())
@@ -432,14 +425,30 @@ async fn health_gates_on_the_engine_link_and_the_drain_flag() {
         .into_inner();
     assert!(!held.healthy);
     assert_eq!(held.message, "Warming up");
+    let refused = server
+        .state
+        .shared
+        .registry
+        .register("held-probe")
+        .err()
+        .expect("a request that is not the warm-up's is refused while readiness is held");
+    assert_eq!(refused.code(), Code::Unavailable);
+    assert_eq!(refused.message(), "servicer is warming up");
+    let (admitted, _cancel) = server
+        .state
+        .shared
+        .registry
+        .register("smg-warmup-1")
+        .expect("the warm-up's own request is admitted while readiness is held");
+    drop(admitted);
+    server.set_ready(true);
     let (admitted, _cancel) = server
         .state
         .shared
         .registry
         .register("held-probe")
-        .expect("admission stays open while readiness is held");
+        .expect("the release admits every request");
     drop(admitted);
-    server.set_ready(true);
     assert!(
         client
             .health_check(vllm::HealthCheckRequest::default())
@@ -771,13 +780,13 @@ async fn kv_transfer_params_pass_through_both_ways() {
 
     let mut outputs = batch("pd1", vec![7], Some(EngineCoreFinishReason::Length), None);
     if let EngineCoreOutputs::RequestBatch(batch) = &mut outputs {
-        batch.outputs[0].kv_transfer_params = Some(serde_json::json!({
+        batch.outputs[0].kv_transfer_params = Some(Box::new(serde_json::json!({
             "do_remote_prefill": true,
             "remote_block_ids": [1, 2],
             "remote_engine_id": "eng-a",
             "remote_host": "10.0.0.1",
             "remote_port": 5600,
-        }));
+        })));
     }
     h.engine_out.send_outputs(&outputs).await.unwrap();
     let finished = complete(stream.message().bounded().await.unwrap().unwrap());
@@ -1123,12 +1132,12 @@ async fn spec_decode_counts_reach_the_complete() {
         None,
     );
     if let EngineCoreOutputs::RequestBatch(batch) = &mut outputs {
-        batch.outputs[0].spec_decode_metrics = Some(SpecDecodeMetrics {
+        batch.outputs[0].spec_decode_metrics = Some(Box::new(SpecDecodeMetrics {
             num_spec_tokens: 3,
             histogram: vec![1, 2, 0, 1],
             num_draft_tokens: 9,
             ..Default::default()
-        });
+        }));
     }
     h.engine_out.send_outputs(&outputs).await.unwrap();
     let done = complete(stream.message().bounded().await.unwrap().unwrap());
@@ -1559,11 +1568,11 @@ async fn remote_kv_waiting_load_is_reported_per_rank() {
         rank1_out
             .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
                 engine_index: 1,
-                scheduler_stats: Some(Box::new(SchedulerStats {
+                scheduler_stats: Some(SchedulerStats {
                     num_waiting_reqs: runnable,
                     num_skipped_waiting_reqs: deferred,
                     ..Default::default()
-                })),
+                }),
                 ..Default::default()
             }))
             .await
@@ -1630,7 +1639,7 @@ async fn a_second_rank_reports_its_own_hit_rate_and_throughput() {
                 }),
                 ..Default::default()
             }],
-            scheduler_stats: Some(Box::new(step(1))),
+            scheduler_stats: Some(step(1)),
             ..Default::default()
         }))
         .await
@@ -1647,7 +1656,7 @@ async fn a_second_rank_reports_its_own_hit_rate_and_throughput() {
     h.engine_out
         .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
             engine_index: 0,
-            scheduler_stats: Some(Box::new(step(0))),
+            scheduler_stats: Some(step(0)),
             ..Default::default()
         }))
         .await
@@ -1871,28 +1880,13 @@ async fn relayed_batches_carry_the_servicers_load_record() {
 /// publisher's first batch, and the first gateway gets all four from it.
 #[tokio::test]
 async fn a_publisher_already_counting_when_the_servicer_starts_is_replayed_from_its_start() {
-    use kv_events::golden;
-    use zeromq::{prelude::*, PubSocket, RouterSocket, ZmqMessage};
+    use crate::testing::{publisher_and_replay_socket, replayed_from_the_publishers_start};
 
-    let mut publisher = PubSocket::new();
-    let pub_port = bound_port(
-        &publisher
-            .bind("tcp://127.0.0.1:0")
-            .await
-            .expect("publisher binds")
-            .to_string(),
-    );
-    let mut router = RouterSocket::new();
-    let replay_port = bound_port(
-        &router
-            .bind("tcp://127.0.0.1:0")
-            .await
-            .expect("replay socket binds")
-            .to_string(),
-    );
+    let (mut publisher, mut router, events_endpoint, replay_endpoint) =
+        publisher_and_replay_socket().await;
     let mut model = model_info();
-    model.kv_events_endpoint = format!("tcp://*:{pub_port}");
-    model.kv_events_replay_endpoint = format!("tcp://*:{replay_port}");
+    model.kv_events_endpoint = events_endpoint;
+    model.kv_events_replay_endpoint = replay_endpoint;
     model.kv_events_topic = "kv".to_string();
     let mut h = harness(model, None).await;
     let relay = h
@@ -1902,61 +1896,7 @@ async fn a_publisher_already_counting_when_the_servicer_starts_is_replayed_from_
         .kv_relay
         .clone()
         .expect("a relay for the publisher");
-    // Sequences 0..=2 went out before the subscription landed: publish 3
-    // until the relay asks the replay socket, which it must do from 0.
-    let batch1 = golden::bytes(golden::BATCH1);
-    let batch2 = golden::bytes(golden::BATCH2);
-    let mut request = None;
-    for _ in 0..250 {
-        publisher
-            .send(golden::frame(b"kv", 3, &batch2))
-            .await
-            .expect("publish");
-        if let Ok(message) = tokio::time::timeout(Duration::from_millis(20), router.recv()).await {
-            request = Some(message.expect("a replay request"));
-            break;
-        }
-    }
-    let request = request.expect("the relay asked the replay socket");
-    let frames: Vec<Vec<u8>> = request.iter().map(|frame| frame.to_vec()).collect();
-    assert_eq!(frames.len(), 3, "[identity, empty, start]");
-    assert_eq!(
-        frames[2],
-        0u64.to_be_bytes(),
-        "asked from the publisher's start"
-    );
-    for (sequence, payload) in [(0u64, &batch1), (1, &batch2), (2, &batch2), (3, &batch2)] {
-        let mut reply = ZmqMessage::from(frames[0].clone());
-        reply.push_back(Vec::new().into());
-        reply.push_back(b"kv".to_vec().into());
-        reply.push_back(sequence.to_be_bytes().to_vec().into());
-        reply.push_back(payload.clone().into());
-        router.send(reply).await.expect("reply");
-    }
-    let mut end = ZmqMessage::from(frames[0].clone());
-    end.push_back(Vec::new().into());
-    end.push_back(Vec::new().into());
-    end.push_back([0xff; 8].to_vec().into());
-    end.push_back(Vec::new().into());
-    router.send(end).await.expect("end marker");
-    for _ in 0..250 {
-        if relay.counts().relayed >= 4 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    // Whichever asked first, the start replay or the late join: all four came
-    // from the replay socket and nothing is unknown.
-    let counts = relay.counts();
-    assert_eq!(
-        (
-            counts.relayed,
-            counts.gap_batches_recovered + counts.primed_batches,
-            counts.unknown_before_start
-        ),
-        (4, 4, 0),
-        "{counts:?}"
-    );
+    replayed_from_the_publishers_start(&mut publisher, &mut router, &relay).await;
 
     // The window is the publisher's whole life: the first gateway gets it.
     let mut stream = h
@@ -2288,6 +2228,88 @@ mod flush_cache {
         answered
     }
 
+    /// `StartProfile` is vLLM's `profile(True)` as a utility call on every rank and
+    /// `StopProfile` its `profile(False)`; the engine's answer is the Python servicer's
+    /// success response; an option the engine takes only at its launch is refused before
+    /// any call; the engine's own failure (a profiler it was launched without) is INTERNAL
+    /// with its words.
+    #[tokio::test]
+    async fn starts_and_stops_the_profiler_through_utility_calls() {
+        let mut h = harness(model_info(), None).await;
+        for (start, expected_args, op_name) in [
+            (true, vec![OpaqueValue::from(true)], "Start profiling"),
+            (false, vec![OpaqueValue::from(false)], "Stop profiling"),
+        ] {
+            let answer = async {
+                let call = recv_utility(&mut h.engine_in).await;
+                h.engine_out
+                    .send_utility_reply(0, call.call_id, Ok(OpaqueValue::Nil))
+                    .await
+                    .unwrap();
+                call
+            };
+            let (response, call) = if start {
+                let (response, call) = tokio::join!(
+                    h.client
+                        .start_profile(common::StartProfileRequest::default()),
+                    answer
+                );
+                (response, call)
+            } else {
+                let (response, call) =
+                    tokio::join!(h.client.stop_profile(common::StopProfileRequest {}), answer);
+                (response, call)
+            };
+            assert_eq!(call.method, "profile");
+            assert_eq!(call.args, expected_args);
+            assert_eq!(call.client_index, 0);
+            let response = response.expect(op_name).into_inner();
+            assert!(response.success, "{op_name}");
+            assert_eq!(response.message, format!("{op_name} succeeded"));
+        }
+        // Options the engine takes at its launch are refused before any call.
+        let status = h
+            .client
+            .start_profile(common::StartProfileRequest {
+                output_dir: Some("/traces".to_string()),
+                num_steps: Some(3),
+                ..Default::default()
+            })
+            .await
+            .expect_err("refused");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(
+            status.message().contains("output_dir, num_steps"),
+            "{}",
+            status.message()
+        );
+        assert_engine_idle(&mut h.engine_in).await;
+        // The engine's own failure, in its words.
+        let (response, ()) = tokio::join!(
+            h.client
+                .start_profile(common::StartProfileRequest::default()),
+            async {
+                let call = recv_utility(&mut h.engine_in).await;
+                h.engine_out
+                    .send_utility_reply(
+                        0,
+                        call.call_id,
+                        Err("Profiler is not enabled.".to_string()),
+                    )
+                    .await
+                    .unwrap();
+            }
+        );
+        let status = response.expect_err("failed");
+        assert_eq!(status.code(), Code::Internal);
+        assert!(
+            status.message().contains("Profiler is not enabled"),
+            "{}",
+            status.message()
+        );
+        h.server.stop(Duration::from_secs(5)).expect("clean stop");
+    }
+
     /// The RPC is vLLM's `reset_prefix_cache(False, False)` as a utility call;
     /// `true` from the engine is the Python servicer's success response.
     #[tokio::test]
@@ -2447,9 +2469,9 @@ fn pooled_batch(request_id: &str, values: Vec<f32>) -> EngineCoreOutputs {
     EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
         outputs: vec![EngineCoreOutput {
             request_id: request_id.to_string(),
-            pooling_output: Some(PoolingOutput::new(
+            pooling_output: Some(Box::new(PoolingOutput::new(
                 WireTensor::from_f32(vec![values.len()], values).unwrap(),
-            )),
+            ))),
             finish_reason: Some(EngineCoreFinishReason::Stop),
             ..Default::default()
         }],
@@ -3518,6 +3540,10 @@ async fn an_engine_that_never_dials_in_fails_the_link_at_the_startup_bound() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
     assert!(error.contains("timed out"), "{error}");
+    assert!(
+        error.starts_with("vLLM engine connection failed: "),
+        "{error}"
+    );
     assert!(!server.engine_ready());
     assert!(
         server.running(),
@@ -4076,10 +4102,20 @@ async fn the_configured_silence_bound_and_prefill_allowance_reach_the_engine_lin
 /// A bound servicer with its metrics listener on an ephemeral port, a
 /// handshaken mock engine and a gRPC client.
 async fn metrics_harness(model: VllmModelInfo, tokenizer: Option<Arc<dyn Tokenizer>>) -> Harness {
+    metrics_harness_with(model, tokenizer, None).await
+}
+
+/// [`metrics_harness`] with a worker-side media processor.
+async fn metrics_harness_with(
+    model: VllmModelInfo,
+    tokenizer: Option<Arc<dyn Tokenizer>>,
+    media_processor: Option<Arc<dyn MediaProcessor>>,
+) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let handshake = handshake_address(dir.path());
     let mut config = config(dir.path(), &handshake, model);
     config.servicer.metrics_bind_address = Some("127.0.0.1:0".to_string());
+    config.media_processor = media_processor;
     let server = match tokenizer {
         Some(tokenizer) => VllmServicerServer::start_with_tokenizer(config, tokenizer),
         None => VllmServicerServer::start(config),
@@ -4114,6 +4150,68 @@ fn scrape(server: &VllmServicerServer) -> String {
     let (status, body) = http_get(address, "/metrics");
     assert_eq!(status, 200);
     body
+}
+
+/// Worker-side media is measured at the gate: the references a request
+/// carries by modality (a refused request's too), the wait and the
+/// processing time, and the outcome.
+#[tokio::test]
+async fn media_processing_records_its_families() {
+    let processor = MockMediaProcessor::answering(Ok(processed_media()));
+    let mut h = metrics_harness_with(model_info(), None, Some(processor.clone())).await;
+    let mut request = generate_request("mm-m1", true, Vec::new());
+    request.input = Some(vllm::generate_request::Input::Tokenized(
+        vllm::TokenizedInput {
+            original_text: "describe".to_string(),
+            input_ids: vec![1, 2, 3],
+        },
+    ));
+    request.media_refs = Some(media_refs(&[
+        "https://example.com/x.png",
+        "https://example.com/y.png",
+    ]));
+    let _stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    let _frames = h.engine_in.recv_frames().await.expect("add frames");
+    let mut audio = generate_request("mm-m2", false, Vec::new());
+    audio.media_refs = Some(vllm::MediaRefs {
+        items: vec![vllm::MediaRef {
+            modality: common::Modality::Audio as i32,
+            url: "https://example.com/x.wav".to_string(),
+        }],
+    });
+    let status = h.client.generate(audio).await.expect_err("refused");
+    assert_eq!(status.code(), Code::InvalidArgument, "{}", status.message());
+
+    let body = scrape(&h.server);
+    let items = "smg_servicer_media_items_per_request";
+    assert_eq!(
+        sample(&body, &format!("{items}_count"), "modality=\"image\""),
+        1.0
+    );
+    assert_eq!(
+        sample(&body, &format!("{items}_sum"), "modality=\"image\""),
+        2.0
+    );
+    assert_eq!(
+        sample(&body, &format!("{items}_count"), "modality=\"audio\""),
+        1.0
+    );
+    let stages = "smg_servicer_media_processing_seconds_count";
+    assert_eq!(sample(&body, stages, "stage=\"wait\""), 1.0);
+    assert_eq!(sample(&body, stages, "stage=\"process\""), 1.0);
+    let outcomes = "smg_servicer_media_requests_total";
+    assert_eq!(sample(&body, outcomes, "outcome=\"ok\""), 1.0);
+    assert_eq!(sample(&body, outcomes, "outcome=\"refused\""), 1.0);
+    assert!(
+        body.contains("# TYPE smg_servicer_media_processing_seconds histogram"),
+        "{body}"
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
 /// The value of the sample of `name` whose labels contain `labels`.
@@ -4171,7 +4269,7 @@ const GOLDEN_SCRAPE: &str = r#"
 # HELP smg_servicer_requests_refused_total Requests refused before they reached the engine, by reason.
 # HELP smg_servicer_requests_total Requests whose stream ended, by how they ended; a fan-out (n > 1) is one request with the reason of its last choice to end, an abort winning.
 # HELP smg_servicer_start_time_seconds When the servicer started, in seconds since the Unix epoch.
-# HELP smg_servicer_state The servicer's lifecycle state, one-hot: starting, serving, warming_up (readiness held with admission open), draining (admission closed) or engine_down.
+# HELP smg_servicer_state The servicer's lifecycle state, one-hot: starting, serving, warming_up (readiness held, admitting the warm-up's own requests only), draining (admission closed) or engine_down.
 # HELP smg_servicer_string_stops_total Requests this servicer ended on a stop string it matched itself.
 # HELP smg_servicer_time_to_first_token_seconds Seconds from a request's arrival at the servicer to its first output.
 # TYPE smg_servicer_e2e_request_latency_seconds histogram
@@ -4236,6 +4334,29 @@ smg_servicer_state{model="served",wire="vllm",state="warming_up"} 0
 smg_servicer_string_stops_total{model="served",wire="vllm",rank="0"} 0
 smg_servicer_time_to_first_token_seconds_count{model="served",wire="vllm",rank="0"} 5
 smg_servicer_time_to_first_token_seconds_sum{model="served",wire="vllm",rank="0"} <v>
+# HELP smg_servicer_media_items_per_request Media references a request carried, by modality, counted before they are checked (a refused request counts).
+# HELP smg_servicer_media_processing_seconds Seconds a request's worker-side media spent in a stage: waiting for a processing slot, or being processed.
+# HELP smg_servicer_media_requests_total Requests with worker-side media, by outcome: ok, refused before processing, or the processor's verdict (client, transient, invalid, unavailable, internal).
+# TYPE smg_servicer_media_items_per_request histogram
+# TYPE smg_servicer_media_processing_seconds histogram
+# TYPE smg_servicer_media_requests_total counter
+smg_servicer_media_items_per_request_count{model="served",wire="vllm",modality="audio"} 0
+smg_servicer_media_items_per_request_count{model="served",wire="vllm",modality="image"} 0
+smg_servicer_media_items_per_request_count{model="served",wire="vllm",modality="video"} 0
+smg_servicer_media_items_per_request_sum{model="served",wire="vllm",modality="audio"} 0
+smg_servicer_media_items_per_request_sum{model="served",wire="vllm",modality="image"} 0
+smg_servicer_media_items_per_request_sum{model="served",wire="vllm",modality="video"} 0
+smg_servicer_media_processing_seconds_count{model="served",wire="vllm",stage="process"} 0
+smg_servicer_media_processing_seconds_count{model="served",wire="vllm",stage="wait"} 0
+smg_servicer_media_processing_seconds_sum{model="served",wire="vllm",stage="process"} <v>
+smg_servicer_media_processing_seconds_sum{model="served",wire="vllm",stage="wait"} <v>
+smg_servicer_media_requests_total{model="served",wire="vllm",outcome="client"} 0
+smg_servicer_media_requests_total{model="served",wire="vllm",outcome="internal"} 0
+smg_servicer_media_requests_total{model="served",wire="vllm",outcome="invalid"} 0
+smg_servicer_media_requests_total{model="served",wire="vllm",outcome="ok"} 0
+smg_servicer_media_requests_total{model="served",wire="vllm",outcome="refused"} 0
+smg_servicer_media_requests_total{model="served",wire="vllm",outcome="transient"} 0
+smg_servicer_media_requests_total{model="served",wire="vllm",outcome="unavailable"} 0
 "#;
 
 /// One streamed request (three chunks, the engine's stop), one non-streamed
@@ -4650,8 +4771,8 @@ async fn the_listener_binds_before_the_engine_connects_and_answers_starting() {
         sample(&body, "smg_servicer_state", "state=\"serving\""),
         1.0
     );
-    // Readiness held with admission open (the planned warm-up) is not a
-    // drain: the drain is read off the registry.
+    // Readiness held (the planned warm-up, admitting its own requests only)
+    // is not a drain: the drain is read off the registry.
     server.set_ready(false);
     let body = scrape(&server);
     assert_eq!(
@@ -4757,4 +4878,102 @@ async fn a_process_hosting_two_servicers_keeps_two_registries() {
         .server
         .stop(Duration::from_secs(5))
         .expect("clean stop");
+}
+
+/// Readiness held for the lifecycle owner's planned warm-up: a request that
+/// is not the warm-up's own is refused as not serving before anything of it
+/// reaches the engine (the engine's next admission is the warm-up's), the
+/// warm-up's own request is served, and the release admits the other again.
+#[tokio::test]
+async fn a_request_that_is_not_the_warm_ups_is_refused_while_readiness_is_held() {
+    let mut h = harness(model_info(), None).await;
+    h.server.set_ready(false);
+    let status = h
+        .client
+        .generate(generate_request("chatcmpl-1", true, Vec::new()))
+        .await
+        .expect_err("readiness held: not the warm-up's request");
+    assert_eq!(status.code(), Code::Unavailable);
+    assert_eq!(status.message(), "servicer is warming up");
+    assert_eq!(h.server.active_requests(), 0);
+
+    let mut own = h
+        .client
+        .generate(generate_request("smg-warmup-1", true, Vec::new()))
+        .await
+        .expect("the warm-up's own request is admitted")
+        .into_inner();
+    let request = recv_add(&mut h.engine_in).await;
+    assert_eq!(
+        request.request_id, "smg-warmup-1",
+        "the engine's first admission is the warm-up's"
+    );
+    h.engine_out
+        .send_outputs(&batch(
+            "smg-warmup-1",
+            vec![10],
+            Some(EngineCoreFinishReason::Length),
+            None,
+        ))
+        .await
+        .unwrap();
+    while own.message().bounded().await.unwrap().is_some() {}
+
+    h.server.set_ready(true);
+    let mut late = h
+        .client
+        .generate(generate_request("chatcmpl-1", true, Vec::new()))
+        .await
+        .expect("the release admits every request")
+        .into_inner();
+    let request = recv_add(&mut h.engine_in).await;
+    assert_eq!(request.request_id, "chatcmpl-1");
+    h.engine_out
+        .send_outputs(&batch(
+            "chatcmpl-1",
+            vec![10],
+            Some(EngineCoreFinishReason::Length),
+            None,
+        ))
+        .await
+        .unwrap();
+    while late.message().bounded().await.unwrap().is_some() {}
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A data-parallel engine whose ranks were launched independently: each
+/// rank's handshake says a data-parallel size of one while the servicer
+/// serves two. `GetServerInfo` advertises the two (the gateway expands the
+/// worker into that many rank workers under `--dp-aware`) and the
+/// zero-filled `GetLoads` before the first snapshot names both ranks.
+#[tokio::test]
+async fn server_info_and_the_zero_filled_loads_count_the_connected_ranks() {
+    let mut model = model_info();
+    model.data_parallel_size = 2;
+    let (mut h, _rank1_in, _rank1_out) = two_rank_harness(model).await;
+    assert_eq!(default_ready_response().data_parallel_size, 1);
+
+    let server = h
+        .client
+        .get_server_info(vllm::GetServerInfoRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(server.data_parallel_size, 2);
+
+    let loads = h
+        .client
+        .get_loads(vllm::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(loads.dp_rank_count, 2);
+    assert_eq!(
+        loads
+            .loads
+            .iter()
+            .map(|load| load.dp_rank)
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
 }

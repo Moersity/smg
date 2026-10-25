@@ -47,6 +47,7 @@ from .process_utils import (
     ProcessExitedError,
     detect_ib_device,
     detect_rdma_fabric_devices,
+    get_engine_port,
     get_open_port,
     get_open_port_block,
     gpu_compute_apps,
@@ -71,6 +72,14 @@ _ERROR_LEVEL_LINE = re.compile(r"\b(?:ERROR|CRITICAL|FATAL)\b|panicked at ")
 # the exception marker only: a level word inside the message (torch's NCCL error
 # ends with "run with NCCL_DEBUG=INFO for details") does not lower the line.
 _BELOW_ERROR_LEVEL_LINE = re.compile(r"\b(?:DEBUG|INFO|WARNING|WARN)\b")
+
+# The engines whose gRPC server carries no ``grpc.health.v1`` service:
+# TRT-LLM, whose upstream server registers its own service and no standard
+# health (it answers its own proto's HealthCheck, the one the gateway
+# probes). For these alone a ready channel that answers UNIMPLEMENTED counts
+# as the worker, until the harness asks their own HealthCheck instead. The
+# scripted mock worker hosts the standard service like the engine servicers.
+ENGINES_WITHOUT_GRPC_HEALTH = frozenset({"trtllm"})
 
 
 def _excerpt(line: str) -> str:
@@ -151,6 +160,10 @@ class Worker:
     # The launcher's process group, from its spawn to the end of ``stop``: what
     # is reaped and waited for when the launcher itself is already gone.
     _pgid: int | None = field(default=None, repr=False)
+    # Set by ``stop``, cleared by ``start``: the teardown (the reaping, the log
+    # handle, the ports) runs once per start, and once for a worker that never
+    # started; a second ``stop`` finds nothing to do.
+    _torn_down: bool = field(default=False, repr=False)
     _moriio_ports: list[int] = field(default_factory=list, repr=False)
 
     @property
@@ -196,6 +209,8 @@ class Worker:
             wait_ready: If True, block until the worker passes health checks.
                 If False, spawn the process and return immediately.
         """
+        # Every start arms its teardown, before anything is built or spawned for it.
+        self._torn_down = False
         cmd = self._build_cmd()
         env = self._build_env()
 
@@ -238,7 +253,8 @@ class Worker:
         if self.mode == ConnectionMode.ZMQ:
             # SMG (the router) binds the ZMQ sockets and this engine dials in;
             # there is no worker port to probe. The gateway's readiness gate
-            # (wait_for_workers_ready) covers the engine, so just proceed.
+            # (wait_for_workers_ready, started with this worker) covers the
+            # engine's load and its exit, so just proceed.
             logger.info(
                 "Worker %s spawned at %s (PID %d) — ZMQ readiness gated by the gateway",
                 self.model_id,
@@ -269,7 +285,8 @@ class Worker:
         )
 
     def stop(self) -> None:
-        """Terminate the worker and reap everything it started.
+        """Terminate the worker and reap everything it started, then release
+        what the harness holds for it: the log handle and the reserved ports.
 
         Also the teardown after the launcher exited on its own (its engine
         died under it, or :meth:`kill_engine` took the engine away): the
@@ -277,32 +294,44 @@ class Worker:
         their device contexts, and a replacement started on the same GPUs
         inside that window fails its startup memory check against the old
         allocation. So the group and the memory are waited for whether the
-        launcher is alive or gone, once per start.
+        launcher is alive or gone, once per start. A worker that never
+        spawned (its launch failed before the spawn) has nothing to wait for;
+        its log handle and its ports are released all the same, so a restart
+        opens one log file and the port pool keeps its size. A second call
+        finds nothing to do.
         """
-        if self.process is None or (self._pgid is None and self.process.poll() is not None):
-            return  # never started, or torn down already
+        if self._torn_down:
+            return
+        self._torn_down = True
+        if self.process is not None and (self._pgid is not None or self.process.poll() is None):
+            self._reap(self.process)
+        self._close_log_file()
+        self._release_ports()
 
-        pid = self.process.pid
+    def _reap(self, process: subprocess.Popen) -> None:
+        """Signal the launcher's group while it is alive, then wait for the
+        group to empty and for the GPU memory to come back (see :meth:`stop`)."""
+        pid = process.pid
         # Workers run in their own session, so the launcher and every engine
         # process share one group, led by the launcher.
         pgid = self._pgid if self._pgid is not None else pid
         self._pgid = None
 
-        if self.process.poll() is None:
+        if process.poll() is None:
             logger.info("Stopping worker %s (PID %d)", self.model_id, pid)
             try:
                 os.killpg(pgid, signal.SIGTERM)
             except (ProcessLookupError, OSError):
-                self.process.terminate()
+                process.terminate()
             try:
-                self.process.wait(timeout=10)
+                process.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 try:
                     os.killpg(pgid, signal.SIGKILL)
                 except (ProcessLookupError, OSError):
-                    self.process.kill()
+                    process.kill()
                 try:
-                    self.process.wait(timeout=5)
+                    process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     logger.error("Worker PID %d did not die after SIGKILL", pid)
         else:
@@ -310,7 +339,7 @@ class Worker:
                 "Worker %s (PID %d) had exited with %s; reaping what it left behind",
                 self.model_id,
                 pid,
-                self.process.returncode,
+                process.returncode,
             )
 
         # ``process.wait`` only reaps the launcher. The engine's children
@@ -342,7 +371,7 @@ class Worker:
                     gpu_compute_apps(sorted(held)),
                 )
 
-        # Clean up log file
+    def _close_log_file(self) -> None:
         if self._log_file is not None:
             try:
                 self._log_file.close()
@@ -350,7 +379,7 @@ class Worker:
                 pass
             self._log_file = None
 
-        # Release reserved ports
+    def _release_ports(self) -> None:
         from .process_utils import release_port
 
         release_port(self.port)
@@ -405,6 +434,13 @@ class Worker:
     def is_alive(self) -> bool:
         """Check if the worker process is still running."""
         return self.process is not None and self.process.poll() is None
+
+    def raise_if_exited(self) -> None:
+        """End a start-up wait on this worker's exit: the death report (the
+        exit status, what the log says, the log's path), raised at once
+        instead of the wait running to its bound."""
+        if not self.is_alive():
+            raise RuntimeError(self._death_report())
 
     def effective_kv_backend(self) -> str:
         """This worker's KV transfer backend: its own override, else the lane's."""
@@ -777,7 +813,7 @@ class Worker:
         # advertised at all. ``ts serve`` always enables the control app, so
         # every lane runs the engine as deployed.
         if self.rl_control_port is None:
-            self.rl_control_port = get_open_port()
+            self.rl_control_port = get_engine_port()
         cmd.extend(["--rl-control-port", str(self.rl_control_port)])
         if self.worker_type in (WorkerType.ENCODE, WorkerType.PREFILL, WorkerType.DECODE):
             cmd.extend(["--disaggregation-mode", self.worker_type.value])
@@ -928,7 +964,7 @@ class Worker:
                 # the peer through the worker's moriio_host label.
                 env["VLLM_HOST_IP"] = moriio_host()
             else:
-                self.nixl_port = get_open_port()
+                self.nixl_port = get_engine_port()
                 env["VLLM_NIXL_SIDE_CHANNEL_PORT"] = str(self.nixl_port)
                 # Single-host NIXL moves KV over CUDA IPC, and UCX caches the
                 # imported handles on the reader. A decode worker then keeps a
@@ -1050,9 +1086,21 @@ class Worker:
             raise
 
     def grpc_serving(self, timeout: float = 5.0) -> bool:
-        """One health answer of a gRPC worker: ``True`` on SERVING (or, from a
-        server without the health service, on a ready channel), ``False`` on
-        anything else, a refused connection and a NOT_SERVING included."""
+        """One health answer of a gRPC worker: ``True`` on SERVING from its
+        ``grpc.health.v1`` service, ``False`` on anything else: a NOT_SERVING,
+        a refused connection, and an answer without the health service.
+
+        Every engine servicer of this repository hosts the health service, so
+        UNIMPLEMENTED is not this worker speaking. An engine binds its port
+        only once it has loaded its model, and another process's listener can
+        sit on the number until then: an HTTP/2 server's 404 reads as
+        UNIMPLEMENTED through grpc, and the ready channel behind it is the
+        stranger's, which the nightly PD sweep once certified as a decode
+        worker. One engine's server carries no such service, TRT-LLM
+        (``ENGINES_WITHOUT_GRPC_HEALTH``; it answers its own proto's
+        HealthCheck, the one the gateway probes); for it alone a ready
+        channel that answers UNIMPLEMENTED counts.
+        """
         try:
             import grpc
             from grpc_health.v1 import health_pb2, health_pb2_grpc
@@ -1069,9 +1117,11 @@ class Worker:
                 response = stub.Check(request, timeout=timeout)
                 return response.status == health_pb2.HealthCheckResponse.SERVING
             except grpc.RpcError as e:
-                # UNIMPLEMENTED means server is up but doesn't have health service;
-                # fall back to channel connectivity check
-                if hasattr(e, "code") and e.code() == grpc.StatusCode.UNIMPLEMENTED:
+                if (
+                    self.engine in ENGINES_WITHOUT_GRPC_HEALTH
+                    and hasattr(e, "code")
+                    and e.code() == grpc.StatusCode.UNIMPLEMENTED
+                ):
                     try:
                         grpc.channel_ready_future(channel).result(timeout=timeout)
                         return True
@@ -1087,8 +1137,7 @@ class Worker:
         """Wait for a gRPC worker to become healthy."""
         start = time.perf_counter()
         while time.perf_counter() - start < timeout:
-            if not self.is_alive():
-                raise RuntimeError(self._death_report())
+            self.raise_if_exited()
             if self.grpc_serving():
                 return
             time.sleep(HEALTH_CHECK_INTERVAL)
@@ -1195,16 +1244,20 @@ def start_workers(
         for i in range(count):
             gpu_ids = list(range(gpu_offset, gpu_offset + gpus_per_worker))
             gpu_offset += gpus_per_worker
-            port = get_open_port()
+            # The engine binds these once it has loaded its model: numbers the
+            # kernel never hands to another process's bind(0) meanwhile.
+            port = get_engine_port()
             bootstrap_port = (
-                get_open_port() if worker_type in (WorkerType.PREFILL, WorkerType.ENCODE) else None
+                get_engine_port()
+                if worker_type in (WorkerType.PREFILL, WorkerType.ENCODE)
+                else None
             )
             is_ts_disagg = engine == "tokenspeed" and worker_type in (
                 WorkerType.ENCODE,
                 WorkerType.PREFILL,
                 WorkerType.DECODE,
             )
-            dist_init_port = get_open_port() if is_ts_disagg else None
+            dist_init_port = get_engine_port() if is_ts_disagg else None
             dist_init_addr = host_port(DEFAULT_HOST, dist_init_port) if dist_init_port else None
 
             worker = Worker(

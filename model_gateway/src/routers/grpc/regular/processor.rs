@@ -7,7 +7,7 @@ use std::{sync::Arc, time::Instant};
 
 use futures::future::try_join_all;
 use llm_tokenizer::{
-    stop::{SequenceDecoderOutput, StopSequenceDecoder},
+    stop::{SequenceDecoderOutput, SequenceDecoderStep, StopSequenceDecoder},
     traits::Tokenizer,
 };
 use openai_protocol::{
@@ -22,19 +22,26 @@ use symphony::{adapt, Events};
 use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{error, warn};
 
-use crate::routers::{
-    error,
-    grpc::{
-        common::{response_collection, response_formatting},
-        context::{DispatchMetadata, ExecutionResult},
-        proto_wrapper::ProtoGenerateComplete,
-        regular::symphony::{
-            engine_finish, finished,
-            telemetry::{self, Who},
-            Assignment, Delta, Reader, SymphonyError,
+use crate::{
+    observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
+    routers::{
+        common::retry::mark_non_retryable,
+        error,
+        grpc::{
+            common::{response_collection, response_formatting},
+            context::{DispatchMetadata, ExecutionResult},
+            proto_wrapper::ProtoGenerateComplete,
+            regular::symphony::{
+                engine_finish, finished,
+                telemetry::{self, Who},
+                Assignment, Delta, Reader, SymphonyError,
+            },
+            spec::{ChatResponseSpec, CompletionResponseSpec, MessagesResponseSpec},
+            utils::{
+                self,
+                isolation::{isolated, isolated_sync, Panicked, READER_PANICKED_CODE},
+            },
         },
-        spec::{ChatResponseSpec, CompletionResponseSpec, MessagesResponseSpec},
-        utils,
     },
 };
 
@@ -45,6 +52,9 @@ pub(crate) struct ResponseProcessor {
     pub reasoning_parser_factory: ReasoningParserFactory,
     /// Per-request parser-name resolution (model-card override → configured).
     pub parser_resolver: utils::ParserResolver,
+    /// The `backend_type` label of the answers' token and generation
+    /// records, the one the streaming processor beside it carries.
+    backend_type: &'static str,
 }
 
 impl ResponseProcessor {
@@ -57,7 +67,14 @@ impl ResponseProcessor {
             tool_parser_factory,
             reasoning_parser_factory,
             parser_resolver,
+            backend_type: metrics_labels::BACKEND_REGULAR,
         }
+    }
+
+    /// The processor with its records labeled `backend_type`.
+    pub fn with_backend(mut self, backend_type: &'static str) -> Self {
+        self.backend_type = backend_type;
+        self
     }
 
     /// Process a single choice from GenerateComplete response
@@ -403,6 +420,7 @@ impl ResponseProcessor {
         request_logprobs: bool,
     ) -> Result<(ChatCompletionResponse, response_formatting::TokenCounts), axum::response::Response>
     {
+        let started = generation_start(&execution_result, Instant::now());
         let model = &dispatch.model;
         let reasoning_parser_name = self.parser_resolver.reasoning_parser(model);
         let tool_parser_name = self.parser_resolver.tool_parser(model);
@@ -450,36 +468,43 @@ impl ResponseProcessor {
             tracing::debug!("No tool parser found for model '{model}', skipping tool call parsing");
         }
 
-        // Process all choices
+        // Process all choices. Each choice's reading is isolated: a panic in
+        // it is this request's 500, not the connection's end (see
+        // `utils::isolation`).
+        let table = chat_request.symphony.as_ref().map(Assignment::table);
         let mut choices = Vec::new();
         let mut parsed_reasoning_tokens = 0;
         for (index, complete) in all_responses.iter().enumerate() {
-            match self
-                .process_single_choice(
-                    &dispatch.request_id,
-                    complete,
-                    index,
-                    &chat_request,
-                    model,
-                    &tokenizer,
-                    stop_decoder,
-                    history_tool_calls_count,
-                    reasoning_parser_available,
-                    tool_parser_available,
-                    reasoning_parser_name.as_deref(),
-                    tool_parser_name.as_deref(),
-                )
-                .await
-            {
-                Ok((choice, reasoning_tokens)) => {
+            let read = isolated(self.process_single_choice(
+                &dispatch.request_id,
+                complete,
+                index,
+                &chat_request,
+                model,
+                &tokenizer,
+                stop_decoder,
+                history_tool_calls_count,
+                reasoning_parser_available,
+                tool_parser_available,
+                reasoning_parser_name.as_deref(),
+                tool_parser_name.as_deref(),
+            ))
+            .await;
+            match read {
+                Ok(Ok((choice, reasoning_tokens))) => {
                     choices.push(choice);
                     parsed_reasoning_tokens += reasoning_tokens;
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     return Err(error::internal_error(
                         "process_choice_failed",
                         format!("Failed to process choice {index}: {e}"),
                     ));
+                }
+                Err(panicked) => {
+                    let panicked = panicked.read_by(table);
+                    panicked.record(&dispatch.request_id, model);
+                    return Err(reader_panicked(&panicked));
                 }
             }
         }
@@ -503,6 +528,19 @@ impl ResponseProcessor {
             .usage(usage)
             .maybe_system_fingerprint(dispatch.weight_version.clone())
             .build();
+        // The answer's token and generation records, the ones a streamed
+        // answer makes at its end; a collected answer shows no first token.
+        Metrics::record_streaming_metrics(StreamingMetricsParams {
+            router_type: metrics_labels::ROUTER_GRPC,
+            backend_type: self.backend_type,
+            model_id: &dispatch.model,
+            endpoint: metrics_labels::ENDPOINT_CHAT,
+            ttft: None,
+            generation_duration: started.elapsed(),
+            input_tokens: Some(u64::from(counts.prompt)),
+            cached_tokens: Some(u64::from(counts.cached)),
+            output_tokens: u64::from(counts.completion),
+        });
         Ok((response, counts))
     }
 
@@ -667,6 +705,10 @@ impl ResponseProcessor {
     }
 
     /// Process non-streaming generate response (collects all responses and builds final response array)
+    ///
+    /// `metrics_endpoint` labels the answer's token and generation records:
+    /// the endpoint the request's own count carries (the transcription stage
+    /// decodes through this processor too).
     pub async fn process_non_streaming_generate_response(
         &self,
         execution_result: ExecutionResult,
@@ -674,7 +716,9 @@ impl ResponseProcessor {
         stop_decoder: &mut StopSequenceDecoder,
         request_logprobs: bool,
         start_time: Instant,
+        metrics_endpoint: &'static str,
     ) -> Result<Vec<GenerateResponse>, axum::response::Response> {
+        let started = generation_start(&execution_result, start_time);
         // Collect all responses from the execution result
         let all_responses =
             response_collection::collect_responses(execution_result, request_logprobs).await?;
@@ -739,6 +783,22 @@ impl ResponseProcessor {
             });
         }
 
+        // The records a streamed generate answer makes at its end, which
+        // counts no prompt figures either.
+        Metrics::record_streaming_metrics(StreamingMetricsParams {
+            router_type: metrics_labels::ROUTER_GRPC,
+            backend_type: self.backend_type,
+            model_id: &dispatch.model,
+            endpoint: metrics_endpoint,
+            ttft: None,
+            generation_duration: started.elapsed(),
+            input_tokens: None,
+            cached_tokens: None,
+            output_tokens: result_array
+                .iter()
+                .map(|response| u64::from(response.meta_info.completion_tokens))
+                .sum(),
+        });
         Ok(result_array)
     }
 
@@ -758,6 +818,7 @@ impl ResponseProcessor {
         tokenizer: Arc<dyn Tokenizer>,
         stop_decoder: &mut StopSequenceDecoder,
     ) -> Result<(Message, response_formatting::TokenCounts), axum::response::Response> {
+        let started = Instant::now();
         let model = &dispatch.model;
         let reasoning_parser_name = self.parser_resolver.reasoning_parser(model);
         let tool_parser_name = self.parser_resolver.tool_parser(model);
@@ -793,34 +854,106 @@ impl ResponseProcessor {
         let complete = all_responses.into_iter().next().unwrap();
         // The engine's counters, for the settlement, whichever reader builds the message.
         let counts = response_formatting::TokenCounts::of(std::slice::from_ref(&complete));
+        // The records a streamed message makes at its end; a collected one
+        // shows no first token. Made once the read succeeded, on either path.
+        let record = || {
+            Metrics::record_streaming_metrics(StreamingMetricsParams {
+                router_type: metrics_labels::ROUTER_GRPC,
+                backend_type: self.backend_type,
+                model_id: &dispatch.model,
+                endpoint: metrics_labels::ENDPOINT_MESSAGES,
+                ttft: None,
+                generation_duration: started.elapsed(),
+                input_tokens: Some(u64::from(counts.prompt)),
+                cached_tokens: Some(u64::from(counts.cached)),
+                output_tokens: u64::from(counts.completion),
+            });
+        };
         if let Some(assignment) = &messages_request.symphony {
-            return Self::read_messages_with_symphony(
-                &dispatch,
-                assignment,
-                &complete,
-                &messages_request,
-                stop_decoder,
-            )
-            .map(|message| (message, counts))
-            .map_err(|e| match e {
+            // The reading, isolated: a panic in it is this request's 500,
+            // not the connection's end (see `utils::isolation`).
+            let read = isolated_sync(|| {
+                Self::read_messages_with_symphony(
+                    &dispatch,
+                    assignment,
+                    &complete,
+                    &messages_request,
+                    stop_decoder,
+                )
+            });
+            return match read {
+                Ok(Ok(message)) => {
+                    record();
+                    Ok((message, counts))
+                }
                 // The output's own doing: the model wrote arguments no tool_use input holds.
-                SymphonyError::InputRefused(why) => {
+                Ok(Err(SymphonyError::InputRefused(why))) => {
                     telemetry::record_refused(telemetry::table_label(assignment.format.name()));
                     warn!(function = "process_non_streaming_messages_response", error = %why, "the message's tool_use input cannot carry the model's arguments");
-                    error::internal_error("symphony_tool_use_input_refused", why)
+                    Err(error::internal_error(
+                        "symphony_tool_use_input_refused",
+                        why,
+                    ))
                 }
-                e => {
+                Ok(Err(e)) => {
                     error!(function = "process_non_streaming_messages_response", error = %e, "Symphony failed to read the message");
-                    error::internal_error("symphony_read_failed", e.to_string())
+                    Err(error::internal_error("symphony_read_failed", e.to_string()))
                 }
-            });
+                Err(panicked) => {
+                    let panicked = panicked.read_by(Some(assignment.table()));
+                    panicked.record(&dispatch.request_id, &dispatch.model);
+                    Err(reader_panicked(&panicked))
+                }
+            };
         }
 
+        // The older parsers' reading, isolated like the Symphony read: a
+        // panic in it is this request's 500, not the connection's end.
+        let read = isolated(self.read_message_with_the_older_parsers(
+            &dispatch,
+            &messages_request,
+            &complete,
+            &tokenizer,
+            stop_decoder,
+            reasoning_parser_name.as_deref(),
+            tool_parser_name.as_deref(),
+        ))
+        .await;
+        match read {
+            Ok(Ok(message)) => {
+                record();
+                Ok((message, counts))
+            }
+            Ok(Err(response)) => Err(response),
+            Err(panicked) => {
+                let panicked = panicked.read_by(None);
+                panicked.record(&dispatch.request_id, &dispatch.model);
+                Err(reader_panicked(&panicked))
+            }
+        }
+    }
+
+    /// The message as the older parsers read it (the reasoning split, then the
+    /// tool calls out of the content, the blocks assembled): the whole of a
+    /// `/v1/messages` answer no Symphony table reads, run isolated by its
+    /// caller as the Symphony read is.
+    #[expect(clippy::too_many_arguments)]
+    async fn read_message_with_the_older_parsers(
+        &self,
+        dispatch: &DispatchMetadata,
+        messages_request: &MessagesResponseSpec,
+        complete: &ProtoGenerateComplete,
+        tokenizer: &Arc<dyn Tokenizer>,
+        stop_decoder: &mut StopSequenceDecoder,
+        reasoning_parser_name: Option<&str>,
+        tool_parser_name: Option<&str>,
+    ) -> Result<Message, axum::response::Response> {
+        let model = &dispatch.model;
         // Check parser availability. Run parser when the user explicitly enabled thinking,
         // or when the selected parser needs structural special tokens (e.g. Inkling).
         let reasoning_requires_special_tokens = utils::reasoning_parser_requires_special_tokens(
             &self.reasoning_parser_factory,
-            reasoning_parser_name.as_deref(),
+            reasoning_parser_name,
             model,
         );
         let separate_reasoning =
@@ -828,7 +961,7 @@ impl ResponseProcessor {
         let reasoning_parser_available = separate_reasoning
             && utils::check_reasoning_parser_availability(
                 &self.reasoning_parser_factory,
-                reasoning_parser_name.as_deref(),
+                reasoning_parser_name,
                 model,
             );
 
@@ -841,7 +974,7 @@ impl ResponseProcessor {
             && messages_request.has_tools
             && utils::check_tool_parser_availability(
                 &self.tool_parser_factory,
-                tool_parser_name.as_deref(),
+                tool_parser_name,
                 model,
             );
 
@@ -869,7 +1002,7 @@ impl ResponseProcessor {
             })?
             .with_eager_token_ends(
                 reasoning_parser_available,
-                &tokenizer,
+                tokenizer,
                 complete.output_ids(),
                 stop_decoder.skip_special_tokens(),
             );
@@ -889,7 +1022,7 @@ impl ResponseProcessor {
             ReasoningSource {
                 wanted: reasoning_parser_available,
                 in_prefill: messages_request.reasoning_in_prefill,
-                parser_name: reasoning_parser_name.as_deref(),
+                parser_name: reasoning_parser_name,
                 model,
             },
         );
@@ -903,7 +1036,7 @@ impl ResponseProcessor {
                         .then_some(&messages_request.chat_tools[..]),
                     tool_choice: chat_tool_choice.as_ref(),
                     model,
-                    parser_name: tool_parser_name.as_deref(),
+                    parser_name: tool_parser_name,
                     parser_available: tool_parser_available,
                     history_tool_calls_count: messages_request.history_tool_calls_count,
                     first_call_only: messages_request.first_tool_call_only,
@@ -962,8 +1095,8 @@ impl ResponseProcessor {
         // Step 4: Determine stop_reason and stop_sequence (derived from same
         // conditions): a local stop beats the engine's reason, and the matched
         // sequence is surfaced for a StopSequence result.
-        let finish_reason_str = finish_after_local_stop(stopped, &complete);
-        let stop_sequence = matched_stop_string(stop_decoder, &complete);
+        let finish_reason_str = finish_after_local_stop(stopped, complete);
+        let stop_sequence = matched_stop_string(stop_decoder, complete);
 
         // Parsed calls do not override a truncation, as in Chat.
         let stop_reason = if finish_reason_str == "length" {
@@ -994,19 +1127,18 @@ impl ResponseProcessor {
         );
 
         // Step 6: Build Message
-        let message = Message {
-            id: dispatch.request_id,
+        Ok(Message {
+            id: dispatch.request_id.clone(),
             message_type: "message".to_string(),
             role: "assistant".to_string(),
             content: content_blocks,
-            model: dispatch.model,
+            model: dispatch.model.clone(),
             stop_reason,
             stop_sequence,
             stop_details: None,
             usage,
             container: None,
-        };
-        Ok((message, counts))
+        })
     }
 
     /// Process non-streaming completion response
@@ -1022,6 +1154,7 @@ impl ResponseProcessor {
         dispatch: DispatchMetadata,
         stop_decoder: &mut StopSequenceDecoder,
     ) -> Result<CompletionResponse, axum::response::Response> {
+        let started = Instant::now();
         let request_logprobs = completion_req.logprobs;
         let per_prompt_results = match execution_result {
             ExecutionResult::Batch { results } => results,
@@ -1110,6 +1243,20 @@ impl ResponseProcessor {
             total_cached += cached_tokens;
         }
 
+        // The records a streamed completion makes at its end; a collected
+        // one shows no first token.
+        Metrics::record_streaming_metrics(StreamingMetricsParams {
+            router_type: metrics_labels::ROUTER_GRPC,
+            backend_type: self.backend_type,
+            model_id: &dispatch.model,
+            endpoint: metrics_labels::ENDPOINT_COMPLETIONS,
+            ttft: None,
+            generation_duration: started.elapsed(),
+            input_tokens: Some(u64::from(total_prompt)),
+            cached_tokens: Some(u64::from(total_cached)),
+            output_tokens: u64::from(total_completion),
+        });
+
         Ok(CompletionResponse {
             id: dispatch.request_id.clone(),
             object: "text_completion".to_string(),
@@ -1130,6 +1277,17 @@ impl ResponseProcessor {
             ),
             system_fingerprint: dispatch.weight_version.clone(),
         })
+    }
+}
+
+/// Where a collected answer's generation clock starts, as its streamed
+/// twin's does: at the prefill dispatch of a disaggregated pair (whose
+/// prefill may already have run when the answer is collected), else at
+/// `start`, the processor's entry or the stage's.
+fn generation_start(execution_result: &ExecutionResult, start: Instant) -> Instant {
+    match execution_result {
+        ExecutionResult::PrefillDecode { pd_timing, .. } => pd_timing.prefill_start,
+        _ => start,
     }
 }
 
@@ -1166,6 +1324,17 @@ struct ToolCallSource<'a> {
     parser_available: bool,
     history_tool_calls_count: usize,
     first_call_only: bool,
+}
+
+/// The 500 a whole response whose reading panicked is answered with: under
+/// [`READER_PANICKED_CODE`], and never retried. The panic is the gateway's
+/// own, on this output; another attempt would run the engine again for the
+/// same reading, so the answer stands (the stream's error event is final by
+/// its nature: the response began).
+fn reader_panicked(panicked: &Panicked) -> axum::response::Response {
+    let mut response = error::internal_error(READER_PANICKED_CODE, panicked.to_string());
+    mark_non_retryable(&mut response);
+    response
 }
 
 /// Whether a forced call shaped the output as JSON the constraint dictated
@@ -1251,23 +1420,17 @@ fn decode_complete(
     index: u32,
 ) -> Result<Decoded, DecodeFailure> {
     stop_decoder.reset();
-    let outputs = stop_decoder
-        .process_tokens(output_ids)
-        .map_err(|e| DecodeFailure::Process(e.to_string()))?;
-
     let mut text = String::new();
     let mut stopped = false;
     let mut held = false;
-    let mut token_ends = Vec::with_capacity(outputs.len());
-    for output in outputs {
-        match output {
-            SequenceDecoderOutput::Text(t) => text.push_str(&t),
-            SequenceDecoderOutput::StoppedWithText(t) => {
-                text.push_str(&t);
-                stopped = true;
-            }
-            SequenceDecoderOutput::Stopped => stopped = true,
-            SequenceDecoderOutput::Held => held = true,
+    let mut token_ends = Vec::with_capacity(output_ids.len());
+    for &token_id in output_ids {
+        match stop_decoder
+            .process_token_into(token_id, &mut text)
+            .map_err(|e| DecodeFailure::Process(e.to_string()))?
+        {
+            SequenceDecoderStep::Held => held = true,
+            step => stopped |= step.stopped(),
         }
         token_ends.push(text.len());
         if stopped {
@@ -1276,11 +1439,13 @@ fn decode_complete(
     }
 
     let tail = stop_decoder
-        .finish()
+        .finish_into(&mut text)
         .map_err(|e| DecodeFailure::Finish(e.to_string()))?;
     utils::warn_detokenize_recoveries(request_id, index, stop_decoder);
-    if let SequenceDecoderOutput::Text(t) | SequenceDecoderOutput::StoppedWithText(t) = tail {
-        text.push_str(&t);
+    if matches!(
+        tail,
+        SequenceDecoderStep::Text | SequenceDecoderStep::StoppedWithText
+    ) {
         if let Some(last) = token_ends.last_mut() {
             *last = text.len();
         }

@@ -83,7 +83,9 @@ class Gateway:
     """Manages a Shepherd Model Gateway router instance.
 
     Four startup modes:
-    - Regular: start(worker_urls=[...], model_path="...")
+    - Regular: start(worker_urls=[...], model_path="...") — with
+      workers=[...] when this harness launched them: a worker's exit ends
+      the readiness wait at once with its death report
     - PD: start(prefill_workers=[...], decode_workers=[...])
     - IGW: start(igw_mode=True), then add_worker(url) dynamically
     - Cloud: start(cloud_backend="openai"|"xai"|"anthropic")
@@ -137,6 +139,7 @@ class Gateway:
         self,
         *,
         worker_urls: list[str] | None = None,
+        workers: list[Worker] | None = None,
         model_path: str | None = None,
         prefill_workers: list[Worker] | None = None,
         decode_workers: list[Worker] | None = None,
@@ -152,10 +155,17 @@ class Gateway:
         extra_args: list[str] | None = None,
         log_level: str | None = None,
         log_dir: str | None = None,
+        env: dict[str, str] | None = None,
     ) -> None:
-        """Start the gateway in exactly one mode (regular, PD, IGW, or cloud)."""
+        """Start the gateway in exactly one mode (regular, PD, IGW, or cloud).
+
+        ``env`` adds variables to the gateway process's environment (over the
+        test process's own), for a test that arms a gateway-side test hook.
+        """
         if self._started:
             raise RuntimeError("Gateway already started")
+        if env:
+            self._env = {**os.environ, **env}
 
         is_epd_mode = encode_workers is not None
         is_pd_mode = (prefill_workers is not None or decode_workers is not None) and not is_epd_mode
@@ -171,6 +181,8 @@ class Gateway:
                 "Specify exactly one mode: worker_urls, encode/prefill/decode_workers "
                 "(EPD), prefill/decode_workers (PD), igw_mode=True, or cloud_backend"
             )
+        if workers is not None and not is_regular_mode:
+            raise ValueError("workers are the launched processes behind worker_urls")
 
         if show_output is None:
             show_output = os.environ.get(ENV_SHOW_ROUTER_LOGS, "0") == "1"
@@ -276,6 +288,7 @@ class Gateway:
                 num_workers=len(worker_urls),
                 log_msg=f"gateway with {len(worker_urls)} worker(s)",
                 worker_urls=worker_urls,
+                workers=workers,
             )
 
     def _ensure_ports_free(self) -> None:
@@ -353,11 +366,14 @@ class Gateway:
         num_workers: int | None = None,
         log_msg: str = "",
         worker_urls: list[str] | None = None,
+        workers: list[Worker] | None = None,
     ) -> None:
         """Launch the gateway process and wait for it to become ready.
 
         The wait ends early when the process exits: the exit code and the
-        tail of its output are the error, not a readiness timeout.
+        tail of its output are the error, not a readiness timeout. It ends
+        the same way when one of ``workers`` exits, with that worker's death
+        report.
         """
         self._ensure_ports_free()
         cmd = self._build_base_cmd()
@@ -399,6 +415,7 @@ class Gateway:
                     timeout=timeout,
                     process=self.process,
                     expected_urls=worker_urls,
+                    workers=workers,
                 )
             else:
                 wait_for_health(self.base_url, timeout=timeout, process=self.process)
@@ -406,7 +423,7 @@ class Gateway:
             detail = self._output_tail()
             self.shutdown()
             raise ProcessExitedError(f"{e}; {detail}") from e
-        except TimeoutError:
+        except (RuntimeError, TimeoutError):
             self.shutdown()
             raise
 
@@ -487,7 +504,7 @@ class Gateway:
         if not api_key:
             raise ValueError(f"{api_key_env} environment variable required")
 
-        self._env = os.environ.copy()
+        self._env = dict(self._env or os.environ)
         self._env[api_key_env] = api_key
 
         actual_history_backend = history_backend

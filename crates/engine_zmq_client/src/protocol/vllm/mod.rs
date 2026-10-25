@@ -67,6 +67,7 @@ pub struct VllmProtocol;
 impl EngineProtocol for VllmProtocol {
     type Request = EngineCoreRequest;
     type Output = EngineCoreOutput;
+    type Layout = ();
 
     fn add_frame() -> Bytes {
         EngineCoreRequestType::Add.to_frame()
@@ -143,7 +144,7 @@ impl EngineProtocol for VllmProtocol {
         )))
     }
 
-    fn decode_batch(frames: &[Bytes]) -> Result<EngineBatch<Self::Output>> {
+    fn decode_batch(frames: &[Bytes], _layout: &()) -> Result<EngineBatch<Self::Output>> {
         // vLLM multiplexes request batches, utility replies, and DP control on
         // one wire struct; each lands in its own slot of the batch.
         match decode_engine_core_outputs(frames)? {
@@ -154,7 +155,7 @@ impl EngineProtocol for VllmProtocol {
                     .finished_requests
                     .map(|ids| ids.into_iter().collect())
                     .unwrap_or_default(),
-                load: batch.scheduler_stats.map(|stats| EngineLoad::from(*stats)),
+                load: batch.scheduler_stats.map(EngineLoad::from),
                 wave: None,
                 utility: None,
             }),
@@ -342,7 +343,6 @@ mod tests {
                 num_waiting_reqs: runnable,
                 num_skipped_waiting_reqs: deferred,
                 kv_cache_usage: 0.5,
-                ..Default::default()
             });
             assert_eq!(load.num_waiting, total);
             assert_eq!(load.num_running, 2);

@@ -267,7 +267,7 @@ struct Node {
     children: DashMap<char, NodeRef, CharHasherBuilder>,
     /// Node text with cached character count
     text: RwLock<NodeText>,
-    /// Per-tenant last access epoch for LRU ordering. Using TenantId (Arc<str>) for cheap cloning.
+    /// Per-tenant last access epoch for LRU ordering. Using TenantId (`Arc<str>`) for cheap cloning.
     tenant_last_access_time: TenantMap<u64>,
     /// Parent pointer for upward traversal during timestamp updates.
     /// Uses Weak to avoid Arc reference cycles (parent -> child -> parent).
@@ -422,7 +422,7 @@ fn shared_prefix_count_chars(a: &str, b: &str) -> usize {
 }
 
 /// Intern tenant ID to avoid repeated allocations.
-/// Returns cached Arc<str> if tenant was seen before.
+/// Returns cached `Arc<str>` if tenant was seen before.
 #[inline]
 fn intern_tenant(tenant: &str) -> TenantId {
     // Fast path: check if already interned
@@ -709,79 +709,40 @@ impl Tree {
 
         let curr = prev;
 
-        // Try cached tenant first (O(1)) before falling back to O(shards) DashMap iteration.
-        // The cache is valid if the tenant still exists in tenant_last_access_time.
-        let tenant: TenantId = {
-            let cached = curr.last_tenant.read();
-            if let Some(ref t) = *cached {
-                if curr.tenant_last_access_time.contains_key(t.as_ref()) {
-                    Arc::clone(t)
-                } else {
-                    drop(cached);
-                    // Cache stale, fall back to iteration and update cache
-                    let t = curr
-                        .tenant_last_access_time
-                        .iter()
-                        .next()
-                        .map(|kv| Arc::clone(kv.key()))
-                        .unwrap_or_else(|| intern_tenant("empty"));
-                    *curr.last_tenant.write() = Some(Arc::clone(&t));
-                    t
-                }
-            } else {
-                drop(cached);
-                // No cache, iterate and populate cache
-                let t = curr
-                    .tenant_last_access_time
-                    .iter()
-                    .next()
-                    .map(|kv| Arc::clone(kv.key()))
-                    .unwrap_or_else(|| intern_tenant("empty"));
-                *curr.last_tenant.write() = Some(Arc::clone(&t));
-                t
-            }
-        };
-
-        // Update timestamp probabilistically (1 in 8 matches) to reduce DashMap contention.
-        // LRU eviction doesn't need perfect accuracy - approximate timestamps suffice.
-        // Skip the update for the synthetic "empty" tenant to avoid polluting the tree
-        // with a tenant that was never inserted via insert_text.
-        let epoch = get_epoch();
-        if epoch & 0x7 == 0 && tenant.as_ref() != "empty" {
-            curr.tenant_last_access_time
-                .insert(Arc::clone(&tenant), epoch);
-        }
-
         // Compute input char count directly from input text.
         // This is equivalent to matched_chars + remaining.chars().count() but avoids
         // needing to track remaining precisely through the traversal.
         let input_char_count = text.chars().count();
 
-        PrefixMatchResult {
+        // The tenant pick (the `last_tenant` cache first, the tenant map on a
+        // miss), its cache populate on that slow path, the probabilistic
+        // timestamp touch and the result are the tail the fused walk shares
+        // with this match.
+        let (tenant, took_slow_path) = self.resolve_tenant_readonly(&curr);
+        self.finish_match(
+            &curr,
             tenant,
-            matched_char_count: matched_chars,
+            took_slow_path,
+            matched_chars,
             input_char_count,
-            matched_tenants: if matched_chars > 0 {
-                curr.matched_tenants()
-            } else {
-                Vec::new()
-            },
-        }
+        )
     }
 
-    /// Read-only resolution of a node's "owning" tenant, mirroring the tenant
-    /// pick in [`Self::match_prefix_with_counts`] **without** the cache-populate
-    /// or probabilistic timestamp side effects. Returns the tenant plus whether
-    /// the slow (iteration) path was taken — the caller replays the original's
-    /// single deferred side effect on the final node.
+    /// Read-only resolution of a node's "owning" tenant: the `last_tenant`
+    /// cache when it still names a tenant of the node, else the first tenant
+    /// of the node's map (the slow path), **without** the cache-populate or
+    /// probabilistic timestamp side effects. Returns the tenant plus whether
+    /// the slow path was taken; [`Self::finish_match`] replays the single
+    /// deferred side effect on the final node.
     ///
-    /// Used by [`Self::match_and_insert`] so the match tenant is resolved from a
-    /// node's state **before** the fused insert adds the inserting tenant to it,
-    /// reproducing the original "match runs fully before insert" ordering for the
-    /// (otherwise non-deterministic) slow-path tenant pick.
+    /// Both [`Self::match_prefix_with_counts`] and the fused walk behind
+    /// [`Self::match_and_insert_with`] resolve through it; the fused walk does
+    /// so **before** its insert adds the inserting tenant to the node, which
+    /// keeps the "match runs fully before insert" ordering for the (otherwise
+    /// non-deterministic) slow-path tenant pick.
     #[expect(
         clippy::unused_self,
-        reason = "method logically belongs to the tree; mirrors match_prefix_with_counts resolution"
+        reason = "method logically belongs to the tree; the match's tenant resolution"
     )]
     fn resolve_tenant_readonly(&self, node: &NodeRef) -> (TenantId, bool) {
         let cached = node.last_tenant.read();
@@ -913,9 +874,9 @@ impl Tree {
             (None, None) => &self.root,
         };
         let (match_tenant, match_slow) = self.resolve_tenant_readonly(match_curr);
-        let result = self.finish_match_and_insert(
+        let result = self.finish_match(
             match_curr,
-            &match_tenant,
+            match_tenant,
             match_slow,
             matched_chars,
             input_char_count,
@@ -1026,39 +987,43 @@ impl Tree {
         result
     }
 
-    /// Replay `match_prefix_with_counts`'s single deferred side effect (populate
-    /// the `last_tenant` cache on the slow path, then a probabilistic 1/8
-    /// timestamp touch) on the resolved final node, and build the match result.
-    /// Factored out so [`Self::match_and_insert_with`] applies it identically to
-    /// the standalone `match_prefix_with_counts` tail.
+    /// The match's tail, shared by [`Self::match_prefix_with_counts`] and the
+    /// fused walk behind [`Self::match_and_insert_with`]: replay the single
+    /// deferred side effect of the tenant resolution (populate the
+    /// `last_tenant` cache on the slow path), then the probabilistic 1-in-8
+    /// timestamp touch on the resolved final node, and build the match result,
+    /// which takes `tenant` as it is (the callers hand over the id they
+    /// resolved, so the tail costs what the inline one did).
     #[expect(
         clippy::unused_self,
-        reason = "method logically belongs to the tree; mirrors match_prefix_with_counts tail"
+        reason = "method logically belongs to the tree; the match's tail"
     )]
-    fn finish_match_and_insert(
+    fn finish_match(
         &self,
         match_node: &NodeRef,
-        tenant: &TenantId,
+        tenant: TenantId,
         took_slow_path: bool,
         matched_chars: usize,
         input_char_count: usize,
     ) -> PrefixMatchResult {
         // On the slow path the original resolution populates the cache.
         if took_slow_path {
-            *match_node.last_tenant.write() = Some(Arc::clone(tenant));
+            *match_node.last_tenant.write() = Some(Arc::clone(&tenant));
         }
 
-        // Probabilistic (1 in 8) timestamp touch on the resolved tenant, skipping
-        // the synthetic "empty" tenant — identical to match_prefix_with_counts.
+        // Probabilistic (1 in 8) timestamp touch on the resolved tenant, to keep
+        // the contention on the tenant map low (LRU eviction needs no exact
+        // timestamps), skipping the synthetic "empty" tenant so a tenant no
+        // insert ever named does not enter the tree.
         let epoch = get_epoch();
         if epoch & 0x7 == 0 && tenant.as_ref() != "empty" {
             match_node
                 .tenant_last_access_time
-                .insert(Arc::clone(tenant), epoch);
+                .insert(Arc::clone(&tenant), epoch);
         }
 
         PrefixMatchResult {
-            tenant: Arc::clone(tenant),
+            tenant,
             matched_char_count: matched_chars,
             input_char_count,
             matched_tenants: if matched_chars > 0 {
@@ -1873,31 +1838,9 @@ impl Tree {
 
     fn merge_nodes(&self, local: &NodeRef, remote: &NodeRef) {
         // Merge tenants at this node
-        for entry in &remote.tenant_last_access_time {
-            let tenant_id = Arc::clone(entry.key());
-            let remote_epoch = *entry.value();
-
-            let is_new = !local
-                .tenant_last_access_time
-                .contains_key(tenant_id.as_ref());
-
-            let should_update = local
-                .tenant_last_access_time
-                .get(tenant_id.as_ref())
-                .map(|local_epoch| remote_epoch > *local_epoch)
-                .unwrap_or(true);
-
-            if should_update {
-                local
-                    .tenant_last_access_time
-                    .insert(Arc::clone(&tenant_id), remote_epoch);
-
-                if is_new {
-                    let edge_chars = local.text.read().char_count();
-                    self.add_tenant_chars(&tenant_id, edge_chars);
-                }
-            }
-        }
+        self.merge_remote_tenants(local, &remote.tenant_last_access_time, || {
+            local.text.read().char_count()
+        });
 
         // Merge children
         for remote_entry in &remote.children {
@@ -1922,60 +1865,39 @@ impl Tree {
                     //
                     // First, merge remote tenants into local_child (the prefix node).
                     // The remote tenant owns the full path including this prefix.
-                    for entry in &remote_child.tenant_last_access_time {
-                        let tid = Arc::clone(entry.key());
-                        let epoch = *entry.value();
-                        let is_new = !local_child
-                            .tenant_last_access_time
-                            .contains_key(tid.as_ref());
-                        let should_update = local_child
-                            .tenant_last_access_time
-                            .get(tid.as_ref())
-                            .map(|e| epoch > *e)
-                            .unwrap_or(true);
-                        if should_update {
-                            local_child
-                                .tenant_last_access_time
-                                .insert(Arc::clone(&tid), epoch);
-                            if is_new {
-                                let edge_chars = local_edge.chars().count();
-                                self.add_tenant_chars(&tid, edge_chars);
-                            }
-                        }
-                    }
+                    self.merge_remote_tenants(
+                        &local_child,
+                        &remote_child.tenant_last_access_time,
+                        || local_edge.chars().count(),
+                    );
 
                     let remote_remainder = advance_by_chars(&remote_edge, shared);
                     let Some(rem_first) = remote_remainder.chars().next() else {
                         continue;
                     };
 
-                    // Create a virtual remote node with the trimmed edge.
-                    // Use clone_subtree for children to rewrite parent pointers.
-                    let trimmed_remote = Arc::new(Node {
+                    // The remote continues below the local child's edge. Merge
+                    // the remainder as the one child of a tenant-less virtual
+                    // entry standing in for the local child: the children loop
+                    // then compares the remainder's edge against the local
+                    // child's own child under the same first char (exact,
+                    // prefix or diverging) and grafts it when there is none.
+                    // The two entries share that first char only, so they are
+                    // never merged as one path.
+                    let trimmed_remote = Self::clone_subtree_as(
+                        &remote_child,
+                        NodeText::new(remote_remainder.to_string()),
+                        None,
+                    );
+                    let below_local_child = Arc::new(Node {
                         children: new_children_map(),
-                        text: RwLock::new(NodeText::new(remote_remainder.to_string())),
-                        tenant_last_access_time: remote_child.tenant_last_access_time.clone(),
+                        text: RwLock::new(NodeText::empty()),
+                        tenant_last_access_time: new_tenant_map(),
                         parent: RwLock::new(None),
-                        last_tenant: RwLock::new(remote_child.last_tenant.read().clone()),
+                        last_tenant: RwLock::new(None),
                     });
-                    for child_entry in &remote_child.children {
-                        let child_clone =
-                            Self::clone_subtree(child_entry.value(), Some(&trimmed_remote));
-                        trimmed_remote
-                            .children
-                            .insert(*child_entry.key(), child_clone);
-                    }
-
-                    if let Some(deeper_local) = local_child.children.get(&rem_first) {
-                        let deeper_local = deeper_local.value().clone();
-                        // Recurse: merge trimmed remote into the deeper local child
-                        self.merge_nodes(&deeper_local, &trimmed_remote);
-                    } else {
-                        // No local child at this position — graft remote subtree
-                        *trimmed_remote.parent.write() = Some(Arc::downgrade(&local_child));
-                        self.accumulate_tenant_counts(&trimmed_remote);
-                        local_child.children.insert(rem_first, trimmed_remote);
-                    }
+                    below_local_child.children.insert(rem_first, trimmed_remote);
+                    self.merge_nodes(&local_child, &below_local_child);
                 } else {
                     // Case 3: shared prefix shorter than at least one edge.
                     // Covers both "shorter than both" and "remote is prefix of local".
@@ -2007,26 +1929,11 @@ impl Tree {
                     // Union remote tenants into the split node, updating
                     // tenant_char_count for newly added tenants.
                     let split_chars = shared;
-                    for entry in &remote_child.tenant_last_access_time {
-                        let tid = Arc::clone(entry.key());
-                        let epoch = *entry.value();
-                        let is_new = !split_node
-                            .tenant_last_access_time
-                            .contains_key(tid.as_ref());
-                        let should_update = split_node
-                            .tenant_last_access_time
-                            .get(tid.as_ref())
-                            .map(|e| epoch > *e)
-                            .unwrap_or(true);
-                        if should_update {
-                            split_node
-                                .tenant_last_access_time
-                                .insert(Arc::clone(&tid), epoch);
-                            if is_new {
-                                self.add_tenant_chars(&tid, split_chars);
-                            }
-                        }
-                    }
+                    self.merge_remote_tenants(
+                        &split_node,
+                        &remote_child.tenant_last_access_time,
+                        || split_chars,
+                    );
 
                     // Push local child down as child of split node. Re-parent
                     // inside the same `text` write section as the truncation
@@ -2040,37 +1947,74 @@ impl Tree {
                         .children
                         .insert(local_remainder_first, Arc::clone(&local_child));
 
-                    // Create remote remainder as another child of split node
-                    // Use clone_subtree to rewrite parent pointers correctly
+                    // Publish the split entry now: until it replaces the local
+                    // child under `local`, a walker through this edge finds the
+                    // truncated child re-parented elsewhere and spins on the
+                    // stale edge; the remote side below is grafted or merged
+                    // into the live split entry after this.
+                    local.children.insert(rc, Arc::clone(&split_node));
+
+                    // Create remote remainder as another child of split node,
+                    // its children cloned under it with their parent pointers
+                    // rewritten.
                     let remote_remainder = advance_by_chars(&remote_edge, shared);
                     if let Some(rem_first) = remote_remainder.chars().next() {
-                        let remote_subtree = Arc::new(Node {
-                            children: new_children_map(),
-                            text: RwLock::new(NodeText::new(remote_remainder.to_string())),
-                            tenant_last_access_time: remote_child.tenant_last_access_time.clone(),
-                            parent: RwLock::new(Some(Arc::downgrade(&split_node))),
-                            last_tenant: RwLock::new(remote_child.last_tenant.read().clone()),
-                        });
-                        // Clone remote children with correct parent pointers
-                        for child_entry in &remote_child.children {
-                            let child_clone =
-                                Self::clone_subtree(child_entry.value(), Some(&remote_subtree));
-                            remote_subtree
-                                .children
-                                .insert(*child_entry.key(), child_clone);
-                        }
+                        let remote_subtree = Self::clone_subtree_as(
+                            &remote_child,
+                            NodeText::new(remote_remainder.to_string()),
+                            Some(&split_node),
+                        );
                         self.accumulate_tenant_counts(&remote_subtree);
                         split_node.children.insert(rem_first, remote_subtree);
+                    } else {
+                        // The remote edge ended at the split point (it is a
+                        // prefix of the local edge): its children belong under
+                        // the split entry, each compared against the local
+                        // remainder in the children loop; the tenants re-merge
+                        // as a no-op (same tenants, same epochs).
+                        self.merge_nodes(&split_node, &remote_child);
                     }
-
-                    // Replace local's child with the split node
-                    local.children.insert(rc, split_node);
                 }
             } else {
                 // No local child at this char — copy entire remote subtree
                 let cloned = Self::clone_subtree(&remote_child, Some(local));
                 self.accumulate_tenant_counts(&cloned);
                 local.children.insert(rc, cloned);
+            }
+        }
+    }
+
+    /// Merge a remote node's tenants into `node`: a tenant the node does not
+    /// carry is attached with the remote epoch and credited the node's edge
+    /// (`edge_chars`, read only then); a tenant both carry keeps the newer
+    /// epoch.
+    fn merge_remote_tenants(
+        &self,
+        node: &NodeRef,
+        remote_tenants: &TenantMap<u64>,
+        edge_chars: impl Fn() -> usize,
+    ) {
+        for entry in remote_tenants {
+            let tenant_id = Arc::clone(entry.key());
+            let remote_epoch = *entry.value();
+
+            let is_new = !node
+                .tenant_last_access_time
+                .contains_key(tenant_id.as_ref());
+
+            let should_update = node
+                .tenant_last_access_time
+                .get(tenant_id.as_ref())
+                .map(|local_epoch| remote_epoch > *local_epoch)
+                .unwrap_or(true);
+
+            if should_update {
+                node.tenant_last_access_time
+                    .insert(Arc::clone(&tenant_id), remote_epoch);
+
+                if is_new {
+                    self.add_tenant_chars(&tenant_id, edge_chars());
+                }
             }
         }
     }
@@ -2091,9 +2035,17 @@ impl Tree {
 
     /// Deep clone a subtree, setting parent pointers correctly.
     fn clone_subtree(node: &NodeRef, parent: Option<&NodeRef>) -> NodeRef {
+        let text = node.text.read().clone_text();
+        Self::clone_subtree_as(node, text, parent)
+    }
+
+    /// Deep clone a subtree whose root carries `text` instead of the node's own
+    /// edge (a remote edge trimmed to the part below a local prefix), setting
+    /// parent pointers correctly.
+    fn clone_subtree_as(node: &NodeRef, text: NodeText, parent: Option<&NodeRef>) -> NodeRef {
         let new_node = Arc::new(Node {
             children: new_children_map(),
-            text: RwLock::new(node.text.read().clone_text()),
+            text: RwLock::new(text),
             tenant_last_access_time: node.tenant_last_access_time.clone(),
             parent: RwLock::new(parent.map(Arc::downgrade)),
             last_tenant: RwLock::new(node.last_tenant.read().clone()),

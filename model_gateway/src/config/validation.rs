@@ -1122,6 +1122,7 @@ impl ConfigValidator {
         }
     }
 
+    /// Validate listener settings and mode-specific serving constraints.
     fn validate_server_settings(config: &RouterConfig) -> ConfigResult<()> {
         if let Err(reason) = parse_bind_host(&config.host) {
             return Err(ConfigError::invalid_value("host", &config.host, reason));
@@ -1161,6 +1162,20 @@ impl ConfigValidator {
             ));
         }
 
+        if let Some(pd_readiness) = config.pd_readiness {
+            if !matches!(
+                config.mode,
+                RoutingMode::PrefillDecode { .. } | RoutingMode::EncodePrefillDecode { .. }
+            ) {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "PD readiness thresholds require --pd-disaggregation or --epd-disaggregation"
+                        .to_string(),
+                });
+            }
+
+            Self::validate_readiness_role("prefill", pd_readiness.prefill)?;
+            Self::validate_readiness_role("decode", pd_readiness.decode)?;
+        }
         // The admin listener: a port of 0 would be an unstable ephemeral one
         // (as for the probe listener), a host without a port names a listener
         // that does not exist, and the host must be a bind host.
@@ -1363,6 +1378,54 @@ impl ConfigValidator {
                 config.load_monitor_interval_secs,
                 "Must be > 0",
             ));
+        }
+
+        Ok(())
+    }
+
+    /// Reject invalid or incomplete per-role capacity thresholds.
+    fn validate_readiness_role(role: &str, threshold: ReadinessRoleConfig) -> ConfigResult<()> {
+        if threshold.min_healthy_workers == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: format!("pd_readiness.{role}.min_healthy_workers"),
+                value: "0".to_string(),
+                reason: "Must be > 0".to_string(),
+            });
+        }
+
+        if threshold.min_healthy_percent.is_some() && threshold.expected_workers.is_none() {
+            return Err(ConfigError::MissingRequired {
+                field: format!(
+                    "pd_readiness.{role}.expected_workers (required when a percentage is set)"
+                ),
+            });
+        }
+
+        if let Some(expected) = threshold.expected_workers {
+            if expected == 0 {
+                return Err(ConfigError::InvalidValue {
+                    field: format!("pd_readiness.{role}.expected_workers"),
+                    value: "0".to_string(),
+                    reason: "Must be > 0".to_string(),
+                });
+            }
+            if threshold.min_healthy_workers > expected {
+                return Err(ConfigError::InvalidValue {
+                    field: format!("pd_readiness.{role}.min_healthy_workers"),
+                    value: threshold.min_healthy_workers.to_string(),
+                    reason: format!("Must not exceed expected worker count ({expected})"),
+                });
+            }
+        }
+
+        if let Some(percent) = threshold.min_healthy_percent {
+            if !(1..=100).contains(&percent) {
+                return Err(ConfigError::InvalidValue {
+                    field: format!("pd_readiness.{role}.min_healthy_percent"),
+                    value: percent.to_string(),
+                    reason: "Must be in 1..=100".to_string(),
+                });
+            }
         }
 
         Ok(())
@@ -2255,6 +2318,57 @@ impl ConfigValidator {
 mod tests {
     use super::*;
     use crate::worker::ConnectionMode;
+
+    /// Serialized thresholds survive round trips and reject invalid values for either role.
+    #[test]
+    fn pd_readiness_config_round_trip_and_validation() {
+        let mut value = serde_json::to_value(RouterConfig {
+            mode: RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(value.get("pd_readiness").is_none());
+        for role in ["prefill", "decode"] {
+            for (threshold, valid) in [
+                (serde_json::json!({"expected_workers": 8}), true),
+                (serde_json::json!({"min_healthy_workers": 0}), false),
+                (serde_json::json!({"expected_workers": 0}), false),
+                (serde_json::json!({"min_healthy_percent": 80}), false),
+                (
+                    serde_json::json!({"expected_workers": 8, "min_healthy_percent": 0}),
+                    false,
+                ),
+                (
+                    serde_json::json!({"expected_workers": 8, "min_healthy_percent": 101}),
+                    false,
+                ),
+                (
+                    serde_json::json!({"expected_workers": 8, "min_healthy_workers": 9}),
+                    false,
+                ),
+                (
+                    serde_json::json!({"expected_workers": 8, "min_healthy_percent": 100}),
+                    true,
+                ),
+            ] {
+                value["pd_readiness"] = serde_json::json!({role: threshold});
+                let config: RouterConfig = serde_json::from_value(value.clone()).unwrap();
+                let result = ConfigValidator::validate(&config);
+                assert_eq!(result.is_ok(), valid, "{value}");
+                if let Err(error) = result {
+                    assert!(error.to_string().contains(&format!("pd_readiness.{role}.")));
+                }
+                let restored: RouterConfig =
+                    serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+                assert_eq!(restored.pd_readiness, config.pd_readiness);
+            }
+        }
+    }
 
     /// The OTLP endpoint is validated as the URL the exporter dials, so an
     /// unbracketed IPv6 literal is a configuration error with the bracketed
@@ -3767,25 +3881,7 @@ mod tests {
                     "http://worker2:8000".to_string(),
                 ],
             },
-            PolicyConfig::CacheAware {
-                cache_threshold: 1.5, // Invalid: > 1.0
-                balance_abs_threshold: 32,
-                balance_rel_threshold: 1.1,
-                eviction_interval_secs: 60,
-                max_tree_size: 1000,
-                block_size: 16,
-                balance_token_usage_threshold: 1.0,
-                overload_token_usage_threshold: 1.0,
-                overlap_decay: 0.0,
-                selection_temperature: 0.0,
-                cache_index: Default::default(),
-                cache_ttl_secs: 180,
-                cache_boundaries: Vec::new(),
-                selection_policy: None,
-                selection_accounting_ttl_ms: 0,
-                balance_prefix_margin_tokens: 0,
-                balance_uncached_credit: false,
-            },
+            PolicyConfig::cache_aware(1.5, 32, 1.1, 60, 1000), // Invalid: cache_threshold > 1.0
         );
 
         assert!(ConfigValidator::validate(&config).is_err());
@@ -4047,25 +4143,7 @@ mod tests {
             RoutingMode::Regular {
                 worker_urls: vec!["http://worker1:8000".to_string()],
             },
-            PolicyConfig::CacheAware {
-                cache_threshold: 0.5,
-                balance_abs_threshold: 32,
-                balance_rel_threshold: 1.1,
-                eviction_interval_secs: 60,
-                max_tree_size: 1000,
-                block_size: 16,
-                balance_token_usage_threshold: 1.0,
-                overload_token_usage_threshold: 1.0,
-                overlap_decay: 0.0,
-                selection_temperature: 0.0,
-                cache_index: Default::default(),
-                cache_ttl_secs: 180,
-                cache_boundaries: Vec::new(),
-                selection_policy: None,
-                selection_accounting_ttl_ms: 0,
-                balance_prefix_margin_tokens: 0,
-                balance_uncached_credit: false,
-            },
+            PolicyConfig::cache_aware(0.5, 32, 1.1, 60, 1000),
         );
 
         assert!(ConfigValidator::validate(&config).is_ok());
@@ -4172,25 +4250,7 @@ mod tests {
                 prefill_policy: None,
                 decode_policy: None,
             },
-            PolicyConfig::CacheAware {
-                cache_threshold: 0.5,
-                balance_abs_threshold: 32,
-                balance_rel_threshold: 1.1,
-                eviction_interval_secs: 60,
-                max_tree_size: 1000,
-                block_size: 16,
-                balance_token_usage_threshold: 1.0,
-                overload_token_usage_threshold: 1.0,
-                overlap_decay: 0.0,
-                selection_temperature: 0.0,
-                cache_index: Default::default(),
-                cache_ttl_secs: 180,
-                cache_boundaries: Vec::new(),
-                selection_policy: None,
-                selection_accounting_ttl_ms: 0,
-                balance_prefix_margin_tokens: 0,
-                balance_uncached_credit: false,
-            },
+            PolicyConfig::cache_aware(0.5, 32, 1.1, 60, 1000),
         );
 
         let result = ConfigValidator::validate(&config);
@@ -4228,25 +4288,7 @@ mod tests {
                     "http://decode1:8000".to_string(),
                     "http://decode2:8000".to_string(),
                 ],
-                prefill_policy: Some(PolicyConfig::CacheAware {
-                    cache_threshold: 0.5,
-                    balance_abs_threshold: 32,
-                    balance_rel_threshold: 1.1,
-                    eviction_interval_secs: 60,
-                    max_tree_size: 1000,
-                    block_size: 16,
-                    balance_token_usage_threshold: 1.0,
-                    overload_token_usage_threshold: 1.0,
-                    overlap_decay: 0.0,
-                    selection_temperature: 0.0,
-                    cache_index: Default::default(),
-                    cache_ttl_secs: 180,
-                    cache_boundaries: Vec::new(),
-                    selection_policy: None,
-                    selection_accounting_ttl_ms: 0,
-                    balance_prefix_margin_tokens: 0,
-                    balance_uncached_credit: false,
-                }),
+                prefill_policy: Some(PolicyConfig::cache_aware(0.5, 32, 1.1, 60, 1000)),
                 decode_policy: Some(PolicyConfig::PowerOfTwo {
                     load_metric: Default::default(),
                 }),
@@ -4366,25 +4408,7 @@ mod tests {
                 encode_urls: vec![("http://encode:8000".to_string(), None)],
                 prefill_urls: vec![("http://prefill:8000".to_string(), None)],
                 decode_urls: vec!["http://decode:8000".to_string()],
-                encode_policy: Some(PolicyConfig::CacheAware {
-                    cache_threshold: 0.5,
-                    balance_abs_threshold: 32,
-                    balance_rel_threshold: 1.1,
-                    eviction_interval_secs: 60,
-                    max_tree_size: 1000,
-                    block_size: 16,
-                    balance_token_usage_threshold: 1.0,
-                    overload_token_usage_threshold: 1.0,
-                    overlap_decay: 0.0,
-                    selection_temperature: 0.0,
-                    cache_index: Default::default(),
-                    cache_ttl_secs: 180,
-                    cache_boundaries: Vec::new(),
-                    selection_policy: None,
-                    selection_accounting_ttl_ms: 0,
-                    balance_prefix_margin_tokens: 0,
-                    balance_uncached_credit: false,
-                }),
+                encode_policy: Some(PolicyConfig::cache_aware(0.5, 32, 1.1, 60, 1000)),
                 prefill_policy: None,
                 decode_policy: None,
             },

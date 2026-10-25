@@ -16,12 +16,12 @@ mod tests;
 use std::{sync::Arc, time::Duration};
 
 use engine_zmq_adapter::{
-    StructuredOutputBackend, StructuredOutputsBackendConfig, StructuredOutputsSupport,
+    GridTensors, MropeLayout, StructuredOutputBackend, StructuredOutputsBackendConfig,
+    StructuredOutputsSupport,
 };
 use llm_tokenizer::traits::Tokenizer;
 use smg_grpc_client::tokenspeed_proto::token_speed_scheduler_server::TokenSpeedSchedulerServer;
 use tonic::service::Routes;
-use tracing::info;
 
 use crate::{
     engine_link::{EngineLink, TokenizerSlot},
@@ -62,10 +62,20 @@ pub struct TokenSpeedModelInfo {
     pub supported_modalities: Vec<i32>,
     /// Whether the language model's rotary positions are MRoPE (the text rope
     /// config carries an `mrope_section`), which the launcher reads off the
-    /// checkpoint: a multimodal item's grid tensors then feed positions this
-    /// wire cannot derive and are refused; `Some(false)` lets a patch-layout
-    /// grid through; `None` (a launcher that does not say) refuses as before.
+    /// checkpoint: a multimodal item's grid tensors then feed a position
+    /// table the adapter computes for the families whose rule it has (from
+    /// `architectures` / `model_type` and the three layout facts below) and
+    /// refuses for the rest; `Some(false)` lets a patch-layout grid through;
+    /// `None` (a launcher that does not say) refuses as before.
     pub mrope_positions: Option<bool>,
+    /// The vision tower's spatial merge size (`vision_config.spatial_merge_size`),
+    /// one of the position rule's inputs; `None` when the checkpoint has none.
+    pub spatial_merge_size: Option<u32>,
+    /// The checkpoint's image placeholder token id (`image_token_id`), which
+    /// the position rule checks each image span against.
+    pub image_token_id: Option<u32>,
+    /// The checkpoint's video placeholder token id (`video_token_id`).
+    pub video_token_id: Option<u32>,
     pub model_dtype: String,
     pub multimodal_encoder_dtype: String,
     /// TokenSpeed's `ServerArgs` as a JSON object, reported as
@@ -97,13 +107,43 @@ pub struct TokenSpeedModelInfo {
     pub kv_events_topic: String,
 }
 
+impl TokenSpeedModelInfo {
+    /// What a multimodal item's grid tensors are for this model
+    /// ([`GridTensors`]): the position rule's layout facts travel together,
+    /// so a launcher that shipped only some of them ships none.
+    pub(super) fn grid_tensors(&self) -> GridTensors {
+        let layout = match (
+            self.spatial_merge_size,
+            self.image_token_id,
+            self.video_token_id,
+        ) {
+            (Some(spatial_merge_size), Some(image_token_id), Some(video_token_id)) => {
+                Some(MropeLayout {
+                    spatial_merge_size,
+                    image_token_id,
+                    video_token_id,
+                })
+            }
+            _ => None,
+        };
+        GridTensors::for_model(
+            &self.architectures,
+            &self.model_type,
+            self.mrope_positions,
+            layout,
+        )
+    }
+}
+
 /// What the scheduler enforces of a structured request, read off the
 /// launcher's `server_args`: the `grammar_backend` the launcher resolved
 /// (TokenSpeed's `--grammar-backend`, `xgrammar` or `none`: `none` unless
 /// set, `xgrammar` for the checkpoints the engine defaults so). `none`
 /// enforces nothing: the scheduler refuses such a request at admission with
-/// a 400 that the slim wire reports as a bare `abort`, which reaches the
-/// caller as an empty answer. `xgrammar` compiles all four kinds, a JSON
+/// a 400 that reaches the caller as INTERNAL with `BARE_ENGINE_ABORT` from
+/// an engine that declares no status columns, or as INVALID_ARGUMENT with
+/// the engine's reason from one that does; refusing before the scheduler
+/// gives the caller's error on either. `xgrammar` compiles all four kinds, a JSON
 /// schema with the features it lacks dropped. A launcher that wrote no
 /// backend could not tell (a checkpoint default not resolved yet, or an
 /// older launcher), and a name this servicer does not know is not one the
@@ -225,6 +265,9 @@ impl TokenSpeedServicerServer {
                 ranks: config.servicer.engine_count,
                 max_model_len: u32::try_from(config.model.max_context_length).unwrap_or(0),
                 matches_string_stops: true,
+                // Media reach this wire as the router's preprocessed tensors: the
+                // router-side families are their measurement.
+                processes_media: false,
             },
             config.servicer.metrics_bind_address.is_some(),
         )?;
@@ -244,43 +287,14 @@ impl TokenSpeedServicerServer {
             .max_encoding_message_size(usize::MAX),
         );
         let connect_state = Arc::clone(&state);
-        let silence = config.servicer.silence_bounds();
-        let ServicerConfig {
-            bind_address,
-            metrics_bind_address,
-            ipc_base_url,
-            handshake_address,
-            engine_count,
-            tokenizer_dir,
-            engine_startup_timeout,
-            engine_startup_ceiling,
-            ..
-        } = config.servicer;
         let server = servicer::Server::start(
             "smg-tokenspeed-servicer",
-            &bind_address,
-            metrics_bind_address.as_deref(),
+            config.servicer,
             SERVICE_NAME,
+            "TokenSpeed",
             &state,
             routes,
-            move |address, last_error| {
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "engine connect is fire-and-forget; the runtime drop cancels it"
-                )]
-                let _connect = tokio::spawn(engine::connect_engine(
-                    connect_state,
-                    ipc_base_url,
-                    handshake_address,
-                    engine_count,
-                    engine_startup_timeout,
-                    engine_startup_ceiling,
-                    silence,
-                    tokenizer_dir,
-                    last_error,
-                ));
-                info!(%address, "TokenSpeed gRPC servicer listening");
-            },
+            move |inputs| engine::connect_engine(connect_state, inputs),
         )?;
         Ok(Self { server, state })
     }
@@ -325,9 +339,11 @@ impl TokenSpeedServicerServer {
     }
 
     /// Hold (`false`) or release (`true`) readiness alone: health flips as
-    /// with `set_serving`, admission stays open, so the lifecycle owner's own
-    /// requests (its planned warm-up before SERVING) still reach the engine.
-    /// `set_serving(false)` is the drain switch and closes admission as well.
+    /// with `set_serving`, admission stays open to the lifecycle owner's own
+    /// requests (its planned warm-up before SERVING, `smg-warmup-<n>`) and to
+    /// nothing else, so the warm-up's steps share the engine with no client
+    /// request. `set_serving(false)` is the drain switch and closes admission
+    /// as well.
     pub fn set_ready(&self, ready: bool) {
         self.state.shared.set_ready(ready);
     }

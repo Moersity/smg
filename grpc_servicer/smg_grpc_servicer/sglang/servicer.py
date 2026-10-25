@@ -50,6 +50,10 @@ from smg_grpc_servicer.engine_status import abort_for_constraint_failure
 from smg_grpc_servicer.health_probe import await_probe
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
+from smg_grpc_servicer.sglang.hidden_states import (
+    refuse_hidden_states_above_server_mode,
+    refuse_hidden_states_on_this_servicer,
+)
 from smg_grpc_servicer.sglang.kv_events import subscribe_kv_events
 from smg_grpc_servicer.sglang.loads import (
     convert_loads_to_protobuf,
@@ -975,6 +979,11 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
 
         # Create request
         require_reasoning = bool(grpc_req.require_reasoning)
+        if grpc_req.return_hidden_states:
+            # The engine's launch-time cap first, in its own words; then this
+            # servicer's own answer: hidden states are served by the Rust one.
+            refuse_hidden_states_above_server_mode()
+            refuse_hidden_states_on_this_servicer()
 
         return TokenizedGenerateReqInput(
             rid=grpc_req.request_id,
@@ -1105,14 +1114,26 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         stop = list(grpc_params.stop) if grpc_params.stop else None
         stop_token_ids = list(grpc_params.stop_token_ids) if grpc_params.stop_token_ids else None
 
+        # proto3 cannot tell an unset scalar from its zero, and the zeros of
+        # these three are never meant: top_p 0.0 keeps the top token only,
+        # top_k 0 is an empty candidate set, and a repetition factor of 0.0
+        # sends a repeated token's positive logit to infinity (the scheduler's
+        # own checks refuse all three where they run). An unset one means the
+        # neutral value: the whole distribution, every token, no penalty.
+        top_p = grpc_params.top_p if grpc_params.top_p != 0.0 else 1.0
+        top_k = grpc_params.top_k if grpc_params.top_k != 0 else -1
+        repetition_penalty = (
+            grpc_params.repetition_penalty if grpc_params.repetition_penalty != 0.0 else 1.0
+        )
+
         return SGLSamplingParams(
             temperature=grpc_params.temperature,
-            top_p=grpc_params.top_p,
-            top_k=grpc_params.top_k,
+            top_p=top_p,
+            top_k=top_k,
             min_p=grpc_params.min_p,
             frequency_penalty=grpc_params.frequency_penalty,
             presence_penalty=grpc_params.presence_penalty,
-            repetition_penalty=grpc_params.repetition_penalty,
+            repetition_penalty=repetition_penalty,
             max_new_tokens=max_new_tokens,
             min_new_tokens=grpc_params.min_new_tokens,
             stop=stop,

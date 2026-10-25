@@ -38,7 +38,15 @@ flips, so the first-time costs are paid while nothing is routed here:
   with a collective of the overlapped previous chunk still in flight, that
   load has deadlocked the forward. The ``fast`` level plans none of them and
   leaves that hazard open (the start log says so): it is for a test leg or a
-  quick restart, and the shipped default is ``full``.
+  quick restart, and the shipped default is ``full``;
+- the **media leg**, when the engine module asks for it
+  (:attr:`WarmupInputs.media_leg`): one request carrying one media item
+  through the engine's own media path, after the second pass and before the
+  chunk remainders, so the first-use cost of that path (a kernel compiled on
+  the first media forward, which no text request reaches) is paid before
+  SERVING as well. The wire builds that request (the prompt the model's own
+  template renders around the item, its ids, the item); the planner only
+  places it.
 
 Every request carries its own token ids (no two requests share a prefix
 block), so prefix caching never turns a planned prefill into a hit, and the
@@ -56,6 +64,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextlib
 import dataclasses
 import logging
 import random
@@ -185,6 +194,15 @@ class WarmupInputs:
     capture_sizes: tuple[int, ...] = ()
     #: Where the figures came from, for the start line.
     source: str = ""
+    #: How many positions of the context the engine's scheduler keeps back
+    #: beyond a request's prompt and its output budget: a planned prompt is
+    #: at most the context less the request's output less this many tokens.
+    #: The engines differ (one admits a prompt and an output budget that
+    #: together fill the context; the others keep one or more positions back
+    #: and refuse, or clamp the output of, a request that reaches them), so
+    #: an engine module states what its scheduler's own admission computes,
+    #: read off the engine's configuration.
+    context_reserve_tokens: int = 0
     #: How many data-parallel ranks the servicer fronts, each a scheduler of
     #: its own with the window and the step above. Above one, the plan runs
     #: every shape on every rank, each request pinned to its rank; an engine
@@ -199,6 +217,17 @@ class WarmupInputs:
     #: ``full`` level alone: a ``fast`` start plans the classes and leaves the
     #: hazard open, and :func:`plan_for` warns so.
     every_prefill_length: bool = False
+    #: The bootstrap host the engine's scheduler takes as a transfer to
+    #: nobody (its own warm-up's stand-in), when the engine is one leg of a
+    #: disaggregated pair: every request carries it, so the leg warms up
+    #: without its peer. ``None`` for a single engine.
+    lone_leg_bootstrap: str | None = None
+    #: Whether the plan carries one request with one media item through the
+    #: engine's media path (after the second pass, before the chunk
+    #: remainders): an engine module sets it for a worker whose first media
+    #: request pays a first-use cost no text request reaches, and its wire
+    #: builds that request.
+    media_leg: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -217,6 +246,13 @@ class WarmupRequest:
     #: The data-parallel rank the request is pinned to; ``None`` leaves the
     #: servicer's own routing to pick the engine (one rank, or no pinning).
     data_parallel_rank: int | None = None
+    #: A lone leg's stand-in bootstrap host
+    #: (:attr:`WarmupInputs.lone_leg_bootstrap`), for the wire to carry.
+    lone_leg_bootstrap: str | None = None
+    #: The request carries one media item: the wire supplies the item and the
+    #: prompt around it (its own token ids), so :attr:`prompt_tokens` and
+    #: :attr:`token_ids` are not what reaches the engine for this one.
+    media: bool = False
 
     @property
     def token_ids(self) -> tuple[int, ...]:
@@ -229,8 +265,10 @@ class WarmupStep:
     """One scheduler shape: the requests sent together to reach it."""
 
     name: str
-    # "decode", "prefill", "again" (the measuring second pass) or "remainder"
-    # (a prompt length the ladder left out, for an engine that asks for all)
+    # "decode", "prefill", "again" (the measuring second pass), "media" (one
+    # media item through the engine's media path, for an engine that asks for
+    # it) or "remainder" (a prompt length the ladder left out, for an engine
+    # that asks for all)
     kind: str
     requests: tuple[WarmupRequest, ...]
 
@@ -260,18 +298,24 @@ class WarmupPlan:
     def describe(self) -> str:
         kinds = {
             kind: sum(1 for step in self.steps if step.kind == kind)
-            for kind in ("decode", "prefill", "again", "remainder")
+            for kind in ("decode", "prefill", "again", "media", "remainder")
         }
         ranks = self.inputs.data_parallel_size
         return (
             f"level {self.level}: {len(self.steps)} steps ({kinds['decode']} decode "
             f"staircase{'s' if kinds['decode'] != 1 else ''}, "
             f"{kinds['prefill']} prefill shapes, {kinds['again']} measured again"
+            + (", one media item" if kinds["media"] else "")
             + (f", {kinds['remainder']} chunk remainders" if kinds["remainder"] else "")
             + f"), {self.prompt_tokens} prompt tokens and {self.output_tokens} output tokens over "
             f"a window of {self.inputs.max_num_seqs} and a step of "
             f"{self.inputs.max_num_batched_tokens}"
             + (f" on each of {ranks} data-parallel ranks" if ranks > 1 else "")
+            + (
+                ", the requests carrying the lone leg's stand-in bootstrap"
+                if self.inputs.lone_leg_bootstrap
+                else ""
+            )
         )
 
 
@@ -345,13 +389,23 @@ def token_ids(count: int, seed: int, vocab_size: int) -> tuple[int, ...]:
 class _Requests:
     """The requests of one plan, numbered: the ordinal seeds the token ids."""
 
-    def __init__(self, vocab_size: int) -> None:
+    def __init__(self, vocab_size: int, lone_leg_bootstrap: str | None = None) -> None:
         self._vocab_size = vocab_size
+        self._lone_leg_bootstrap = lone_leg_bootstrap
         self._next = 0
 
-    def one(self, prompt_tokens: int, max_tokens: int, rank: int | None = None) -> WarmupRequest:
+    def one(
+        self,
+        prompt_tokens: int,
+        max_tokens: int,
+        rank: int | None = None,
+        media: bool = False,
+    ) -> WarmupRequest:
         ordinal = self._next
         self._next += 1
+        # The exact form the Rust servicers admit while readiness is held
+        # (`is_warmup_request_id` in the engine servicer crate's request
+        # registry): the prefix, the ordinal, nothing else.
         return WarmupRequest(
             request_id=f"smg-warmup-{ordinal}",
             prompt_tokens=prompt_tokens,
@@ -359,32 +413,41 @@ class _Requests:
             seed=ordinal,
             vocab_size=self._vocab_size,
             data_parallel_rank=rank,
+            lone_leg_bootstrap=self._lone_leg_bootstrap,
+            media=media,
         )
 
 
 def plan_warmup(inputs: WarmupInputs, level: str = DEFAULT_LEVEL) -> WarmupPlan:
     """The steps for ``inputs`` at ``level``, in the order they run: the
     decode staircase first (cheap, and every ramp's first shapes), then the
-    prefill shapes by length, the odd variants, the second pass, and, when
+    prefill shapes by length, the odd variants, the second pass, the media
+    leg when the inputs ask for one, and, when
     the inputs ask for every prefill length, the chunk remainders in
     :func:`spread_order` at the ``full`` level (the ``fast`` level keeps the
     merged ladder: a test leg or a quick start takes the classes alone, and
     the shipped default is ``full``). A prompt never exceeds the admission
-    step nor the context less its output. Under data parallelism (``inputs.data_parallel_size`` above
-    one) the staircase runs once per rank and every prefill shape goes to
-    every rank at once, each request pinned to its rank."""
+    step, nor the context less its output and the positions the engine's
+    scheduler keeps back (:attr:`WarmupInputs.context_reserve_tokens`), so
+    no step reaches a shape the engine refuses. Under data parallelism
+    (``inputs.data_parallel_size`` above one) the staircase runs once per
+    rank and every prefill shape goes to every rank at once, each request
+    pinned to its rank."""
     if level not in LEVELS:
         raise ValueError(f"unknown warm-up level {level!r}; expected one of {LEVELS}")
     steps: list[WarmupStep] = []
     if inputs.max_num_batched_tokens <= 0 or inputs.vocab_size <= 0:
         return WarmupPlan(level, inputs, ())
-    requests = _Requests(inputs.vocab_size)
+    requests = _Requests(inputs.vocab_size, inputs.lone_leg_bootstrap)
     window = inputs.max_num_seqs if inputs.max_num_seqs > 0 else DEFAULT_WINDOW
-    # The longest prompt a one-token request may carry.
+    # The longest prompt a one-token request may carry: the context less the
+    # token and the positions the engine keeps back (the step alone when the
+    # configuration states no context).
     context = (
         inputs.max_model_len if inputs.max_model_len > 0 else inputs.max_num_batched_tokens + 1
     )
-    limit = min(inputs.max_num_batched_tokens, context - 1)
+    reserve = max(inputs.context_reserve_tokens, 0) if inputs.max_model_len > 0 else 0
+    limit = min(inputs.max_num_batched_tokens, context - 1 - reserve)
     if limit < 1:
         return WarmupPlan(level, inputs, ())
     ranks: tuple[int | None, ...] = (
@@ -396,7 +459,7 @@ def plan_warmup(inputs: WarmupInputs, level: str = DEFAULT_LEVEL) -> WarmupPlan:
     # first token comes out of the prefill step; the decode batch holds the
     # requests still generating after it).
     count = min(window, inputs.max_num_batched_tokens // STAIRCASE_PROMPT_TOKENS)
-    count = min(count, max(context - 1 - STAIRCASE_PROMPT_TOKENS, 0))
+    count = min(count, max(context - 1 - reserve - STAIRCASE_PROMPT_TOKENS, 0))
     for rank in ranks if count >= 1 else ():
         on_rank = f" on rank {rank}" if rank is not None else ""
         steps.append(
@@ -432,6 +495,18 @@ def plan_warmup(inputs: WarmupInputs, level: str = DEFAULT_LEVEL) -> WarmupPlan:
                 requests=tuple(requests.one(length, 1, rank) for rank in ranks),
             )
         )
+    if inputs.media_leg:
+        # One item through the engine's media path, on every rank: its
+        # first-use cost is the media path's own, which no text shape reaches.
+        steps.append(
+            WarmupStep(
+                name="one media item through the engine's media path",
+                kind="media",
+                requests=tuple(
+                    requests.one(STAIRCASE_PROMPT_TOKENS, 1, rank, media=True) for rank in ranks
+                ),
+            )
+        )
     if inputs.every_prefill_length and level == LEVEL_FULL:
         for length in spread_order(limit):
             if length in lengths:
@@ -463,6 +538,79 @@ class WarmupWire(Protocol):
     def close(self) -> Any: ...
 
 
+#: The finishes with which an engine ends a request it did not run to its
+#: end: refused at admission (a prompt past its input bound, a parameter its
+#: scheduler rejects) or cut short (a pause, a failure). Whatever the reason,
+#: and whether or not the wire carries it, nothing of the step's shape is
+#: known to be warm: the pass counts such a request as failed.
+UNSERVED_FINISHES = frozenset({"abort", "error"})
+
+
+class UnservedRequest(RuntimeError):
+    """A request the engine answered without serving it: a completion with
+    one of :data:`UNSERVED_FINISHES`, or the status a servicer raises for
+    the same refusal (one of :data:`REFUSAL_STATUS_CODES`). A failed request
+    in the pass's accounting, like any raised status; unlike one, no sign
+    that the engine stopped taking requests: the engine answered. So a step
+    of these counts toward the consecutive-failures stop
+    (:data:`CONSECUTIVE_FAILED_STEPS`), which exists for an engine that
+    answers nothing, only while no step has been covered: an engine whose
+    input bound sits below the plan's longest prompts covers the shorter
+    shapes first, then refuses those steps in a row, and the pass still runs
+    everything after them; a servicer that refuses from the first request on
+    (a field the engine rejects on every call) stops the pass after three
+    steps as any failure does."""
+
+
+def unserved(finish_reason: str | None, output_tokens: int) -> UnservedRequest | None:
+    """The :class:`UnservedRequest` a completion that was not served
+    raises, or ``None`` when it was served: the finish the engine ended it
+    with, when that finish is one of :data:`UNSERVED_FINISHES`, and how
+    many tokens came before it (none for a refusal at admission). A wire
+    raises it from ``generate`` so the pass records the request as failed
+    and the step as not covered. An empty or absent finish is not a refusal
+    (a completion a stand-in answers without one)."""
+    if (finish_reason or "") not in UNSERVED_FINISHES:
+        return None
+    produced = (
+        "before any token"
+        if output_tokens == 0
+        else f"after {output_tokens} token{'s' if output_tokens != 1 else ''}"
+    )
+    return UnservedRequest(
+        f"the engine ended the request with finish_reason {finish_reason!r} {produced}"
+    )
+
+
+#: The gRPC status codes a servicer answers a request it refused with: the
+#: request's shape (``INVALID_ARGUMENT``: a prompt past the engine's input
+#: bound, a parameter its scheduler rejects) or no room for it now
+#: (``RESOURCE_EXHAUSTED``). The other encoding of the refusals above: the
+#: servicers that attribute an engine's abort raise its status instead of
+#: completing the request. The codes of a servicer that could not answer
+#: (``DEADLINE_EXCEEDED``, ``UNAVAILABLE``, ``INTERNAL``, ...) stay real
+#: failures.
+REFUSAL_STATUS_CODES = frozenset({"INVALID_ARGUMENT", "RESOURCE_EXHAUSTED"})
+
+
+def refused(error: BaseException) -> UnservedRequest | None:
+    """The :class:`UnservedRequest` a raised status that means a refusal
+    becomes (its code one of :data:`REFUSAL_STATUS_CODES`; the words carry
+    the code and the status' details), or ``None`` for any other error. A
+    wire raises it in place of the status, so the pass records the request
+    as failed and the step as not covered, and counts the step toward the
+    stop by :class:`UnservedRequest`'s rule (only while no step has been
+    covered). The status is read as a gRPC call exposes it (``code()``,
+    ``details()``), without a gRPC import here."""
+    code = getattr(error, "code", None)
+    name = getattr(code() if callable(code) else code, "name", None)
+    if name not in REFUSAL_STATUS_CODES:
+        return None
+    details = getattr(error, "details", None)
+    details = details() if callable(details) else details
+    return UnservedRequest(f"the engine refused the request: {name}: {details or 'no details'}")
+
+
 @dataclasses.dataclass
 class StepResult:
     step: WarmupStep
@@ -478,6 +626,10 @@ class WarmupReport:
     budget_hit: bool = False
     stopped: str | None = None
     flushed: bool | None = None
+    #: Why the flush was refused, when the wire raised or the servicer
+    #: answered the refusal with a message: the servicer's own words (a
+    #: status' details, else its code), for the end line.
+    flush_refusal: str | None = None
 
     @property
     def covered(self) -> int:
@@ -504,6 +656,8 @@ class WarmupReport:
             text += f"; stopped: {self.stopped}"
         if self.flushed is False:
             text += "; the engine's cache was not flushed (the warm-up's blocks stay cached)"
+            if self.flush_refusal:
+                text += f": {self.flush_refusal}"
         return text
 
 
@@ -519,6 +673,10 @@ class _Pass:
         self.report = WarmupReport(plan)
         self._started = time.monotonic()
         self._failed_in_a_row = 0
+        # The step that opened the current run of whole failures: the one the
+        # end line names. A partly failed step neither extends nor ends the
+        # run, so the run's length does not locate its first step.
+        self._first_failed: int | None = None
         self._remainders = sum(1 for step in plan.steps if step.kind == "remainder")
         self._remainders_done = 0
         self._remainder_secs = 0.0
@@ -538,7 +696,13 @@ class _Pass:
             self.report.budget_hit = True
             return None
         if self._failed_in_a_row >= CONSECUTIVE_FAILED_STEPS:
-            self.report.stopped = f"{CONSECUTIVE_FAILED_STEPS} steps failed in a row"
+            # The end line names the first of them: the shape the engine
+            # refused, or the step at which it stopped answering.
+            opener = (
+                done - self._failed_in_a_row if self._first_failed is None else self._first_failed
+            )
+            first = self.plan.steps[opener].name
+            self.report.stopped = f"{CONSECUTIVE_FAILED_STEPS} steps failed in a row, from {first}"
             return None
         return self.plan.steps[done]
 
@@ -559,7 +723,20 @@ class _Pass:
         index = len(self.report.results)
         remainder = step.kind == "remainder"
         if errors:
-            self._failed_in_a_row += 1 if len(errors) == len(step.requests) else 0
+            # A whole step of refusals (the engine answered every request
+            # with an abort) is a failed step, not a step toward the stop:
+            # the stop is for an engine that answers nothing. Only once some
+            # step has been covered, though: a servicer that refuses from the
+            # first request on is stopped as before, not warned about once
+            # per step over the whole plan.
+            whole = len(errors) == len(step.requests)
+            answered = self.report.covered > 0 and all(
+                isinstance(error, UnservedRequest) for error in errors
+            )
+            if whole and not answered:
+                if self._failed_in_a_row == 0:
+                    self._first_failed = index - 1
+                self._failed_in_a_row += 1
             self.log.warning(
                 "Warm-up step %d/%d %s: %d of %d requests failed in %.0f ms (first: %s)",
                 index,
@@ -572,6 +749,7 @@ class _Pass:
             )
         else:
             self._failed_in_a_row = 0
+            self._first_failed = None
             # A chunk remainder is one of thousands of one-token requests: its
             # own line is DEBUG, and the remainders' progress is one INFO line
             # every so many (:data:`REMAINDER_PROGRESS_EVERY`) and at their end.
@@ -606,9 +784,10 @@ class _Pass:
             " (every count up to the step used once)" if done == self._remainders else "",
         )
 
-    def finish(self, flushed: bool | None) -> WarmupReport:
+    def finish(self, flushed: bool | None, flush_refusal: str | None = None) -> WarmupReport:
         self.report.secs = time.monotonic() - self._started
         self.report.flushed = flushed
+        self.report.flush_refusal = flush_refusal
         # The remainders the budget or a stop cut short: their last partial
         # batch reported once, as the periodic line would have.
         done = self._remainders_done
@@ -618,13 +797,42 @@ class _Pass:
         return self.report
 
 
-def _flush(wire: WarmupWire, log: logging.Logger) -> bool:
-    """The engine's cache flushed, best effort; the outcome is logged, never raised."""
+def _refusal(error: BaseException) -> str:
+    """The words of a refused flush, for the log and the end line: a gRPC
+    status' details when the error carries them (a status' ``str`` runs over
+    several lines), else its code's name, else the error itself. Whatever the
+    source, the words are one line: runs of whitespace, newlines included,
+    read as one space (an engine's multi-line message would otherwise split
+    the end line)."""
+    details = getattr(error, "details", None)
+    if callable(details):
+        with contextlib.suppress(Exception):
+            if text := _one_line(str(details() or "")):
+                return text
+    # A status with empty details: its code's name keeps the reason to one
+    # line (the status' ``str`` is the multi-line repr).
+    code = getattr(error, "code", None)
+    if callable(code):
+        with contextlib.suppress(Exception):
+            if (status := code()) is not None:
+                return _one_line(str(getattr(status, "name", status)))
+    return _one_line(str(error)) or type(error).__name__
+
+
+def _one_line(text: str) -> str:
+    """``text`` with every run of whitespace, newlines included, as one space."""
+    return " ".join(text.split())
+
+
+def _flush(wire: WarmupWire, log: logging.Logger) -> tuple[bool, str | None]:
+    """The engine's cache flushed, best effort; the outcome is logged, never
+    raised. Returns whether it was, and the refusal's words when it was not."""
     try:
-        return bool(wire.flush_cache())
+        return bool(wire.flush_cache()), None
     except Exception as error:  # noqa: BLE001 -- the flush is a courtesy to the next requests
-        log.info("The warm-up's cache flush was not accepted: %s", error)
-        return False
+        refusal = _refusal(error)
+        log.info("The warm-up's cache flush was not accepted: %s", refusal)
+        return False, refusal
 
 
 def run_warmup(
@@ -665,7 +873,7 @@ def run_warmup(
                     if error is not None:
                         errors.append(error)
         run.record(step, time.monotonic() - started, errors)
-    return run.finish(_flush(wire, log) if run.report.results else None)
+    return run.finish(*(_flush(wire, log) if run.report.results else (None, None)))
 
 
 async def run_warmup_async(
@@ -688,14 +896,14 @@ async def run_warmup_async(
         )
         errors = [outcome for outcome in outcomes if isinstance(outcome, BaseException)]
         run.record(step, time.monotonic() - started, errors)
-    flushed = None
+    flushed = refusal = None
     if run.report.results:
         try:
             flushed = bool(await wire.flush_cache())
         except Exception as error:  # noqa: BLE001 -- the flush is a courtesy to the next requests
-            log.info("The warm-up's cache flush was not accepted: %s", error)
-            flushed = False
-    return run.finish(flushed)
+            flushed, refusal = False, _refusal(error)
+            log.info("The warm-up's cache flush was not accepted: %s", refusal)
+    return run.finish(flushed, refusal)
 
 
 def plan_for(

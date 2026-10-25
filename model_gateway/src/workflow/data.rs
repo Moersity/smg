@@ -62,6 +62,12 @@ pub trait WorkerRegistrationData: WorkflowData {
     /// Get the labels for policy registration.
     fn get_labels(&self) -> Option<&HashMap<String, String>>;
 
+    /// The Symphony table whose failure classes exist at zero once the
+    /// workers are registered, when the workflow resolved one.
+    fn symphony_table(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Select the semantics of the final registry write.
     ///
     /// Defaults to upsert, which is what every caller did before this method
@@ -146,6 +152,12 @@ pub struct WorkerWorkflowData {
     pub detected_runtime_type: Option<String>,
     pub discovered_labels: HashMap<String, String>,
     pub dp_info: Option<super::steps::local::DpInfo>,
+    /// Under Symphony, the table whose failure classes the registration step
+    /// publishes at zero once the worker is in the registry (transient; the
+    /// create step resolves it from the model card and the names; none for
+    /// an HTTP worker, the legacy parsers or a model no table reads).
+    #[serde(skip, default)]
+    pub symphony_table: Option<&'static str>,
     // -- External-only fields --
     pub model_cards: Vec<ModelCard>,
     // -- Shared fields --
@@ -207,6 +219,10 @@ impl WorkerRegistrationData for WorkerWorkflowData {
 
     fn get_labels(&self) -> Option<&HashMap<String, String>> {
         Some(&self.final_labels)
+    }
+
+    fn symphony_table(&self) -> Option<&'static str> {
+        self.symphony_table
     }
 
     fn registration_mode(&self) -> WorkerRegistrationMode {
@@ -308,10 +324,9 @@ pub struct WorkerUpdateWorkflowData {
     /// the update step (transient).
     #[serde(skip, default)]
     pub fresh_engine_labels: Option<HashMap<String, String>>,
-    /// For a label refresh: each worker's registry id and revision as the
-    /// find step found it, in `workers_to_update` order, captured once before
-    /// any read so the write-back targets exactly that registration whatever
-    /// happens meanwhile (transient).
+    /// Each worker's registry id and revision as the find step found it, in
+    /// `workers_to_update` order, captured once so the write-back targets
+    /// exactly that registration whatever happens meanwhile (transient).
     #[serde(skip, default)]
     pub snapshot: Option<Vec<(WorkerId, u64)>>,
 }

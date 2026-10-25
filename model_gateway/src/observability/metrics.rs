@@ -15,8 +15,8 @@ use metrics_util::parse_quantiles;
 use once_cell::sync::Lazy;
 use smg_external_router::metrics::Metrics as RouterMetrics;
 pub use smg_external_router::metrics::{
-    bool_to_static_str, intern_model_label, intern_tool_label, metrics_labels, STREAMING_FALSE,
-    STREAMING_TRUE,
+    bool_to_static_str, error_reason_from_status, intern_model_label, intern_tool_label,
+    metrics_labels, STREAMING_FALSE, STREAMING_TRUE,
 };
 
 use super::worker_metrics::{self, WorkerSeries, WorkerSeriesRecorder};
@@ -29,7 +29,7 @@ use crate::routers::grpc::regular::symphony::telemetry as symphony_telemetry;
 /// Uses DashMap for lock-free concurrent access.
 static STRING_INTERNER: Lazy<DashMap<String, Arc<str>>> = Lazy::new(DashMap::new);
 
-/// Intern a string, returning a cheaply-cloneable Arc<str>.
+/// Intern a string, returning a cheaply-cloneable `Arc<str>`.
 ///
 /// This function is designed for high-throughput scenarios where the same
 /// strings (model IDs, worker URLs) appear repeatedly. The first call allocates,
@@ -100,12 +100,18 @@ mod handles {
         pub(super) ttft: OnceCell<Histogram>,
         /// `smg_router_tpot_seconds`.
         pub(super) tpot: OnceCell<Histogram>,
+        /// `smg_router_time_to_first_token_seconds`.
+        pub(super) first_token: OnceCell<Histogram>,
+        /// `smg_router_request_time_per_output_token_seconds`.
+        pub(super) per_output_token: OnceCell<Histogram>,
         /// `smg_router_generation_duration_seconds`.
         pub(super) generation: OnceCell<Histogram>,
         /// `smg_router_tokens_total{token_type="input"}`.
         pub(super) input_tokens: OnceCell<Counter>,
         /// `smg_router_tokens_total{token_type="output"}`.
         pub(super) output_tokens: OnceCell<Counter>,
+        /// `smg_router_tokens_total{token_type="cached"}`.
+        pub(super) cached_tokens: OnceCell<Counter>,
     }
 
     /// Every registration or removal of a worker moves this on, and a
@@ -316,6 +322,37 @@ pub(crate) const UPKEEP_INTERVAL_SECS: u64 = 5 * 60;
 pub(crate) const CACHE_AWARE_MATCH_RATIO_BUCKETS: &[f64] =
     &[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
 
+/// Time to first token on edges that resolve it. The same observation as
+/// `smg_router_ttft_seconds`, which keeps the request-duration buckets (and
+/// so the `le` values recording rules were written against).
+pub(crate) const TIME_TO_FIRST_TOKEN_SECONDS: &str = "smg_router_time_to_first_token_seconds";
+/// Per-request mean time per output token on edges that resolve it. The
+/// same observation as `smg_router_tpot_seconds`, which keeps the
+/// request-duration buckets; named like the servicer's per-request mean
+/// (`request_time_per_output_token`), as the per-interval gap is another
+/// family's quantity.
+pub(crate) const REQUEST_TIME_PER_OUTPUT_TOKEN_SECONDS: &str =
+    "smg_router_request_time_per_output_token_seconds";
+
+/// Histogram buckets for `smg_router_time_to_first_token_seconds`: six per
+/// decade (1, 1.5, 2, 3, 5, 7.5) from 10 ms to 10 s, where a first-token
+/// objective lives, then coarser to two minutes; a first token later than that
+/// is a timeout class and lands in `+Inf`. The request-duration list has four
+/// edges between 50 ms and 500 ms; this one has seven.
+pub(crate) const TIME_TO_FIRST_TOKEN_BUCKETS: &[f64] = &[
+    0.01, 0.015, 0.02, 0.03, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0,
+    7.5, 10.0, 20.0, 30.0, 60.0, 120.0,
+];
+
+/// Histogram buckets for `smg_router_request_time_per_output_token_seconds`: six per
+/// decade (1, 1.5, 2, 3, 5, 7.5) from 1 ms to 1 s, where a per-token objective
+/// lives, then two edges for stalled decodes. The request-duration list has
+/// four edges between 5 ms and 50 ms; this one has seven.
+pub(crate) const REQUEST_TIME_PER_OUTPUT_TOKEN_BUCKETS: &[f64] = &[
+    0.001, 0.0015, 0.002, 0.003, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.05, 0.075, 0.1, 0.15,
+    0.2, 0.3, 0.5, 0.75, 1.0, 2.5, 10.0,
+];
+
 /// Histogram buckets for `smg_kv_index_lookup_seconds` and
 /// `smg_kv_event_apply_seconds`: a lookup takes microseconds and a batch
 /// apply tens of microseconds, below the request-latency buckets' first
@@ -363,6 +400,27 @@ pub(crate) const KV_EVENT_LAG_BUCKETS: &[f64] = &[
 pub(crate) const WORKER_RETRY_BACKOFF_BUCKETS: &[f64] = &[
     0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
 ];
+
+/// Buckets of the media pipeline's times (seconds): a processing stage or
+/// one fetch runs from well under a millisecond (a token expansion, inline
+/// bytes) to seconds (a video decode, a slow host).
+pub(crate) const MM_SECONDS_BUCKETS: &[f64] = &[
+    0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+];
+
+/// Buckets of the media items a request carries, per modality.
+pub(crate) const MM_MEDIA_PER_REQUEST_BUCKETS: &[f64] =
+    &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 16.0, 32.0, 64.0];
+
+/// The `modality` label of a media series.
+fn mm_modality_label(modality: llm_multimodal::Modality) -> &'static str {
+    match modality {
+        llm_multimodal::Modality::Image => "image",
+        llm_multimodal::Modality::ImageEmbeds => "image_embeds",
+        llm_multimodal::Modality::Audio => "audio",
+        llm_multimodal::Modality::Video => "video",
+    }
+}
 
 /// Jemalloc's run-time options for a long-running gateway, for every final
 /// artifact (the `smg` executable, the Python extension, the Go FFI library)
@@ -412,7 +470,7 @@ pub(crate) fn init_metrics() {
     // (`routers::grpc::regular::symphony::telemetry`).
     describe_counter!(
         symphony_telemetry::OUTPUTS,
-        "Outputs a Symphony table read to their end, by table and outcome: clean, malformed (a call region the table gave up on, or a marker of the table where no row leads, kept as content), failed (the table refused the output and the request failed), empty (no text, reasoning or call: whitespace and framing alone, or nothing), unknown_tool (read whole, with a call to a function the request did not declare, delivered as the model named it)"
+        "Outputs a Symphony table read to their end, by table and outcome: clean, malformed (a call region the table gave up on, or a marker of the table where no row leads, kept as content), failed (the table refused the output and the request failed), empty (no text, reasoning or call: whitespace and framing alone, or nothing), unknown_tool (read whole, with a call to a function the request did not declare, delivered as the model named it), panicked (the gateway's reading of the output panicked, caught at the request's boundary; the request failed under reader_panicked)"
     );
     describe_counter!(
         symphony_telemetry::MALFORMED,
@@ -515,7 +573,7 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         "smg_router_request_errors_total",
-        "Router errors by router_type, backend_type, connection_mode, model, endpoint, error_type; model is the served model's id, unknown for a request that names no model, or other for a model the gateway does not serve"
+        "Router errors by router_type, backend_type, connection_mode, model, endpoint, error_type, reason; model is the served model's id, unknown for a request that names no model, or other for a model the gateway does not serve; reason is the cause behind the error_type as far as the router could tell it (deadline, transport_disconnect, engine_error, engine_internal, engine_unavailable, overloaded, rate_limited, overload_shed, selection_queue_timeout, no_available_workers, no_capable_worker, model_not_found, invalid_request, media_fault, constraint_failed, bad_response, internal, other)"
     );
     describe_counter!(
         "smg_router_upstream_responses_total",
@@ -543,9 +601,17 @@ pub(crate) fn init_metrics() {
         "smg_router_tpot_seconds",
         "Time per output token by router_type, backend_type, model, endpoint (gRPC only)"
     );
+    describe_histogram!(
+        TIME_TO_FIRST_TOKEN_SECONDS,
+        "Time to first token by router_type, backend_type, model, endpoint (gRPC only): the observations of smg_router_ttft_seconds on buckets that resolve them (six per decade from 10 ms to 10 s; the request-duration bucket flag does not apply)"
+    );
+    describe_histogram!(
+        REQUEST_TIME_PER_OUTPUT_TOKEN_SECONDS,
+        "Per-request mean time per output token by router_type, backend_type, model, endpoint (gRPC only): the observations of smg_router_tpot_seconds on buckets that resolve them (six per decade from 1 ms to 1 s; the request-duration bucket flag does not apply); a per-request mean, as the servicer's request_time_per_output_token family, not the per-interval gap"
+    );
     describe_counter!(
         "smg_router_tokens_total",
-        "Total tokens processed by router_type, backend_type, model, endpoint, token_type (gRPC only)"
+        "Total tokens processed by router_type, backend_type, model, endpoint, token_type (gRPC only); token_type is input, output, or cached (the prompt tokens the engine reports it served from its cache, a share of input counted again, so cached / input is the cache hit share the router's overlap prediction is judged by)"
     );
     describe_histogram!(
         "smg_router_generation_duration_seconds",
@@ -810,6 +876,10 @@ pub(crate) fn init_metrics() {
         "smg_worker_stalled",
         "Liveness veto on a worker: 1 while routing skips it, by worker and reason"
     );
+    describe_gauge!(
+        "smg_worker_state",
+        "Routing state of a worker: 1 on the series of its current state and reason, 0 on a series it left; state is available or excluded, reason the first fact of the routing decision that excludes the worker (pending, not_ready, failed, draining: its status; overloaded: the load monitor's veto; unreachable, wedged: the liveness veto; circuit_open: its breaker) or none while it is available"
+    );
     describe_counter!(
         "smg_worker_stall_transitions_total",
         "Times the liveness veto was set on a worker, by worker and reason"
@@ -890,7 +960,7 @@ pub(crate) fn init_metrics() {
     );
     describe_histogram!(
         "smg_cache_aware_match_ratio",
-        "Cache-aware tree-mode best prefix match ratio per request (matched/input, 0..1)"
+        "The predicted overlap of a cache-aware routing decision as a ratio (0..1), one observation per decision: in tree mode the best prefix match in the tree (matched/input units, whatever branch the decision took); in event mode the chosen worker's overlap in blocks over the request's blocks (0 where the chosen worker holds none: a miss, a spill, a warm-up placement)"
     );
 
     // Layer 3: Worker resilience metrics (circuit breaker)
@@ -954,6 +1024,14 @@ pub(crate) fn init_metrics() {
     describe_gauge!(
         "smg_engine_cache_hit_rate",
         "Engine-reported prefix cache hit rate (0.0-1.0) by worker, model, dp_rank"
+    );
+    describe_gauge!(
+        "smg_engine_kv_capacity_tokens",
+        "Engine-reported KV cache capacity in tokens by worker, model, dp_rank: the denominator of smg_engine_token_usage; absent while the engine has not reported it (a record that carries only the core figures keeps the last reported value); divided by smg_kv_block_size_tokens it is the engine's total KV blocks"
+    );
+    describe_gauge!(
+        "smg_kv_block_size_tokens",
+        "Tokens per KV block of a model as the gateway knows it: seeded from a worker's registration, replaced by the size of the first block its KV event stream stores, 0 once the model's last subscription ended and no size is known"
     );
     describe_gauge!(
         "smg_engine_pd_kv_transfer_latency_ms",
@@ -1057,6 +1135,29 @@ pub(crate) fn init_metrics() {
         "Bytes of preprocessed encoder inputs the pixel cache holds"
     );
     describe_gauge!("smg_mm_pixel_cache_entries", "Images the pixel cache holds");
+    // The media pipeline per request, from the clock reads and counts it
+    // already makes: its stages' time, the items a request carries and its
+    // fetches.
+    describe_histogram!(
+        "smg_mm_processing_seconds",
+        "Seconds a multimodal request spent in a processing stage (config_lookup, media_fetch_decode, preprocess, token_expand, total), by model"
+    );
+    describe_histogram!(
+        "smg_mm_media_per_request",
+        "Media items a generation request carried, by model and modality, counted before any refusal or limit (a refused request counts; a token count does not)"
+    );
+    describe_counter!(
+        "smg_mm_media_items_total",
+        "Media items generation requests carried, by model, modality and source (url, data_url, inline, read as the fetch reads them), counted before any refusal or limit"
+    );
+    describe_histogram!(
+        "smg_mm_media_fetch_seconds",
+        "Seconds one media fetch and decode took, by model, modality, source and outcome (ok, too_large, client_fault, host_fault)"
+    );
+    describe_counter!(
+        "smg_mm_media_fetch_bytes_total",
+        "Bytes the media fetches brought in, by model, modality and source"
+    );
     describe_counter!(
         "smg_responses_stream_failures_total",
         "Responses streams that ended with a response.failed terminal, by model and reason"
@@ -1256,11 +1357,18 @@ fn histogram_bucket_overrides(duration_buckets: Option<Vec<f64>>) -> HashMap<Mat
 
     // TTFT and TPOT (per-request mean inter-token latency) end in `_seconds`
     // but NOT `duration_seconds`, so without explicit buckets the recorder
-    // renders them as summaries (quantile lines only) — not heatmap-able. Reuse
-    // the request-latency buckets: they span 0.001-7200s, fine for both the
-    // sub-second-to-seconds TTFT and the tens-of-ms TPOT.
+    // renders them as summaries (quantile lines only) — not heatmap-able. They
+    // keep the request-latency buckets (0.001-7200s, an operator's list with
+    // them), so recording rules on their `le` values hold; the same
+    // observations on edges that resolve them are the two families below.
     let ttft_matcher = Matcher::Suffix(String::from("ttft_seconds"));
     let tpot_matcher = Matcher::Suffix(String::from("tpot_seconds"));
+
+    // The first-token and per-output-token families: their own log-spaced
+    // edges, which `--prometheus-duration-buckets` does not replace.
+    let first_token_matcher = Matcher::Full(String::from(TIME_TO_FIRST_TOKEN_SECONDS));
+    let per_output_token_matcher =
+        Matcher::Full(String::from(REQUEST_TIME_PER_OUTPUT_TOKEN_SECONDS));
 
     // The cache-aware match ratio is a dimensionless 0..1 value: no `_seconds`
     // matcher applies, so it also needs its own buckets or it renders as a
@@ -1284,11 +1392,21 @@ fn histogram_bucket_overrides(duration_buckets: Option<Vec<f64>>) -> HashMap<Mat
     // The malformed bytes of an output run from a marker's worth to a whole
     // answer: their own buckets, or the recorder renders them as a summary.
     let malformed_bytes_matcher = Matcher::Full(String::from(symphony_telemetry::MALFORMED_BYTES));
+    // The media pipeline's histograms (seconds, and items per request): their
+    // own buckets, or the recorder renders them as summaries.
+    let mm_processing_matcher = Matcher::Full(String::from("smg_mm_processing_seconds"));
+    let mm_fetch_matcher = Matcher::Full(String::from("smg_mm_media_fetch_seconds"));
+    let mm_per_request_matcher = Matcher::Full(String::from("smg_mm_media_per_request"));
 
     HashMap::from([
         (duration_matcher, duration_bucket.clone()),
         (ttft_matcher, duration_bucket.clone()),
         (tpot_matcher, duration_bucket),
+        (first_token_matcher, TIME_TO_FIRST_TOKEN_BUCKETS.to_vec()),
+        (
+            per_output_token_matcher,
+            REQUEST_TIME_PER_OUTPUT_TOKEN_BUCKETS.to_vec(),
+        ),
         (
             canary_matcher,
             super::runtime_metrics::EVENT_LOOP_DELAY_BUCKETS.to_vec(),
@@ -1304,6 +1422,12 @@ fn histogram_bucket_overrides(duration_buckets: Option<Vec<f64>>) -> HashMap<Mat
         (
             malformed_bytes_matcher,
             symphony_telemetry::MALFORMED_BYTES_BUCKETS.to_vec(),
+        ),
+        (mm_processing_matcher, MM_SECONDS_BUCKETS.to_vec()),
+        (mm_fetch_matcher, MM_SECONDS_BUCKETS.to_vec()),
+        (
+            mm_per_request_matcher,
+            MM_MEDIA_PER_REQUEST_BUCKETS.to_vec(),
         ),
     ])
 }
@@ -1435,6 +1559,9 @@ pub struct StreamingMetricsParams<'a> {
     pub generation_duration: Duration,
     /// Input token count (None for endpoints that don't track this)
     pub input_tokens: Option<u64>,
+    /// Prompt tokens the engine reported it served from its cache (None for
+    /// endpoints that don't track this)
+    pub cached_tokens: Option<u64>,
     /// Output token count
     pub output_tokens: u64,
 }
@@ -1481,6 +1608,7 @@ impl Metrics {
         model_id: &str,
         endpoint: &'static str,
         error_type: &'static str,
+        reason: &'static str,
     ) {
         RouterMetrics::record_router_error(
             router_type,
@@ -1489,6 +1617,7 @@ impl Metrics {
             model_id,
             endpoint,
             error_type,
+            reason,
         );
     }
     pub fn record_worker_retry(worker_type: &'static str, endpoint: &'static str) {
@@ -1747,6 +1876,75 @@ impl Metrics {
         .increment(1);
     }
 
+    /// The interned label of `model_id`, for a handle that reports under it
+    /// (the media tracker's fetch observer).
+    pub fn interned_model_label(model_id: &str) -> Arc<str> {
+        intern_model_label(model_id)
+    }
+
+    /// One processing stage of a multimodal request: `seconds` spent in
+    /// `stage` (`config_lookup`, `media_fetch_decode`, `preprocess`,
+    /// `token_expand`, `total`), the clock reads the timing log makes.
+    pub fn record_mm_processing_stage(model_id: &str, stage: &'static str, seconds: f64) {
+        let model = intern_model_label(model_id);
+        histogram!("smg_mm_processing_seconds", "model" => model, "stage" => stage).record(seconds);
+    }
+
+    /// The media a request carries of `modality`, counted once per request
+    /// before its limits are checked: `count` items, `by_source` of them per
+    /// source (`url`, `data_url`, `inline`; a zero is skipped).
+    pub fn record_mm_request_media(
+        model_id: &str,
+        modality: llm_multimodal::Modality,
+        count: usize,
+        by_source: &[(&'static str, usize)],
+    ) {
+        let model = intern_model_label(model_id);
+        let modality = mm_modality_label(modality);
+        histogram!(
+            "smg_mm_media_per_request",
+            "model" => model.clone(),
+            "modality" => modality
+        )
+        .record(count as f64);
+        for (source, items) in by_source {
+            if *items > 0 {
+                counter!(
+                    "smg_mm_media_items_total",
+                    "model" => model.clone(),
+                    "modality" => modality,
+                    "source" => *source
+                )
+                .increment(*items as u64);
+            }
+        }
+    }
+
+    /// One media fetch, as the tracker reports it: its time by outcome, and
+    /// the bytes it brought in.
+    pub fn record_mm_fetch(model_id: &str, report: &llm_multimodal::FetchReport) {
+        let model = intern_model_label(model_id);
+        let modality = mm_modality_label(report.modality);
+        let source = report.source.as_str();
+        histogram!(
+            "smg_mm_media_fetch_seconds",
+            "model" => model.clone(),
+            "modality" => modality,
+            "source" => source,
+            "outcome" => report.outcome.as_str()
+        )
+        .record(report.duration.as_secs_f64());
+        if report.bytes > 0 {
+            counter!(
+                "smg_mm_media_fetch_bytes_total",
+                "model" => model,
+                "modality" => modality,
+                "source" => source
+            )
+            .increment(report.bytes as u64);
+        }
+    }
+
     // ========================================================================
     // Layer 2: Router metrics
     // ========================================================================
@@ -1829,10 +2027,11 @@ impl Metrics {
         .increment(tail_tokens);
     }
 
-    /// Record all streaming metrics in a single batch call.
-    ///
-    /// This consolidates TTFT, TPOT, generation duration, and token metrics
-    /// into one function, handling TPOT calculation internally.
+    /// Record an answer's token and latency families in a single batch call:
+    /// TTFT, TPOT, generation duration and the token counters, with the TPOT
+    /// computed here. A streamed answer records at its end; a collected one
+    /// when its response is built, with no TTFT (no first token is seen on
+    /// that path) and so no TPOT.
     pub fn record_streaming_metrics(params: StreamingMetricsParams<'_>) {
         let StreamingMetricsParams {
             router_type,
@@ -1842,6 +2041,7 @@ impl Metrics {
             ttft,
             generation_duration,
             input_tokens,
+            cached_tokens,
             output_tokens,
         } = params;
 
@@ -1866,6 +2066,24 @@ impl Metrics {
         let tpot_histogram = || {
             histogram!(
                 "smg_router_tpot_seconds",
+                "router_type" => router_type,
+                "backend_type" => backend_type,
+                "model" => model(),
+                "endpoint" => endpoint
+            )
+        };
+        let first_token_histogram = || {
+            histogram!(
+                TIME_TO_FIRST_TOKEN_SECONDS,
+                "router_type" => router_type,
+                "backend_type" => backend_type,
+                "model" => model(),
+                "endpoint" => endpoint
+            )
+        };
+        let per_output_token_histogram = || {
+            histogram!(
+                REQUEST_TIME_PER_OUTPUT_TOKEN_SECONDS,
                 "router_type" => router_type,
                 "backend_type" => backend_type,
                 "model" => model(),
@@ -1901,17 +2119,34 @@ impl Metrics {
                 "token_type" => metrics_labels::TOKEN_OUTPUT
             )
         };
+        let cached_counter = || {
+            counter!(
+                "smg_router_tokens_total",
+                "router_type" => router_type,
+                "backend_type" => backend_type,
+                "model" => model(),
+                "endpoint" => endpoint,
+                "token_type" => metrics_labels::TOKEN_CACHED
+            )
+        };
 
         if !handles::keep_handles() {
             if let Some(ttft) = ttft {
-                ttft_histogram().record(ttft.as_secs_f64());
+                let seconds = ttft.as_secs_f64();
+                ttft_histogram().record(seconds);
+                first_token_histogram().record(seconds);
             }
             if let Some(tpot) = tpot {
-                tpot_histogram().record(tpot.as_secs_f64());
+                let seconds = tpot.as_secs_f64();
+                tpot_histogram().record(seconds);
+                per_output_token_histogram().record(seconds);
             }
             generation_histogram().record(generation_duration.as_secs_f64());
             if let Some(input) = input_tokens {
                 input_counter().increment(input);
+            }
+            if let Some(cached) = cached_tokens {
+                cached_counter().increment(cached);
             }
             output_counter().increment(output_tokens);
             return;
@@ -1929,14 +2164,18 @@ impl Metrics {
                 |_label| handles::StreamHandles::default(),
                 |kept| {
                     if let Some(ttft) = ttft {
-                        kept.ttft
-                            .get_or_init(ttft_histogram)
-                            .record(ttft.as_secs_f64());
+                        let seconds = ttft.as_secs_f64();
+                        kept.ttft.get_or_init(ttft_histogram).record(seconds);
+                        kept.first_token
+                            .get_or_init(first_token_histogram)
+                            .record(seconds);
                     }
                     if let Some(tpot) = tpot {
-                        kept.tpot
-                            .get_or_init(tpot_histogram)
-                            .record(tpot.as_secs_f64());
+                        let seconds = tpot.as_secs_f64();
+                        kept.tpot.get_or_init(tpot_histogram).record(seconds);
+                        kept.per_output_token
+                            .get_or_init(per_output_token_histogram)
+                            .record(seconds);
                     }
                     kept.generation
                         .get_or_init(generation_histogram)
@@ -1945,6 +2184,11 @@ impl Metrics {
                         kept.input_tokens
                             .get_or_init(input_counter)
                             .increment(input);
+                    }
+                    if let Some(cached) = cached_tokens {
+                        kept.cached_tokens
+                            .get_or_init(cached_counter)
+                            .increment(cached);
                     }
                     kept.output_tokens
                         .get_or_init(output_counter)
@@ -2309,8 +2553,9 @@ impl Metrics {
         .increment(released as u64);
     }
 
-    /// Record the best prefix match ratio (matched/input, 0..1) of a cache-aware
-    /// tree-mode routing decision
+    /// Record the predicted overlap ratio (0..1) of a cache-aware routing
+    /// decision: the tree's best prefix match in tree mode, the chosen
+    /// worker's overlap over the request's blocks in event mode.
     pub fn record_cache_aware_match_ratio(ratio: f64) {
         histogram!("smg_cache_aware_match_ratio").record(ratio);
     }
@@ -2428,6 +2673,35 @@ impl Metrics {
             )
             .increment(1);
         }
+    }
+
+    /// The tokens per KV block of `model_id` as the gateway knows it now
+    /// (`smg_kv_block_size_tokens`): seeded at a worker's registration,
+    /// replaced by the first block its event stream stores, 0 when the
+    /// model's last subscription ended and no size is known.
+    pub fn set_kv_block_size(model_id: &str, tokens: usize) {
+        gauge!(
+            "smg_kv_block_size_tokens",
+            "model" => intern_model_label(model_id)
+        )
+        .set(tokens as f64);
+    }
+
+    /// Set one `smg_worker_state` series of a worker: 1 on the state and
+    /// reason it is on, 0 on the pair it left.
+    pub fn set_worker_state(
+        worker_url: &str,
+        state: &'static str,
+        reason: &'static str,
+        current: bool,
+    ) {
+        gauge!(
+            "smg_worker_state",
+            "worker" => intern_string(worker_url),
+            "state" => state,
+            "reason" => reason
+        )
+        .set(if current { 1.0 } else { 0.0 });
     }
 
     /// Set worker health status
@@ -2579,6 +2853,18 @@ impl Metrics {
         .increment(1);
         if missed > 0 {
             counter!("smg_kv_event_missed_batches_total", "worker" => worker_interned)
+                .increment(missed);
+        }
+    }
+
+    /// Count the batches of a gap no replay will bring: the pending replay
+    /// was dropped, because the resume the subscriber asked for was refused
+    /// (the server's history is gone), because the publisher started over
+    /// before it answered, or because another rank's unrecoverable gap
+    /// cleared the worker and reset this rank's cursor.
+    pub fn record_kv_event_missed_batches(worker_url: &str, missed: u64) {
+        if missed > 0 {
+            counter!("smg_kv_event_missed_batches_total", "worker" => intern_string(worker_url))
                 .increment(missed);
         }
     }
@@ -2919,6 +3205,18 @@ impl Metrics {
                 "dp_rank" => Arc::clone(&dp_rank),
             )
             .set(load.cache_hit_rate);
+            // The capacity behind the usage ratio, when the engine reports
+            // it (a snapshot read off an HTTP metrics page carries the
+            // ratio alone and leaves it 0).
+            if load.max_total_num_tokens > 0 {
+                gauge!(
+                    "smg_engine_kv_capacity_tokens",
+                    "worker" => Arc::clone(&worker),
+                    "model" => Arc::clone(&model),
+                    "dp_rank" => Arc::clone(&dp_rank),
+                )
+                .set(f64::from(load.max_total_num_tokens));
+            }
 
             // PD gauges only when the engine reported a disagg section. Labeled
             // by dp_rank too, so DP ranks sharing a role don't overwrite.
@@ -3012,6 +3310,7 @@ impl Metrics {
                 "smg_engine_token_usage",
                 "smg_engine_gen_throughput",
                 "smg_engine_cache_hit_rate",
+                "smg_engine_kv_capacity_tokens",
             ] {
                 gauge!(
                     name,

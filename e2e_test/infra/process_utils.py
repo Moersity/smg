@@ -10,10 +10,16 @@ import signal
 import socket
 import subprocess
 import time
+from typing import TYPE_CHECKING
 
 import requests
 
 from .constants import DEFAULT_HOST
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from .worker import Worker
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +114,20 @@ def get_open_port_block(count: int, max_attempts: int = 50) -> int:
     raise RuntimeError(
         f"Failed to find {count} consecutive free ports after {max_attempts} attempts"
     )
+
+
+def get_engine_port() -> int:
+    """Reserve a port an engine binds long after the harness chose it.
+
+    An engine listens last: it loads its model first, so its ports sit chosen
+    and unbound for a minute or more. A number from :func:`get_open_port` is
+    one the kernel's ephemeral range gave out, and every ``bind(0)`` and
+    outgoing connection on the host draws from that range: a stranger's HTTP
+    server sat on a decode worker's port by the time the engine bound it.
+    The engines' ports come from below that range instead, as the MoRI-IO
+    ports do. Release with :func:`release_port`.
+    """
+    return get_open_port_block(1)
 
 
 def port_is_free(port: int, host: str = DEFAULT_HOST) -> bool:
@@ -510,6 +530,7 @@ def wait_for_workers_ready(
     api_key: str | None = None,
     process: subprocess.Popen | None = None,
     expected_urls: list[str] | None = None,
+    workers: Sequence[Worker] | None = None,
 ) -> None:
     """Wait for all workers to connect and for the router to become ready.
 
@@ -524,6 +545,10 @@ def wait_for_workers_ready(
             still missing at the deadline are named in the error (a
             data-parallel worker counts as registered once any of its ranks
             is).
+        workers: The workers behind those URLs, when the caller launched them;
+            a worker's exit ends the wait at once with its death report. An
+            engine that dials the router in loads its model inside this wait,
+            so its death would otherwise run the wait to its bound.
     """
     start = time.perf_counter()
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
@@ -534,17 +559,19 @@ def wait_for_workers_ready(
     with requests.Session() as session:
         while time.perf_counter() - start < timeout:
             _raise_if_exited(process, "Router", router_url, start)
+            for worker in workers or ():
+                worker.raise_if_exited()
             try:
                 resp = session.get(f"{router_url}/workers", headers=headers, timeout=5)
                 if resp.status_code == 200:
                     data = resp.json()
-                    workers = data.get("workers", [])
-                    connected_workers = data.get("total", len(workers))
+                    listed = data.get("workers", [])
+                    connected_workers = data.get("total", len(listed))
                     # A data-parallel worker registers each rank as
                     # "<base>@<rank>" with the base URL in dp_base_url.
                     registered_urls = [
                         w.get("dp_base_url") or w["url"]
-                        for w in workers
+                        for w in listed
                         if isinstance(w, dict) and "url" in w
                     ]
                     if connected_workers >= expected_workers:

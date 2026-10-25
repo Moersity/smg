@@ -20,6 +20,7 @@
 //! fan-out, the string-stop resolution helpers in [`stops`], and the pooling
 //! params an `Embed` request carries ([`translate_embed_request`]).
 
+mod abort_status;
 mod client;
 mod context_window;
 mod embed;
@@ -27,6 +28,7 @@ mod eos;
 mod fanout;
 pub mod multimodal;
 mod sglang;
+pub mod sglang_encode;
 mod sockets;
 pub mod stops;
 mod stream;
@@ -47,11 +49,17 @@ pub use engine_zmq_client::protocol::vllm::{
 };
 pub use eos::{fold_tokenizer_eos_backstop, EosTokenIds};
 pub use sglang::{to_sglang_response, SglangGenerateStream, SglangProfileStart};
+pub use sglang_encode::{
+    EncodeDispatchErrorSink, EncodeDispatchOutcome, EncodeDispatchRequest, EncodeFuture,
+    EncodeRelease, EncoderDispatchErrorReq, SglangEncodeDispatcher,
+};
 pub use sockets::{zmq_handshake_address, Handshake};
 pub use stream::ZmqGenerateStream;
 pub use structured_outputs::{
     refuse_unenforceable_constraint, ConstraintKinds, ConstraintRef,
     StructuredOutputsBackendConfig, StructuredOutputsSupport,
 };
-pub use tokenspeed::{to_tokenspeed_response, GridTensors, TokenSpeedGenerateStream};
+pub use tokenspeed::{
+    qwen35_lineage, to_tokenspeed_response, GridTensors, MropeLayout, TokenSpeedGenerateStream,
+};
 pub use vllm::{structured_outputs_backend_from_config, ProcessedMedia, VllmGenerateStream};

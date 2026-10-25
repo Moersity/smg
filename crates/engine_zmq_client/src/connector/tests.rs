@@ -234,10 +234,10 @@ async fn output_silence_counts_from_the_dispatch_and_ends_with_the_requests() {
     // A stats-only step is output: the engine is alive, if quiet.
     let stats_only = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
         engine_index: 0,
-        scheduler_stats: Some(Box::new(SchedulerStats {
+        scheduler_stats: Some(SchedulerStats {
             num_running_reqs: 1,
             ..Default::default()
-        })),
+        }),
         ..Default::default()
     });
     engine
@@ -340,11 +340,11 @@ async fn scheduler_stats_surface_as_load_signal() {
             new_token_ids: vec![7],
             ..Default::default()
         }],
-        scheduler_stats: Some(Box::new(SchedulerStats {
+        scheduler_stats: Some(SchedulerStats {
             num_running_reqs: 3,
             num_waiting_reqs: 5,
             ..Default::default()
-        })),
+        }),
         ..Default::default()
     });
     engine
@@ -376,11 +376,11 @@ async fn unpinned_requests_prefer_the_least_loaded_engine() {
             new_token_ids: vec![7],
             ..Default::default()
         }],
-        scheduler_stats: Some(Box::new(SchedulerStats {
+        scheduler_stats: Some(SchedulerStats {
             num_running_reqs: 3,
             num_waiting_reqs: 5,
             ..Default::default()
-        })),
+        }),
         ..Default::default()
     });
     engines[0]
@@ -545,11 +545,11 @@ async fn an_emptied_rank_sheds_its_stale_queue_counts() {
             finish_reason: Some(EngineCoreFinishReason::Stop),
             ..Default::default()
         }],
-        scheduler_stats: Some(Box::new(SchedulerStats {
+        scheduler_stats: Some(SchedulerStats {
             num_running_reqs: 3,
             num_waiting_reqs: 5,
             ..Default::default()
-        })),
+        }),
         finished_requests: Some(std::collections::BTreeSet::from(["last".to_string()])),
         ..Default::default()
     });
@@ -2499,11 +2499,17 @@ fn large_tagged_request(request_id: &str) -> TaggedWireRequest {
                 hash: 1,
                 pad_value: pad,
                 offsets: vec![(1, 1)],
-                feature: WireTensor::from_raw("uint8", vec![64 << 20], vec![0; 64 << 20]),
+                feature: Some(WireTensor::from_raw(
+                    "uint8",
+                    vec![64 << 20],
+                    vec![0; 64 << 20],
+                )),
                 model_specific_data: std::collections::BTreeMap::new(),
+                encode_handshake: None,
             }],
             im_token_id: Some(9),
             video_token_id: None,
+            ..Default::default()
         }),
         ..TaggedWireRequest::default()
     }

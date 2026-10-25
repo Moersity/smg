@@ -31,6 +31,7 @@ pub mod kv_events;
 pub mod kv_history;
 pub mod kv_state;
 pub mod kv_wire;
+mod load_report;
 mod load_tracker;
 mod metrics;
 mod proto_json;
@@ -50,6 +51,10 @@ pub mod vllm;
 
 use std::{pin::Pin, time::Duration};
 
+pub use engine_zmq_adapter::{
+    EncodeDispatchErrorSink, EncodeDispatchOutcome, EncodeDispatchRequest, EncodeFuture,
+    EncodeRelease, EncoderDispatchErrorReq, SglangEncodeDispatcher,
+};
 pub use error::ServicerError;
 use futures::Stream;
 pub use server::init_tracing;

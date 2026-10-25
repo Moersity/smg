@@ -19,8 +19,10 @@ use crate::{
             mm_settings, pool_processes_media_refs, registration_lacks_media_processing,
             SUPPORTS_VISION_LABEL,
         },
-        regular::symphony::{check_names, labels_select_nothing, set_aside_by_the_registry},
-        utils::Names,
+        regular::symphony::{
+            check_names, labels_select_nothing, set_aside_by_the_registry, table_label_read,
+        },
+        utils::{ModelNames, Names},
         zmq_client::zmq_handshake_address,
     },
     worker::{
@@ -134,19 +136,19 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         // worker whose labels select no reader, whatever the gateway's flags
         // name (`regular::symphony::names::reads`): the model's first such worker
         // says so.
+        let flags = Names {
+            tool: app_context.router_config.tool_call_parser.clone(),
+            reasoning: app_context.router_config.reasoning_parser.clone(),
+        };
         if let Some(message) = registry_reads_over_the_flags(
             &model_card,
             &config.url,
             app_context.router_config.parser,
-            &Names {
-                tool: app_context.router_config.tool_call_parser.clone(),
-                reasoning: app_context.router_config.reasoning_parser.clone(),
-            },
+            &flags,
             &app_context.worker_registry,
         ) {
             warn!(model = %model_card.id, worker = %config.url, "{message}");
         }
-
         let runtime_type = match context.data.detected_runtime_type.as_deref() {
             Some(s) => s.parse::<RuntimeType>().unwrap_or(config.runtime_type),
             None => config.runtime_type,
@@ -253,6 +255,20 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         } else {
             vec![None] // single worker, no DP
         };
+
+        // Under Symphony the failure classes of the table that reads the model
+        // exist at zero from the registration of a worker the pipeline reads
+        // with, so a dashboard finds `failed` and `malformed` before the first
+        // such output. The table is resolved here, where the card and the
+        // names are, and published by the registration step once the worker
+        // is in the registry, so a registration refused there leaves no
+        // series behind.
+        context.data.symphony_table = symphony_table_of(
+            &model_card,
+            app_context.router_config.parser,
+            *connection_mode,
+            &flags,
+        );
 
         // The worker keeps the spec it was registered with, so every field
         // the API accepted rides along: provider, kv_block_size, the
@@ -539,6 +555,31 @@ pub(super) fn validate_parser_overrides(
             card.id
         )
     })
+}
+
+/// Under `--parser symphony`, the table whose failure classes the registration step publishes at
+/// zero for a gRPC or ZMQ worker of `card`'s model, as this worker's labels and the gateway's flags
+/// select it, so `failed`, `malformed` and the rest exist before the first such output
+/// (`regular::symphony::telemetry::init_table_series`, called once the worker is in the registry).
+/// Every worker of a model resolves one (a later worker whose labels select another table brings
+/// that table's series; publishing a table again sets nothing). An HTTP worker resolves none: only
+/// the gRPC and ZMQ pipeline reads with Symphony. The legacy parser choice and a model the legacy
+/// parsers read resolve none either (the fallback series of such a model, under `none`, exist from
+/// start-up).
+pub(super) fn symphony_table_of(
+    card: &ModelCard,
+    parser: ParserChoice,
+    connection_mode: ConnectionMode,
+    flags: &Names,
+) -> Option<&'static str> {
+    if parser != ParserChoice::Symphony || connection_mode == ConnectionMode::Http {
+        return None;
+    }
+    let labels = Names {
+        tool: card.tool_parser.clone(),
+        reasoning: card.reasoning_parser.clone(),
+    };
+    table_label_read(&ModelNames { labels, flags }, &card.id)
 }
 
 /// Under `--parser symphony`, the registry's table reads a model it knows for every worker whose
@@ -1098,6 +1139,122 @@ fn validate_zmq_dp(
 mod tests {
     use super::*;
 
+    /// Under `--parser symphony`, a gRPC worker's registration resolves the table whose failure
+    /// classes are published at zero: the registry's table for an unlabeled worker of a model it
+    /// knows, and another table for a worker whose labels name one. The legacy parser choice and
+    /// an HTTP worker (the pipeline that reads with Symphony never serves it) resolve none.
+    #[test]
+    fn a_workers_registration_resolves_the_table_whose_failure_classes_are_published() {
+        let known = ModelCard::new("Qwen/Qwen3-8B");
+        let table = |card: &ModelCard, parser, connection_mode| {
+            symphony_table_of(card, parser, connection_mode, &Names::default())
+        };
+        assert_eq!(
+            table(&known, ParserChoice::Legacy, ConnectionMode::Grpc),
+            None,
+            "the legacy parsers publish no table"
+        );
+        assert_eq!(
+            table(&known, ParserChoice::Symphony, ConnectionMode::Http),
+            None,
+            "an HTTP worker publishes no table"
+        );
+        assert_eq!(
+            table(&known, ParserChoice::Symphony, ConnectionMode::Grpc),
+            Some("qwen3")
+        );
+        // A later worker of the model whose labels name another table brings
+        // that table's series: requests count under it from then on.
+        let mut labeled = known.clone();
+        labeled.tool_parser = Some("kimi_k2".to_string());
+        assert_eq!(
+            table(&labeled, ParserChoice::Symphony, ConnectionMode::Zmq),
+            Some("kimi_k2")
+        );
+    }
+
+    /// The table a worker's registration resolves is published by the registration step, once the
+    /// worker is in the registry: under `--parser symphony` a gRPC worker of a model the registry
+    /// knows resolves the registry's table in the create step, a registration the registration
+    /// step refuses leaves no series behind, and an accepted one leaves the table's failure classes
+    /// at zero.
+    #[tokio::test]
+    async fn a_refused_registration_publishes_no_table_and_an_accepted_one_its_failure_classes() {
+        use crate::workflow::steps::RegisterWorkersStep;
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let symphony = || {
+            app_context_with(
+                crate::config::RouterConfig::builder()
+                    .worker_startup_timeout_secs(1)
+                    .parser(ParserChoice::Symphony)
+                    .build_unchecked(),
+            )
+        };
+
+        // The replacement of a worker the registry no longer holds is refused.
+        let refused = WorkerRegistrationMode::ReplaceById {
+            worker_id: "worker-gone".to_string(),
+            expected_revision: 0,
+        };
+        let mut ctx = grpc_worker_context("Qwen/Qwen3-8B", refused, symphony());
+        assert_eq!(
+            CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
+            StepResult::Success
+        );
+        assert_eq!(ctx.data.symphony_table, Some("qwen3"));
+        assert!(RegisterWorkersStep.execute(&mut ctx).await.is_err());
+        assert!(
+            !handle.render().contains("smg_symphony_"),
+            "{}",
+            handle.render()
+        );
+
+        let mut ctx =
+            grpc_worker_context("Qwen/Qwen3-8B", WorkerRegistrationMode::Upsert, symphony());
+        assert_eq!(
+            CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
+            StepResult::Success
+        );
+        assert_eq!(ctx.data.symphony_table, Some("qwen3"));
+        assert_eq!(
+            RegisterWorkersStep.execute(&mut ctx).await.unwrap(),
+            StepResult::Success
+        );
+        let scrape = handle.render();
+        assert!(
+            scrape.lines().any(|line| {
+                line.starts_with("smg_symphony_outputs_total")
+                    && line.contains("table=\"qwen3\"")
+                    && line.contains("outcome=\"failed\"")
+                    && line.ends_with(" 0")
+            }),
+            "{scrape}"
+        );
+    }
+
+    /// A registration context for a gRPC worker of `model` at a loopback URL
+    /// under `app_context`'s configuration.
+    fn grpc_worker_context(
+        model: &str,
+        registration_mode: WorkerRegistrationMode,
+        app_context: Arc<crate::app_context::AppContext>,
+    ) -> WorkflowContext<WorkerWorkflowData> {
+        use openai_protocol::worker::WorkerModels;
+        use wfaas::WorkflowInstanceId;
+
+        use crate::workflow::steps::create_worker_workflow_data;
+
+        let mut spec = WorkerSpec::new("grpc://127.0.0.1:18001");
+        spec.models = WorkerModels::Single(Box::new(ModelCard::new(model)));
+        let mut data = create_worker_workflow_data(spec, registration_mode, app_context);
+        data.worker_kind = Some(WorkerKind::Local);
+        data.connection_mode = Some(ConnectionMode::Grpc);
+        WorkflowContext::new(WorkflowInstanceId::new(), data)
+    }
+
     /// Under `--parser symphony`, the registration of a model's first worker whose labels select
     /// no reader (none, or a reasoning name no table answers to) says that the registry's table
     /// reads the model, not what the gateway's flags name, naming both; the model's next worker,
@@ -1230,60 +1387,9 @@ mod tests {
     fn app_context_with(
         router_config: crate::config::RouterConfig,
     ) -> Arc<crate::app_context::AppContext> {
-        use crate::{
-            middleware::{AuthConfig, TokenBucket},
-            observability::inflight_tracker::InFlightRequestTracker,
-            routers::{
-                common::{openai_bridge, realtime::RealtimeRegistry},
-                grpc::multimodal::MultimodalConfigRegistry,
-            },
-            worker::WorkerService,
-        };
+        use crate::app_context::testing::app_context_for_tests;
 
-        let registry = Arc::new(WorkerRegistry::new());
-        let job_queue = Arc::new(std::sync::OnceLock::new());
-
-        Arc::new(crate::app_context::AppContext {
-            gateway_auth: AuthConfig::new(None),
-            client: crate::clients::http_client(),
-            router_config: router_config.clone(),
-            rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
-            rate_limit_manager: None,
-            worker_registry: Arc::clone(&registry),
-            prefill_admission: None,
-            policy_registry: Arc::new(crate::policies::PolicyRegistry::new(
-                router_config.policy.clone(),
-            )),
-            reasoning_parser_factory: None,
-            tool_parser_factory: None,
-            gateway: None,
-            response_storage: Arc::new(smg_data_connector::MemoryResponseStorage::new()),
-            conversation_storage: Arc::new(smg_data_connector::MemoryConversationStorage::new()),
-            conversation_item_storage: Arc::new(
-                smg_data_connector::MemoryConversationItemStorage::new(),
-            ),
-            worker_monitor: None,
-            configured_reasoning_parser: None,
-            configured_tool_parser: None,
-            worker_job_queue: Arc::clone(&job_queue),
-            workflow_engines: Arc::new(std::sync::OnceLock::new()),
-            mcp_orchestrator: Arc::new(std::sync::OnceLock::new()),
-            mcp_format_registry: openai_bridge::FormatRegistry::new(),
-            tokenizer_registry: Arc::new(llm_tokenizer::registry::TokenizerRegistry::new()),
-            multimodal_config_registry: Arc::new(MultimodalConfigRegistry::new()),
-            tokenizer_load_failures: Arc::default(),
-            wasm_manager: None,
-            worker_client_cache: Arc::new(crate::worker::WorkerHttpClientCache::new(
-                &router_config,
-            )),
-            worker_service: Arc::new(WorkerService::new(registry, job_queue, router_config)),
-            inflight_tracker: InFlightRequestTracker::new(),
-            kv_event_monitor: None,
-            rl: None,
-            realtime_registry: Arc::new(RealtimeRegistry::new()),
-            webrtc_bind_addr: None,
-            webrtc_stun_server: None,
-        })
+        app_context_for_tests(router_config, Arc::new(WorkerRegistry::new()), None)
     }
 
     /// A worker registered through the API keeps every spec field the

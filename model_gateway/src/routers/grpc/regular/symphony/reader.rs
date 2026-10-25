@@ -6,7 +6,7 @@ use std::{
     sync::{Arc, LazyLock},
 };
 
-use llm_tokenizer::stop::{SequenceDecoderOutput, StopSequenceDecoder};
+use llm_tokenizer::stop::StopSequenceDecoder;
 use openai_protocol::common::Tool;
 use parking_lot::RwLock;
 use symphony::{
@@ -22,7 +22,10 @@ use super::{
     template::Templates,
     SymphonyError,
 };
-use crate::{config::ParserChoice, routers::grpc::utils::ModelNames};
+use crate::{
+    config::ParserChoice,
+    routers::grpc::utils::{isolation, ModelNames},
+};
 
 /// Symphony's assignment to a response: the table that reads it, as the request's asks make it
 /// ([`assign`]), and the part of the rendered prompt the engine replays.
@@ -31,6 +34,13 @@ pub(crate) struct Assignment {
     /// The table, shared with every reader of the response and every request it reads for.
     pub format: Arc<Format>,
     pub prompt: String,
+}
+
+impl Assignment {
+    /// The `table` label of the format, for the counters and the lines.
+    pub(crate) fn table(&self) -> &'static str {
+        telemetry::table_label(self.format.name())
+    }
 }
 
 /// The assignment of `format` to a response, with the part of `prompt` the engine replays.
@@ -274,6 +284,11 @@ pub(crate) struct Reader {
     refused_spans: Vec<(usize, usize)>,
     /// The ranges of the bytes released at the end, once released.
     released_spans: Vec<(usize, usize)>,
+    /// The text the test trap springs on, when this process runs with one
+    /// ([`isolation::test_trap`]): a step whose delta carries it panics the reader, so the
+    /// request's isolation is driven end to end. `None` in every other process: one branch per
+    /// step.
+    trap: Option<&'static str>,
 }
 
 impl Reader {
@@ -287,7 +302,7 @@ impl Reader {
         out: &mut Events<'_>,
     ) -> Result<Self, SymphonyError> {
         let mut reader = Self {
-            table: telemetry::table_label(assignment.format.name()),
+            table: assignment.table(),
             engine: Engine::shared(Arc::clone(&assignment.format), Declared::shared(tools)),
             tally: Tally::default(),
             last_token: None,
@@ -303,6 +318,7 @@ impl Reader {
             unshown_spans: Vec::new(),
             refused_spans: Vec::new(),
             released_spans: Vec::new(),
+            trap: isolation::test_trap(),
         };
         // The prompt's events carry no text of the prompt (a thought it opens or closes), so they
         // move from the replay's own buffer into the caller's, whatever delta that one borrows.
@@ -342,21 +358,15 @@ impl Reader {
         delta.clear();
         let mut stopped = false;
         for &token_id in token_ids {
-            let output = decoder.process_token(token_id).map_err(|e| {
-                self.failed(format!(
-                    "Stop decoder failed to process token {token_id}: {e}"
-                ))
-            })?;
             let start = delta.text.len();
-            match output {
-                SequenceDecoderOutput::Text(released) => delta.text.push_str(&released),
-                SequenceDecoderOutput::StoppedWithText(released) => {
-                    delta.text.push_str(&released);
-                    stopped = true;
-                }
-                SequenceDecoderOutput::Stopped => stopped = true,
-                SequenceDecoderOutput::Held => {}
-            }
+            stopped = decoder
+                .process_token_into(token_id, &mut delta.text)
+                .map_err(|e| {
+                    self.failed(format!(
+                        "Stop decoder failed to process token {token_id}: {e}"
+                    ))
+                })?
+                .stopped();
             delta.spans.push(TokenSpan {
                 token_id,
                 start,
@@ -371,6 +381,11 @@ impl Reader {
             }
         }
         self.read += delta.text.len();
+        if let Some(marker) = self.trap {
+            if delta.text.contains(marker) {
+                isolation::spring_test_trap(marker);
+            }
+        }
         self.feed(delta.input(), out)?;
         Ok(stopped)
     }
@@ -960,6 +975,58 @@ mod tests {
             .is_none(),
             "{scrape}"
         );
+    }
+
+    /// A call whose elements nest past the bound the JSON reader applies to every syntax
+    /// (`PartialJson::DEFAULT_MAX_DEPTH` containers, the arguments object counted) still reaches
+    /// the client as a call: its arguments close whole without the member that crossed the
+    /// bound, so a strict reader takes them, and the output counts as malformed under
+    /// `invalid_arguments`, once.
+    #[test]
+    fn a_call_nested_past_the_bound_reaches_the_client_whole_and_counts_as_malformed() {
+        use symphony::{adapt::chat::message, formats::minimax_m3, json::PartialJson};
+        let levels = PartialJson::DEFAULT_MAX_DEPTH + 1;
+        let body = format!("{}1{}", "<d>".repeat(levels), "</d>".repeat(levels))
+            .replace('<', "]<]minimax[>[<");
+        let output = format!(
+            "</mm:think>]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"lookup\">{body}\
+             ]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>"
+        );
+        let scrape = rendered(|| {
+            let events = read_pieces(minimax_m3(), "]~b]ai\n", &[&output], EngineFinish::Stop);
+            let choice = message(0, &events);
+            let calls = choice.message.tool_calls.expect("the call");
+            assert_eq!(calls.len(), 1, "{events:?}");
+            assert_eq!(calls[0].function.name, "lookup");
+            let arguments: Value =
+                serde_json::from_str(calls[0].function.arguments.as_deref().expect("arguments"))
+                    .expect("arguments a strict reader takes");
+            // The arguments object and the containers below it, as many as the reader takes:
+            // the deepest closes empty, the member that would have crossed the bound unwritten.
+            let mut depth = 0;
+            let mut value = &arguments;
+            while let Some(inner) = value.get("d") {
+                depth += 1;
+                value = inner;
+            }
+            assert_eq!(depth, PartialJson::DEFAULT_MAX_DEPTH - 1, "{arguments}");
+            assert_eq!(value, &serde_json::json!({}), "{arguments}");
+            assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
+        });
+        let outputs = line_with(
+            &scrape,
+            "smg_symphony_outputs_total",
+            &["table=\"minimax_m3\"", "outcome=\"malformed\""],
+        )
+        .expect("the outputs counter");
+        assert!(outputs.ends_with(" 1"), "{outputs}");
+        let reason = line_with(
+            &scrape,
+            "smg_symphony_malformed_total",
+            &["table=\"minimax_m3\"", "reason=\"invalid_arguments\""],
+        )
+        .expect("the reason counter");
+        assert!(reason.ends_with(" 1"), "{reason}");
     }
 
     /// The released bytes have their places in the output, not the event's: the content spans

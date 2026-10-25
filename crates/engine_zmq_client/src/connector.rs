@@ -1062,6 +1062,29 @@ impl<P: EngineProtocol> ClientInner<P> {
     }
 }
 
+/// The output layout of a connection: what its engines declared for the
+/// optional output columns `P` knows. The ranks of one connection run one
+/// engine build and declare one layout; a group that disagrees reads none of
+/// the optional columns (the default layout) rather than a column at the
+/// wrong position on some rank, and says so once.
+fn connection_layout<P: EngineProtocol>(engines: &[ConnectedEngine]) -> P::Layout {
+    let mut layouts = engines
+        .iter()
+        .map(|engine| P::read_layout(&engine.ready_response));
+    let Some(first) = layouts.next() else {
+        return P::Layout::default();
+    };
+    if layouts.all(|layout| layout == first) {
+        first
+    } else {
+        warn!(
+            "the engines of this connection declare different output layouts; the optional \
+             output columns are not read"
+        );
+        P::Layout::default()
+    }
+}
+
 /// Direct ZMQ connection to a same-host engine (one or more DP ranks behind one
 /// shared transport), generic over the engine's wire protocol `P`.
 pub struct Client<P: EngineProtocol> {
@@ -1167,7 +1190,11 @@ impl<P: EngineProtocol> Client<P> {
             clippy::disallowed_methods,
             reason = "background tasks are aborted on client drop"
         )]
-        let output_task = tokio::spawn(run_output_loop::<P>(output_socket, out_tx));
+        let output_task = tokio::spawn(run_output_loop::<P>(
+            output_socket,
+            out_tx,
+            connection_layout::<P>(&inner.engines),
+        ));
         #[expect(
             clippy::disallowed_methods,
             reason = "background tasks are aborted on client drop"
@@ -1415,6 +1442,19 @@ impl<P: EngineProtocol> Client<P> {
         self.inner.registry.lock().remove_all([&request_id]);
         self.inner.release_one(engine_id, &request_id);
         self.inner.abort(engine_id, &request_id).await
+    }
+
+    /// Hand one engine a notice under the protocol's add frame: a message of
+    /// the engine's own request vocabulary that names a request already
+    /// submitted to that engine and that the engine consumes itself (nothing
+    /// answers it, no stream is opened, no registration or in-flight slot is
+    /// taken). The caller encodes it; the frame is queued in order behind
+    /// the frames before it, so a notice sent after a request's submit
+    /// reaches the engine after that request.
+    pub async fn notify(&self, engine_id: &EngineId, payload: Vec<u8>) -> Result<()> {
+        self.inner
+            .send_to_engine(engine_id, P::add_frame(), payload, Vec::new())
+            .await
     }
 }
 

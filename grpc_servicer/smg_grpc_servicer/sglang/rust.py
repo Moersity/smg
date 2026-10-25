@@ -15,11 +15,32 @@ them), each with this package's SGLang plugin dialing the servicer's same-host
 msgpack ZMQ handshake. Python keeps the lifecycle only. The Router cannot tell
 the two implementations apart.
 
-What the msgpack wire does not carry, the Rust path reports rather than
-emulates: ``Embed``, ``FlushCache``, profiling, LoRA loading and the KV-event
-relay answer UNIMPLEMENTED, prompt logprobs, hidden states and multimodal
-inputs are refused, and PD/EPD disaggregation stays with the Python
-implementation.
+Prefill/decode disaggregation is served as on the Python servicer: a request's
+bootstrap fields (host, port, room) ride the scheduler's own request struct
+over the wire, and the prefill side's bootstrap server starts in this process
+before the ranks, where the Python servicer starts it; the planned warm-up
+runs on a prefill or decode leg as on a single engine, its requests carrying
+the engine's stand-in bootstrap, so the leg warms up without its peer and no
+first request of a prompt-length class pays a kernel compile under the
+Router's prefill-liveness bound. A leg of more than one scheduler rank is
+served too: a prefill leg's request runs on the rank of its room's residue
+(``bootstrap_room % dp_size``, where SGLang's prefill side requires it and
+the decode side looks for the KV), the Router's pin yielding to it with a
+warning, and a decode leg's on its pinned rank. Multimodal inputs reach the scheduler as its
+own processor output over the wire. The language side of
+encode/prefill disaggregation (``--language-only``) is served as behind
+SGLang's own frontend: this process runs SGLang's own encoder bootstrap server
+and receiver (:mod:`.rust_encode`), the Rust server hands each request's image
+references to them before the request reaches the scheduler, and the request
+carries what the dispatch set. What the msgpack wire does not carry, the Rust
+path reports rather than emulates: LoRA loading answers UNIMPLEMENTED (as on
+the Python servicer), an encoder-only launch is refused (SGLang's entrypoint
+runs that role on its own encoder server, never on a servicer), and so is a
+language-only launch on the ``zmq_to_tokenizer`` transfer backend, where the
+frontend itself receives and processes the embeddings (neither servicer runs
+that); ``Embed``, ``FlushCache``, profiling, the KV-event relay, prompt
+logprobs and hidden states are served (hidden states on this path only: the
+Python servicer refuses them by name).
 """
 
 from __future__ import annotations
@@ -66,7 +87,7 @@ from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
 )
 from smg_grpc_servicer.sglang import METRICS_HOST_ENV, METRICS_PORT_ENV
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
-from smg_grpc_servicer.sglang.warmup import WARMUP_ENV, warmup_inputs, warmup_wire
+from smg_grpc_servicer.sglang.warmup import WARMUP_ENV, media_warmup, warmup_inputs, warmup_wire
 
 logger = logging.getLogger(__name__)
 
@@ -315,7 +336,7 @@ def launch_headless_scheduler(server_args: Any, *, handshake_port: int) -> Engin
 
 
 def launch_scheduler_ranks(
-    server_args: Any, *, handshake_port: int
+    server_args: Any, *, handshake_port: int, encode_bridge: Any | None = None
 ) -> EngineProcessGroup | EngineProcess:
     """Start the scheduler ranks from this process, the way this package's
     headless launcher (:func:`headless.run`) starts them: the server args
@@ -339,6 +360,11 @@ def launch_scheduler_ranks(
             "Scheduler launch left to the headless launcher in a spawned process "
             "(not on the main thread)"
         )
+        # The encode dispatch serves the Rust server of THIS process, so it
+        # starts here whichever process runs the ranks (it publishes the
+        # runtime context it reads when the spawned launch left none).
+        if encode_bridge is not None:
+            encode_bridge.start()
         return launch_headless_scheduler(server_args, handshake_port=handshake_port)
     from sglang.srt.entrypoints.engine import Engine, _set_envs_and_config
     from sglang.srt.managers.scheduler import run_scheduler_process
@@ -361,6 +387,15 @@ def launch_scheduler_ranks(
     # This process fills the tokenizer manager's role for argument resolution
     # only; the ranks publish their own records when they start.
     publish(server_args, role="tokenizer")
+    # A prefill side's bootstrap server, before the ranks that register with
+    # it; the ranks' handle holds it for their lifetime.
+    bootstrap_server = start_bootstrap_server(server_args)
+    # A language side's encode dispatch (its encoder bootstrap server and
+    # receiver), where SGLang's own frontend starts them: after the runtime
+    # context they read, before the ranks; held the same way.
+    if encode_bridge is not None:
+        encode_bridge.start()
+    held = [server for server in (bootstrap_server, encode_bridge) if server is not None]
     port_args = PortArgs.init_new(server_args)
     # The fault handler goes in before the spawner starts a rank: a rank that
     # fails during its start signals its parent at once.
@@ -369,7 +404,11 @@ def launch_scheduler_ranks(
     init, processes = Engine._launch_scheduler_processes(
         server_args, port_args, run_scheduler_process
     )
-    ranks = SchedulerProcesses(list(processes or []), ready=init.wait_for_ready)
+    ranks = SchedulerProcesses(
+        list(processes or []),
+        ready=init.wait_for_ready,
+        holding=held,
+    )
     engine = latch.attach(EngineProcessGroup(ranks))
     ranks.watch_ready("SGLang scheduler", on_failure=engine.fault)
     logger.info(
@@ -391,21 +430,87 @@ def tokenizer_dir_for(server_args: Any) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def refuse_disaggregation(server_args: Any) -> None:
-    """PD/EPD stays with the Python servicer: the msgpack wire carries no
-    bootstrap fields and this path starts no bootstrap server, so such a
-    worker must not start rather than report SERVING and hang requests."""
+def refuse_epd_disaggregation(server_args: Any) -> None:
+    """The EPD roles this process cannot serve are a configuration error
+    before the server binds. ``encoder_only`` is not a servicer role on either
+    path: SGLang's entrypoint hands an encoder-only launch to its own encoder
+    server before this package is reached, so a launch that still arrives
+    here is misrouted. ``language_only`` is served (the encode dispatch runs
+    SGLang's own receiver in this process, :mod:`.rust_encode`) on the
+    transfer backends whose scheduler ranks receive the embeddings
+    themselves; under ``zmq_to_tokenizer`` the frontend is the receiver and
+    processes the prompt itself, which neither servicer runs, so that launch
+    must not start rather than report SERVING and refuse every image.
+    Prefill/decode disaggregation is served (the wire carries the bootstrap
+    fields; :func:`start_bootstrap_server`) on a leg of any number of
+    scheduler ranks: the Rust servicer places a prefill leg's request on the
+    rank of its room (``bootstrap_room % dp_size``, where the decode side looks
+    for the KV) and a decode leg's on its pinned rank. One prefill shape is
+    refused whatever its load-balance method and environment: several plain
+    data-parallel replicas (``--dp-size N`` without attention DP), where every
+    replica reports attention-DP rank 0 to the engine's KV sender; following
+    the room, the sender fails each request whose room's residue is not 0, and
+    under any other method or the engine's force-query switch it registers
+    rank 0, so the decode side bootstraps against replica 0 for every request
+    that ran elsewhere; attention DP (``--tp-size N --attn-dp-size N``) is the
+    multi-rank prefill shape."""
     args = EngineConfigView(server_args).server_args
-    if args.disaggregation_mode != "null":
+    if args.encoder_only:
         raise ServicerConfigError(
-            f"{SERVICER_IMPL_ENV}=rust does not support PD disaggregation "
-            f"(disaggregation_mode={args.disaggregation_mode!r}); unset it for this worker"
+            f"{SERVICER_IMPL_ENV}=rust does not serve an encoder-only worker: the engine's "
+            "entrypoint runs that role on its own encoder server, not on a servicer"
         )
-    if args.language_only or args.encoder_only:
+    if args.language_only:
+        from smg_grpc_servicer.sglang.rust_encode import (
+            SCHEDULER_RECEIVE_BACKENDS,
+            resolve_encoder_transfer_backend,
+        )
+
+        backend = resolve_encoder_transfer_backend(server_args)
+        if backend not in SCHEDULER_RECEIVE_BACKENDS:
+            raise ServicerConfigError(
+                f"{SERVICER_IMPL_ENV}=rust does not serve a language-only worker on the "
+                f"{backend!r} encoder transfer backend (the frontend receives and processes "
+                "the embeddings itself there); use one of "
+                f"{', '.join(SCHEDULER_RECEIVE_BACKENDS)}"
+            )
+    if (
+        args.disaggregation_mode == "prefill"
+        and args.scheduler_count > 1
+        and args.attention_dp_width == 1
+    ):
         raise ServicerConfigError(
-            f"{SERVICER_IMPL_ENV}=rust does not support EPD disaggregation "
-            "(language_only / encoder_only); unset it for this worker"
+            f"a prefill leg of {args.scheduler_count} plain data-parallel replicas is not served: "
+            "each replica reports attention-DP rank 0 to the engine's KV sender, which fails every "
+            "request whose bootstrap_room % dp_size is not 0 when it follows the room, and "
+            "registers rank 0 for the decode side's bootstrap under any other load-balance "
+            "method; run attention DP (--tp-size N --attn-dp-size N) or one rank per leg"
         )
+
+
+def start_bootstrap_server(server_args: Any) -> Any | None:
+    """The prefill side's KV bootstrap server, started where the Python
+    servicer starts it (``serve_grpc``, before the schedulers): SGLang's
+    ``start_disagg_service`` builds the transfer backend's server on the
+    launcher's ``--host`` and ``--disaggregation-bootstrap-port`` in the
+    process that fills the tokenizer manager's role, so the runtime context
+    must be published first. The prefill ranks register their KV senders with
+    it as they start and the decode ranks' receivers query it by room.
+    ``None`` for every other role (a decode side starts none); otherwise the
+    server, to be held for the ranks' lifetime (it serves on a daemon
+    thread)."""
+    if EngineConfigView(server_args).server_args.disaggregation_mode != "prefill":
+        return None
+    from sglang.srt.managers.disagg_service import start_disagg_service
+
+    bootstrap_server = start_disagg_service()
+    if bootstrap_server is not None:
+        logger.info(
+            "Bootstrap server started for disaggregation mode on %s:%s",
+            getattr(server_args, "host", None),
+            getattr(server_args, "disaggregation_bootstrap_port", None),
+        )
+    return bootstrap_server
 
 
 class SglangLauncher(RustLauncher):
@@ -440,14 +545,68 @@ class SglangLauncher(RustLauncher):
     def tokenizer_dir(self, args: Any) -> str | None:
         return tokenizer_dir_for(args)
 
+    # The language side's encode dispatch (``--language-only``), built for the
+    # server and started with the ranks; ``None`` on every other worker.
+    encode: Any | None = None
+
+    def server_extras(self, args: Any, tokenizer_dir: str | None) -> dict[str, Any]:
+        """A language-side worker's encode dispatch: SGLang's own receiver and
+        encoder bootstrap server behind a bridge the Rust server drives per
+        request (:mod:`.rust_encode`); nothing for every other worker."""
+        from smg_grpc_servicer.sglang.rust_encode import (
+            EncodeDispatchBridge,
+            dispatches_from_the_frontend,
+        )
+
+        if not dispatches_from_the_frontend(args):
+            return {}
+        self.encode = EncodeDispatchBridge(args)
+        logger.info(
+            "Encode dispatch for the language-only worker: SGLang's own receiver in this "
+            "process, %d encoder URL(s) configured, bootstrap port %s",
+            len(self.encode.encoder_urls),
+            getattr(args, "encoder_bootstrap_port", None),
+        )
+        return {"encode_dispatcher": self.encode}
+
     def launch(self, args: Any, handshake_port: int, facts: Mapping[str, Any]) -> Any:
-        return launch_scheduler_ranks(args, handshake_port=handshake_port)
+        if self.encode is None:
+            return launch_scheduler_ranks(args, handshake_port=handshake_port)
+        return launch_scheduler_ranks(
+            args, handshake_port=handshake_port, encode_bridge=self.encode
+        )
+
+    # The media leg's request material, built with the inputs for a
+    # language-side worker whose frontend dispatches to the encoders; ``None``
+    # on every other worker and where no prompt could be rendered.
+    media: Any | None = None
 
     def warmup_inputs(self, args: Any, facts: Mapping[str, Any]) -> Any:
-        return warmup_inputs(args, facts)
+        """The plan's inputs; on a language-side worker whose frontend
+        dispatches to the encoders, with the media leg when the model's chat
+        template renders an image placeholder (the text ladder never reaches
+        the scheduler's media path, whose first use costs a fresh worker
+        seconds once)."""
+        from smg_grpc_servicer.sglang.rust_encode import dispatches_from_the_frontend
+
+        inputs = warmup_inputs(args, facts)
+        if inputs is None or not dispatches_from_the_frontend(args):
+            return inputs
+        self.media = media_warmup(
+            self.tokenizer_dir(args),
+            trust_remote_code=bool(getattr(args, "trust_remote_code", False)),
+        )
+        if self.media is None:
+            return inputs
+        logger.info(
+            "Planned warm-up ends its shapes with one image through the encoders (the prompt the "
+            "model's chat template renders around it, %d tokens)",
+            len(self.media.input_ids),
+        )
+        return dataclasses.replace(inputs, media_leg=True)
 
     def warmup_wire(self, target: str) -> Any:
-        return warmup_wire(target)
+        return warmup_wire(target, media=self.media)
 
 
 async def serve_rust(server_args: Any) -> int:
@@ -455,5 +614,5 @@ async def serve_rust(server_args: Any) -> int:
     start the scheduler ranks against its handshake, and supervise both
     until a signal or a failure (:class:`SglangLauncher`). Returns the
     process exit code."""
-    refuse_disaggregation(server_args)
+    refuse_epd_disaggregation(server_args)
     return await SglangLauncher().serve(server_args)

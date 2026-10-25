@@ -31,10 +31,10 @@ use smg::{
         CircuitBreakerConfig, ConfigError, ConfigResult, ConsulDiscoveryConfig, DiscoveryConfig,
         FileDiscoveryConfig, HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig,
         ManualAssignmentMode, MemoryConfig, MetricsConfig, OracleConfig, ParserChoice,
-        PdPairingMode, PolicyConfig, PostgresConfig, PowerOfTwoLoadMetric, RedisConfig,
-        RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode, SchemaConfig,
-        SlurmDiscoveryConfig, TokenizerCacheConfig, TraceConfig, TurboJpegPolicy,
-        DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS, DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
+        PdPairingMode, PdReadinessConfig, PolicyConfig, PostgresConfig, PowerOfTwoLoadMetric,
+        ReadinessRoleConfig, RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig,
+        RoutingMode, SchemaConfig, SlurmDiscoveryConfig, TokenizerCacheConfig, TraceConfig,
+        TurboJpegPolicy, DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS, DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
     },
     mesh_discovery::MeshDiscoveryConfig,
     observability::metrics::{register_jemalloc_as_global_allocator, PrometheusConfig},
@@ -232,6 +232,39 @@ struct RoutingArgs {
     /// Unset = dedicated probe listener off.
     #[arg(long, help_heading = "Worker Configuration")]
     health_check_port: Option<u16>,
+
+    /// Desired number of prefill workers used as the stable readiness
+    /// percentage denominator. This does not enable a percentage gate by
+    /// itself; set `--prefill-min-ready-percent` to do that.
+    #[arg(long = "prefill-expected-workers", help_heading = "Health Checks")]
+    readiness_prefill_expected_workers: Option<usize>,
+
+    /// Absolute minimum number of healthy prefill workers required.
+    #[arg(long = "prefill-min-ready-workers", help_heading = "Health Checks")]
+    readiness_prefill_min_healthy_workers: Option<usize>,
+
+    /// Minimum healthy percentage of the expected prefill workers (1-100).
+    #[arg(
+        long = "prefill-min-ready-percent",
+        value_parser = clap::value_parser!(u8).range(1..=100),
+        help_heading = "Health Checks"
+    )]
+    readiness_prefill_min_healthy_percent: Option<u8>,
+
+    /// Absolute minimum number of healthy decode workers required (default 1).
+    #[arg(long = "decode-min-ready-workers", help_heading = "Health Checks")]
+    readiness_decode_min_healthy_workers: Option<usize>,
+    /// Desired decode fleet size used as the fixed readiness percentage denominator.
+    #[arg(long = "decode-expected-workers", help_heading = "Health Checks")]
+    readiness_decode_expected_workers: Option<usize>,
+
+    /// Minimum healthy percentage of expected decode workers (1-100).
+    #[arg(
+        long = "decode-min-ready-percent",
+        value_parser = clap::value_parser!(u8).range(1..=100),
+        help_heading = "Health Checks"
+    )]
+    readiness_decode_min_healthy_percent: Option<u8>,
 
     /// Port of the admin listener. When set, the control-plane routes (the
     /// admin routes /flush_cache, /start_profile, /stop_profile,
@@ -526,7 +559,7 @@ struct RoutingArgs {
     least_load_kv_pressure_weight: f64,
 
     /// Input throughput (tokens/s) for least_load prefill workers; fallback
-    /// output throughput for other workers when no live rate is reported.
+    /// output throughput for other workers when no candidate reports a live rate.
     /// Shared across roles; separate prefill/decode values require constructing
     /// RouterConfig programmatically in Rust.
     #[arg(long, default_value_t = 2000.0, help_heading = "Routing Policy")]
@@ -864,6 +897,16 @@ struct WorkerArgs {
     #[arg(long, value_parser = parse_mm_turbojpeg, help_heading = "Multimodal")]
     mm_turbojpeg: Option<TurboJpegPolicy>,
 
+    /// Video download timeout in milliseconds; positive.
+    /// Falls back to `SMG_MM_VIDEO_FETCH_TIMEOUT_MS`, then 30000.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..), help_heading = "Multimodal")]
+    mm_video_fetch_timeout_ms: Option<u64>,
+
+    /// Image/audio download timeout in milliseconds; positive.
+    /// Falls back to `SMG_MM_FETCH_TIMEOUT_MS`, then 10000.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..), help_heading = "Multimodal")]
+    mm_fetch_timeout_ms: Option<u64>,
+
     /// Listener IP for the RDMA pixel lane's metadata exchange, a plain IPv4
     /// or IPv6 address (no hostname, port or brackets: the workers connect to
     /// it as written); without one the lane stays on the inline path. Falls
@@ -947,7 +990,7 @@ struct DiscoveryArgs {
     router_selector: Vec<String>,
 
     /// Override each worker's model_id from pod metadata.
-    /// Accepted values: "namespace", "label:<key>", or "annotation:<key>"
+    /// Accepted values: `namespace`, `label:<key>`, or `annotation:<key>`
     #[arg(long, help_heading = "Service Discovery (Kubernetes)", value_parser = parse_model_id_from)]
     model_id_from: Option<String>,
 
@@ -1866,6 +1909,34 @@ impl CliArgs {
 }
 
 impl CliArgs {
+    /// Preserve legacy readiness unless a role threshold was explicitly configured.
+    fn pd_readiness_config(&self) -> Option<PdReadinessConfig> {
+        let configured = self.routing.readiness_prefill_expected_workers.is_some()
+            || self.routing.readiness_prefill_min_healthy_workers.is_some()
+            || self.routing.readiness_prefill_min_healthy_percent.is_some()
+            || self.routing.readiness_decode_min_healthy_workers.is_some()
+            || self.routing.readiness_decode_expected_workers.is_some()
+            || self.routing.readiness_decode_min_healthy_percent.is_some();
+        configured.then(|| PdReadinessConfig {
+            prefill: ReadinessRoleConfig {
+                expected_workers: self.routing.readiness_prefill_expected_workers,
+                min_healthy_workers: self
+                    .routing
+                    .readiness_prefill_min_healthy_workers
+                    .unwrap_or(1),
+                min_healthy_percent: self.routing.readiness_prefill_min_healthy_percent,
+            },
+            decode: ReadinessRoleConfig {
+                expected_workers: self.routing.readiness_decode_expected_workers,
+                min_healthy_workers: self
+                    .routing
+                    .readiness_decode_min_healthy_workers
+                    .unwrap_or(1),
+                min_healthy_percent: self.routing.readiness_decode_min_healthy_percent,
+            },
+        })
+    }
+
     /// Build control plane authentication configuration from CLI args. A
     /// configuration that asks for authentication but cannot be honoured
     /// (a malformed key entry, an issuer without an audience or the reverse)
@@ -2823,6 +2894,7 @@ impl CliArgs {
             .zmq_startup_timeout_secs(self.routing.zmq_startup_timeout_secs)
             .host(&self.routing.host)
             .port(self.routing.port)
+            .pd_readiness(self.pd_readiness_config())
             .health_check_port(self.routing.health_check_port)
             .admin_port(self.routing.admin_port)
             .admin_host(self.routing.admin_host.clone())
@@ -2875,6 +2947,8 @@ impl CliArgs {
             .mm_allowed_media_domains(self.workers.mm_allowed_media_domains.clone())
             .mm_allow_private_media_hosts(self.workers.mm_allow_private_media_hosts)
             .mm_turbojpeg(self.workers.mm_turbojpeg)
+            .mm_video_fetch_timeout_ms(self.workers.mm_video_fetch_timeout_ms)
+            .mm_fetch_timeout_ms(self.workers.mm_fetch_timeout_ms)
             .rdma_listen_ip(self.workers.rdma_listen_ip.clone())
             .rdma_slot_ttl_s(self.workers.rdma_slot_ttl_s)
             .log_mm_timing(self.workers.log_mm_timing)
@@ -3273,6 +3347,88 @@ mod tests {
             .chain(args.iter().map(|s| (*s).to_string()))
             .collect();
         Cli::parse_from(argv).router_args
+    }
+
+    /// The CLI preserves independent role thresholds and rounds percentages up.
+    #[test]
+    fn pd_readiness_cli_flags_flow_into_router_config() {
+        let config = cli_args_from(&[
+            "--pd-disaggregation",
+            "--prefill-expected-workers",
+            "8",
+            "--prefill-min-ready-workers",
+            "4",
+            "--prefill-min-ready-percent",
+            "80",
+            "--decode-min-ready-workers",
+            "2",
+            "--decode-expected-workers",
+            "4",
+            "--decode-min-ready-percent",
+            "75",
+        ])
+        .to_router_config(vec![], vec![])
+        .unwrap();
+
+        let readiness = config.pd_readiness.unwrap();
+        assert_eq!(readiness.prefill.expected_workers, Some(8));
+        assert_eq!(readiness.prefill.min_healthy_workers, 4);
+        assert_eq!(readiness.prefill.min_healthy_percent, Some(80));
+        assert_eq!(readiness.prefill.required_workers(), 7);
+        assert_eq!(readiness.decode.expected_workers, Some(4));
+        assert_eq!(readiness.decode.min_healthy_percent, Some(75));
+        assert_eq!(readiness.decode.required_workers(), 3);
+    }
+
+    /// An expected size alone preserves the legacy one-worker minimum.
+    #[test]
+    fn pd_readiness_expected_count_does_not_enable_a_percentage_gate() {
+        let config = cli_args_from(&["--pd-disaggregation", "--prefill-expected-workers", "8"])
+            .to_router_config(vec![], vec![])
+            .unwrap();
+
+        let readiness = config.pd_readiness.unwrap();
+        assert_eq!(readiness.prefill.min_healthy_percent, None);
+        assert_eq!(readiness.prefill.required_workers(), 1);
+        assert_eq!(readiness.decode.required_workers(), 1);
+    }
+
+    /// An absolute floor remains effective when the percentage asks for fewer workers.
+    #[test]
+    fn pd_readiness_uses_the_larger_absolute_and_percentage_gate() {
+        let config = cli_args_from(&[
+            "--pd-disaggregation",
+            "--prefill-expected-workers",
+            "4",
+            "--prefill-min-ready-workers",
+            "3",
+            "--prefill-min-ready-percent",
+            "50",
+        ])
+        .to_router_config(vec![], vec![])
+        .unwrap();
+
+        let readiness = config.pd_readiness.unwrap();
+        assert_eq!(readiness.prefill.required_workers(), 3);
+    }
+
+    /// A percentage without a stable denominator is rejected at startup.
+    #[test]
+    fn pd_readiness_percentage_requires_expected_count() {
+        let result = cli_args_from(&["--pd-disaggregation", "--prefill-min-ready-percent", "80"])
+            .to_router_config(vec![], vec![]);
+        assert!(matches!(result, Err(ConfigError::MissingRequired { .. })));
+    }
+
+    /// Role thresholds cannot silently do nothing in regular routing mode.
+    #[test]
+    fn pd_readiness_flags_are_rejected_outside_disaggregated_mode() {
+        let result =
+            cli_args_from(&["--prefill-min-ready-workers", "2"]).to_router_config(vec![], vec![]);
+        assert!(matches!(
+            result,
+            Err(ConfigError::IncompatibleConfig { .. })
+        ));
     }
 
     /// `--prefill` / `--encode` take an optional trailing bootstrap port (a
@@ -5225,6 +5381,16 @@ mod tests {
         assert!(Cli::try_parse_from(["smg", "--cache-ttl-secs", "0"]).is_err());
     }
 
+    /// Millisecond fetch budgets accept only positive integers at the CLI boundary.
+    #[test]
+    fn mm_fetch_timeout_flags_reject_invalid_values() {
+        for flag in ["--mm-fetch-timeout-ms", "--mm-video-fetch-timeout-ms"] {
+            for value in ["0", "-1", "invalid", "1.5"] {
+                assert!(Cli::try_parse_from(["smg", flag, value]).is_err());
+            }
+        }
+    }
+
     /// The media placement and engine-side media flags must reach both
     /// `RouterConfig` and the wrapped `ServerConfig.router_config`.
     #[test]
@@ -5232,6 +5398,10 @@ mod tests {
         let cli = cli_args_from(&[
             "--mm-processing",
             "worker",
+            "--mm-fetch-timeout-ms",
+            "60000",
+            "--mm-video-fetch-timeout-ms",
+            "120000",
             "--mm-pixel-cache-mb",
             "256",
             "--mm-pixel-rdma",
@@ -5251,6 +5421,8 @@ mod tests {
         let router_config = cli.to_router_config(vec![], vec![]).unwrap();
         assert_eq!(router_config.mm_processing, Some(MmProcessingMode::Worker));
         assert_eq!(router_config.mm_pixel_cache_mb, Some(256));
+        assert_eq!(router_config.mm_fetch_timeout_ms, Some(60000));
+        assert_eq!(router_config.mm_video_fetch_timeout_ms, Some(120000));
         assert!(router_config.mm_pixel_rdma);
         assert_eq!(router_config.rdma_listen_ip.as_deref(), Some("10.0.0.7"));
         assert_eq!(router_config.rdma_slot_ttl_s, Some(600));
@@ -5263,6 +5435,8 @@ mod tests {
         let nested = &server_config.router_config;
         assert_eq!(nested.mm_processing, Some(MmProcessingMode::Worker));
         assert_eq!(nested.mm_pixel_cache_mb, Some(256));
+        assert_eq!(nested.mm_fetch_timeout_ms, Some(60000));
+        assert_eq!(nested.mm_video_fetch_timeout_ms, Some(120000));
         assert!(nested.mm_pixel_rdma);
         assert_eq!(nested.rdma_listen_ip.as_deref(), Some("10.0.0.7"));
         assert_eq!(nested.rdma_slot_ttl_s, Some(600));
@@ -5285,6 +5459,8 @@ mod tests {
         assert_eq!(router_config.mm_allowed_media_domains, None);
         assert!(!router_config.mm_allow_private_media_hosts);
         assert_eq!(router_config.mm_turbojpeg, None);
+        assert_eq!(router_config.mm_fetch_timeout_ms, None);
+        assert_eq!(router_config.mm_video_fetch_timeout_ms, None);
 
         let server_config = cli.to_server_config(router_config).unwrap();
         assert_eq!(server_config.router_config.mm_processing, None);
