@@ -1015,3 +1015,34 @@ def test_slim_output_carries_hidden_states_as_rows_per_position():
         msgspec.msgpack.encode(arr[:-1]), type=wire.BatchTokenIDSlimOutput
     )
     assert older.output_hidden_states is None
+
+
+# Pinned by the Rust request encoder test, including the video_token_id slot.
+RUST_VIDEO_REQUEST = (
+    "9eb9546f6b656e697a656447656e6572617465526571496e707574a26d6dc0c0950107070702c099919902c0c09192010301"
+    "c734020000001093920204a7666c6f61743332a3637075000000000000003f0000803f0000c03f0000004000002040000040"
+    "4000006040c0c281ae766964656f5f677269645f746877c72a020000000e93920103a5696e743634a3637075010000000000"
+    "000002000000000000000200000000000000c0c007c0c0c0c007c0dc001acc80c0c0c0cb3ff0000000000000cb3ff0000000"
+    "000000ffcb0000000000000000cb0000000000000000cb0000000000000000cb3ff00000000000000001c0c0c0c0c0c2c3c3"
+    "c2c0c0c0c0c2ff00c0c2"
+)
+
+
+def test_rust_video_tokens_are_padded_before_embedding():
+    """Use the native SGLang decoder to verify video placeholder padding."""
+    from sglang.srt.managers.mm_utils import (
+        MultiModalityDataPaddingPatternMultimodalTokens,
+    )
+    from sglang.srt.managers.schedule_batch import Modality
+
+    (req,) = wire.decode_request_frames([wire.REQ_TYPE_ADD, bytes.fromhex(RUST_VIDEO_REQUEST)])
+    media = req.mm_inputs
+    assert media.video_token_id == 7
+    (item,) = media.mm_items
+    assert item.modality is Modality.VIDEO
+    item.pad_value = 1000
+    padded = MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens(
+        req.input_ids, media
+    )
+    assert list(padded) == [1, 1000, 1000, 1000, 2]
+    assert list(req.input_ids) == [1, 7, 7, 7, 2]

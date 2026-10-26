@@ -32,7 +32,7 @@ use crate::{
 /// each choice's request so the engine's spans join the Router's trace.
 pub(super) async fn generate(
     state: &Arc<State>,
-    req: sg::GenerateRequest,
+    mut req: sg::GenerateRequest,
     trace_headers: Option<BTreeMap<String, String>>,
 ) -> Result<BoxStream<sg::GenerateResponse>, Status> {
     // The request's arrival, the instant its latencies are measured from.
@@ -47,7 +47,18 @@ pub(super) async fn generate(
     let request_id: Arc<str> = Arc::from(req.request_id.as_str());
     // Register before the submit: an `Abort` landing in the gap must find the
     // entry, and a duplicate id is refused up front.
-    let (registration, cancel) = state.shared.registry.register(&request_id)?;
+    let (registration, mut cancel) = state.shared.registry.register(&request_id)?;
+    if req.mm_inputs.as_ref().is_some_and(|mm| {
+        mm.pixel_values.is_none() && (!mm.image_urls.is_empty() || !mm.video_urls.is_empty())
+    }) {
+        if let Some(processor) = &state.media {
+            req = tokio::select! {
+                biased;
+                _ = &mut cancel => return Err(Status::cancelled("media request aborted")),
+                result = processor.process(req) => result?,
+            };
+        }
+    }
     let streaming = req.stream;
     let prompt_tokens = req.tokenized.as_ref().map_or(0, |tokenized| {
         u32::try_from(tokenized.input_ids.len()).unwrap_or(u32::MAX)

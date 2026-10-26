@@ -4419,7 +4419,7 @@ mod tests {
             ..Default::default()
         }));
         request
-            .set_vllm_media_refs(refs.clone())
+            .set_media_refs(refs.clone())
             .expect("vLLM request accepts media refs");
         assert!(request.has_vllm_media_refs());
         let clone = request.clone_without_mm_pixels();
@@ -4446,7 +4446,7 @@ mod tests {
             ..Default::default()
         }));
         request
-            .set_vllm_media_refs(vllm::MediaRefs {
+            .set_media_refs(vllm::MediaRefs {
                 items: vec![vllm::MediaRef {
                     modality: smg_grpc_client::common_proto::Modality::Image as i32,
                     url: "https://a/1.png".to_string(),
@@ -4769,7 +4769,7 @@ mod tests {
         }));
         request.set_kv_transfer_params_json("{\"do_remote_prefill\":true}".to_string());
         request
-            .set_vllm_media_refs(vllm::MediaRefs {
+            .set_media_refs(vllm::MediaRefs {
                 items: vec![vllm::MediaRef {
                     modality: smg_grpc_client::common_proto::Modality::Image as i32,
                     url: "https://a/1.png".to_string(),

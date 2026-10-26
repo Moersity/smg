@@ -531,29 +531,29 @@ pub(crate) fn encode_media_refs(
     Ok((!mm.image_urls.is_empty()).then(|| mm.image_urls.clone()))
 }
 
-/// The request's multimodal payload as the scheduler's processor output, by
-/// the Python servicer's rules (`_parse_mm_inputs`): one image item whose
-/// feature is `pixel_values`, the model-specific tensors beside it, the
-/// placeholder ranges as inclusive `[start, end]` offsets (none at all leaves
-/// the slot unset, with the same warning), and the image token id. Nothing
-/// is derived here: the scheduler hashes the feature, pads the prompt with
-/// its model's pattern and computes the position tensors it needs, as it
-/// does behind the Python servicer. What that servicer would mis-tag or
-/// silently drop is refused instead: a payload naming another modality
-/// (every item is tagged an image), one of media references without tensors
-/// (the encoders' input, which [`encode_media_refs`] takes before this and
-/// the dispatch serves; refused here on a worker that runs none), a tensor
-/// of a dtype the wire does not carry or of the wrong length, and a
-/// placeholder outside the prompt or of zero length.
+/// Translate a single image or video batch to the scheduler's native
+/// processor output. Preserve patch offsets, modality and model tensors;
+/// the scheduler derives its hashes, padded prompt and position tensors.
+/// Media references must have been resolved by a configured native processor
+/// or dispatched to an encoder before reaching this tensor-only boundary.
 pub(crate) fn translate_sglang_multimodal(
     mm: sglang_proto::MultimodalInputs,
     prompt_len: usize,
 ) -> Result<SglangWireMmInputs, String> {
-    if let Some(other) = mm.modalities.iter().find(|modality| *modality != "image") {
+    let modality = if mm.modalities.iter().all(|name| name == "image") {
+        // Empty metadata and repeated image labels are accepted by the
+        // existing image contract.
+        SglangWireModality::Image
+    } else if mm.modalities.iter().all(|name| name == "video") {
+        SglangWireModality::Video
+    } else {
         return Err(format!(
-            "multimodal modality {other:?} is not carried over the SGLang ZMQ backend; the \
-             scheduler takes preprocessed image tensors on this wire"
+            "unsupported SGLang tensor modalities {:?}",
+            mm.modalities
         ));
+    };
+    if modality == SglangWireModality::Video && mm.im_token_id.is_none() {
+        return Err("SGLang video tensors require a placeholder token id".into());
     }
     let Some(pixel_values) = mm.pixel_values else {
         return Err(
@@ -602,12 +602,15 @@ pub(crate) fn translate_sglang_multimodal(
     };
     Ok(SglangWireMmInputs {
         mm_items: vec![SglangWireMmItem {
-            modality: SglangWireModality::Image,
+            modality,
             offsets,
             feature: Some(feature),
             model_specific_data,
         }],
         im_token_id: mm.im_token_id,
+        video_token_id: (modality == SglangWireModality::Video)
+            .then_some(mm.im_token_id)
+            .flatten(),
     })
 }
 
@@ -1063,6 +1066,35 @@ mod tests {
         assert_eq!(translate(text).unwrap().mm_inputs, None);
     }
 
+    #[test]
+    /// Preserve video grid and inclusive offsets; reject missing padding token IDs.
+    fn video_tensors_preserve_modality_grid_and_offsets() {
+        let mut mm = media_payload();
+        mm.modalities = vec!["video".to_string()];
+        let mut missing_id = mm.clone();
+        missing_id.im_token_id = None;
+        assert!(translate_sglang_multimodal(missing_id, 5)
+            .unwrap_err()
+            .contains("placeholder token id"));
+        let grid = mm.model_specific_tensors.remove("image_grid_thw").unwrap();
+        mm.model_specific_tensors
+            .insert("video_grid_thw".into(), grid.clone());
+        let output = translate_sglang_multimodal(mm, 5).unwrap();
+        let item = &output.mm_items[0];
+        assert_eq!(item.modality, SglangWireModality::Video);
+        assert_eq!(output.video_token_id, Some(7));
+        assert_eq!(item.offsets, Some(vec![(1, 3)]));
+        assert_eq!(
+            item.model_specific_data["video_grid_thw"]
+                .data
+                .as_raw_view()
+                .expect("inline grid")
+                .as_ref(),
+            grid.data.as_ref()
+        );
+        assert!(!item.model_specific_data.contains_key("image_grid_thw"));
+    }
+
     /// What the Python servicer would mis-tag or drop is refused by name:
     /// another modality, references without tensors, a dtype the wire does
     /// not carry, a wrong byte length, a placeholder outside the prompt or
@@ -1073,9 +1105,9 @@ mod tests {
             let error = translate(media_request(mm)).unwrap_err();
             assert!(error.contains(needle), "{error}");
         };
-        let mut video = media_payload();
-        video.modalities = vec!["video".to_string()];
-        refused(video, "modality \"video\" is not carried");
+        let mut audio = media_payload();
+        audio.modalities = vec!["audio".to_string()];
+        refused(audio, "unsupported SGLang tensor modalities");
         // References without tensors are the encoders' input, taken before
         // this translation by `encode_media_refs`; handed to the
         // processor-output path anyway, they are refused by name.

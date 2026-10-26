@@ -76,6 +76,7 @@ fn config(dir: &std::path::Path, handshake: &str, model: SglangModelInfo) -> Sgl
         servicer: servicer_config(dir, handshake),
         model,
         encode_dispatcher: None,
+        media_processor: None,
     }
 }
 
@@ -3453,4 +3454,133 @@ async fn the_zero_filled_loads_count_the_connected_ranks() {
             .collect::<Vec<_>>(),
         vec![0, 1]
     );
+}
+
+struct NativeVideoProcessor;
+
+impl SglangMediaProcessor for NativeVideoProcessor {
+    /// Provide deterministic media behavior without decoding or model inference.
+    fn process(
+        &self,
+        mut request: sg::GenerateRequest,
+    ) -> crate::BoxFuture<Result<sg::GenerateRequest, tonic::Status>> {
+        Box::pin(async move {
+            let refs = request.mm_inputs.take().unwrap();
+            assert_eq!(refs.video_urls, ["data:video/mp4;base64,AA=="]);
+            assert!(refs.pixel_values.is_none());
+            assert_eq!(request.tokenized.as_ref().unwrap().input_ids, [1, 7, 2]);
+            request.tokenized.as_mut().unwrap().input_ids = vec![1, 7, 7, 7, 2];
+            request.mm_inputs = Some(sg::MultimodalInputs {
+                modalities: vec!["video".into()],
+                pixel_values: Some(sg::TensorData {
+                    data: vec![0; 32].into(),
+                    shape: vec![2, 4],
+                    dtype: "float32".into(),
+                }),
+                model_specific_tensors: [(
+                    "video_grid_thw".into(),
+                    sg::TensorData {
+                        data: [1i64, 2, 2]
+                            .iter()
+                            .flat_map(|x| x.to_le_bytes())
+                            .collect::<Vec<_>>()
+                            .into(),
+                        shape: vec![1, 3],
+                        dtype: "int64".into(),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                im_token_id: Some(7),
+                mm_placeholders: vec![sg::PlaceholderRange {
+                    offset: 1,
+                    length: 3,
+                }],
+                ..Default::default()
+            });
+            Ok(request)
+        })
+    }
+}
+
+#[tokio::test]
+/// References must expand tokens before their video tensors reach the scheduler.
+async fn native_video_refs_expand_before_scheduler_dispatch() {
+    use engine_zmq_client::protocol::sglang::multimodal::SglangWireModality;
+    let mut h = harness_with(model_info(), |config| {
+        config.media_processor = Some(Arc::new(NativeVideoProcessor));
+    })
+    .await;
+    let info = h
+        .client
+        .get_server_info(sg::GetServerInfoRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        info.server_args.unwrap().fields["mm_processor"].kind,
+        Some(Kind::StringValue("smg".into()))
+    );
+    let mut request = generate_request("native-video", true, Vec::new());
+    request.tokenized.as_mut().unwrap().input_ids = vec![1, 7, 2];
+    request.mm_inputs = Some(sg::MultimodalInputs {
+        video_urls: vec!["data:video/mp4;base64,AA==".into()],
+        ..Default::default()
+    });
+    let _stream = h.client.generate(request).await.unwrap().into_inner();
+    let received = recv_add(&mut h.engine_in).await;
+    assert_eq!(received.input_ids, [1, 7, 7, 7, 2]);
+    let mm = received.mm_inputs.unwrap();
+    assert_eq!(mm.mm_items[0].modality, SglangWireModality::Video);
+    assert_eq!(mm.mm_items[0].offsets, Some(vec![(1, 3)]));
+    assert!(mm.mm_items[0]
+        .model_specific_data
+        .contains_key("video_grid_thw"));
+    h.server.stop(Duration::from_secs(5)).unwrap();
+}
+
+struct PendingMediaProcessor;
+
+impl SglangMediaProcessor for PendingMediaProcessor {
+    /// Provide deterministic media behavior without decoding or model inference.
+    fn process(
+        &self,
+        _request: sg::GenerateRequest,
+    ) -> crate::BoxFuture<Result<sg::GenerateRequest, tonic::Status>> {
+        Box::pin(std::future::pending())
+    }
+}
+
+#[tokio::test]
+/// Aborting preprocessing unregisters the request without sending scheduler work.
+async fn abort_during_native_media_processing_never_submits_to_scheduler() {
+    let mut h = harness_with(model_info(), |config| {
+        config.media_processor = Some(Arc::new(PendingMediaProcessor));
+    })
+    .await;
+    let mut request = generate_request("pending-media", true, Vec::new());
+    request.mm_inputs = Some(sg::MultimodalInputs {
+        image_urls: vec!["https://example.test/image.png".into()],
+        ..Default::default()
+    });
+    let mut client = h.client.clone();
+    #[expect(clippy::disallowed_methods, reason = "test awaits this request task")]
+    let pending = tokio::spawn(async move { client.generate(request).await });
+    wait_until(|| h.server.active_requests() == 1).await;
+    h.client
+        .abort(sg::AbortRequest {
+            request_id: "pending-media".into(),
+            reason: String::new(),
+        })
+        .await
+        .unwrap();
+    let error = pending.bounded().await.unwrap().unwrap_err();
+    assert_eq!(error.code(), Code::Cancelled);
+    wait_until(|| h.server.active_requests() == 0).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), h.engine_in.recv_frames())
+            .await
+            .is_err()
+    );
+    h.server.stop(Duration::from_secs(5)).unwrap();
 }

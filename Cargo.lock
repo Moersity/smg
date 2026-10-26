@@ -7937,6 +7937,7 @@ dependencies = [
  "smg-symphony",
  "tikv-jemallocator",
  "tokio",
+ "tonic",
  "tool-parser",
  "tracing",
 ]

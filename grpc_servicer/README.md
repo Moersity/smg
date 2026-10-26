@@ -1189,8 +1189,8 @@ reaches the scheduler, the scheduler's request carries what the dispatch set
 (its wait flag, the per-encoder assignment, the encoder list) and the prompt
 text the scheduler rebuilds from once the embeddings arrive, and a dispatch
 that fails afterwards reaches the scheduler as its own failure notice. A
-request of references on any other worker, or on a language-only worker with
-no encoder registered, is refused (`FAILED_PRECONDITION`) rather than answered
+request of references on a worker without native media processing (below)
+or encoder dispatch is refused (`FAILED_PRECONDITION`) rather than answered
 as text. A request the Router pins to a data-parallel rank (`--dp-size` above one
 behind a dp-aware Router) goes to that rank's scheduler, as the engine's
 data-parallel controller sends it behind SGLang's own frontend; a pin past the
@@ -1268,6 +1268,38 @@ on the Rust path either).
 ```bash
 sglang serve --model-path Qwen/Qwen3-0.6B --grpc-mode --port 30000 --servicer-impl rust --metrics-port 29100
 ```
+
+#### SGLang native worker-side media preprocessing
+
+With the Rust servicer, set `SMG_SGLANG_MM_PROCESSOR=smg` on both P and D
+and select `--mm-processing worker` on the router. The workers advertise
+`mm_processor=smg`; a worker without that capability is not selected for
+references. Leave the environment variable unset to retain tensor requests
+from `--mm-processing router`. `SMG_SGLANG_MM_MAX_INFLIGHT` (default 4,
+positive integer) bounds concurrent preprocessing on each worker.
+
+`SMG_SGLANG_MM_DTYPE` selects the worker's pixel tensor dtype (`float32`, the
+compatible default; `bfloat16`; or `float16`). Match the **vision encoder's**
+dtype, which may differ from the language model or KV-cache dtype. Normalization
+still runs in float32, followed by one conversion before transport; integer
+metadata retain their dtype. A 16-bit pixel tensor halves the transfer size.
+This setting applies to worker processing, not router-side tensor assembly.
+Install `libturbojpeg.so.0` in the worker image and set
+`SMG_MM_TURBOJPEG=require` when JPEG decoding must match CPU PIL.
+
+The router sends unexpanded tokens and image or video URLs (including data
+URLs). The worker uses the shared Rust media pipeline, follows SGLang's
+alpha handling, expands tokens and writes SGLang's native MessagePack tensor
+and processor-output structures. This does not use vLLM's feature encoding.
+In parallel PD both workers receive the references and independently construct
+the prompt; use immutable media URLs. Decode retains the metadata required by
+SGLang while KV transfer remains the engine's responsibility.
+
+This path currently accepts a single modality per request. Mixed image/video,
+per-item image resize hints, audio, and encode/prefill disaggregation are
+rejected rather than silently altered. Per-item video sampling hints require
+router processing. This feature requires updated Rust servicer and
+router components; the Python SGLang servicer does not implement it.
 
 #### Headless over ZMQ (no SGLang change)
 

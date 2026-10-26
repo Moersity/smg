@@ -229,6 +229,16 @@ pub(super) fn hidden_states_cap(model: &SglangModelInfo) -> Option<HiddenStatesC
     }
 }
 
+/// Native worker-side media preprocessing. Implementations retain the
+/// SGLang request and replace only its unexpanded prompt and media inputs.
+pub trait SglangMediaProcessor: Send + Sync {
+    /// Resolve references before dispatch, preserving the request's generation options.
+    fn process(
+        &self,
+        request: smg_grpc_client::sglang_proto::GenerateRequest,
+    ) -> crate::BoxFuture<Result<smg_grpc_client::sglang_proto::GenerateRequest, tonic::Status>>;
+}
+
 /// How to bind, where the engines dial in, and what to advertise.
 #[derive(Clone)]
 pub struct SglangServicerConfig {
@@ -236,8 +246,8 @@ pub struct SglangServicerConfig {
     /// the start-up bounds. `handshake_address` is what the headless
     /// scheduler dials (the launcher's `--zmq-handshake-address`),
     /// `engine_count` the data-parallel size; `tokenizer_dir` is bundled by
-    /// `GetTokenizer` only, the scheduler keeps its own tokenizer for stop
-    /// strings.
+    /// `GetTokenizer` and the native media launcher uses it for expansion.
+    /// The scheduler keeps its own tokenizer for stop strings.
     pub servicer: ServicerConfig,
     pub model: SglangModelInfo,
     /// The encode dispatch of a language-side worker under encode/prefill
@@ -246,6 +256,8 @@ pub struct SglangServicerConfig {
     /// as the engine's own frontend sends them ([`SglangEncodeDispatcher`]).
     /// `None` on every other worker: a request of references is refused.
     pub encode_dispatcher: Option<Arc<dyn SglangEncodeDispatcher>>,
+    /// Optional native image/video processor; mutually exclusive with encode dispatch.
+    pub media_processor: Option<Arc<dyn SglangMediaProcessor>>,
 }
 
 impl std::fmt::Debug for SglangServicerConfig {
@@ -282,6 +294,7 @@ pub(super) struct State {
     pub(super) shared: Shared,
     /// The language-side encode dispatch, when this worker runs one.
     pub(super) encode: Option<Arc<dyn SglangEncodeDispatcher>>,
+    pub(super) media: Option<Arc<dyn SglangMediaProcessor>>,
 }
 
 impl WireState for State {
@@ -302,6 +315,11 @@ impl SglangServicerServer {
     pub fn start(config: SglangServicerConfig) -> Result<Self, ServicerError> {
         let invalid = |message: &str| ServicerError::InvalidConfig(message.to_string());
         config.servicer.validate()?;
+        if config.encode_dispatcher.is_some() && config.media_processor.is_some() {
+            return Err(invalid(
+                "native media processing cannot be combined with encode disaggregation",
+            ));
+        }
         if config.model.model_path.trim().is_empty() {
             return Err(invalid("model_path must not be empty"));
         }
@@ -331,7 +349,7 @@ impl SglangServicerServer {
                 max_model_len: u32::try_from(config.model.max_context_length).unwrap_or(0),
                 // The scheduler matches string stops itself.
                 matches_string_stops: false,
-                // No media reach this scheduler through the servicer yet.
+                // Native SGLang stage timing is emitted by its processor.
                 processes_media: false,
             },
             config.servicer.metrics_bind_address.is_some(),
@@ -340,6 +358,7 @@ impl SglangServicerServer {
             model: config.model,
             shared: Shared::new(kv_relay, metrics, config.servicer.tokenizer_dir.clone()),
             encode: config.encode_dispatcher,
+            media: config.media_processor,
         });
         let routes = Routes::new(
             SglangSchedulerServer::new(service::SglangService {

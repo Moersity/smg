@@ -69,7 +69,20 @@ pub(super) fn server_info(state: &State) -> sg::GetServerInfoResponse {
     let model = &state.model;
     let ready = state.shared.ready();
     let max_total_num_tokens = state.shared.kv_capacity_tokens();
-    let server_args = struct_from_json(&model.server_args_json);
+    let mut server_args = struct_from_json(&model.server_args_json);
+    if state.media.is_some() {
+        for (key, value) in [
+            ("mm_processor", "smg"),
+            ("mm_media_ref_schemes", "http,https,data"),
+        ] {
+            server_args.fields.insert(
+                key.to_string(),
+                prost_types::Value {
+                    kind: Some(prost_types::value::Kind::StringValue(value.to_string())),
+                },
+            );
+        }
+    }
     let mut scheduler_info = struct_from_json(&model.scheduler_info_json);
     if let Some(ready) = ready {
         insert_capacity(

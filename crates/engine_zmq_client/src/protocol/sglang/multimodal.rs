@@ -58,6 +58,19 @@ pub const MULTIMODAL_DATA_ITEM_NAME: &str = "MultimodalDataItem";
 pub const PROCESSOR_OUTPUT_WIRE_FIELDS: [&str; 4] =
     ["mm_items", "input_ids", "padded_input_ids", "im_token_id"];
 
+/// Videos also need their token id so the scheduler replaces their placeholders.
+pub const VIDEO_PROCESSOR_OUTPUT_WIRE_FIELDS: [&str; 9] = [
+    "mm_items",
+    "input_ids",
+    "padded_input_ids",
+    "im_token_id",
+    "im_start_id",
+    "im_end_id",
+    "slice_start_id",
+    "slice_end_id",
+    "video_token_id",
+];
+
 /// The same for `MultimodalDataItem`.
 pub const DATA_ITEM_WIRE_FIELDS: [&str; 9] = [
     "modality",
@@ -391,15 +404,15 @@ impl<'de> Deserialize<'de> for SglangWireMmItem {
 
 /// The request's multimodal payload, the scheduler's
 /// `MultimodalProcessorOutput`: a positional array of which this side sends the
-/// prefix through `im_token_id` (the token the model's pad pattern replaces),
-/// with `mm_items` filled and the prompt-side slots (`input_ids`,
-/// `padded_input_ids`) at their defaults; the other token ids and the position
-/// tensors are the scheduler's defaults past the prefix, which computes what it
-/// needs of them itself.
+/// prefix through `im_token_id` for images, extended through `video_token_id`
+/// for videos. Both ids tell the scheduler which modality's placeholders to
+/// pad. The prompt-side slots and position tensors retain their defaults;
+/// the scheduler computes positions itself.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct SglangWireMmInputs {
     pub mm_items: Vec<SglangWireMmItem>,
     pub im_token_id: Option<u32>,
+    pub video_token_id: Option<u32>,
 }
 
 impl TensorFields for SglangWireMmInputs {
@@ -415,11 +428,22 @@ impl TensorFields for SglangWireMmInputs {
 impl Serialize for SglangWireMmInputs {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         const NIL: Option<()> = None;
-        let mut tuple = serializer.serialize_tuple(PROCESSOR_OUTPUT_WIRE_FIELDS.len())?;
+        let fields = if self.video_token_id.is_some() {
+            VIDEO_PROCESSOR_OUTPUT_WIRE_FIELDS.len()
+        } else {
+            PROCESSOR_OUTPUT_WIRE_FIELDS.len()
+        };
+        let mut tuple = serializer.serialize_tuple(fields)?;
         tuple.serialize_element(&self.mm_items)?;
         tuple.serialize_element(&NIL)?; // input_ids
         tuple.serialize_element(&NIL)?; // padded_input_ids
         tuple.serialize_element(&self.im_token_id)?;
+        if self.video_token_id.is_some() {
+            for _ in 0..4 {
+                tuple.serialize_element(&NIL)?;
+            }
+            tuple.serialize_element(&self.video_token_id)?;
+        }
         tuple.end()
     }
 }
@@ -440,10 +464,15 @@ impl<'de> Deserialize<'de> for SglangWireMmInputs {
                 let _input_ids: IgnoredAny = next_field(&mut seq, "input_ids")?;
                 let _padded_input_ids: IgnoredAny = next_field(&mut seq, "padded_input_ids")?;
                 let im_token_id = next_field(&mut seq, "im_token_id")?;
+                for _ in 0..4 {
+                    let _: Option<IgnoredAny> = seq.next_element()?;
+                }
+                let video_token_id = seq.next_element::<Option<u32>>()?.flatten();
                 drain_trailing(&mut seq)?;
                 Ok(SglangWireMmInputs {
                     mm_items,
                     im_token_id,
+                    video_token_id,
                 })
             }
         }
@@ -539,6 +568,7 @@ mod tests {
                 model_specific_data: BTreeMap::from([("image_grid_thw".to_string(), grid())]),
             }],
             im_token_id: Some(7),
+            video_token_id: None,
         }
     }
 
@@ -598,6 +628,7 @@ mod tests {
                 model_specific_data: BTreeMap::new(),
             }],
             im_token_id: None,
+            video_token_id: None,
         };
         assert_eq!(
             encode_msgpack(&no_offsets).unwrap(),
@@ -710,6 +741,7 @@ mod tests {
                 },
             ],
             im_token_id: None,
+            video_token_id: None,
         };
         let mut seen = Vec::new();
         inputs.for_each_tensor(&mut |data| {
